@@ -1,0 +1,23 @@
+{
+  "eventType": "TEXT_SUCCESSFUL",
+  "eventVersion": "1.0",
+  "eventTimestamp": 1686975103470,
+  "isFinal": true,
+  "originationPhoneNumber": "+12065550152",
+  "destinationPhoneNumber": "+14255550156",
+  "isInternationalSend": false,
+  "mcc": "310",
+  "mnc": "800",
+  "messageId": "862a8790-60c0-4430-9b2b-658bdexample",
+  "messageRequestTimestamp": 1686975103170,
+  "messageEncoding": "GSM",
+  "messageType": "PROMOTIONAL",
+  "messageStatus": "SUCCESSFUL",
+  "messageStatusDescription": "Message has been accepted by phone carrier",
+  "context": {
+    "account": "bar"
+  },
+  "totalMessageParts": 1,
+  "totalMessagePrice": 0.09582,
+  "totalCarrierFee": 0.0
+}

@@ -6,6 +6,7 @@ pub mod allowlist;
 pub mod app;
 pub mod aws;
 pub mod config;
+pub mod entry;
 pub mod error;
 pub mod model;
 pub mod publish;

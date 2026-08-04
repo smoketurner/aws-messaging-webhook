@@ -1,0 +1,33 @@
+{
+  "eventType": "TEXT_PROTECT_BLOCKED",
+  "eventVersion": "1.0",
+  "eventTimestamp": 1686975103470,
+  "isFinal": true,
+  "originationPhoneNumber": "+12065550152",
+  "destinationPhoneNumber": "+14255550156",
+  "isoCountryCode": "US",
+  "mcc": "310",
+  "mnc": "800",
+  "messageId": "862a8790-60c0-4430-9b2b-658bdexample",
+  "messageRequestTimestamp": 1686975103170,
+  "messageEncoding": "GSM",
+  "messageType": "PROMOTIONAL",
+  "messageStatus": "PROTECT_BLOCKED",
+  "messageStatusDescription": "Message blocked by protect configuration",
+  "context": {
+    "account": "bar"
+  },
+  "totalMessageParts": 1,
+  "totalMessagePrice": 0,
+  "totalCarrierFee": 0,
+  "protectConfiguration": {
+    "protectConfigurationId": "protect-d777777777777771bbd5d59f4d903479",
+    "protectStatus": "FILTER"
+  },
+  "protectConfigurationAssessment": {
+    "protectRecommendation": "BLOCK",
+    "protectInsights": {
+      "blockReason": "AIT_SUSPECTED"
+    }
+  }
+}

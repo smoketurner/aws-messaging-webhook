@@ -8,24 +8,29 @@ use crate::error::AppError;
 use crate::state::{AppState, Services};
 
 /// An SNS delivery that passed the topic allowlist and signature
-/// verification. Handlers take this as their body extractor, so no handler
-/// can see an unverified message.
+/// verification. Both ingress paths — this extractor on the HTTP routes and
+/// `entry::dispatch` on direct SNS → Lambda invokes — construct it only via
+/// [`VerifiedSns::verify`], so no handler can see an unverified message.
 pub struct VerifiedSns {
     pub envelope: SnsEnvelope,
-    /// The exact bytes received — these get persisted, not a re-serialization.
+    /// The envelope bytes that get persisted: the exact HTTP body on the
+    /// webhook path; on the direct-invoke path, the `Sns` record re-serialized
+    /// from the invocation payload (every field value preserved verbatim).
     pub raw_body: Bytes,
 }
 
-impl<T: Services> FromRequest<Arc<AppState<T>>> for VerifiedSns {
-    type Rejection = AppError;
-
-    async fn from_request(req: Request, state: &Arc<AppState<T>>) -> Result<Self, Self::Rejection> {
-        if req.headers().get("x-amz-sns-message-type").is_none() {
-            return Err(AppError::MissingSnsHeader);
-        }
-        let raw_body = Bytes::from_request(req, state)
-            .await
-            .map_err(|_| AppError::UnreadableBody)?;
+impl VerifiedSns {
+    /// The security boundary for a raw envelope body: parse, topic allowlist,
+    /// signature verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError`] when the body is not an envelope, the topic is
+    /// not allowlisted, or the signature does not verify.
+    pub(crate) async fn verify<T: Services>(
+        state: &AppState<T>,
+        raw_body: Bytes,
+    ) -> Result<Self, AppError> {
         let envelope: SnsEnvelope =
             serde_json::from_slice(&raw_body).map_err(|e| AppError::Verification(e.into()))?;
 
@@ -41,5 +46,19 @@ impl<T: Services> FromRequest<Arc<AppState<T>>> for VerifiedSns {
         state.verifier.verify(&envelope).await?;
 
         Ok(Self { envelope, raw_body })
+    }
+}
+
+impl<T: Services> FromRequest<Arc<AppState<T>>> for VerifiedSns {
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &Arc<AppState<T>>) -> Result<Self, Self::Rejection> {
+        if req.headers().get("x-amz-sns-message-type").is_none() {
+            return Err(AppError::MissingSnsHeader);
+        }
+        let raw_body = Bytes::from_request(req, state)
+            .await
+            .map_err(|_| AppError::UnreadableBody)?;
+        Self::verify(state, raw_body).await
     }
 }

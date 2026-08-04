@@ -10,12 +10,14 @@ use aws_messaging_webhook::actions::{
 use aws_messaging_webhook::allowlist::TopicAllowlist;
 use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::Config;
+use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::model::DomainEvent;
 use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
 use aws_messaging_webhook::state::AppState;
 use aws_messaging_webhook::store::{EventRecord, EventStore, PersistOutcome, StoreError};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use lambda_http::{Context, LambdaEvent};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsVerifier;
 use sns_message_verifier::fixtures::{SnsFixture, notification, subscription_confirmation};
@@ -239,8 +241,28 @@ async fn valid_notification_persists_then_publishes_then_marks() {
     let meta = &published[0].detail["meta"];
     assert_eq!(meta["snsMessageId"], "165545c9-2a5c-472c-8df2-7ff2be2b3b1b");
     assert_eq!(meta["messageId"], "165545c9-2a5c-472c-8df2-7ff2be2b3b1b");
-    assert_eq!(meta["webhookPath"], "/webhooks/ses/events");
+    // The payload matches no family, so it has no canonical path.
+    assert_eq!(meta["webhookPath"], Value::Null);
     assert_eq!(published[0].detail["event"], json!({"hello": "world"}));
+}
+
+#[tokio::test]
+async fn mis_wired_topic_still_classifies_correctly() {
+    let h = harness().await;
+    // An inbound SMS delivered to the SES events path: the family comes from
+    // the payload shape, so it still processes as sms.inbound (with a
+    // family_mismatch warning) instead of degrading to unknown.
+    let body = wrapped(&h, &inbound_sms("HELLO"));
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.fake().calls().contains(&"publish:sms.inbound".to_owned()));
+    let published = h.fake().published.lock().unwrap();
+    assert_eq!(
+        published[0].detail["meta"]["webhookPath"],
+        "/webhooks/sms/inbound"
+    );
 }
 
 #[tokio::test]
@@ -843,6 +865,215 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     let status = post(state, "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Re-keys a signed envelope to the casing a direct SNS → Lambda record uses.
+fn lambda_record_casing(mut envelope: Value) -> Value {
+    let record = envelope.as_object_mut().unwrap();
+    if let Some(url) = record.remove("SigningCertURL") {
+        record.insert("SigningCertUrl".to_owned(), url);
+    }
+    if let Some(url) = record.remove("UnsubscribeURL") {
+        record.insert("UnsubscribeUrl".to_owned(), url);
+    }
+    envelope
+}
+
+fn direct_sns_record(envelope: &Value) -> Value {
+    json!({
+        "EventSource": "aws:sns",
+        "EventVersion": "1.0",
+        "EventSubscriptionArn":
+            "arn:aws:sns:us-east-1:123456789012:test-topic:11111111-2222-3333-4444-555555555555",
+        "Sns": lambda_record_casing(envelope.clone()),
+    })
+}
+
+fn direct_sns_event(envelope: &Value) -> Value {
+    json!({ "Records": [direct_sns_record(envelope)] })
+}
+
+/// A Function URL invocation payload (API Gateway v2 shape) that POSTs `body`.
+fn function_url_event(path: &str, body: &Value) -> Value {
+    json!({
+        "version": "2.0",
+        "routeKey": "$default",
+        "rawPath": path,
+        "rawQueryString": "",
+        "headers": {
+            "content-type": "text/plain; charset=UTF-8",
+            "x-amz-sns-message-type": "Notification",
+        },
+        "requestContext": {
+            "accountId": "anonymous",
+            "apiId": "url-id",
+            "domainName": "url-id.lambda-url.us-east-1.on.aws",
+            "domainPrefix": "url-id",
+            "http": {
+                "method": "POST",
+                "path": path,
+                "protocol": "HTTP/1.1",
+                "sourceIp": "10.0.0.1",
+                "userAgent": "Amazon Simple Notification Service Agent",
+            },
+            "requestId": "request-id",
+            "routeKey": "$default",
+            "stage": "$default",
+            "time": "04/Aug/2026:00:00:00 +0000",
+            "timeEpoch": 1_754_265_600_000_i64,
+        },
+        "body": body.to_string(),
+        "isBase64Encoded": false,
+    })
+}
+
+/// Drives the single-binary entry point exactly as the Lambda runtime would.
+async fn invoke(
+    state: Arc<AppState<FakeServices>>,
+    payload: Value,
+) -> Result<Value, lambda_http::Error> {
+    let router = app(state.clone());
+    dispatch(state, router, LambdaEvent::new(payload, Context::default())).await
+}
+
+#[tokio::test]
+async fn direct_invoke_runs_the_full_pipeline() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+
+    let result = invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+
+    assert_eq!(result, Value::Null);
+    assert_eq!(
+        h.fake().calls(),
+        vec![
+            "persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned(),
+            "publish:unknown".to_owned(),
+            "mark".to_owned(),
+        ]
+    );
+    let published = h.fake().published.lock().unwrap();
+    // The fixture message matches no family; it still publishes as unknown.
+    assert_eq!(published[0].detail["meta"]["webhookPath"], Value::Null);
+}
+
+#[tokio::test]
+async fn direct_invoke_processes_every_record() {
+    let h = harness().await;
+    let mut first = notification(&h.cert_url);
+    h.fixture.sign(&mut first, "2");
+    let mut second = notification(&h.cert_url);
+    second["MessageId"] = json!("second-message-id");
+    h.fixture.sign(&mut second, "2");
+    let payload = json!({ "Records": [direct_sns_record(&first), direct_sns_record(&second)] });
+
+    invoke(h.state.clone(), payload).await.unwrap();
+
+    let persists = h
+        .fake()
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("persist:"))
+        .count();
+    assert_eq!(persists, 2);
+}
+
+#[tokio::test]
+async fn direct_invoke_tampered_signature_is_dropped_not_retried() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    body["Message"] = json!("tampered");
+
+    // A 4xx-class rejection must complete the invocation (Ok): failing it
+    // would ask Lambda to redeliver a permanently rejected message.
+    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+
+    assert!(result.is_ok());
+    assert!(h.fake().calls().is_empty());
+}
+
+#[tokio::test]
+async fn direct_invoke_unlisted_topic_rejected_before_any_verification_work() {
+    let h = harness_with(HarnessOptions {
+        allowed_topics: "999999999999",
+        cert_fetches: Some(0),
+        ..HarnessOptions::default()
+    })
+    .await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+
+    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+
+    assert!(result.is_ok());
+    assert!(h.fake().calls().is_empty());
+    h.server.verify().await;
+}
+
+#[tokio::test]
+async fn direct_invoke_classifies_by_payload_shape() {
+    let h = harness().await;
+    // No routing config exists for the direct pathway: the family (and the
+    // canonical path reported to consumers) comes from the payload alone.
+    let body = wrapped(&h, &inbound_sms("HELLO"));
+
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+
+    assert!(h.fake().calls().contains(&"publish:sms.inbound".to_owned()));
+    let published = h.fake().published.lock().unwrap();
+    assert_eq!(
+        published[0].detail["meta"]["webhookPath"],
+        "/webhooks/sms/inbound"
+    );
+}
+
+#[tokio::test]
+async fn direct_invoke_transient_failure_fails_the_invocation_for_retry() {
+    let h = harness().await;
+    h.fake().fail_persist.store(true, Ordering::SeqCst);
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+
+    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+
+    assert!(
+        result.is_err(),
+        "5xx-class failures must fail the invocation"
+    );
+}
+
+#[tokio::test]
+async fn function_url_payload_dispatches_through_the_router() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    let payload = function_url_event("/webhooks/ses/events", &body);
+
+    let response = invoke(h.state.clone(), payload).await.unwrap();
+
+    assert_eq!(response["statusCode"], 200);
+    assert_eq!(
+        h.fake().calls(),
+        vec![
+            "persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned(),
+            "publish:unknown".to_owned(),
+            "mark".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unrecognized_invoke_payload_is_an_error() {
+    let h = harness().await;
+    let result = invoke(h.state.clone(), json!({"hello": "world"})).await;
+    assert!(result.is_err());
+    assert!(h.fake().calls().is_empty());
 }
 
 #[tokio::test]

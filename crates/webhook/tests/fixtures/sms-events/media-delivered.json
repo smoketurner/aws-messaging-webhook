@@ -1,0 +1,21 @@
+{
+  "contentType": "MMS",
+  "eventType": "MEDIA_DELIVERED",
+  "eventVersion": "1.0",
+  "eventTimestamp": 1635197695208,
+  "isFinal": true,
+  "originationPhoneNumber": "+12065550153",
+  "destinationPhoneNumber": "+14255550159",
+  "isoCountryCode": "US",
+  "messageId": "b4a3196d-5b61-4884-a0d9-745acf1f6235example",
+  "messageRequestTimestamp": 1635197693241,
+  "messageType": "TRANSACTIONAL",
+  "messageStatus": "DELIVERED",
+  "messageStatusDescription": "Message has been accepted by phone",
+  "context": {
+    "foo": "bar"
+  },
+  "totalMessageParts": 1,
+  "totalMessagePrice": 0.0195,
+  "totalCarrierFee": 0.00266
+}

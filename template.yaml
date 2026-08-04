@@ -176,6 +176,20 @@ Resources:
           MetricValue: "1"
           Unit: Count
 
+  # A payload matched no known event family: it was still persisted and
+  # forwarded (detail-type `unknown`), but a sustained rate means AWS shipped
+  # a new event shape or junk is being published to a subscribed topic.
+  UnclassifiedPayloadsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "unclassified_payload" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: UnclassifiedPayloads
+          MetricValue: "1"
+          Unit: Count
+
   DuplicatesFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -248,6 +262,9 @@ Outputs:
   WebhookUrl:
     Description: Base Function URL; append /webhooks/<source> per topic.
     Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  WebhookFunctionArn:
+    Description: Function ARN for direct SNS -> Lambda subscriptions.
+    Value: !GetAtt WebhookFunction.Arn
   EventBusName:
     Value: !Ref EventBus
   EventBusArn:

@@ -72,7 +72,7 @@ fn arn_account(topic_arn: &str) -> Option<&str> {
 
 /// `*`-wildcard match without a regex dependency: fixed segments must appear
 /// in order, anchored at both ends.
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     let segments: Vec<&str> = pattern.split('*').collect();
     let [only] = segments.as_slice() else {
         let mut rest = value;

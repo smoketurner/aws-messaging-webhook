@@ -4,9 +4,10 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.97.1-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
 
-One Rust Lambda function (Axum behind a Lambda Function URL) that receives AWS messaging events
-delivered over SNS — End User Messaging two-way SMS and delivery receipts, SES sending events,
-and SES inbound email notifications — then:
+One Rust Lambda function that receives AWS messaging events delivered over SNS — End User
+Messaging two-way SMS and delivery receipts, SES sending events, and SES inbound email
+notifications — over either pathway: HTTPS to a Lambda Function URL (Axum), or direct
+SNS → Lambda invocation. Then it:
 
 1. **Verifies** the SNS message signature (`SignatureVersion` 1 and 2) and enforces a topic
    allowlist. Together these are the security boundary for the public URL.
@@ -31,14 +32,18 @@ and SES inbound email notifications — then:
 ## Architecture
 
 ```
-EUM two-way SMS ──────► SNS ─┐
-EUM config set (DLR) ─► SNS ─┤  POST /webhooks/…       ┌─► DynamoDB (events + aggregates)
-SES config set ───────► SNS ─┼─► Lambda Function URL ──┼─► lifecycle actions (EUM/SES APIs)
-SES receipt rule ─────► SNS ─┘  verify → persist →     └─► EventBridge bus ─► your apps
+EUM two-way SMS ──────► SNS ─┐  POST /webhooks/… (https)   ┌─► DynamoDB (events + aggregates)
+EUM config set (DLR) ─► SNS ─┤  ─► Lambda Function URL ─┐  │
+SES config set ───────► SNS ─┤  or direct invoke        ├──┼─► lifecycle actions (EUM/SES APIs)
+SES receipt rule ─────► SNS ─┘  (lambda protocol) ──────┘  │
+                                verify → persist →         └─► EventBridge bus ─► your apps
                                 act → publish
 ```
 
-Each webhook path expects one event family, so wire each SNS topic to its own path:
+The event family is classified from each payload's shape, so no routing configuration exists.
+Wire each SNS topic to its matching path anyway — a topic delivering a different family than
+its path logs a `family_mismatch` warning (the event still processes correctly). Direct
+SNS → Lambda subscriptions carry no path and need no substitute for one:
 
 | Path | Subscribe this topic |
 |---|---|
@@ -65,7 +70,6 @@ cd aws-messaging-webhook
 sam build --config-env dev
 sam deploy --config-env dev --parameter-overrides \
   "Stage=dev AllowedTopics=<your-account-id> OptOutListName=<your-opt-out-list>"
-scripts/subscribe.sh aws-messaging-webhook-dev ses/events <topic-arn>
 ```
 
 > [!IMPORTANT]
@@ -76,7 +80,50 @@ scripts/subscribe.sh aws-messaging-webhook-dev ses/events <topic-arn>
 
 > [!WARNING]
 > **Raw message delivery must stay disabled** on subscriptions (the default). Raw delivery
-> strips the signed JSON envelope, and the webhook rejects the request.
+> strips the signed JSON envelope, and the webhook rejects the request. This applies to both
+> pathways.
+
+### Wire up topics
+
+Topics and subscriptions live outside the stack, next to your EUM/SES configuration. To wire
+a topic to the Function URL (the HTTPS pathway), subscribe it to the matching webhook path:
+
+```bash
+webhook_url=$(aws cloudformation describe-stacks --stack-name aws-messaging-webhook-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='WebhookUrl'].OutputValue" --output text)
+aws sns set-topic-attributes --topic-arn <topic-arn> \
+  --attribute-name SignatureVersion --attribute-value 2
+aws sns subscribe --topic-arn <topic-arn> --protocol https \
+  --notification-endpoint "${webhook_url%/}/webhooks/<path>"
+```
+
+The function auto-confirms the subscription: `PendingConfirmation` on the new subscription
+flips to `false` within seconds. If it stays pending, check the function logs — is the topic
+allowlisted? Is raw message delivery disabled? `SignatureVersion` 2 (SHA256) is recommended;
+version 1, the SNS default, also verifies.
+
+### Direct SNS → Lambda (optional)
+
+Topics can also invoke the function directly instead of POSTing to the Function URL. The same
+signature verification and allowlist apply; there is no confirmation handshake (Lambda
+subscriptions confirm via IAM) and no routing to configure — the event family comes from the
+payload shape. Grant the topic permission to invoke the function (keep the `--source-arn`
+scope: it is the per-topic gate on this pathway), then subscribe:
+
+```bash
+function_arn=$(aws cloudformation describe-stacks --stack-name aws-messaging-webhook-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='WebhookFunctionArn'].OutputValue" --output text)
+aws lambda add-permission --function-name "${function_arn}" \
+  --statement-id "sns-<topic-name>" --action lambda:InvokeFunction \
+  --principal sns.amazonaws.com --source-arn <topic-arn>
+aws sns subscribe --topic-arn <topic-arn> --protocol lambda \
+  --notification-endpoint "${function_arn}"
+```
+
+The retry behavior differs: SNS hands direct deliveries to Lambda's async-invoke queue, which
+retries a failed invocation **twice** and then drops it, while the HTTPS delivery policy
+retries far longer. If you need durability past two retries, configure an on-failure
+destination (SQS) on the function.
 
 ### Parameters
 
@@ -93,8 +140,8 @@ scripts/subscribe.sh aws-messaging-webhook-dev ses/events <topic-arn>
 
 ### Deployment contract
 
-- **`SignatureVersion: 2`** (SHA256) is recommended per topic; `subscribe.sh` sets it. Version 1
-  (the SNS default) is also supported.
+- **`SignatureVersion: 2`** (SHA256) is recommended per topic (the wiring commands above set
+  it). Version 1 (the SNS default) is also supported.
 - **SES inbound email**: use the receipt rule **S3 action** to store message content, with the
   SNS notification carrying the pointer. Full content over SNS is size-limited and discouraged;
   oversized inbound payloads have their embedded content stripped from the EventBridge event
@@ -102,7 +149,7 @@ scripts/subscribe.sh aws-messaging-webhook-dev ses/events <topic-arn>
 - **SMS opt-out handling** fires only with self-managed opt-outs enabled on your numbers
   (AWS-managed opt-outs intercept STOP before SNS ever sees it) and requires `OptOutListName`.
 - SNS topics and subscriptions deliberately live *outside* this stack, next to your EUM/SES
-  configuration; `scripts/subscribe.sh` bridges the two after deploy.
+  configuration; the wiring commands above bridge the two after deploy.
 
 ## EventBridge contract
 
@@ -155,14 +202,20 @@ A message's full timeline is one `Query` on `pk`; its current state is one `GetI
   (`published|duplicate|resumed|confirmed|resubscribed`) and `action`.
 - CloudWatch metrics (namespace = stack name) via log metric filters: `MessagesReceived`
   (notification deliveries: published + resumed + duplicate), `SignatureRejections`,
-  `AllowlistRejections`, `Duplicates`, `EventsPublished`, `InternalErrors`, `ActionFailures`,
-  `Resubscribes`, and `SubscriptionsLost` (alarm on this — a subscription was cancelled and, with
-  `AutoResubscribe=false`, not re-attached).
+  `AllowlistRejections`, `UnclassifiedPayloads` (events forwarded as `unknown` — a sustained
+  rate means a new AWS event shape or junk on a topic), `Duplicates`, `EventsPublished`, `InternalErrors`,
+  `ActionFailures`, `Resubscribes`, and `SubscriptionsLost` (alarm on this — a subscription was
+  cancelled and, with `AutoResubscribe=false`, not re-attached).
 - Transient downstream failures return 5xx on purpose: SNS redelivers, and the store's
   `PERSISTED`/`PUBLISHED` status makes the retry resume exactly where it died. Consumers must
   tolerate rare duplicate bus events (SNS is at-least-once end to end).
-- End-to-end check: `scripts/e2e-ses-bounce.sh <stack> <verified-sender>` drives the SES
-  mailbox simulator through the full pipeline.
+- End-to-end check on a deployed stack: send a probe through the SES mailbox simulator —
+  `aws sesv2 send-email --from-email-address <verified-sender> --destination
+  ToAddresses=bounce@simulator.amazonses.com --content
+  "Simple={Subject={Data=probe},Body={Text={Data=probe}}}"` — then confirm a `ses.bounce`
+  event arrives on the bus (temporary rule → SQS, or CloudWatch), the event item in DynamoDB
+  reaches `status = PUBLISHED`, and the simulator address lands on the SES account
+  suppression list.
 
 ## Development
 
@@ -174,8 +227,8 @@ prek run                               # fmt, clippy, deny, actionlint, zizmor
 
 The handler tests drive the real router end to end with properly signed SNS envelopes (the
 verifier crate's `test-fixtures` feature generates throwaway keys and certificates), so no AWS
-account is needed for development. For a deployed end-to-end check use
-`scripts/e2e-ses-bounce.sh`.
+account is needed for development. For a deployed end-to-end check see the SES-simulator probe
+under Observability.
 
 > [!NOTE]
 > Debug builds honor `SNS_CERT_HOST_OVERRIDE` for running against a local fake SNS under

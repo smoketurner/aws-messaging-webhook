@@ -24,7 +24,8 @@ pub struct EventRecord {
     pub sns_message_id: String,
     /// The exact HTTP body bytes as received (the full signed envelope).
     pub raw_body: Bytes,
-    pub source: Source,
+    /// The classified event family; `None` for unrecognized payloads.
+    pub source: Option<Source>,
     pub detail_type: String,
     pub topic_arn: String,
     pub received_at: String,
@@ -40,7 +41,7 @@ impl EventRecord {
     /// Returns an error if the system clock cannot be represented as a
     /// timestamp (practically unreachable).
     pub fn build(
-        source: Source,
+        source: Option<Source>,
         envelope: &SnsEnvelope,
         raw_body: Bytes,
         event: &DomainEvent,
@@ -69,6 +70,12 @@ impl EventRecord {
             received_at,
             expires_at,
         })
+    }
+
+    /// The family label persisted and logged; `"unknown"` when unclassified.
+    #[must_use]
+    pub fn source_label(&self) -> &'static str {
+        self.source.map_or("unknown", Source::as_str)
     }
 }
 
