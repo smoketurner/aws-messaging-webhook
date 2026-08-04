@@ -1,0 +1,27 @@
+version = 0.1
+
+[default.build.parameters]
+beta_features = true
+
+[default.validate.parameters]
+lint = true
+
+[dev.build.parameters]
+beta_features = true
+
+[dev.deploy.parameters]
+stack_name = "aws-messaging-webhook-dev"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+parameter_overrides = "Stage=dev"
+
+[prod.build.parameters]
+beta_features = true
+
+[prod.deploy.parameters]
+stack_name = "aws-messaging-webhook"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "Stage=prod"

@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Webhook receiver for AWS End User Messaging and SES events delivered over
+  SNS: verifies signatures, persists an event-sourced record to DynamoDB,
+  performs lifecycle actions, and re-publishes to an EventBridge bus.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR, FATAL]
+  AllowedTopics:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma-separated allowlist: 12-digit account ids and/or TopicArn globs.
+      Empty allows every topic — development only; the function logs a loud
+      warning at startup.
+  AutoResubscribe:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  EventSource:
+    Type: String
+    Default: aws-messaging-webhook
+    Description: The `source` field on published EventBridge events.
+  OptOutListName:
+    Type: String
+    Default: ""
+    Description: >-
+      End User Messaging opt-out list updated by STOP/START keywords. Empty
+      disables that action.
+  RawEventRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  IsProd: !Equals [!Ref Stage, prod]
+  HasOptOutList: !Not [!Equals [!Ref OptOutListName, ""]]
+
+Resources:
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+      BuildProperties:
+        # Workspace build: pick the webhook binary explicitly.
+        Binary: aws-messaging-webhook
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-webhook"
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 10
+      FunctionUrlConfig:
+        AuthType: NONE
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: !Ref LogLevel
+        SystemLogLevel: INFO
+        LogGroup: !Ref FunctionLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EventsTable
+          EVENT_BUS_NAME: !Ref EventBus
+          EVENT_SOURCE: !Ref EventSource
+          ALLOWED_TOPICS: !Ref AllowedTopics
+          AUTO_RESUBSCRIBE: !Ref AutoResubscribe
+          OPT_OUT_LIST_NAME: !Ref OptOutListName
+          RAW_EVENT_RETENTION_DAYS: !Ref RawEventRetentionDays
+      Policies:
+        - Statement:
+            - Sid: PersistEvents
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt EventsTable.Arn
+            - Sid: PublishEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt EventBus.Arn
+            - !If
+              - HasOptOutList
+              - Sid: ManageOptOuts
+                Effect: Allow
+                Action:
+                  - sms-voice:PutOptedOutNumber
+                  - sms-voice:DeleteOptedOutNumber
+                Resource: !Sub "arn:${AWS::Partition}:sms-voice:${AWS::Region}:${AWS::AccountId}:opt-out-list/${OptOutListName}"
+              - !Ref AWS::NoValue
+            # PutMessageFeedback acts on a message id and
+            # PutSuppressedDestination on the account-level suppression list —
+            # neither exposes a resource ARN to scope to.
+            - Sid: MessageFeedback
+              Effect: Allow
+              Action: sms-voice:PutMessageFeedback
+              Resource: "*"
+            - Sid: SuppressionList
+              Effect: Allow
+              Action: sesv2:PutSuppressedDestination
+              Resource: "*"
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
+      RetentionInDays: !Ref LogRetentionDays
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${AWS::StackName}-events"
+
+  MessagesReceivedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.outcome = * }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: MessagesReceived
+          MetricValue: "1"
+          Unit: Count
+
+  SignatureRejectionsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "signature_rejection" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: SignatureRejections
+          MetricValue: "1"
+          Unit: Count
+
+  AllowlistRejectionsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "allowlist_rejection" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: AllowlistRejections
+          MetricValue: "1"
+          Unit: Count
+
+  DuplicatesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.outcome = "duplicate" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: Duplicates
+          MetricValue: "1"
+          Unit: Count
+
+  EventsPublishedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.outcome = "published" || $.fields.outcome = "resumed" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: EventsPublished
+          MetricValue: "1"
+          Unit: Count
+
+  InternalErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "internal_error" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: InternalErrors
+          MetricValue: "1"
+          Unit: Count
+
+  ActionFailuresFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "action_failure" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: ActionFailures
+          MetricValue: "1"
+          Unit: Count
+
+  ResubscribesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "resubscribed" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: Resubscribes
+          MetricValue: "1"
+          Unit: Count
+
+Outputs:
+  WebhookUrl:
+    Description: Base Function URL; append /webhooks/<source> per topic.
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  EventBusName:
+    Value: !Ref EventBus
+  EventBusArn:
+    Value: !GetAtt EventBus.Arn
+  TableName:
+    Value: !Ref EventsTable
