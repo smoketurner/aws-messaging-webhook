@@ -11,7 +11,9 @@ use crate::model::eum_sms::{SmsDeliveryEvent, SmsInboundMessage};
 use crate::model::ses_inbound::SesInboundNotification;
 use crate::model::ses_notification::SesNotification;
 
-/// Which webhook path (and therefore which SNS wiring) a message arrived on.
+/// An event family. Each HTTP webhook path is wired to one family, but the
+/// family a message actually belongs to comes from
+/// [`DomainEvent::classify`] — the path only names what the operator expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     SmsInbound,
@@ -71,11 +73,14 @@ pub enum DomainEvent {
 }
 
 impl DomainEvent {
-    /// Parses the inner SNS `Message` string according to the webhook path it
-    /// arrived on. Anything that does not match the expected shape (including
-    /// mis-wired topics) is forwarded as `Unknown` with a warning.
+    /// Classifies the inner SNS `Message` string by shape: try-parse each
+    /// family, most specific first. The order is load-bearing in exactly one
+    /// place — an inbound receipt also satisfies the sending-notification
+    /// shape (`notificationType` + `mail`), so `SesInbound` must be tried
+    /// before `Ses`; every other pair of families is structurally disjoint
+    /// (pinned by the fixture matrix in `tests/model_fixtures.rs`).
     #[must_use]
-    pub fn parse(source: Source, message: &str) -> Self {
+    pub fn classify(message: &str) -> Self {
         let Ok(raw) = serde_json::from_str::<Value>(message) else {
             return Self::Unknown {
                 raw: Value::String(message.to_owned()),
@@ -84,39 +89,31 @@ impl DomainEvent {
 
         // Deserialize by borrowing `&raw` (no clone of the parsed tree), then
         // move `raw` into the variant exactly once on success.
-        match source {
-            Source::SmsInbound => match SmsInboundMessage::deserialize(&raw) {
-                Ok(event) => Self::SmsInbound { event, raw },
-                Err(error) => Self::forward_unknown(source, raw, &error),
-            },
-            Source::SmsEvents => match SmsDeliveryEvent::deserialize(&raw) {
-                Ok(event) => Self::SmsDelivery { event, raw },
-                Err(error) => Self::forward_unknown(source, raw, &error),
-            },
-            Source::SesEvents => match SesNotification::deserialize(&raw) {
-                Ok(event) => Self::Ses { event, raw },
-                Err(error) => Self::forward_unknown(source, raw, &error),
-            },
-            // Inbound notifications carry a `receipt`; an SES *sending*
-            // notification wired to this path lacks one, so fall through and
-            // classify it properly rather than calling it unknown.
-            Source::SesInbound => match SesInboundNotification::deserialize(&raw) {
-                Ok(event) => Self::SesInbound { event, raw },
-                Err(_) => match SesNotification::deserialize(&raw) {
-                    Ok(event) => Self::Ses { event, raw },
-                    Err(error) => Self::forward_unknown(source, raw, &error),
-                },
-            },
+        if let Ok(event) = SesInboundNotification::deserialize(&raw) {
+            return Self::SesInbound { event, raw };
         }
+        if let Ok(event) = SesNotification::deserialize(&raw) {
+            return Self::Ses { event, raw };
+        }
+        if let Ok(event) = SmsInboundMessage::deserialize(&raw) {
+            return Self::SmsInbound { event, raw };
+        }
+        if let Ok(event) = SmsDeliveryEvent::deserialize(&raw) {
+            return Self::SmsDelivery { event, raw };
+        }
+        Self::Unknown { raw }
     }
 
-    fn forward_unknown(source: Source, raw: Value, error: &serde_json::Error) -> Self {
-        tracing::warn!(
-            source = source.as_str(),
-            error = %error,
-            "unrecognized payload; forwarding as unknown"
-        );
-        Self::Unknown { raw }
+    /// The family this event classified into; `None` for [`Self::Unknown`].
+    #[must_use]
+    pub fn family(&self) -> Option<Source> {
+        match self {
+            Self::SmsInbound { .. } => Some(Source::SmsInbound),
+            Self::SmsDelivery { .. } => Some(Source::SmsEvents),
+            Self::Ses { .. } => Some(Source::SesEvents),
+            Self::SesInbound { .. } => Some(Source::SesInbound),
+            Self::Unknown { .. } => None,
+        }
     }
 
     /// The EventBridge detail-type this event publishes as.
@@ -176,76 +173,78 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn routes_fix_the_expected_schema() {
-        let inbound = DomainEvent::parse(
-            Source::SmsInbound,
+    fn shapes_classify_into_their_families() {
+        let inbound = DomainEvent::classify(
             r#"{"originationNumber":"+14255550182","inboundMessageId":"in-1"}"#,
         );
-        assert!(matches!(inbound, DomainEvent::SmsInbound { .. }));
+        assert_eq!(inbound.family(), Some(Source::SmsInbound));
         assert_eq!(inbound.detail_type(), "sms.inbound");
         assert_eq!(inbound.aggregate_id("sns-1"), "in-1");
 
-        let dlr = DomainEvent::parse(
-            Source::SmsEvents,
+        let dlr = DomainEvent::classify(
             r#"{"eventType":"TEXT_DELIVERED","messageId":"out-1","isFinal":true}"#,
         );
+        assert_eq!(dlr.family(), Some(Source::SmsEvents));
         assert_eq!(dlr.detail_type(), "sms.delivery");
         assert_eq!(dlr.aggregate_id("sns-1"), "out-1");
     }
 
     #[test]
     fn ses_event_detail_type_follows_kind() {
-        let event = DomainEvent::parse(
-            Source::SesEvents,
-            r#"{"eventType":"Open","mail":{"messageId":"m-1"}}"#,
-        );
+        let event = DomainEvent::classify(r#"{"eventType":"Open","mail":{"messageId":"m-1"}}"#);
+        assert_eq!(event.family(), Some(Source::SesEvents));
         assert_eq!(event.detail_type(), "ses.open");
         assert_eq!(event.aggregate_id("sns-1"), "m-1");
     }
 
     #[test]
     fn unmapped_ses_kind_is_ses_unknown_not_unknown() {
-        let event = DomainEvent::parse(
-            Source::SesEvents,
-            r#"{"eventType":"BrandNewThing","mail":{"messageId":"m-2"}}"#,
-        );
+        let event =
+            DomainEvent::classify(r#"{"eventType":"BrandNewThing","mail":{"messageId":"m-2"}}"#);
         assert!(matches!(event, DomainEvent::Ses { .. }));
         // Distinct from the Unknown variant's "unknown": this parsed cleanly.
         assert_eq!(event.detail_type(), "ses.unknown");
         assert_eq!(event.aggregate_id("sns-1"), "m-2");
     }
 
+    /// The one real overlap: a `Received` notification also satisfies the
+    /// sending-notification shape, so the SesInbound-before-Ses try order is
+    /// what keeps receipts out of the Ses family.
     #[test]
-    fn sending_notification_on_inbound_path_still_classifies() {
-        let event = DomainEvent::parse(
-            Source::SesInbound,
+    fn received_notification_classifies_inbound_not_ses() {
+        let event = DomainEvent::classify(
+            r#"{"notificationType":"Received","receipt":{},"mail":{"messageId":"m-3"}}"#,
+        );
+        assert_eq!(event.family(), Some(Source::SesInbound));
+
+        let bounce = DomainEvent::classify(
             r#"{"notificationType":"Bounce",
                 "bounce":{"bounceType":"Permanent","bouncedRecipients":[]},
-                "mail":{"messageId":"m-3"}}"#,
+                "mail":{"messageId":"m-4"}}"#,
         );
-        assert_eq!(event.detail_type(), "ses.bounce");
+        assert_eq!(bounce.family(), Some(Source::SesEvents));
+        assert_eq!(bounce.detail_type(), "ses.bounce");
     }
 
     #[test]
-    fn wrong_shape_falls_back_to_unknown_with_sns_id() {
-        let event = DomainEvent::parse(Source::SmsInbound, r#"{"something":"else"}"#);
+    fn unmatched_shape_falls_back_to_unknown_with_sns_id() {
+        let event = DomainEvent::classify(r#"{"something":"else"}"#);
         assert!(matches!(event, DomainEvent::Unknown { .. }));
+        assert_eq!(event.family(), None);
         assert_eq!(event.detail_type(), "unknown");
         assert_eq!(event.aggregate_id("sns-9"), "sns-9");
     }
 
     #[test]
     fn non_json_message_falls_back_to_unknown_string() {
-        let event = DomainEvent::parse(Source::SesEvents, "plain text");
+        let event = DomainEvent::classify("plain text");
         assert_eq!(event.payload(), &Value::String("plain text".to_owned()));
     }
 
     proptest! {
         #[test]
-        fn parse_never_panics(message in ".{0,256}") {
-            for source in [Source::SmsInbound, Source::SmsEvents, Source::SesEvents, Source::SesInbound] {
-                drop(DomainEvent::parse(source, &message));
-            }
+        fn classify_never_panics(message in ".{0,256}") {
+            drop(DomainEvent::classify(&message));
         }
     }
 }

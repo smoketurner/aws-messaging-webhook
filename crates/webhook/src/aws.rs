@@ -81,7 +81,7 @@ fn aggregate_update(
         .key("pk", AttributeValue::S(partition_key(record)))
         .key("sk", AttributeValue::S("AGG".to_owned()))
         .expression_attribute_names("#source", "source")
-        .expression_attribute_values(":source", AttributeValue::S(record.source.as_str().into()))
+        .expression_attribute_values(":source", AttributeValue::S(record.source_label().into()))
         .expression_attribute_values(":ts", AttributeValue::S(record.event_timestamp.clone()))
         .expression_attribute_values(":expires", AttributeValue::N(record.expires_at.to_string()));
 
@@ -172,7 +172,7 @@ impl EventStore for AwsServices {
             )
             .item(
                 "source",
-                AttributeValue::S(record.source.as_str().to_owned()),
+                AttributeValue::S(record.source_label().to_owned()),
             )
             .item("detail_type", AttributeValue::S(record.detail_type.clone()))
             .item("topic_arn", AttributeValue::S(record.topic_arn.clone()))
@@ -435,7 +435,7 @@ mod tests {
     use super::*;
     use crate::model::Source;
 
-    fn record(source: Source, aggregate_id: &str) -> EventRecord {
+    fn record(source: Option<Source>, aggregate_id: &str) -> EventRecord {
         EventRecord {
             aggregate_id: aggregate_id.to_owned(),
             event_timestamp: "2026-08-03T19:12:52.000Z".to_owned(),
@@ -449,9 +449,9 @@ mod tests {
         }
     }
 
-    fn expression_for(source: Source, message: &str) -> (String, Vec<String>) {
-        let event = DomainEvent::parse(source, message);
-        let update = aggregate_update("t", &record(source, "agg-1"), &event).unwrap();
+    fn expression_for(message: &str) -> (String, Vec<String>) {
+        let event = DomainEvent::classify(message);
+        let update = aggregate_update("t", &record(event.family(), "agg-1"), &event).unwrap();
         let expression = update.update_expression.clone();
         let mut value_keys: Vec<String> = update
             .expression_attribute_values
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn base_expression_tracks_first_and_last_event() {
-        let (expr, keys) = expression_for(Source::SesEvents, "not json");
+        let (expr, keys) = expression_for("not json");
         assert!(expr.contains("first_event_at = if_not_exists(first_event_at, :ts)"));
         assert!(expr.contains("last_event_at = :ts"));
         assert!(!expr.contains("current_status"));
@@ -474,10 +474,7 @@ mod tests {
 
     #[test]
     fn open_event_increments_count_and_sets_last_opened() {
-        let (expr, keys) = expression_for(
-            Source::SesEvents,
-            r#"{"eventType":"Open","mail":{"messageId":"m"}}"#,
-        );
+        let (expr, keys) = expression_for(r#"{"eventType":"Open","mail":{"messageId":"m"}}"#);
         assert!(expr.contains("ADD open_count :one"));
         assert!(expr.contains("last_opened_at = :ts"));
         assert!(keys.contains(&":one".to_owned()));
@@ -485,27 +482,20 @@ mod tests {
 
     #[test]
     fn click_event_increments_click_count() {
-        let (expr, _) = expression_for(
-            Source::SesEvents,
-            r#"{"eventType":"Click","mail":{"messageId":"m"}}"#,
-        );
+        let (expr, _) = expression_for(r#"{"eventType":"Click","mail":{"messageId":"m"}}"#);
         assert!(expr.contains("ADD click_count :one"));
         assert!(expr.contains("last_clicked_at = :ts"));
     }
 
     #[test]
     fn send_never_overwrites_a_terminal_status() {
-        let (expr, _) = expression_for(
-            Source::SesEvents,
-            r#"{"eventType":"Send","mail":{"messageId":"m"}}"#,
-        );
+        let (expr, _) = expression_for(r#"{"eventType":"Send","mail":{"messageId":"m"}}"#);
         assert!(expr.contains("current_status = if_not_exists(current_status, :status)"));
     }
 
     #[test]
     fn permanent_bounce_overwrites_status_and_records_bounce_type() {
         let (expr, keys) = expression_for(
-            Source::SesEvents,
             r#"{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[]},
                 "mail":{"messageId":"m"}}"#,
         );
@@ -521,7 +511,6 @@ mod tests {
         // A transient bounce is retryable, so it must not clobber a prior
         // delivered/sent status — matching the suppression action's gate.
         let (expr, keys) = expression_for(
-            Source::SesEvents,
             r#"{"eventType":"Bounce","bounce":{"bounceType":"Transient","bouncedRecipients":[]},
                 "mail":{"messageId":"m"}}"#,
         );
@@ -532,16 +521,12 @@ mod tests {
 
     #[test]
     fn final_dlr_sets_delivered_or_failed() {
-        let (delivered, _) = expression_for(
-            Source::SmsEvents,
-            r#"{"eventType":"TEXT_DELIVERED","messageId":"m","isFinal":true}"#,
-        );
+        let (delivered, _) =
+            expression_for(r#"{"eventType":"TEXT_DELIVERED","messageId":"m","isFinal":true}"#);
         assert!(delivered.contains("current_status = :status"));
 
-        let (queued, keys) = expression_for(
-            Source::SmsEvents,
-            r#"{"eventType":"TEXT_QUEUED","messageId":"m","isFinal":false}"#,
-        );
+        let (queued, keys) =
+            expression_for(r#"{"eventType":"TEXT_QUEUED","messageId":"m","isFinal":false}"#);
         assert!(!queued.contains("current_status"));
         assert!(!keys.contains(&":status".to_owned()));
     }

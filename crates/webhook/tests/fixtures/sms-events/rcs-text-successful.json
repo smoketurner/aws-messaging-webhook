@@ -1,0 +1,17 @@
+{
+  "eventType": "TEXT_SUCCESSFUL",
+  "eventVersion": "1.0",
+  "eventTimestamp": 1714000000000,
+  "isFinal": true,
+  "originationPhoneNumber": "rcs-agent-id-example",
+  "destinationPhoneNumber": "+14255550156",
+  "isInternationalSend": false,
+  "messageId": "a1b2c3d4-e5f6-7890-abcd-ef1234example",
+  "messageRequestTimestamp": 1714000000000,
+  "messageType": "TRANSACTIONAL",
+  "messageStatus": "SUCCESSFUL",
+  "messageStatusDescription": "Message has been accepted by phone carrier",
+  "totalMessageParts": 1,
+  "totalMessagePrice": 0.003,
+  "totalCarrierFee": 0.0
+}

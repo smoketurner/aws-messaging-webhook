@@ -9,7 +9,7 @@ use tower_http::trace::TraceLayer;
 use crate::error::AppError;
 use crate::model::Source;
 use crate::sns::extractor::VerifiedSns;
-use crate::sns::handle_sns;
+use crate::sns::{Ingress, handle_sns};
 use crate::state::{AppState, Services};
 
 /// SNS caps messages at 256 KiB; 1 MiB bounds abuse with headroom.
@@ -35,26 +35,26 @@ async fn sms_inbound<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(&state, Source::SmsInbound, verified).await
+    handle_sns(&state, Ingress::Http(Source::SmsInbound), verified).await
 }
 
 async fn sms_events<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(&state, Source::SmsEvents, verified).await
+    handle_sns(&state, Ingress::Http(Source::SmsEvents), verified).await
 }
 
 async fn ses_events<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(&state, Source::SesEvents, verified).await
+    handle_sns(&state, Ingress::Http(Source::SesEvents), verified).await
 }
 
 async fn ses_inbound<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(&state, Source::SesInbound, verified).await
+    handle_sns(&state, Ingress::Http(Source::SesInbound), verified).await
 }

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::aws::AwsServices;
 use aws_messaging_webhook::config::Config;
+use aws_messaging_webhook::entry;
 use aws_messaging_webhook::state::AppState;
 use sns_message_verifier::SnsVerifier;
 
@@ -42,5 +42,5 @@ async fn main() -> Result<(), lambda_http::Error> {
         dangerous_subscribe_url_prefix,
     });
 
-    lambda_http::run(app(state)).await
+    entry::run(state).await
 }

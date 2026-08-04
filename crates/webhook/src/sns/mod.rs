@@ -18,7 +18,26 @@ use crate::sns::extractor::VerifiedSns;
 use crate::state::{AppState, Services};
 use crate::store::{EventRecord, PersistOutcome};
 
-/// Entry point for all webhook routes; input is already allowlisted and
+/// How a message arrived: a webhook path (which names the event family the
+/// operator wired to it) or a direct SNS → Lambda invocation (no path). The
+/// family an event actually belongs to comes from [`DomainEvent::classify`];
+/// the HTTP expectation is only checked to surface mis-wired topics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingress {
+    Http(Source),
+    Direct,
+}
+
+impl Ingress {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http(source) => source.as_str(),
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// Entry point for both ingress pathways; input is already allowlisted and
 /// signature-verified.
 ///
 /// # Errors
@@ -27,23 +46,23 @@ use crate::store::{EventRecord, PersistOutcome};
 /// 5xx to recruit SNS redelivery for transient downstream failures.
 pub async fn handle_sns<T: Services>(
     state: &AppState<T>,
-    source: Source,
+    ingress: Ingress,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
     match verified.envelope.message_type {
         MessageType::SubscriptionConfirmation => {
-            confirm_subscription(state, source, &verified.envelope).await
+            confirm_subscription(state, ingress, &verified.envelope).await
         }
         MessageType::UnsubscribeConfirmation => {
-            handle_unsubscribe(state, source, &verified.envelope).await
+            handle_unsubscribe(state, ingress, &verified.envelope).await
         }
-        MessageType::Notification => process_notification(state, source, &verified).await,
+        MessageType::Notification => process_notification(state, ingress, &verified).await,
     }
 }
 
 async fn confirm_subscription<T: Services>(
     state: &AppState<T>,
-    source: Source,
+    ingress: Ingress,
     envelope: &SnsEnvelope,
 ) -> Result<Response, AppError> {
     let subscribe_url = envelope
@@ -56,7 +75,7 @@ async fn confirm_subscription<T: Services>(
     )?;
     confirm::get_subscribe_url(&state.http, url).await?;
     tracing::info!(
-        source = source.as_str(),
+        ingress = ingress.as_str(),
         topic_arn = envelope.topic_arn,
         sns_message_id = envelope.message_id,
         outcome = "confirmed",
@@ -74,12 +93,12 @@ async fn confirm_subscription<T: Services>(
 /// respected.
 async fn handle_unsubscribe<T: Services>(
     state: &AppState<T>,
-    source: Source,
+    ingress: Ingress,
     envelope: &SnsEnvelope,
 ) -> Result<Response, AppError> {
     if !state.config.auto_resubscribe {
         tracing::warn!(
-            source = source.as_str(),
+            ingress = ingress.as_str(),
             topic_arn = envelope.topic_arn,
             sns_message_id = envelope.message_id,
             outcome = "unsubscribed",
@@ -99,7 +118,7 @@ async fn handle_unsubscribe<T: Services>(
     )?;
     confirm::get_subscribe_url(&state.http, url).await?;
     tracing::warn!(
-        source = source.as_str(),
+        ingress = ingress.as_str(),
         topic_arn = envelope.topic_arn,
         sns_message_id = envelope.message_id,
         outcome = "resubscribed",
@@ -125,13 +144,34 @@ async fn handle_unsubscribe<T: Services>(
 
 async fn process_notification<T: Services>(
     state: &AppState<T>,
-    source: Source,
+    ingress: Ingress,
     verified: &VerifiedSns,
 ) -> Result<Response, AppError> {
     let envelope = &verified.envelope;
-    let event = DomainEvent::parse(source, &envelope.message);
+    let event = DomainEvent::classify(&envelope.message);
+    if let Some(family) = event.family() {
+        if let Ingress::Http(expected) = ingress
+            && family != expected
+        {
+            tracing::warn!(
+                expected = expected.as_str(),
+                actual = family.as_str(),
+                topic_arn = envelope.topic_arn,
+                event = "family_mismatch",
+                "topic is wired to a webhook path for a different event family"
+            );
+        }
+    } else {
+        tracing::warn!(
+            ingress = ingress.as_str(),
+            topic_arn = envelope.topic_arn,
+            sns_message_id = envelope.message_id,
+            event = "unclassified_payload",
+            "payload matches no known event family; forwarding as unknown"
+        );
+    }
     let record = EventRecord::build(
-        source,
+        event.family(),
         envelope,
         verified.raw_body.clone(),
         &event,
@@ -146,7 +186,7 @@ async fn process_notification<T: Services>(
 
     if outcome == PersistOutcome::DuplicatePublished {
         tracing::info!(
-            source = source.as_str(),
+            source = record.source_label(),
             sns_message_id = record.sns_message_id,
             detail_type = record.detail_type,
             outcome = "duplicate",
@@ -177,7 +217,7 @@ async fn process_notification<T: Services>(
         },
     };
 
-    let outbound = build_outbound(source, &record, &event);
+    let outbound = build_outbound(&record, &event);
     state
         .services
         .publish(&outbound)
@@ -190,7 +230,7 @@ async fn process_notification<T: Services>(
         .context("failed to mark event published")?;
 
     tracing::info!(
-        source = source.as_str(),
+        source = record.source_label(),
         sns_message_id = record.sns_message_id,
         topic_arn = record.topic_arn,
         detail_type = record.detail_type,
@@ -216,13 +256,16 @@ fn detail_bytes(detail: &serde_json::Value) -> usize {
 /// entry cap so an oversized payload can never become a poison message that
 /// 5xx-loops through SNS redelivery forever. Oversized events are reduced in
 /// two steps; the full payload always remains in the DynamoDB raw record.
-fn build_outbound(source: Source, record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
+fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
     let meta = json!({
         "snsMessageId": record.sns_message_id,
         "messageId": record.aggregate_id,
         "topicArn": record.topic_arn,
         "receivedAt": record.received_at,
-        "webhookPath": source.webhook_path(),
+        // The classified family's canonical path; null for unknown events.
+        // A label for consumers, not the literal arrival path — a direct
+        // SNS → Lambda delivery never had one.
+        "webhookPath": record.source.map(Source::webhook_path),
     });
     let mut detail = json!({ "meta": meta, "event": event.payload() });
 

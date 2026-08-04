@@ -27,7 +27,7 @@ jobs:
       - run: cargo test --workspace
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
       - run: cargo deny check
 
   workflow-lint:
@@ -41,6 +41,13 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
-          tool: actionlint, zizmor
-      - run: actionlint
+          tool: zizmor@1.28.0
+      # actionlint is a Go tool; install-action only carries Rust-ecosystem manifests.
+      - name: Install actionlint
+        run: |
+          curl -fsSLo /tmp/actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/actionlint.tar.gz actionlint
+      - run: /tmp/actionlint
       - run: zizmor --no-online-audits .github/workflows/

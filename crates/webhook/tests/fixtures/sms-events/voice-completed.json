@@ -1,0 +1,18 @@
+{
+  "eventType": "VOICE_COMPLETED",
+  "eventVersion": "1.0",
+  "eventTimestamp": 1697835373500,
+  "isFinal": true,
+  "originationPhoneNumber": "+12065550153",
+  "destinationPhoneNumber": "+14255550159",
+  "isoCountryCode": "US",
+  "messageId": "567f6c11-6e8b-4352-9749-a42a0example",
+  "messageRequestTimestamp": 1697835372720,
+  "messageStatus": "COMPLETED",
+  "callDurationInSeconds": 60,
+  "totalDurationInMinutes": 1,
+  "totalMessagePrice": 0.013,
+  "context": {
+    "account": "bar"
+  }
+}
