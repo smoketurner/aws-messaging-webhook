@@ -1,0 +1,32 @@
+[package]
+name = "sns-message-verifier"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verify AWS SNS message signatures (SignatureVersion 1 and 2) for HTTPS webhook endpoints"
+publish = false
+
+[dependencies]
+base64.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+rsa.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha1 = { workspace = true, features = ["oid"] }
+sha2 = { workspace = true, features = ["oid"] }
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+x509-cert.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rand.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
+x509-cert = { workspace = true, features = ["builder", "pem"] }
+
+[lints]
+workspace = true

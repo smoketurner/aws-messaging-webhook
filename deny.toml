@@ -1,0 +1,35 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+  # Marvin attack: timing sidechannel in RSA *private-key* operations. This
+  # workspace only verifies SNS signatures (public-key ops); the only private
+  # keys touched are throwaway fixtures generated inside tests.
+  { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification only; no private-key operations on secret material" },
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "OpenSSL",
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

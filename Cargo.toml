@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = ["crates/sns-message-verifier", "crates/webhook"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jplock/aws-messaging-webhook"
+
+[workspace.dependencies]
+sns-message-verifier = { path = "crates/sns-message-verifier" }
+
+# Versions only (exact pins); features are enabled per-crate. default-features
+# is set here where the defaults must be disabled workspace-wide.
+
+# Runtime
+lambda_http = "=1.3.0"
+axum = "=0.8.9"
+tokio = "=1.53.1"
+tower = "=0.5.3"
+tower-http = "=0.7.0"
+
+# AWS SDK — default features off to drop the legacy rustls 0.21 connector
+# (RUSTSEC-2026-0098/0099/0104); crates enable default-https-client (hyper 1).
+aws-config = { version = "=1.10.1", default-features = false }
+aws-sdk-dynamodb = { version = "=1.119.0", default-features = false }
+aws-sdk-eventbridge = { version = "=1.112.0", default-features = false }
+aws-sdk-pinpointsmsvoicev2 = { version = "=1.116.0", default-features = false }
+aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
+
+# Serialization
+serde = "=1.0.229"
+serde_json = "=1.0.151"
+
+# Crypto for SNS signature verification. sha1/sha2 stay on the 0.10.x line and
+# x509-cert on 0.2.x: rsa 0.9 speaks digest 0.10 / spki 0.7, and the newer
+# 0.11 / 0.3 releases are trait-incompatible with it.
+rsa = "=0.9.10"
+sha1 = "=0.10.6"
+sha2 = "=0.10.9"
+x509-cert = "=0.2.5"
+base64 = "=0.23.0"
+url = "=2.5.8"
+reqwest = { version = "=0.13.4", default-features = false }
+
+# Errors and logging
+thiserror = "=2.0.19"
+anyhow = "=1.0.104"
+tracing = "=0.1.44"
+
+# Dev
+proptest = "=1.11.0"
+wiremock = "=0.6.5"
+# rand 0.8 is the last line implementing the rand_core 0.6 traits rsa 0.9 needs
+rand = "=0.8.5"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
