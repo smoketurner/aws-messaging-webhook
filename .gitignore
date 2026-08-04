@@ -1,3 +1,5 @@
 /target
 .aws-sam/
 .env
+mutants.out/
+mutants.out.old/

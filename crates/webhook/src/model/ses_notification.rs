@@ -148,10 +148,17 @@ mod tests {
     fn detail_types_cover_all_documented_kinds() {
         for (kind, expected) in [
             ("Send", "ses.send"),
+            ("Delivery", "ses.delivery"),
+            ("Bounce", "ses.bounce"),
+            ("Complaint", "ses.complaint"),
+            ("Reject", "ses.reject"),
+            ("Open", "ses.open"),
+            ("Click", "ses.click"),
             ("Rendering Failure", "ses.rendering-failure"),
             ("DeliveryDelay", "ses.delivery-delay"),
+            ("Subscription", "ses.subscription"),
         ] {
-            assert_eq!(detail_type_for(kind), Some(expected));
+            assert_eq!(detail_type_for(kind), Some(expected), "kind {kind}");
         }
         assert_eq!(detail_type_for("SomethingNew"), None);
     }

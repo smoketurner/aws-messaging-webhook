@@ -51,6 +51,16 @@ impl SnsFixture {
         })
     }
 
+    #[must_use]
+    pub fn not_yet_valid() -> Self {
+        let not_before = SystemTime::now() + Duration::from_hours(1);
+        let not_after = SystemTime::now() + Duration::from_hours(2);
+        Self::with_validity(Validity {
+            not_before: Time::try_from(not_before).unwrap(),
+            not_after: Time::try_from(not_after).unwrap(),
+        })
+    }
+
     fn with_validity(validity: Validity) -> Self {
         let mut rng = rand::thread_rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();

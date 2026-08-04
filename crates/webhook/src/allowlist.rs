@@ -151,8 +151,20 @@ mod tests {
     }
 
     #[test]
-    fn thirteen_digit_entry_is_a_glob_not_an_account() {
-        let list = TopicAllowlist::parse("1234567890123");
-        assert!(!list.allows(ARN));
+    fn is_empty_reflects_entry_presence() {
+        assert!(TopicAllowlist::parse("").is_empty());
+        assert!(!TopicAllowlist::parse("123456789012").is_empty());
+    }
+
+    #[test]
+    fn only_exactly_twelve_digits_is_an_account_entry() {
+        // 13 digits: not an account, treated as an exact-match glob.
+        assert!(!TopicAllowlist::parse("1234567890123").allows(ARN));
+        // 10 digits: also not an account. If the account-detection used OR
+        // instead of AND (len==12 || all-digit), this would wrongly match the
+        // account field; as an exact glob it cannot match a full ARN.
+        assert!(!TopicAllowlist::parse("1234567890").allows("arn:aws:sns:us-east-1:1234567890:t"));
+        // 12 non-digit chars: not an account either, exact glob only.
+        assert!(!TopicAllowlist::parse("abcdefghijkl").allows(ARN));
     }
 }

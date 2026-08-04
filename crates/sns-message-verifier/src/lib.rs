@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use canonical::build_string_to_sign;
-pub use cert::is_sns_host;
+pub use cert::validate_sns_url;
 pub use envelope::{MessageType, SnsEnvelope};
 pub use error::{CertUrlRejection, VerifyError};
 pub use signature::verify_with_cert;
@@ -124,6 +124,10 @@ impl SnsVerifierBuilder {
             Some(client) => client,
             None => reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
+                // Never follow redirects: the SigningCertURL host policy is the
+                // trust anchor, and a redirect off an allowed host to an
+                // attacker would defeat it and let a forged certificate verify.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         };
         Ok(SnsVerifier {

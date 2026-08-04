@@ -152,31 +152,29 @@ pub async fn run<T: Services>(
                 event.message_keyword.as_deref(),
                 event.message_body.as_deref(),
             );
-            if intent == KeywordIntent::None {
-                return Ok("none");
-            }
-            // Only meaningful with self-managed opt-outs; without a
-            // configured list the event still reaches the bus.
-            let Some(list) = state.config.opt_out_list_name.as_deref() else {
-                tracing::debug!("keyword received but OPT_OUT_LIST_NAME is not set; skipping");
-                return Ok("none");
-            };
-            match intent {
-                KeywordIntent::OptOut => {
+            // Opt-out actions are only meaningful with self-managed opt-outs;
+            // without a configured list the event still reaches the bus.
+            let list = state.config.opt_out_list_name.as_deref();
+            match (intent, list) {
+                (KeywordIntent::OptOut, Some(list)) => {
                     state
                         .services
                         .put_opted_out_number(list, &event.origination_number)
                         .await?;
                     Ok("opt_out")
                 }
-                KeywordIntent::OptIn => {
+                (KeywordIntent::OptIn, Some(list)) => {
                     state
                         .services
                         .delete_opted_out_number(list, &event.origination_number)
                         .await?;
                     Ok("opt_in")
                 }
-                KeywordIntent::None => unreachable!("handled above"),
+                (KeywordIntent::OptOut | KeywordIntent::OptIn, None) => {
+                    tracing::debug!("keyword received but OPT_OUT_LIST_NAME is not set; skipping");
+                    Ok("none")
+                }
+                (KeywordIntent::None, _) => Ok("none"),
             }
         }
         DomainEvent::SmsDelivery { event, .. } => {

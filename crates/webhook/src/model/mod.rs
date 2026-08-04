@@ -4,6 +4,7 @@ pub mod eum_sms;
 pub mod ses_inbound;
 pub mod ses_notification;
 
+use serde::Deserialize as _;
 use serde_json::Value;
 
 use crate::model::eum_sms::{SmsDeliveryEvent, SmsInboundMessage};
@@ -81,56 +82,41 @@ impl DomainEvent {
             };
         };
 
-        let parsed = match source {
-            Source::SmsInbound => {
-                serde_json::from_value::<SmsInboundMessage>(raw.clone()).map(|event| {
-                    Self::SmsInbound {
-                        event,
-                        raw: raw.clone(),
-                    }
-                })
-            }
-            Source::SmsEvents => {
-                serde_json::from_value::<SmsDeliveryEvent>(raw.clone()).map(|event| {
-                    Self::SmsDelivery {
-                        event,
-                        raw: raw.clone(),
-                    }
-                })
-            }
-            Source::SesEvents => {
-                serde_json::from_value::<SesNotification>(raw.clone()).map(|event| Self::Ses {
-                    event,
-                    raw: raw.clone(),
-                })
-            }
+        // Deserialize by borrowing `&raw` (no clone of the parsed tree), then
+        // move `raw` into the variant exactly once on success.
+        match source {
+            Source::SmsInbound => match SmsInboundMessage::deserialize(&raw) {
+                Ok(event) => Self::SmsInbound { event, raw },
+                Err(error) => Self::forward_unknown(source, raw, &error),
+            },
+            Source::SmsEvents => match SmsDeliveryEvent::deserialize(&raw) {
+                Ok(event) => Self::SmsDelivery { event, raw },
+                Err(error) => Self::forward_unknown(source, raw, &error),
+            },
+            Source::SesEvents => match SesNotification::deserialize(&raw) {
+                Ok(event) => Self::Ses { event, raw },
+                Err(error) => Self::forward_unknown(source, raw, &error),
+            },
             // Inbound notifications carry a `receipt`; an SES *sending*
             // notification wired to this path lacks one, so fall through and
             // classify it properly rather than calling it unknown.
-            Source::SesInbound => serde_json::from_value::<SesInboundNotification>(raw.clone())
-                .map(|event| Self::SesInbound {
-                    event,
-                    raw: raw.clone(),
-                })
-                .or_else(|_| {
-                    serde_json::from_value::<SesNotification>(raw.clone()).map(|event| Self::Ses {
-                        event,
-                        raw: raw.clone(),
-                    })
-                }),
-        };
-
-        match parsed {
-            Ok(event) => event,
-            Err(error) => {
-                tracing::warn!(
-                    source = source.as_str(),
-                    error = %error,
-                    "unrecognized payload; forwarding as unknown"
-                );
-                Self::Unknown { raw }
-            }
+            Source::SesInbound => match SesInboundNotification::deserialize(&raw) {
+                Ok(event) => Self::SesInbound { event, raw },
+                Err(_) => match SesNotification::deserialize(&raw) {
+                    Ok(event) => Self::Ses { event, raw },
+                    Err(error) => Self::forward_unknown(source, raw, &error),
+                },
+            },
         }
+    }
+
+    fn forward_unknown(source: Source, raw: Value, error: &serde_json::Error) -> Self {
+        tracing::warn!(
+            source = source.as_str(),
+            error = %error,
+            "unrecognized payload; forwarding as unknown"
+        );
+        Self::Unknown { raw }
     }
 
     /// The EventBridge detail-type this event publishes as.
@@ -139,8 +125,12 @@ impl DomainEvent {
         match self {
             Self::SmsInbound { .. } => "sms.inbound",
             Self::SmsDelivery { event, .. } => event.detail_type(),
+            // A parsed-but-unmapped SES kind is a real, routable event (AWS
+            // added a type we don't have a slug for), distinct from the
+            // Unknown variant's unparseable junk — so downstream rules can
+            // still filter it apart.
             Self::Ses { event, .. } => {
-                ses_notification::detail_type_for(&event.kind).unwrap_or("unknown")
+                ses_notification::detail_type_for(&event.kind).unwrap_or("ses.unknown")
             }
             Self::SesInbound { event, .. } => {
                 if event.receipt.is_quarantined() {
@@ -214,13 +204,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ses_kind_forwards_as_unknown_detail_type() {
+    fn unmapped_ses_kind_is_ses_unknown_not_unknown() {
         let event = DomainEvent::parse(
             Source::SesEvents,
             r#"{"eventType":"BrandNewThing","mail":{"messageId":"m-2"}}"#,
         );
         assert!(matches!(event, DomainEvent::Ses { .. }));
-        assert_eq!(event.detail_type(), "unknown");
+        // Distinct from the Unknown variant's "unknown": this parsed cleanly.
+        assert_eq!(event.detail_type(), "ses.unknown");
         assert_eq!(event.aggregate_id("sns-1"), "m-2");
     }
 

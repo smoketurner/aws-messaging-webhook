@@ -19,6 +19,7 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use crate::actions::{ActionError, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason};
 use crate::config::Config;
 use crate::model::DomainEvent;
+use crate::model::ses_notification::SesBounce;
 use crate::publish::{OutboundEvent, PublishError, PublishEvents};
 use crate::store::{EventRecord, EventStore, PersistOutcome, StoreError};
 
@@ -106,6 +107,7 @@ fn aggregate_update(
             "Send" => Some(set_status(&mut set_clauses, "sent", false)),
             "Delivery" => Some(set_status(&mut set_clauses, "delivered", true)),
             "Bounce" => {
+                let permanent = event.bounce.as_ref().is_some_and(SesBounce::is_permanent);
                 if let Some(bounce) = &event.bounce {
                     set_clauses.push("bounce_type = :bounce_type");
                     builder = builder.expression_attribute_values(
@@ -113,7 +115,10 @@ fn aggregate_update(
                         AttributeValue::S(bounce.bounce_type.clone()),
                     );
                 }
-                Some(set_status(&mut set_clauses, "bounced", true))
+                // Only a permanent bounce is terminal — matching the
+                // suppression action. A transient bounce is retryable, so it
+                // records bounce_type but must not clobber a delivered status.
+                permanent.then(|| set_status(&mut set_clauses, "bounced", true))
             }
             "Complaint" => {
                 set_clauses.push("complained_at = :ts");
@@ -498,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn bounce_overwrites_status_and_records_bounce_type() {
+    fn permanent_bounce_overwrites_status_and_records_bounce_type() {
         let (expr, keys) = expression_for(
             Source::SesEvents,
             r#"{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[]},
@@ -509,6 +514,20 @@ mod tests {
         assert!(expr.contains("bounce_type = :bounce_type"));
         assert!(keys.contains(&":bounce_type".to_owned()));
         assert!(keys.contains(&":status".to_owned()));
+    }
+
+    #[test]
+    fn transient_bounce_records_type_but_does_not_set_status() {
+        // A transient bounce is retryable, so it must not clobber a prior
+        // delivered/sent status — matching the suppression action's gate.
+        let (expr, keys) = expression_for(
+            Source::SesEvents,
+            r#"{"eventType":"Bounce","bounce":{"bounceType":"Transient","bouncedRecipients":[]},
+                "mail":{"messageId":"m"}}"#,
+        );
+        assert!(expr.contains("bounce_type = :bounce_type"));
+        assert!(!expr.contains("current_status"));
+        assert!(!keys.contains(&":status".to_owned()));
     }
 
     #[test]

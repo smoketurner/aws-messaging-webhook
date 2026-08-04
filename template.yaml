@@ -16,7 +16,7 @@ Parameters:
   LogLevel:
     Type: String
     Default: INFO
-    AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR, FATAL]
+    AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR]
   AllowedTopics:
     Type: String
     Default: ""
@@ -141,11 +141,13 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-events"
 
+  # Notification deliveries (fresh, resumed, or duplicate) — excludes
+  # subscription-lifecycle lines so it stays comparable to EventsPublished.
   MessagesReceivedFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref FunctionLogGroup
-      FilterPattern: '{ $.fields.outcome = * }'
+      FilterPattern: '{ $.fields.outcome = "published" || $.fields.outcome = "resumed" || $.fields.outcome = "duplicate" }'
       MetricTransformations:
         - MetricNamespace: !Ref AWS::StackName
           MetricName: MessagesReceived
@@ -226,6 +228,19 @@ Resources:
       MetricTransformations:
         - MetricNamespace: !Ref AWS::StackName
           MetricName: Resubscribes
+          MetricValue: "1"
+          Unit: Count
+
+  # AUTO_RESUBSCRIBE=false only: a cancelled subscription that was NOT
+  # re-attached. Alarm on this — it means the pipeline is silently detached.
+  SubscriptionsLostFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "subscription_lost" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: SubscriptionsLost
           MetricValue: "1"
           Unit: Count
 

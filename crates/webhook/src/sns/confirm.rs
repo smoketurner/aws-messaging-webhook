@@ -8,10 +8,9 @@ use url::Url;
 
 use crate::error::AppError;
 
-/// Validates that a `SubscribeURL` points at a real SNS endpoint over HTTPS.
-/// `dangerous_allow_prefix` additionally accepts URLs starting with that
-/// prefix — for tests and local development against a fake SNS only; the
-/// binary populates it solely in debug builds.
+/// Validates that a `SubscribeURL` points at a real SNS endpoint, using the
+/// exact same policy as certificate fetching so the two SSRF guards cannot
+/// drift. `dangerous_allow_prefix` is honored only in debug builds.
 ///
 /// # Errors
 ///
@@ -21,20 +20,8 @@ pub fn validate_subscribe_url(
     raw: &str,
     dangerous_allow_prefix: Option<&str>,
 ) -> Result<Url, AppError> {
-    let url = Url::parse(raw).map_err(|_| AppError::SubscribeUrlRejected)?;
-    if dangerous_allow_prefix.is_some_and(|prefix| raw.starts_with(prefix)) {
-        return Ok(url);
-    }
-    let accepted = url.scheme() == "https"
-        && matches!(url.port(), None | Some(443))
-        && url
-            .host_str()
-            .is_some_and(sns_message_verifier::is_sns_host);
-    if accepted {
-        Ok(url)
-    } else {
-        Err(AppError::SubscribeUrlRejected)
-    }
+    sns_message_verifier::validate_sns_url(raw, dangerous_allow_prefix)
+        .map_err(|_| AppError::SubscribeUrlRejected)
 }
 
 /// GETs a validated `SubscribeURL`, confirming (or re-confirming) the

@@ -74,8 +74,14 @@ Events publish to the `<stack-name>-events` bus with `source` = `EventSource` pa
 `sms.inbound`, `sms.delivery`, `mms.delivery`, `voice.delivery`, `ses.bounce`, `ses.complaint`, `ses.delivery`, `ses.send`,
 `ses.reject`, `ses.open`, `ses.click`, `ses.rendering-failure`, `ses.delivery-delay`,
 `ses.subscription`, `ses.inbound`, `ses.inbound.quarantined` (spam/virus verdict FAIL —
-classification only, nothing dropped), `subscription.changed` (auto-re-subscribe fired),
-`unknown` (unrecognized payload, forwarded verbatim).
+classification only, nothing dropped), `ses.unknown` (a valid SES event of a kind this version
+doesn't map yet), `subscription.changed` (auto-re-subscribe fired), `unknown` (unparseable
+payload, forwarded verbatim).
+
+An event whose payload exceeds the EventBridge 256 KB entry limit is published with its `event`
+replaced by `{ "payloadOmitted": true, ... }`; `meta` is always preserved, so consumers fetch the
+full record from DynamoDB by `meta.messageId`. (SES inbound raw MIME is dropped first; this
+pointer form is the fallback.)
 
 Detail shape:
 
@@ -109,9 +115,11 @@ A message's full timeline is one `Query` on `pk`; its current state is one `GetI
 
 - Structured JSON logs; one INFO line per message with `outcome`
   (`published|duplicate|resumed|confirmed|resubscribed`) and `action`.
-- CloudWatch metrics (namespace = stack name) via log metric filters: `MessagesReceived`,
-  `SignatureRejections`, `AllowlistRejections`, `Duplicates`, `EventsPublished`,
-  `InternalErrors`, `ActionFailures`, `Resubscribes`.
+- CloudWatch metrics (namespace = stack name) via log metric filters: `MessagesReceived`
+  (notification deliveries: published + resumed + duplicate), `SignatureRejections`,
+  `AllowlistRejections`, `Duplicates`, `EventsPublished`, `InternalErrors`, `ActionFailures`,
+  `Resubscribes`, and `SubscriptionsLost` (alarm on this — a subscription was cancelled and, with
+  `AutoResubscribe=false`, not re-attached).
 - Transient downstream failures return 5xx on purpose: SNS redelivers, and the store's
   `PERSISTED`/`PUBLISHED` status makes the retry resume exactly where it died. Consumers must
   tolerate rare duplicate bus events (SNS is at-least-once end to end).
@@ -126,9 +134,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 prek run                               # fmt, clippy, deny, actionlint, zizmor
 ```
 
-Local run: `cargo lambda watch`, then POST signed fixtures. Debug builds honor
-`SNS_CERT_HOST_OVERRIDE` to trust a local fake SNS certificate server; release builds have no
-bypass.
+The handler tests drive the real router end to end with properly signed SNS envelopes (the
+verifier crate's `test-fixtures` feature generates throwaway keys and certificates), so no AWS
+account is needed for development. For a deployed end-to-end check use
+`scripts/e2e-ses-bounce.sh`. Debug builds honor `SNS_CERT_HOST_OVERRIDE` for running against a
+local fake SNS under `cargo lambda watch`; release builds have no bypass.
 
 ## License
 

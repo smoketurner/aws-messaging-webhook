@@ -23,6 +23,7 @@ serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true, features = ["std", "oid"] }
 sha2 = { workspace = true, features = ["std", "oid"] }
 thiserror = { workspace = true, features = ["std"] }
+tracing = { workspace = true, features = ["std"] }
 url = { workspace = true, features = ["std"] }
 x509-cert = { workspace = true, features = ["std", "pem"] }
 

@@ -54,9 +54,18 @@ impl Config {
 
         let raw_event_retention_days = match optional("RAW_EVENT_RETENTION_DAYS") {
             None => 30,
-            Some(raw) => raw.parse::<u64>().with_context(|| {
-                format!("RAW_EVENT_RETENTION_DAYS must be a positive integer, got {raw:?}")
-            })?,
+            Some(raw) => {
+                let days = raw.parse::<u64>().with_context(|| {
+                    format!("RAW_EVENT_RETENTION_DAYS must be a positive integer, got {raw:?}")
+                })?;
+                // 0 would set a TTL of "now", purging every audit record almost
+                // immediately — reject it rather than silently destroy data.
+                anyhow::ensure!(
+                    days > 0,
+                    "RAW_EVENT_RETENTION_DAYS must be at least 1, got 0"
+                );
+                days
+            }
         };
 
         Ok((

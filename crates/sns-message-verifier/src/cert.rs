@@ -15,9 +15,45 @@ const MAX_CERT_RESPONSE_BYTES: usize = 64 * 1024;
 
 const MAX_CACHED_CERTS: usize = 32;
 
-/// Validates a `SigningCertURL` against the SNS host policy BEFORE any network
-/// request. This is the trust anchor of the whole verification scheme: a lax
-/// check here lets an attacker serve their own certificate.
+/// Validates that `raw` is an SNS service URL: `https`, port 443, and a host
+/// matching `sns.<region>.amazonaws.com(.cn)`. This is the SSRF trust anchor
+/// shared by certificate fetching and `SubscribeURL` confirmation, so both
+/// guards stay identical.
+///
+/// `dangerous_allow_prefix` accepts URLs beginning with that prefix, bypassing
+/// the policy — honored ONLY in debug builds (tests, local development against
+/// a fake SNS), never in a release binary.
+///
+/// # Errors
+///
+/// Returns the specific [`CertUrlRejection`] for the first failed check.
+pub fn validate_sns_url(
+    raw: &str,
+    dangerous_allow_prefix: Option<&str>,
+) -> Result<Url, CertUrlRejection> {
+    let Ok(url) = Url::parse(raw) else {
+        return Err(CertUrlRejection::Unparseable);
+    };
+    if cfg!(debug_assertions)
+        && dangerous_allow_prefix.is_some_and(|prefix| raw.starts_with(prefix))
+    {
+        return Ok(url);
+    }
+    if url.scheme() != "https" {
+        return Err(CertUrlRejection::NotHttps);
+    }
+    if !matches!(url.port(), None | Some(443)) {
+        return Err(CertUrlRejection::InvalidPort);
+    }
+    if !url.host_str().is_some_and(is_sns_host) {
+        return Err(CertUrlRejection::InvalidHost);
+    }
+    Ok(url)
+}
+
+/// Validates a `SigningCertURL`: the SNS URL policy plus a `.pem` path. The
+/// trust anchor of the whole verification scheme — a lax check here lets an
+/// attacker serve their own certificate.
 pub(crate) fn validate_cert_url(
     raw: &str,
     dangerous_allow_prefix: Option<&str>,
@@ -26,23 +62,7 @@ pub(crate) fn validate_cert_url(
         url: raw.to_owned(),
         reason,
     };
-
-    let Ok(url) = Url::parse(raw) else {
-        return Err(reject(CertUrlRejection::Unparseable));
-    };
-    if dangerous_allow_prefix.is_some_and(|prefix| raw.starts_with(prefix)) {
-        return Ok(url);
-    }
-    if url.scheme() != "https" {
-        return Err(reject(CertUrlRejection::NotHttps));
-    }
-    if !matches!(url.port(), None | Some(443)) {
-        return Err(reject(CertUrlRejection::InvalidPort));
-    }
-    let is_sns = url.host_str().is_some_and(is_sns_host);
-    if !is_sns {
-        return Err(reject(CertUrlRejection::InvalidHost));
-    }
+    let url = validate_sns_url(raw, dangerous_allow_prefix).map_err(reject)?;
     let is_pem = std::path::Path::new(url.path())
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pem"));
@@ -56,10 +76,7 @@ pub(crate) fn validate_cert_url(
 /// `sns.<region>.amazonaws.com.cn`, where `<region>` is one label of
 /// `[a-z0-9-]`. ISO partitions are unsupported.
 ///
-/// Exposed so callers can apply the same policy to other SNS-provided URLs
-/// (e.g. `SubscribeURL`) before fetching them.
-#[must_use]
-pub fn is_sns_host(host: &str) -> bool {
+fn is_sns_host(host: &str) -> bool {
     let Some(rest) = host.strip_prefix("sns.") else {
         return false;
     };
@@ -79,12 +96,18 @@ pub(crate) async fn fetch_and_parse(
     client: &reqwest::Client,
     url: &Url,
 ) -> Result<RsaPublicKey, VerifyError> {
-    let response = client.get(url.clone()).send().await?.error_for_status()?;
-    let body = response.bytes().await?;
-    if body.len() > MAX_CERT_RESPONSE_BYTES {
-        return Err(VerifyError::CertParse(
-            "certificate response too large".to_owned(),
-        ));
+    let mut response = client.get(url.clone()).send().await?.error_for_status()?;
+    // Enforce the size cap while streaming so a malicious or misbehaving cert
+    // server can't OOM the function by returning a huge body — checking after
+    // `bytes()` would already have buffered all of it.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_CERT_RESPONSE_BYTES {
+            return Err(VerifyError::CertParse(
+                "certificate response too large".to_owned(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
     }
     parse_cert_pem(&body)
 }
@@ -123,14 +146,16 @@ pub(crate) struct CertCache {
 
 impl CertCache {
     pub(crate) fn get(&self, url: &str) -> Option<Arc<RsaPublicKey>> {
-        match self.keys.read() {
-            Ok(keys) => keys.get(url).cloned(),
-            Err(_) => None,
-        }
+        let Ok(keys) = self.keys.read() else {
+            tracing::warn!("certificate cache lock poisoned; treating as a cache miss");
+            return None;
+        };
+        keys.get(url).cloned()
     }
 
     pub(crate) fn insert(&self, url: String, key: Arc<RsaPublicKey>) {
         let Ok(mut keys) = self.keys.write() else {
+            tracing::warn!("certificate cache lock poisoned; skipping cache insert");
             return;
         };
         if keys.len() >= MAX_CACHED_CERTS && !keys.contains_key(&url) {

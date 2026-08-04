@@ -5,26 +5,26 @@
 
 use serde::Deserialize;
 
-/// Two-way inbound SMS. `messageKeyword` carries the matched registered
-/// keyword VERBATIM (e.g. "STOP", "JOIN") — no `KEYWORD_` prefix.
+/// Two-way inbound SMS. Only the fields the pipeline reads are typed; the rest
+/// (destination number, prior message id, …) ride along in the raw JSON that
+/// is persisted and forwarded verbatim. `messageKeyword` carries the matched
+/// registered keyword VERBATIM (e.g. "STOP", "JOIN") — no `KEYWORD_` prefix.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmsInboundMessage {
     pub origination_number: String,
     #[serde(default)]
-    pub destination_number: Option<String>,
-    #[serde(default)]
     pub message_keyword: Option<String>,
     #[serde(default)]
     pub message_body: Option<String>,
     pub inbound_message_id: String,
-    #[serde(default)]
-    pub previous_published_message_id: Option<String>,
 }
 
 /// A configuration-set event (delivery receipt) for SMS (`TEXT_*`), MMS
-/// (`MEDIA_*`), or voice (`VOICE_*`). `event_type` stays a string — the value
-/// set grows over time and classification only needs prefixes plus `is_final`.
+/// (`MEDIA_*`), or voice (`VOICE_*`). Only the fields the pipeline reads are
+/// typed; phone numbers, timestamps, pricing, etc. ride along in the raw JSON.
+/// `event_type` stays a string — the value set grows over time and
+/// classification only needs prefixes plus `is_final`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmsDeliveryEvent {
@@ -35,15 +35,6 @@ pub struct SmsDeliveryEvent {
     /// transient — this flag, not the event type, decides terminality.
     #[serde(default)]
     pub is_final: bool,
-    #[serde(default)]
-    pub origination_phone_number: Option<String>,
-    #[serde(default)]
-    pub destination_phone_number: Option<String>,
-    #[serde(default)]
-    pub message_status: Option<String>,
-    /// Epoch milliseconds.
-    #[serde(default)]
-    pub event_timestamp: Option<i64>,
 }
 
 /// Event types that mean the message reached the recipient. Everything else
@@ -107,7 +98,7 @@ mod tests {
         )
         .unwrap();
         assert!(event.message_keyword.is_none());
-        assert!(event.previous_published_message_id.is_none());
+        assert!(event.message_body.is_none());
     }
 
     #[test]
@@ -139,7 +130,7 @@ mod tests {
         assert!(event.is_final);
         assert!(event.is_successful_delivery());
         assert_eq!(event.detail_type(), "sms.delivery");
-        assert_eq!(event.event_timestamp, Some(1_686_975_103_470));
+        assert_eq!(event.message_id, "862a8790-60c0-4430-9b2b-658bdexample");
     }
 
     #[test]

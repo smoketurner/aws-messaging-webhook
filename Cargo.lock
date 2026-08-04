@@ -2440,6 +2440,7 @@ dependencies = [
  "sns-message-verifier",
  "thiserror",
  "tokio",
+ "tracing",
  "url",
  "wiremock",
  "x509-cert",

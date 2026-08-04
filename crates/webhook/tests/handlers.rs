@@ -805,3 +805,64 @@ async fn permanent_action_failure_still_publishes() {
     assert!(calls.contains(&"publish:ses.bounce".to_owned()));
     assert!(calls.contains(&"mark".to_owned()));
 }
+
+#[tokio::test]
+async fn transient_cert_fetch_failure_returns_500_not_403() {
+    // A cold-start cert fetch that fails transiently must not be a permanent
+    // 4xx — that would make SNS drop a correctly-signed message. The verifier
+    // has no cached cert and the cert server 500s, so verify() -> CertFetch.
+    let fixture = SnsFixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/cert.pem"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let cert_url = format!("{}/cert.pem", server.uri());
+    let state = Arc::new(AppState {
+        services: FakeServices::default(),
+        verifier: SnsVerifier::builder()
+            .dangerous_allow_cert_url_prefix(server.uri())
+            .build()
+            .unwrap(),
+        allowlist: TopicAllowlist::parse(ALLOWED_ACCOUNT),
+        http: reqwest::Client::new(),
+        config: Config {
+            table_name: "events".to_owned(),
+            event_bus_name: "bus".to_owned(),
+            event_source: "aws-messaging-webhook".to_owned(),
+            auto_resubscribe: true,
+            opt_out_list_name: Some("opt-out-list".to_owned()),
+            raw_event_retention_days: 30,
+        },
+        dangerous_subscribe_url_prefix: Some(server.uri()),
+    });
+    let mut body = notification(&cert_url);
+    fixture.sign(&mut body, "2");
+
+    let status = post(state, "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn oversized_non_content_payload_publishes_a_pointer_not_a_poison_message() {
+    let h = harness().await;
+    // A large SES event with no `content` field to strip: must still publish
+    // (as a bounded pointer) rather than 5xx-loop forever.
+    let big_reason = "x".repeat(300_000);
+    let inner = json!({
+        "eventType": "Bounce",
+        "bounce": {"bounceType": "Transient", "bouncedRecipients": [], "note": big_reason},
+        "mail": {"messageId": "huge-1"}
+    });
+    let body = wrapped(&h, &inner);
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let published = h.fake().published.lock().unwrap();
+    assert_eq!(published[0].detail["event"]["payloadOmitted"], json!(true));
+    // Meta is always preserved so consumers can fetch the full record.
+    assert_eq!(published[0].detail["meta"]["messageId"], "huge-1");
+}

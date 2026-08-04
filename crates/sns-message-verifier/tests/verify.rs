@@ -2,7 +2,9 @@
 
 use serde_json::json;
 use sns_message_verifier::fixtures::{SnsFixture, notification, subscription_confirmation};
-use sns_message_verifier::{CertUrlRejection, SnsVerifier, VerifyError};
+use sns_message_verifier::{
+    CertUrlRejection, SnsEnvelope, SnsVerifier, VerifyError, verify_with_cert,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -105,6 +107,64 @@ async fn rejects_expired_certificate() {
         .await
         .unwrap_err();
     assert!(matches!(err, VerifyError::CertValidity));
+}
+
+#[tokio::test]
+async fn rejects_not_yet_valid_certificate() {
+    let fixture = SnsFixture::not_yet_valid();
+    let (server, cert_url) = serve_cert(&fixture.cert_pem, 1).await;
+    let sns = verifier(&server);
+
+    let mut body = notification(&cert_url);
+    fixture.sign(&mut body, "1");
+    let err = sns
+        .verify_body(body.to_string().as_bytes())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VerifyError::CertValidity));
+}
+
+#[tokio::test]
+async fn rejects_oversized_certificate_response() {
+    // A body well over the cap must be rejected as "too large" specifically,
+    // proving the streaming size check fires. The fetch fails before the
+    // signature is checked, so the signing fixture is irrelevant here.
+    let oversized = "x".repeat(100 * 1024);
+    let (server, cert_url) = serve_cert(&oversized, 1).await;
+    let sns = verifier(&server);
+
+    let mut body = notification(&cert_url);
+    SnsFixture::new().sign(&mut body, "2");
+    let err = sns
+        .verify_body(body.to_string().as_bytes())
+        .await
+        .unwrap_err();
+    match err {
+        VerifyError::CertParse(message) => {
+            assert!(
+                message.contains("too large"),
+                "expected size error, got {message}"
+            );
+        }
+        other => panic!("expected CertParse(too large), got {other:?}"),
+    }
+}
+
+#[test]
+fn verify_with_cert_accepts_valid_and_rejects_tampered() {
+    let fixture = SnsFixture::new();
+    let mut body = notification("https://sns.us-east-1.amazonaws.com/cert.pem");
+    fixture.sign(&mut body, "2");
+
+    let envelope: SnsEnvelope = serde_json::from_value(body.clone()).unwrap();
+    verify_with_cert(&envelope, fixture.cert_pem.as_bytes()).unwrap();
+
+    body["Message"] = json!("tampered after signing");
+    let tampered: SnsEnvelope = serde_json::from_value(body).unwrap();
+    assert!(matches!(
+        verify_with_cert(&tampered, fixture.cert_pem.as_bytes()),
+        Err(VerifyError::SignatureMismatch)
+    ));
 }
 
 #[tokio::test]

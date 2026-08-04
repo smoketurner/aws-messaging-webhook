@@ -208,33 +208,57 @@ async fn process_notification<T: Services>(
 /// `PutEvents` caps an entry at 256 KB; leave headroom for the envelope.
 const MAX_DETAIL_BYTES: usize = 250_000;
 
-fn build_outbound(source: Source, record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
-    let mut detail = json!({
-        "meta": {
-            "snsMessageId": record.sns_message_id,
-            "messageId": record.aggregate_id,
-            "topicArn": record.topic_arn,
-            "receivedAt": record.received_at,
-            "webhookPath": source.webhook_path(),
-        },
-        "event": event.payload(),
-    });
+fn detail_bytes(detail: &serde_json::Value) -> usize {
+    serde_json::to_vec(detail).map_or(usize::MAX, |bytes| bytes.len())
+}
 
-    // SES inbound notifications from an SNS receipt action embed the raw MIME
-    // in `content` and can exceed the PutEvents entry cap. Strip it from the
-    // bus event only — the DynamoDB raw record keeps everything.
-    let oversized = serde_json::to_string(&detail).is_ok_and(|s| s.len() > MAX_DETAIL_BYTES);
-    if oversized
-        && let Some(content) = detail
-            .get_mut("event")
-            .and_then(|event| event.get_mut("content"))
-            .filter(|content| !content.is_null())
+/// Builds the EventBridge detail, guaranteeing it stays under the `PutEvents`
+/// entry cap so an oversized payload can never become a poison message that
+/// 5xx-loops through SNS redelivery forever. Oversized events are reduced in
+/// two steps; the full payload always remains in the DynamoDB raw record.
+fn build_outbound(source: Source, record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
+    let meta = json!({
+        "snsMessageId": record.sns_message_id,
+        "messageId": record.aggregate_id,
+        "topicArn": record.topic_arn,
+        "receivedAt": record.received_at,
+        "webhookPath": source.webhook_path(),
+    });
+    let mut detail = json!({ "meta": meta, "event": event.payload() });
+
+    if detail_bytes(&detail) <= MAX_DETAIL_BYTES {
+        return OutboundEvent {
+            detail_type: record.detail_type.clone(),
+            detail,
+        };
+    }
+
+    // Step 1: drop embedded raw MIME (SES inbound `content`), the usual cause.
+    if let Some(content) = detail
+        .get_mut("event")
+        .and_then(|event| event.get_mut("content"))
+        .filter(|content| !content.is_null())
     {
         *content = serde_json::Value::Null;
         tracing::warn!(
             sns_message_id = record.sns_message_id,
             event = "content_stripped",
             "stripped oversized inbound content from the EventBridge event"
+        );
+    }
+
+    // Step 2: if still over the cap, replace the payload with a pointer so the
+    // bus event stays publishable. Consumers fetch the full record from
+    // DynamoDB by meta.messageId + meta.snsMessageId.
+    if detail_bytes(&detail) > MAX_DETAIL_BYTES {
+        detail["event"] = json!({
+            "payloadOmitted": true,
+            "reason": "event payload exceeds the EventBridge entry size limit",
+        });
+        tracing::warn!(
+            sns_message_id = record.sns_message_id,
+            event = "payload_omitted",
+            "event payload too large for EventBridge; published a pointer only"
         );
     }
 

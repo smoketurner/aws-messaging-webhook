@@ -33,6 +33,10 @@ async fn main() -> Result<(), lambda_http::Error> {
         allowlist,
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            // Never follow redirects: validate_subscribe_url restricts the
+            // initial host to SNS, but following a 3xx off that host would be
+            // SSRF from the Lambda's network context.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
         config,
         dangerous_subscribe_url_prefix,
