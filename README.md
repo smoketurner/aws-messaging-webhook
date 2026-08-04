@@ -1,5 +1,9 @@
 # aws-messaging-webhook
 
+[![CI](https://img.shields.io/github/actions/workflow/status/smoketurner/aws-messaging-webhook/ci.yml?branch=main)](https://github.com/smoketurner/aws-messaging-webhook/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.97.1-blue)](rust-toolchain.toml)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
+
 One Rust Lambda function (Axum behind a Lambda Function URL) that receives AWS messaging events
 delivered over SNS — End User Messaging two-way SMS and delivery receipts, SES sending events,
 and SES inbound email notifications — then:
@@ -16,14 +20,22 @@ and SES inbound email notifications — then:
    `PutSuppressedDestination`. AWS-native lists stay the source of truth.
 5. **Re-publishes** normalized events to a custom EventBridge bus for downstream applications.
 
+- [Architecture](#architecture)
+- [Deploy](#deploy)
+- [EventBridge contract](#eventbridge-contract)
+- [Data model](#data-model)
+- [Operations](#operations)
+- [Development](#development)
+- [License](#license)
+
 ## Architecture
 
 ```
-EUM two-way SMS ──► SNS ─┐
-EUM config set (DLR) ──► SNS ─┤   POST /webhooks/…      ┌─► DynamoDB (events + aggregates)
-SES config set ──► SNS ─┼──► Lambda Function URL ──┼─► lifecycle actions (EUM/SES APIs)
-SES receipt rule ──► SNS ─┘   verify → persist →    └─► EventBridge bus ─► your apps
-                              act → publish
+EUM two-way SMS ──────► SNS ─┐
+EUM config set (DLR) ─► SNS ─┤  POST /webhooks/…       ┌─► DynamoDB (events + aggregates)
+SES config set ───────► SNS ─┼─► Lambda Function URL ──┼─► lifecycle actions (EUM/SES APIs)
+SES receipt rule ─────► SNS ─┘  verify → persist →     └─► EventBridge bus ─► your apps
+                                act → publish
 ```
 
 Each webhook path expects one event family, so wire each SNS topic to its own path:
@@ -35,26 +47,52 @@ Each webhook path expects one event family, so wire each SNS topic to its own pa
 | `/webhooks/ses/events` | SES configuration-set event destination topic (bounce/complaint/…) |
 | `/webhooks/ses/inbound` | SES receipt-rule SNS topic (inbound email notifications) |
 
+### Workspace
+
+| Crate | Purpose |
+|---|---|
+| `crates/webhook` (`aws-messaging-webhook`) | The Lambda: routing, allowlist, persistence, lifecycle actions, publishing |
+| `crates/sns-message-verifier` | Standalone SNS signature verification (versions 1 and 2) with no AWS SDK dependency; its `test-fixtures` feature generates throwaway keys and certs so consumers can sign test envelopes |
+
 ## Deploy
 
 Prerequisites: Rust (see `rust-toolchain.toml`), [`cargo-lambda`](https://cargo-lambda.info),
 AWS SAM CLI.
 
 ```bash
+git clone https://github.com/smoketurner/aws-messaging-webhook
+cd aws-messaging-webhook
 sam build --config-env dev
 sam deploy --config-env dev --parameter-overrides \
   "Stage=dev AllowedTopics=<your-account-id> OptOutListName=<your-opt-out-list>"
 scripts/subscribe.sh aws-messaging-webhook-dev ses/events <topic-arn>
 ```
 
+> [!IMPORTANT]
+> **`AllowedTopics` is load-bearing security.** Signature verification proves a message came
+> from SNS — from *any* AWS account. The allowlist (12-digit account ids and/or TopicArn globs,
+> comma-separated) is what stops strangers from subscribing your public endpoint to their
+> topics. Empty = accept everything = development only.
+
+> [!WARNING]
+> **Raw message delivery must stay disabled** on subscriptions (the default). Raw delivery
+> strips the signed JSON envelope, and the webhook rejects the request.
+
+### Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `Stage` | `dev` | `dev` or `prod`; `prod` enables DynamoDB deletion protection |
+| `AllowedTopics` | *(empty)* | Comma-separated account ids and/or TopicArn globs — see above |
+| `AutoResubscribe` | `true` | Re-subscribe when an unauthenticated `UnsubscribeURL` is abused |
+| `OptOutListName` | *(empty)* | EUM opt-out list updated by STOP/START keywords; empty disables that action |
+| `EventSource` | `aws-messaging-webhook` | `source` field on published EventBridge events |
+| `RawEventRetentionDays` | `30` | DynamoDB TTL for raw event items |
+| `LogLevel` | `INFO` | `TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR` |
+| `LogRetentionDays` | `30` | CloudWatch log retention |
+
 ### Deployment contract
 
-- **`AllowedTopics` is load-bearing security.** Signature verification proves a message came
-  from SNS — from *any* AWS account. The allowlist (12-digit account ids and/or TopicArn globs,
-  comma-separated) is what stops strangers from subscribing your public endpoint to their
-  topics. Empty = accept everything = development only.
-- **Raw message delivery must stay disabled** on subscriptions (the default). Raw delivery
-  strips the signed JSON envelope, and the webhook rejects the request.
 - **`SignatureVersion: 2`** (SHA256) is recommended per topic; `subscribe.sh` sets it. Version 1
   (the SNS default) is also supported.
 - **SES inbound email**: use the receipt rule **S3 action** to store message content, with the
@@ -137,9 +175,13 @@ prek run                               # fmt, clippy, deny, actionlint, zizmor
 The handler tests drive the real router end to end with properly signed SNS envelopes (the
 verifier crate's `test-fixtures` feature generates throwaway keys and certificates), so no AWS
 account is needed for development. For a deployed end-to-end check use
-`scripts/e2e-ses-bounce.sh`. Debug builds honor `SNS_CERT_HOST_OVERRIDE` for running against a
-local fake SNS under `cargo lambda watch`; release builds have no bypass.
+`scripts/e2e-ses-bounce.sh`.
+
+> [!NOTE]
+> Debug builds honor `SNS_CERT_HOST_OVERRIDE` for running against a local fake SNS under
+> `cargo lambda watch`; release builds have no bypass.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+Licensed under either of the [Apache License 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.

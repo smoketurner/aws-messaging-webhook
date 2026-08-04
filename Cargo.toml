@@ -4,9 +4,9 @@ members = ["crates/sns-message-verifier", "crates/webhook"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/jplock/aws-messaging-webhook"
+repository = "https://github.com/smoketurner/aws-messaging-webhook"
 
 [workspace.dependencies]
 sns-message-verifier = { path = "crates/sns-message-verifier" }
