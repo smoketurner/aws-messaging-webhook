@@ -22,6 +22,10 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          # Dependencies compile the same whether or not deny/clippy/tests pass;
+          # without this, a streak of red runs means every run builds cold.
+          cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
