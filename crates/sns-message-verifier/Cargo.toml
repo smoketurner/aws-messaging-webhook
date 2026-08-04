@@ -9,24 +9,24 @@ description = "Verify AWS SNS message signatures (SignatureVersion 1 and 2) for 
 publish = false
 
 [dependencies]
-base64.workspace = true
+base64 = { workspace = true, features = ["std"] }
 reqwest = { workspace = true, features = ["rustls"] }
-rsa.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-sha1 = { workspace = true, features = ["oid"] }
-sha2 = { workspace = true, features = ["oid"] }
-thiserror.workspace = true
-tracing.workspace = true
-url.workspace = true
-x509-cert.workspace = true
+rsa = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+sha1 = { workspace = true, features = ["std", "oid"] }
+sha2 = { workspace = true, features = ["std", "oid"] }
+thiserror = { workspace = true, features = ["std"] }
+url = { workspace = true, features = ["std"] }
+x509-cert = { workspace = true, features = ["std", "pem"] }
 
 [dev-dependencies]
-proptest.workspace = true
-rand.workspace = true
+proptest = { workspace = true, features = ["std"] }
+rand = { workspace = true, features = ["std", "std_rng"] }
+rsa = { workspace = true, features = ["std", "sha1", "sha2"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock.workspace = true
-x509-cert = { workspace = true, features = ["builder", "pem"] }
+x509-cert = { workspace = true, features = ["std", "pem", "builder"] }
 
 [lints]
 workspace = true
