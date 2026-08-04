@@ -79,3 +79,14 @@ mem_forget = "deny"
 # Pedantic relaxations (too noisy)
 module_name_repetitions = "allow"
 similar_names = "allow"
+
+# Smaller deploy artifact and marginally faster cold start; slower `sam build`.
+# Deliberately NOT set: `panic = "abort"` — lambda_runtime catches handler
+# panics via unwinding, turning them into a 502 (SNS retries) while keeping the
+# sandbox warm; abort would torch the execution environment on every panic.
+# `opt-level = "z"` — per-message RSA verification and JSON parsing are billed
+# CPU time; size-over-speed is the wrong trade for this workload.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
