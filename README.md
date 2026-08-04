@@ -71,7 +71,7 @@ scripts/subscribe.sh aws-messaging-webhook-dev ses/events <topic-arn>
 Events publish to the `<stack-name>-events` bus with `source` = `EventSource` parameter
 (default `aws-messaging-webhook`) and these detail-types:
 
-`sms.inbound`, `sms.delivery`, `ses.bounce`, `ses.complaint`, `ses.delivery`, `ses.send`,
+`sms.inbound`, `sms.delivery`, `mms.delivery`, `voice.delivery`, `ses.bounce`, `ses.complaint`, `ses.delivery`, `ses.send`,
 `ses.reject`, `ses.open`, `ses.click`, `ses.rendering-failure`, `ses.delivery-delay`,
 `ses.subscription`, `ses.inbound`, `ses.inbound.quarantined` (spam/virus verdict FAIL —
 classification only, nothing dropped), `subscription.changed` (auto-re-subscribe fired),

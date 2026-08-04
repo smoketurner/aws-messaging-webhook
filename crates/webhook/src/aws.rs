@@ -51,28 +51,101 @@ fn event_sort_key(record: &EventRecord) -> String {
     format!("EVT#{}#{}", record.event_timestamp, record.sns_message_id)
 }
 
+fn set_status(clauses: &mut Vec<&'static str>, status: &str, overwrite: bool) -> AttributeValue {
+    clauses.push(if overwrite {
+        "current_status = :status"
+    } else {
+        "current_status = if_not_exists(current_status, :status)"
+    });
+    AttributeValue::S(status.to_owned())
+}
+
 /// The aggregate projection applied atomically with the event put. The base
-/// expression maintains first/last timestamps; event-specific fields (counts,
-/// status transitions) extend it per [`DomainEvent`] variant.
+/// expression maintains first/last timestamps; per-event clauses materialize
+/// the message's current state (status transitions, open/click counts).
 fn aggregate_update(
     table_name: &str,
     record: &EventRecord,
     event: &DomainEvent,
 ) -> anyhow::Result<Update> {
-    let DomainEvent::Unknown { .. } = event;
-    let update = Update::builder()
+    let mut set_clauses = vec![
+        "#source = if_not_exists(#source, :source)",
+        "first_event_at = if_not_exists(first_event_at, :ts)",
+        "last_event_at = :ts",
+        "expires_at = :expires",
+    ];
+    let mut add_clause = None;
+    let mut builder = Update::builder()
         .table_name(table_name)
         .key("pk", AttributeValue::S(partition_key(record)))
         .key("sk", AttributeValue::S("AGG".to_owned()))
-        .update_expression(
-            "SET #source = if_not_exists(#source, :source), \
-             first_event_at = if_not_exists(first_event_at, :ts), \
-             last_event_at = :ts, expires_at = :expires",
-        )
         .expression_attribute_names("#source", "source")
         .expression_attribute_values(":source", AttributeValue::S(record.source.as_str().into()))
         .expression_attribute_values(":ts", AttributeValue::S(record.event_timestamp.clone()))
-        .expression_attribute_values(":expires", AttributeValue::N(record.expires_at.to_string()))
+        .expression_attribute_values(":expires", AttributeValue::N(record.expires_at.to_string()));
+
+    let status_value = match event {
+        DomainEvent::SmsInbound { .. } | DomainEvent::SesInbound { .. } => {
+            Some(set_status(&mut set_clauses, "received", true))
+        }
+        DomainEvent::SmsDelivery { event, .. } => {
+            if event.is_final {
+                let status = if event.is_successful_delivery() {
+                    "delivered"
+                } else {
+                    "failed"
+                };
+                Some(set_status(&mut set_clauses, status, true))
+            } else {
+                None
+            }
+        }
+        DomainEvent::Ses { event, .. } => match event.kind.as_str() {
+            // Send never overwrites a terminal status: events arrive out of
+            // order under at-least-once delivery.
+            "Send" => Some(set_status(&mut set_clauses, "sent", false)),
+            "Delivery" => Some(set_status(&mut set_clauses, "delivered", true)),
+            "Bounce" => {
+                if let Some(bounce) = &event.bounce {
+                    set_clauses.push("bounce_type = :bounce_type");
+                    builder = builder.expression_attribute_values(
+                        ":bounce_type",
+                        AttributeValue::S(bounce.bounce_type.clone()),
+                    );
+                }
+                Some(set_status(&mut set_clauses, "bounced", true))
+            }
+            "Complaint" => {
+                set_clauses.push("complained_at = :ts");
+                Some(set_status(&mut set_clauses, "complained", true))
+            }
+            "Open" => {
+                set_clauses.push("last_opened_at = :ts");
+                add_clause = Some("open_count :one");
+                None
+            }
+            "Click" => {
+                set_clauses.push("last_clicked_at = :ts");
+                add_clause = Some("click_count :one");
+                None
+            }
+            _ => None,
+        },
+        DomainEvent::Unknown { .. } => None,
+    };
+    if let Some(status) = status_value {
+        builder = builder.expression_attribute_values(":status", status);
+    }
+
+    let mut expression = format!("SET {}", set_clauses.join(", "));
+    if let Some(add) = add_clause {
+        expression.push_str(" ADD ");
+        expression.push_str(add);
+        builder = builder.expression_attribute_values(":one", AttributeValue::N("1".to_owned()));
+    }
+
+    let update = builder
+        .update_expression(expression)
         .build()
         .context("failed to build aggregate update")?;
     Ok(update)
@@ -271,14 +344,24 @@ impl SmsVoiceApi for AwsServices {
             FeedbackStatus::Received => MessageFeedbackStatus::Received,
             FeedbackStatus::Failed => MessageFeedbackStatus::Failed,
         };
-        self.sms
+        let result = self
+            .sms
             .put_message_feedback()
             .message_id(message_id)
             .message_feedback_status(status)
             .send()
-            .await
-            .map_err(|e| classify_action_error("PutMessageFeedback", &e))?;
-        Ok(())
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            // DLRs carry no flag saying whether the message was sent with
+            // feedback enabled, so this call is made for every terminal
+            // event; "no such feedback record" is the expected no-op.
+            Err(SdkError::ServiceError(ctx)) if ctx.err().is_resource_not_found_exception() => {
+                tracing::debug!(message_id, "message has no feedback record; skipping");
+                Ok(())
+            }
+            Err(error) => Err(classify_action_error("PutMessageFeedback", &error)),
+        }
     }
 
     async fn put_opted_out_number(
@@ -337,5 +420,110 @@ impl SesApi for AwsServices {
             .await
             .map_err(|e| classify_action_error("PutSuppressedDestination", &e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Bytes;
+
+    use super::*;
+    use crate::model::Source;
+
+    fn record(source: Source, aggregate_id: &str) -> EventRecord {
+        EventRecord {
+            aggregate_id: aggregate_id.to_owned(),
+            event_timestamp: "2026-08-03T19:12:52.000Z".to_owned(),
+            sns_message_id: "sns-1".to_owned(),
+            raw_body: Bytes::from_static(b"{}"),
+            source,
+            detail_type: "test".to_owned(),
+            topic_arn: "arn:aws:sns:us-east-1:123456789012:t".to_owned(),
+            received_at: "2026-08-03T19:12:53.000Z".to_owned(),
+            expires_at: 1_800_000_000,
+        }
+    }
+
+    fn expression_for(source: Source, message: &str) -> (String, Vec<String>) {
+        let event = DomainEvent::parse(source, message);
+        let update = aggregate_update("t", &record(source, "agg-1"), &event).unwrap();
+        let expression = update.update_expression.clone();
+        let mut value_keys: Vec<String> = update
+            .expression_attribute_values
+            .unwrap_or_default()
+            .keys()
+            .cloned()
+            .collect();
+        value_keys.sort();
+        (expression, value_keys)
+    }
+
+    #[test]
+    fn base_expression_tracks_first_and_last_event() {
+        let (expr, keys) = expression_for(Source::SesEvents, "not json");
+        assert!(expr.contains("first_event_at = if_not_exists(first_event_at, :ts)"));
+        assert!(expr.contains("last_event_at = :ts"));
+        assert!(!expr.contains("current_status"));
+        assert_eq!(keys, [":expires", ":source", ":ts"]);
+    }
+
+    #[test]
+    fn open_event_increments_count_and_sets_last_opened() {
+        let (expr, keys) = expression_for(
+            Source::SesEvents,
+            r#"{"eventType":"Open","mail":{"messageId":"m"}}"#,
+        );
+        assert!(expr.contains("ADD open_count :one"));
+        assert!(expr.contains("last_opened_at = :ts"));
+        assert!(keys.contains(&":one".to_owned()));
+    }
+
+    #[test]
+    fn click_event_increments_click_count() {
+        let (expr, _) = expression_for(
+            Source::SesEvents,
+            r#"{"eventType":"Click","mail":{"messageId":"m"}}"#,
+        );
+        assert!(expr.contains("ADD click_count :one"));
+        assert!(expr.contains("last_clicked_at = :ts"));
+    }
+
+    #[test]
+    fn send_never_overwrites_a_terminal_status() {
+        let (expr, _) = expression_for(
+            Source::SesEvents,
+            r#"{"eventType":"Send","mail":{"messageId":"m"}}"#,
+        );
+        assert!(expr.contains("current_status = if_not_exists(current_status, :status)"));
+    }
+
+    #[test]
+    fn bounce_overwrites_status_and_records_bounce_type() {
+        let (expr, keys) = expression_for(
+            Source::SesEvents,
+            r#"{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[]},
+                "mail":{"messageId":"m"}}"#,
+        );
+        assert!(expr.contains("current_status = :status"));
+        assert!(!expr.contains("if_not_exists(current_status"));
+        assert!(expr.contains("bounce_type = :bounce_type"));
+        assert!(keys.contains(&":bounce_type".to_owned()));
+        assert!(keys.contains(&":status".to_owned()));
+    }
+
+    #[test]
+    fn final_dlr_sets_delivered_or_failed() {
+        let (delivered, _) = expression_for(
+            Source::SmsEvents,
+            r#"{"eventType":"TEXT_DELIVERED","messageId":"m","isFinal":true}"#,
+        );
+        assert!(delivered.contains("current_status = :status"));
+
+        let (queued, keys) = expression_for(
+            Source::SmsEvents,
+            r#"{"eventType":"TEXT_QUEUED","messageId":"m","isFinal":false}"#,
+        );
+        assert!(!queued.contains("current_status"));
+        assert!(!keys.contains(&":status".to_owned()));
     }
 }

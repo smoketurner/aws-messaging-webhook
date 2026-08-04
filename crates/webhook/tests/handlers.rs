@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use aws_messaging_webhook::actions::{
-    ActionError, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason,
+    ActionError, ActionErrorKind, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason,
 };
 use aws_messaging_webhook::allowlist::TopicAllowlist;
 use aws_messaging_webhook::app::app;
@@ -33,6 +33,7 @@ struct FakeServices {
     fail_persist: AtomicBool,
     fail_publish: AtomicBool,
     fail_mark: AtomicBool,
+    action_error: Mutex<Option<ActionErrorKind>>,
 }
 
 impl FakeServices {
@@ -42,6 +43,18 @@ impl FakeServices {
 
     fn record(&self, call: impl Into<String>) {
         self.calls.lock().unwrap().push(call.into());
+    }
+
+    fn action_result(&self) -> Result<(), ActionError> {
+        match *self.action_error.lock().unwrap() {
+            Some(ActionErrorKind::Transient) => Err(ActionError::transient(anyhow!(
+                "simulated transient action failure"
+            ))),
+            Some(ActionErrorKind::Permanent) => Err(ActionError::permanent(anyhow!(
+                "simulated permanent action failure"
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -89,7 +102,7 @@ impl SmsVoiceApi for FakeServices {
         status: FeedbackStatus,
     ) -> Result<(), ActionError> {
         self.record(format!("feedback:{message_id}:{status:?}"));
-        Ok(())
+        self.action_result()
     }
 
     async fn put_opted_out_number(
@@ -98,7 +111,7 @@ impl SmsVoiceApi for FakeServices {
         phone_number: &str,
     ) -> Result<(), ActionError> {
         self.record(format!("opt_out:{phone_number}"));
-        Ok(())
+        self.action_result()
     }
 
     async fn delete_opted_out_number(
@@ -107,7 +120,7 @@ impl SmsVoiceApi for FakeServices {
         phone_number: &str,
     ) -> Result<(), ActionError> {
         self.record(format!("opt_in:{phone_number}"));
-        Ok(())
+        self.action_result()
     }
 }
 
@@ -118,7 +131,7 @@ impl SesApi for FakeServices {
         reason: SuppressionReason,
     ) -> Result<(), ActionError> {
         self.record(format!("suppress:{email_address}:{reason:?}"));
-        Ok(())
+        self.action_result()
     }
 }
 
@@ -140,6 +153,7 @@ struct HarnessOptions {
     /// `Some(n)`: assert exactly n certificate fetches at teardown.
     cert_fetches: Option<u64>,
     auto_resubscribe: bool,
+    opt_out_list: bool,
 }
 
 impl Default for HarnessOptions {
@@ -148,6 +162,7 @@ impl Default for HarnessOptions {
             allowed_topics: ALLOWED_ACCOUNT,
             cert_fetches: None,
             auto_resubscribe: true,
+            opt_out_list: true,
         }
     }
 }
@@ -178,7 +193,7 @@ async fn harness_with(options: HarnessOptions) -> Harness {
             event_bus_name: "bus".to_owned(),
             event_source: "aws-messaging-webhook".to_owned(),
             auto_resubscribe: options.auto_resubscribe,
-            opt_out_list_name: Some("opt-out-list".to_owned()),
+            opt_out_list_name: options.opt_out_list.then(|| "opt-out-list".to_owned()),
             raw_event_retention_days: 30,
         },
         dangerous_subscribe_url_prefix: Some(server.uri()),
@@ -464,4 +479,329 @@ async fn healthz_responds_ok() {
     let request = Request::get("/healthz").body(Body::empty()).unwrap();
     let response = app(h.state.clone()).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// Wraps an inner AWS payload as the SNS `Message` of a signed notification.
+fn wrapped(h: &Harness, inner: &Value) -> Value {
+    let mut body = notification(&h.cert_url);
+    body["Message"] = json!(inner.to_string());
+    h.fixture.sign(&mut body, "2");
+    body
+}
+
+fn inbound_sms(keyword: &str) -> Value {
+    json!({
+        "originationNumber": "+14255550182",
+        "destinationNumber": "+12125550101",
+        "messageKeyword": keyword,
+        "messageBody": keyword,
+        "inboundMessageId": "in-msg-1"
+    })
+}
+
+#[tokio::test]
+async fn stop_keyword_opts_out_and_still_publishes() {
+    let h = harness().await;
+    let body = wrapped(&h, &inbound_sms("STOP"));
+
+    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        h.fake().calls(),
+        vec![
+            "persist:in-msg-1".to_owned(),
+            "opt_out:+14255550182".to_owned(),
+            "publish:sms.inbound".to_owned(),
+            "mark".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn start_keyword_opts_back_in() {
+    let h = harness().await;
+    let body = wrapped(&h, &inbound_sms("START"));
+
+    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.fake().calls().contains(&"opt_in:+14255550182".to_owned()));
+}
+
+#[tokio::test]
+async fn keyword_without_opt_out_list_configured_is_forwarded_only() {
+    let h = harness_with(HarnessOptions {
+        opt_out_list: false,
+        ..HarnessOptions::default()
+    })
+    .await;
+    let body = wrapped(&h, &inbound_sms("STOP"));
+
+    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("opt_out")),
+        "no opt-out call: {calls:?}"
+    );
+    assert!(calls.contains(&"publish:sms.inbound".to_owned()));
+}
+
+#[tokio::test]
+async fn ordinary_inbound_sms_takes_no_action() {
+    let h = harness().await;
+    let inner = json!({
+        "originationNumber": "+14255550182",
+        "messageBody": "hello there",
+        "inboundMessageId": "in-msg-2"
+    });
+    let body = wrapped(&h, &inner);
+
+    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        h.fake().calls(),
+        vec![
+            "persist:in-msg-2".to_owned(),
+            "publish:sms.inbound".to_owned(),
+            "mark".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delivered_dlr_reports_received_feedback() {
+    let h = harness().await;
+    let inner = json!({"eventType": "TEXT_DELIVERED", "messageId": "out-1", "isFinal": true});
+    let body = wrapped(&h, &inner);
+
+    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        calls.contains(&"feedback:out-1:Received".to_owned()),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"publish:sms.delivery".to_owned()));
+}
+
+#[tokio::test]
+async fn failed_dlr_reports_failed_feedback() {
+    let h = harness().await;
+    let inner =
+        json!({"eventType": "TEXT_CARRIER_UNREACHABLE", "messageId": "out-2", "isFinal": true});
+    let body = wrapped(&h, &inner);
+
+    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        h.fake()
+            .calls()
+            .contains(&"feedback:out-2:Failed".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn intermediate_dlr_sends_no_feedback() {
+    let h = harness().await;
+    let inner = json!({"eventType": "TEXT_QUEUED", "messageId": "out-3", "isFinal": false});
+    let body = wrapped(&h, &inner);
+
+    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("feedback")),
+        "{calls:?}"
+    );
+}
+
+fn ses_bounce(bounce_type: &str, recipients: &[&str]) -> Value {
+    let bounced: Vec<Value> = recipients
+        .iter()
+        .map(|r| json!({"emailAddress": r}))
+        .collect();
+    json!({
+        "eventType": "Bounce",
+        "bounce": {"bounceType": bounce_type, "bouncedRecipients": bounced},
+        "mail": {"messageId": "ses-msg-1"}
+    })
+}
+
+#[tokio::test]
+async fn permanent_bounce_suppresses_every_recipient() {
+    let h = harness().await;
+    let body = wrapped(
+        &h,
+        &ses_bounce("Permanent", &["a@example.com", "b@example.com"]),
+    );
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        calls.contains(&"suppress:a@example.com:Bounce".to_owned()),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"suppress:b@example.com:Bounce".to_owned()));
+    assert!(calls.contains(&"publish:ses.bounce".to_owned()));
+}
+
+#[tokio::test]
+async fn transient_bounce_is_not_suppressed() {
+    let h = harness().await;
+    let body = wrapped(&h, &ses_bounce("Transient", &["a@example.com"]));
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("suppress")),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"publish:ses.bounce".to_owned()));
+}
+
+#[tokio::test]
+async fn complaint_suppresses_recipients() {
+    let h = harness().await;
+    let inner = json!({
+        "notificationType": "Complaint",
+        "complaint": {"complainedRecipients": [{"emailAddress": "c@example.com"}]},
+        "mail": {"messageId": "ses-msg-2"}
+    });
+    let body = wrapped(&h, &inner);
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        h.fake()
+            .calls()
+            .contains(&"suppress:c@example.com:Complaint".to_owned())
+    );
+}
+
+fn ses_inbound(virus_status: &str, content: Option<&str>) -> Value {
+    let mut inner = json!({
+        "notificationType": "Received",
+        "receipt": {
+            "spamVerdict": {"status": "PASS"},
+            "virusVerdict": {"status": virus_status},
+            "action": {"type": "SNS"}
+        },
+        "mail": {"messageId": "inbound-msg-1"}
+    });
+    if let Some(content) = content {
+        inner["content"] = json!(content);
+    }
+    inner
+}
+
+#[tokio::test]
+async fn clean_inbound_email_publishes_ses_inbound() {
+    let h = harness().await;
+    let body = wrapped(&h, &ses_inbound("PASS", Some("Subject: hi\r\n\r\nhello")));
+
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.fake().calls().contains(&"publish:ses.inbound".to_owned()));
+}
+
+#[tokio::test]
+async fn virus_fail_publishes_quarantined_detail_type() {
+    let h = harness().await;
+    let body = wrapped(&h, &ses_inbound("FAIL", None));
+
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        h.fake()
+            .calls()
+            .contains(&"publish:ses.inbound.quarantined".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn oversized_inbound_content_is_stripped_from_bus_event() {
+    let h = harness().await;
+    let big = "x".repeat(300_000);
+    let body = wrapped(&h, &ses_inbound("PASS", Some(&big)));
+
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let published = h.fake().published.lock().unwrap();
+    assert_eq!(published[0].detail["event"]["content"], Value::Null);
+    assert_eq!(
+        published[0].detail["event"]["mail"]["messageId"],
+        "inbound-msg-1"
+    );
+}
+
+#[tokio::test]
+async fn transient_action_failure_returns_500_before_publish() {
+    let h = harness().await;
+    *h.fake().action_error.lock().unwrap() = Some(ActionErrorKind::Transient);
+    let body = wrapped(&h, &inbound_sms("STOP"));
+
+    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let calls = h.fake().calls();
+    assert!(calls.contains(&"opt_out:+14255550182".to_owned()));
+    assert!(!calls.iter().any(|c| c.starts_with("publish")), "{calls:?}");
+}
+
+#[tokio::test]
+async fn redelivery_after_transient_action_failure_reruns_the_action() {
+    let h = harness().await;
+    *h.fake().action_error.lock().unwrap() = Some(ActionErrorKind::Transient);
+    let body = wrapped(&h, &inbound_sms("STOP"));
+    assert_eq!(
+        post(h.state.clone(), "/webhooks/sms/inbound", &body).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    // SNS redelivers; the prior attempt persisted, so this resumes.
+    *h.fake().action_error.lock().unwrap() = None;
+    *h.fake().persist_outcome.lock().unwrap() = Some(PersistOutcome::DuplicatePersisted);
+    assert_eq!(
+        post(h.state.clone(), "/webhooks/sms/inbound", &body).await,
+        StatusCode::OK
+    );
+
+    let opt_outs = h
+        .fake()
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("opt_out"))
+        .count();
+    assert_eq!(opt_outs, 2, "action must run once per attempt");
+    assert!(h.fake().calls().contains(&"publish:sms.inbound".to_owned()));
+}
+
+#[tokio::test]
+async fn permanent_action_failure_still_publishes() {
+    let h = harness().await;
+    *h.fake().action_error.lock().unwrap() = Some(ActionErrorKind::Permanent);
+    let body = wrapped(&h, &ses_bounce("Permanent", &["a@example.com"]));
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(calls.contains(&"suppress:a@example.com:Bounce".to_owned()));
+    assert!(calls.contains(&"publish:ses.bounce".to_owned()));
+    assert!(calls.contains(&"mark".to_owned()));
 }

@@ -205,18 +205,41 @@ async fn process_notification<T: Services>(
     Ok(StatusCode::OK.into_response())
 }
 
+/// `PutEvents` caps an entry at 256 KB; leave headroom for the envelope.
+const MAX_DETAIL_BYTES: usize = 250_000;
+
 fn build_outbound(source: Source, record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
+    let mut detail = json!({
+        "meta": {
+            "snsMessageId": record.sns_message_id,
+            "messageId": record.aggregate_id,
+            "topicArn": record.topic_arn,
+            "receivedAt": record.received_at,
+            "webhookPath": source.webhook_path(),
+        },
+        "event": event.payload(),
+    });
+
+    // SES inbound notifications from an SNS receipt action embed the raw MIME
+    // in `content` and can exceed the PutEvents entry cap. Strip it from the
+    // bus event only — the DynamoDB raw record keeps everything.
+    let oversized = serde_json::to_string(&detail).is_ok_and(|s| s.len() > MAX_DETAIL_BYTES);
+    if oversized
+        && let Some(content) = detail
+            .get_mut("event")
+            .and_then(|event| event.get_mut("content"))
+            .filter(|content| !content.is_null())
+    {
+        *content = serde_json::Value::Null;
+        tracing::warn!(
+            sns_message_id = record.sns_message_id,
+            event = "content_stripped",
+            "stripped oversized inbound content from the EventBridge event"
+        );
+    }
+
     OutboundEvent {
         detail_type: record.detail_type.clone(),
-        detail: json!({
-            "meta": {
-                "snsMessageId": record.sns_message_id,
-                "messageId": record.aggregate_id,
-                "topicArn": record.topic_arn,
-                "receivedAt": record.received_at,
-                "webhookPath": source.webhook_path(),
-            },
-            "event": event.payload(),
-        }),
+        detail,
     }
 }
