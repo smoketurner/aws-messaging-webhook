@@ -4,7 +4,7 @@ members = ["crates/sns-message-verifier", "crates/webhook"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jplock/aws-messaging-webhook"
 
@@ -28,6 +28,7 @@ aws-sdk-dynamodb = { version = "=1.119.0", default-features = false }
 aws-sdk-eventbridge = { version = "=1.112.0", default-features = false }
 aws-sdk-pinpointsmsvoicev2 = { version = "=1.116.0", default-features = false }
 aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
+aws-smithy-types = { version = "=1.6.1", default-features = false }
 
 # Serialization
 serde = { version = "=1.0.229", default-features = false }

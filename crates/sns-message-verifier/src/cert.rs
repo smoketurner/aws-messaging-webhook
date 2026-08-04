@@ -52,9 +52,14 @@ pub(crate) fn validate_cert_url(
     Ok(url)
 }
 
-/// `sns.<region>.amazonaws.com` or `sns.<region>.amazonaws.com.cn`, where
-/// `<region>` is one label of `[a-z0-9-]`. ISO partitions are unsupported.
-fn is_sns_host(host: &str) -> bool {
+/// Whether `host` is an SNS service endpoint: `sns.<region>.amazonaws.com` or
+/// `sns.<region>.amazonaws.com.cn`, where `<region>` is one label of
+/// `[a-z0-9-]`. ISO partitions are unsupported.
+///
+/// Exposed so callers can apply the same policy to other SNS-provided URLs
+/// (e.g. `SubscribeURL`) before fetching them.
+#[must_use]
+pub fn is_sns_host(host: &str) -> bool {
     let Some(rest) = host.strip_prefix("sns.") else {
         return false;
     };

@@ -19,10 +19,27 @@ aws-config = { workspace = true, features = [
   "default-https-client",
   "rt-tokio",
 ] }
-aws-sdk-dynamodb = { workspace = true, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-eventbridge = { workspace = true, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-pinpointsmsvoicev2 = { workspace = true, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sesv2 = { workspace = true, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-eventbridge = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-pinpointsmsvoicev2 = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-sesv2 = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-smithy-types.workspace = true
 axum.workspace = true
 lambda_http = { workspace = true, features = ["apigw_http"] }
 reqwest = { workspace = true, features = ["rustls"] }

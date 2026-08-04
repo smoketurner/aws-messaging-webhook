@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use canonical::build_string_to_sign;
+pub use cert::is_sns_host;
 pub use envelope::{MessageType, SnsEnvelope};
 pub use error::{CertUrlRejection, VerifyError};
 pub use signature::verify_with_cert;

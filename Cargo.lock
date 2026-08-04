@@ -141,6 +141,7 @@ dependencies = [
  "aws-sdk-eventbridge",
  "aws-sdk-pinpointsmsvoicev2",
  "aws-sdk-sesv2",
+ "aws-smithy-types",
  "axum",
  "lambda_http",
  "proptest",
