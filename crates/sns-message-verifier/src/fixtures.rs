@@ -1,7 +1,13 @@
-//! Fixture factory: throwaway RSA keys, self-signed certificates, and signed
-//! SNS envelope bodies, so verification is tested end-to-end without AWS.
+//! Test fixtures: throwaway RSA keys, self-signed certificates, and signed
+//! SNS envelope bodies, so consumers can exercise verification end-to-end
+//! without AWS. Gated behind the `test-fixtures` feature — never enable it in
+//! a production build.
 
-#![expect(clippy::unwrap_used, reason = "test fixtures panic on setup failure")]
+#![expect(
+    clippy::unwrap_used,
+    clippy::missing_panics_doc,
+    reason = "test fixtures panic on setup failure by design"
+)]
 
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -14,7 +20,6 @@ use rsa::signature::{SignatureEncoding, Signer};
 use serde_json::{Value, json};
 use sha1::Sha1;
 use sha2::Sha256;
-use sns_message_verifier::{SnsEnvelope, build_string_to_sign};
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
 use x509_cert::der::EncodePem;
 use x509_cert::name::Name;
@@ -22,16 +27,21 @@ use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::{Time, Validity};
 
+use crate::canonical::build_string_to_sign;
+use crate::envelope::SnsEnvelope;
+
 pub struct SnsFixture {
     pub private_key: RsaPrivateKey,
     pub cert_pem: String,
 }
 
 impl SnsFixture {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_validity(Validity::from_now(Duration::from_hours(1)).unwrap())
     }
 
+    #[must_use]
     pub fn expired() -> Self {
         let not_before = SystemTime::now() - Duration::from_hours(2);
         let not_after = SystemTime::now() - Duration::from_hours(1);
@@ -87,6 +97,14 @@ impl SnsFixture {
     }
 }
 
+impl Default for SnsFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A plausible `Notification` body pointing at `cert_url`; sign before use.
+#[must_use]
 pub fn notification(cert_url: &str) -> Value {
     json!({
         "Type": "Notification",
@@ -102,6 +120,8 @@ pub fn notification(cert_url: &str) -> Value {
     })
 }
 
+/// A plausible `SubscriptionConfirmation` body; sign before use.
+#[must_use]
 pub fn subscription_confirmation(cert_url: &str) -> Value {
     json!({
         "Type": "SubscriptionConfirmation",

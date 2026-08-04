@@ -9,13 +9,22 @@ use url::Url;
 use crate::error::AppError;
 
 /// Validates that a `SubscribeURL` points at a real SNS endpoint over HTTPS.
+/// `dangerous_allow_prefix` additionally accepts URLs starting with that
+/// prefix — for tests and local development against a fake SNS only; the
+/// binary populates it solely in debug builds.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::SubscribeUrlRejected`] for any URL that is not
 /// `https://sns.<region>.amazonaws.com(.cn)` on port 443.
-pub fn validate_subscribe_url(raw: &str) -> Result<Url, AppError> {
+pub fn validate_subscribe_url(
+    raw: &str,
+    dangerous_allow_prefix: Option<&str>,
+) -> Result<Url, AppError> {
     let url = Url::parse(raw).map_err(|_| AppError::SubscribeUrlRejected)?;
+    if dangerous_allow_prefix.is_some_and(|prefix| raw.starts_with(prefix)) {
+        return Ok(url);
+    }
     let accepted = url.scheme() == "https"
         && matches!(url.port(), None | Some(443))
         && url
@@ -57,7 +66,10 @@ mod tests {
             "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&Token=abc",
             "https://sns.cn-north-1.amazonaws.com.cn/?Action=ConfirmSubscription",
         ] {
-            assert!(validate_subscribe_url(url).is_ok(), "should accept {url}");
+            assert!(
+                validate_subscribe_url(url, None).is_ok(),
+                "should accept {url}"
+            );
         }
     }
 
@@ -72,7 +84,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    validate_subscribe_url(url),
+                    validate_subscribe_url(url, None),
                     Err(AppError::SubscribeUrlRejected)
                 ),
                 "should reject {url}"

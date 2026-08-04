@@ -18,6 +18,8 @@ mod canonical;
 mod cert;
 mod envelope;
 mod error;
+#[cfg(feature = "test-fixtures")]
+pub mod fixtures;
 mod signature;
 
 use std::sync::Arc;

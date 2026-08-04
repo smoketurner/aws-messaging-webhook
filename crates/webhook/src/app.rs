@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Response;
@@ -13,7 +15,7 @@ use crate::state::{AppState, Services};
 /// SNS caps messages at 256 KiB; 1 MiB bounds abuse with headroom.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-pub fn app<T: Services>(state: AppState<T>) -> Router {
+pub fn app<T: Services>(state: Arc<AppState<T>>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/webhooks/sms/inbound", post(sms_inbound::<T>))
@@ -30,29 +32,29 @@ async fn healthz() -> &'static str {
 }
 
 async fn sms_inbound<T: Services>(
-    State(state): State<AppState<T>>,
+    State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(state, Source::SmsInbound, verified).await
+    handle_sns(&state, Source::SmsInbound, verified).await
 }
 
 async fn sms_events<T: Services>(
-    State(state): State<AppState<T>>,
+    State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(state, Source::SmsEvents, verified).await
+    handle_sns(&state, Source::SmsEvents, verified).await
 }
 
 async fn ses_events<T: Services>(
-    State(state): State<AppState<T>>,
+    State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(state, Source::SesEvents, verified).await
+    handle_sns(&state, Source::SesEvents, verified).await
 }
 
 async fn ses_inbound<T: Services>(
-    State(state): State<AppState<T>>,
+    State(state): State<Arc<AppState<T>>>,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
-    handle_sns(state, Source::SesInbound, verified).await
+    handle_sns(&state, Source::SesInbound, verified).await
 }

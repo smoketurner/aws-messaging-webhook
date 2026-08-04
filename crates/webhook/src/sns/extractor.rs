@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::body::Bytes;
 use axum::extract::{FromRequest, Request};
 use sns_message_verifier::SnsEnvelope;
@@ -14,10 +16,10 @@ pub struct VerifiedSns {
     pub raw_body: Bytes,
 }
 
-impl<T: Services> FromRequest<AppState<T>> for VerifiedSns {
+impl<T: Services> FromRequest<Arc<AppState<T>>> for VerifiedSns {
     type Rejection = AppError;
 
-    async fn from_request(req: Request, state: &AppState<T>) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &Arc<AppState<T>>) -> Result<Self, Self::Rejection> {
         if req.headers().get("x-amz-sns-message-type").is_none() {
             return Err(AppError::MissingSnsHeader);
         }

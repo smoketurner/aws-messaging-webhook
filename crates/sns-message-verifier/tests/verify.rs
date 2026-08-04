@@ -1,10 +1,8 @@
 #![expect(clippy::unwrap_used, reason = "test code panics on fixture failure")]
 
-mod support;
-
 use serde_json::json;
+use sns_message_verifier::fixtures::{SnsFixture, notification, subscription_confirmation};
 use sns_message_verifier::{CertUrlRejection, SnsVerifier, VerifyError};
-use support::{SnsFixture, notification, subscription_confirmation};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

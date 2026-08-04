@@ -41,7 +41,7 @@ aws-sdk-sesv2 = { workspace = true, features = [
 ] }
 aws-smithy-types.workspace = true
 axum.workspace = true
-lambda_http = { workspace = true, features = ["apigw_http"] }
+lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
 reqwest = { workspace = true, features = ["rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
@@ -54,6 +54,7 @@ url = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 proptest = { workspace = true, features = ["std"] }
+sns-message-verifier = { workspace = true, features = ["test-fixtures"] }
 tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true
 

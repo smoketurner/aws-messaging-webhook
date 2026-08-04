@@ -26,18 +26,18 @@ use crate::store::{EventRecord, PersistOutcome};
 /// Returns [`AppError`] per the response policy: 4xx for rejected messages,
 /// 5xx to recruit SNS redelivery for transient downstream failures.
 pub async fn handle_sns<T: Services>(
-    state: AppState<T>,
+    state: &AppState<T>,
     source: Source,
     verified: VerifiedSns,
 ) -> Result<Response, AppError> {
     match verified.envelope.message_type {
         MessageType::SubscriptionConfirmation => {
-            confirm_subscription(&state, source, &verified.envelope).await
+            confirm_subscription(state, source, &verified.envelope).await
         }
         MessageType::UnsubscribeConfirmation => {
-            handle_unsubscribe(&state, source, &verified.envelope).await
+            handle_unsubscribe(state, source, &verified.envelope).await
         }
-        MessageType::Notification => process_notification(&state, source, &verified).await,
+        MessageType::Notification => process_notification(state, source, &verified).await,
     }
 }
 
@@ -50,7 +50,10 @@ async fn confirm_subscription<T: Services>(
         .subscribe_url
         .as_deref()
         .ok_or(AppError::SubscribeUrlRejected)?;
-    let url = confirm::validate_subscribe_url(subscribe_url)?;
+    let url = confirm::validate_subscribe_url(
+        subscribe_url,
+        state.dangerous_subscribe_url_prefix.as_deref(),
+    )?;
     confirm::get_subscribe_url(&state.http, url).await?;
     tracing::info!(
         source = source.as_str(),
@@ -90,7 +93,10 @@ async fn handle_unsubscribe<T: Services>(
         .subscribe_url
         .as_deref()
         .ok_or(AppError::SubscribeUrlRejected)?;
-    let url = confirm::validate_subscribe_url(subscribe_url)?;
+    let url = confirm::validate_subscribe_url(
+        subscribe_url,
+        state.dangerous_subscribe_url_prefix.as_deref(),
+    )?;
     confirm::get_subscribe_url(&state.http, url).await?;
     tracing::warn!(
         source = source.as_str(),

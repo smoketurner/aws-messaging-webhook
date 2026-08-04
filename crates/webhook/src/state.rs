@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use sns_message_verifier::SnsVerifier;
 
 use crate::actions::{SesApi, SmsVoiceApi};
@@ -21,24 +19,15 @@ impl<T> Services for T where
 {
 }
 
-/// Shared application state.
+/// Shared application state; the router holds it behind one `Arc`.
 pub struct AppState<T: Services> {
-    pub services: Arc<T>,
-    pub verifier: Arc<SnsVerifier>,
-    pub allowlist: Arc<TopicAllowlist>,
+    pub services: T,
+    pub verifier: SnsVerifier,
+    pub allowlist: TopicAllowlist,
     /// Client for `SubscribeURL` GETs (confirm and re-subscribe).
     pub http: reqwest::Client,
-    pub config: Arc<Config>,
-}
-
-impl<T: Services> Clone for AppState<T> {
-    fn clone(&self) -> Self {
-        Self {
-            services: Arc::clone(&self.services),
-            verifier: Arc::clone(&self.verifier),
-            allowlist: Arc::clone(&self.allowlist),
-            http: self.http.clone(),
-            config: Arc::clone(&self.config),
-        }
-    }
+    pub config: Config,
+    /// Accept `SubscribeURL`s with this prefix, bypassing the SNS host
+    /// policy. Tests and debug builds only.
+    pub dangerous_subscribe_url_prefix: Option<String>,
 }

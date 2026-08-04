@@ -8,8 +8,14 @@ repository.workspace = true
 description = "Verify AWS SNS message signatures (SignatureVersion 1 and 2) for HTTPS webhook endpoints"
 publish = false
 
+[features]
+# Throwaway keys, self-signed certs, and envelope signing for tests of code
+# that consumes this crate. Never enable in production builds.
+test-fixtures = ["dep:rand", "rsa/sha1", "rsa/sha2", "x509-cert/builder"]
+
 [dependencies]
 base64 = { workspace = true, features = ["std"] }
+rand = { workspace = true, features = ["std", "std_rng"], optional = true }
 reqwest = { workspace = true, features = ["rustls"] }
 rsa = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["std", "derive"] }
@@ -22,11 +28,9 @@ x509-cert = { workspace = true, features = ["std", "pem"] }
 
 [dev-dependencies]
 proptest = { workspace = true, features = ["std"] }
-rand = { workspace = true, features = ["std", "std_rng"] }
-rsa = { workspace = true, features = ["std", "sha1", "sha2"] }
+sns-message-verifier = { path = ".", features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock.workspace = true
-x509-cert = { workspace = true, features = ["std", "pem", "builder"] }
 
 [lints]
 workspace = true
