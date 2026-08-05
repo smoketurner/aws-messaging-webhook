@@ -33,6 +33,19 @@ impl Source {
         }
     }
 
+    /// Parses the label written by [`Self::as_str`] back into a family;
+    /// `None` for `"unknown"` or any unrecognized label.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "sms-inbound" => Some(Self::SmsInbound),
+            "sms-events" => Some(Self::SmsEvents),
+            "ses-events" => Some(Self::SesEvents),
+            "ses-inbound" => Some(Self::SesInbound),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn webhook_path(self) -> &'static str {
         match self {

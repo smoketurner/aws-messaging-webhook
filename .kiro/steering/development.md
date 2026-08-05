@@ -64,7 +64,7 @@ aws sesv2 send-email --from-email-address <verified-sender> \
   --destination ToAddresses=bounce@simulator.amazonses.com \
   --content "Simple={Subject={Data=probe},Body={Text={Data=probe}}}"
 ```
-Then confirm: `ses.bounce` event arrives on the bus, DynamoDB event item reaches `status = PUBLISHED`, simulator address lands on the SES suppression list.
+Then confirm: `ses.bounce` event arrives on the bus, an event item is written to DynamoDB under `pk = MSG#<messageId>`, simulator address lands on the SES suppression list.
 
 ## Pre-commit hooks (via prek)
 

@@ -41,6 +41,13 @@ Parameters:
   RawEventRetentionDays:
     Type: Number
     Default: 30
+  AggregateRetentionDays:
+    Type: Number
+    Default: 365
+    Description: >-
+      TTL (days) for the per-message aggregate item. Kept separate from — and
+      typically longer than — RawEventRetentionDays so a message's rolled-up
+      current state outlives its bulky raw event items.
 
 Conditions:
   IsProd: !Equals [!Ref Stage, prod]
@@ -78,6 +85,31 @@ Resources:
           AUTO_RESUBSCRIBE: !Ref AutoResubscribe
           OPT_OUT_LIST_NAME: !Ref OptOutListName
           RAW_EVENT_RETENTION_DAYS: !Ref RawEventRetentionDays
+          AGGREGATE_RETENTION_DAYS: !Ref AggregateRetentionDays
+      Events:
+        # The stream relay: the sole publisher of event details to EventBridge.
+        # Retries a failed publish, bisects a poison batch, reports per-record
+        # failures, and routes anything past the retry limit to the DLQ so a
+        # publish can never be silently lost.
+        StreamRelay:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt EventsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            # Aggregate MODIFYs and TTL REMOVEs are not published; the handler
+            # also skips non-event items defensively.
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT"]}'
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt PublishDlq.Arn
       Policies:
         - Statement:
             - Sid: PersistEvents
@@ -110,6 +142,12 @@ Resources:
               Effect: Allow
               Action: sesv2:PutSuppressedDestination
               Resource: "*"
+            # The stream event-source mapping routes records that exhaust their
+            # retries to this queue; the function role needs to write to it.
+            - Sid: PublishOnFailureDlq
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt PublishDlq.Arn
 
   FunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -131,6 +169,8 @@ Resources:
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
@@ -141,13 +181,21 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-events"
 
-  # Notification deliveries (fresh, resumed, or duplicate) — excludes
-  # subscription-lifecycle lines so it stays comparable to EventsPublished.
+  # On-failure destination for the stream relay: an event whose publish exhausts
+  # its retries lands here instead of being lost. Alarm on its depth.
+  PublishDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-publish-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
+  # Notification deliveries (fresh or duplicate) accepted by the request path.
   MessagesReceivedFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref FunctionLogGroup
-      FilterPattern: '{ $.fields.outcome = "published" || $.fields.outcome = "resumed" || $.fields.outcome = "duplicate" }'
+      FilterPattern: '{ $.fields.outcome = "persisted" || $.fields.outcome = "duplicate" }'
       MetricTransformations:
         - MetricNamespace: !Ref AWS::StackName
           MetricName: MessagesReceived
@@ -201,14 +249,28 @@ Resources:
           MetricValue: "1"
           Unit: Count
 
+  # Emitted by the stream relay on a successful EventBridge PutEvents.
   EventsPublishedFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref FunctionLogGroup
-      FilterPattern: '{ $.fields.outcome = "published" || $.fields.outcome = "resumed" }'
+      FilterPattern: '{ $.fields.outcome = "published" }'
       MetricTransformations:
         - MetricNamespace: !Ref AWS::StackName
           MetricName: EventsPublished
+          MetricValue: "1"
+          Unit: Count
+
+  # A stream-relay publish that failed and will be retried (and, past the retry
+  # limit, routed to the DLQ). A sustained rate means EventBridge is unhealthy.
+  PublishFailuresFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FunctionLogGroup
+      FilterPattern: '{ $.fields.event = "publish_failure" }'
+      MetricTransformations:
+        - MetricNamespace: !Ref AWS::StackName
+          MetricName: PublishFailures
           MetricValue: "1"
           Unit: Count
 
@@ -271,3 +333,6 @@ Outputs:
     Value: !GetAtt EventBus.Arn
   TableName:
     Value: !Ref EventsTable
+  PublishDlqUrl:
+    Description: SQS DLQ for stream-relay events that exhausted their publish retries.
+    Value: !Ref PublishDlq

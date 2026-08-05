@@ -33,6 +33,13 @@ aws-smithy-types = { version = "=1.6.1", default-features = false }
 # Serialization
 serde = { version = "=1.0.229", default-features = false }
 serde_json = { version = "=1.0.151", default-features = false }
+# Typed DynamoDB Streams event shapes for the stream relay consumer. The
+# `dynamodb` feature (enabled by the webhook crate) pulls serde_dynamo (typed
+# AttributeValue de/serialization, incl. base64 for binary) and chrono, so the
+# consumer doesn't hand-parse the stream image. serde_dynamo is also a direct
+# dep to name AttributeValue.
+aws_lambda_events = { version = "=1.2.0", default-features = false }
+serde_dynamo = { version = "=4.3.0", default-features = false }
 
 # Crypto for SNS signature verification. sha1/sha2 stay on the 0.10.x line and
 # x509-cert on 0.2.x: rsa 0.9 speaks digest 0.10 / spki 0.7, and the newer

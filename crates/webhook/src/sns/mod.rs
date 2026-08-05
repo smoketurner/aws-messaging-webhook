@@ -13,7 +13,7 @@ use sns_message_verifier::{MessageType, SnsEnvelope};
 use crate::actions::{self, ActionErrorKind};
 use crate::error::AppError;
 use crate::model::{DomainEvent, Source};
-use crate::publish::OutboundEvent;
+use crate::publish::{OutboundEvent, SCHEMA_VERSION};
 use crate::sns::extractor::VerifiedSns;
 use crate::state::{AppState, Services};
 use crate::store::{EventRecord, PersistOutcome};
@@ -131,6 +131,7 @@ async fn handle_unsubscribe<T: Services>(
     let notice = OutboundEvent {
         detail_type: "subscription.changed".to_owned(),
         detail: json!({
+            "schemaVersion": SCHEMA_VERSION,
             "topicArn": envelope.topic_arn,
             "action": "resubscribed",
             "timestamp": envelope.timestamp,
@@ -184,20 +185,11 @@ async fn process_notification<T: Services>(
         .await
         .context("failed to persist event")?;
 
-    if outcome == PersistOutcome::DuplicatePublished {
-        tracing::info!(
-            source = record.source_label(),
-            sns_message_id = record.sns_message_id,
-            detail_type = record.detail_type,
-            outcome = "duplicate",
-            "duplicate SNS delivery; already published"
-        );
-        return Ok(StatusCode::OK.into_response());
-    }
-
-    // Actions run after persistence (the record is durable) and before
-    // publishing (a publish failure re-runs only repeat-safe API calls on
-    // redelivery, instead of emitting duplicate bus events).
+    // Lifecycle actions run after the durable persist. They are idempotent, so
+    // a redelivery re-runs them — preserving at-least-once for the action even
+    // if a prior attempt persisted but died before acting. Publishing the event
+    // to EventBridge is the stream relay's job (see `crate::stream`), not the
+    // request path's: the persisted item is the outbox entry.
     let action = match actions::run(state, &event).await {
         Ok(action) => action,
         Err(error) => match error.kind {
@@ -210,24 +202,12 @@ async fn process_notification<T: Services>(
                 tracing::error!(
                     error = ?error.source,
                     event = "action_failure",
-                    "permanent lifecycle action failure; continuing to publish"
+                    "permanent lifecycle action failure; continuing"
                 );
                 "failed"
             }
         },
     };
-
-    let outbound = build_outbound(&record, &event);
-    state
-        .services
-        .publish(&outbound)
-        .await
-        .context("failed to publish event to EventBridge")?;
-    state
-        .services
-        .mark_published(&record)
-        .await
-        .context("failed to mark event published")?;
 
     tracing::info!(
         source = record.source_label(),
@@ -235,78 +215,11 @@ async fn process_notification<T: Services>(
         topic_arn = record.topic_arn,
         detail_type = record.detail_type,
         outcome = match outcome {
-            PersistOutcome::Fresh => "published",
-            PersistOutcome::DuplicatePersisted => "resumed",
-            PersistOutcome::DuplicatePublished => unreachable!("handled above"),
+            PersistOutcome::Fresh => "persisted",
+            PersistOutcome::Duplicate => "duplicate",
         },
         action,
-        "event published"
+        "event persisted"
     );
     Ok(StatusCode::OK.into_response())
-}
-
-/// `PutEvents` caps an entry at 256 KB; leave headroom for the envelope.
-const MAX_DETAIL_BYTES: usize = 250_000;
-
-fn detail_bytes(detail: &serde_json::Value) -> usize {
-    serde_json::to_vec(detail).map_or(usize::MAX, |bytes| bytes.len())
-}
-
-/// Builds the EventBridge detail, guaranteeing it stays under the `PutEvents`
-/// entry cap so an oversized payload can never become a poison message that
-/// 5xx-loops through SNS redelivery forever. Oversized events are reduced in
-/// two steps; the full payload always remains in the DynamoDB raw record.
-fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
-    let meta = json!({
-        "snsMessageId": record.sns_message_id,
-        "messageId": record.aggregate_id,
-        "topicArn": record.topic_arn,
-        "receivedAt": record.received_at,
-        // The classified family's canonical path; null for unknown events.
-        // A label for consumers, not the literal arrival path — a direct
-        // SNS → Lambda delivery never had one.
-        "webhookPath": record.source.map(Source::webhook_path),
-    });
-    let mut detail = json!({ "meta": meta, "event": event.payload() });
-
-    if detail_bytes(&detail) <= MAX_DETAIL_BYTES {
-        return OutboundEvent {
-            detail_type: record.detail_type.clone(),
-            detail,
-        };
-    }
-
-    // Step 1: drop embedded raw MIME (SES inbound `content`), the usual cause.
-    if let Some(content) = detail
-        .get_mut("event")
-        .and_then(|event| event.get_mut("content"))
-        .filter(|content| !content.is_null())
-    {
-        *content = serde_json::Value::Null;
-        tracing::warn!(
-            sns_message_id = record.sns_message_id,
-            event = "content_stripped",
-            "stripped oversized inbound content from the EventBridge event"
-        );
-    }
-
-    // Step 2: if still over the cap, replace the payload with a pointer so the
-    // bus event stays publishable. Consumers fetch the full record from
-    // DynamoDB by meta.messageId + meta.snsMessageId.
-    if detail_bytes(&detail) > MAX_DETAIL_BYTES {
-        detail["event"] = json!({
-            "payloadOmitted": true,
-            "reason": "event payload exceeds the EventBridge entry size limit",
-        });
-        tracing::warn!(
-            sns_message_id = record.sns_message_id,
-            event = "payload_omitted",
-            "event payload too large for EventBridge; published a pointer only"
-        );
-    }
-
-    OutboundEvent {
-        detail_type: record.detail_type.clone(),
-        detail,
-    }
 }

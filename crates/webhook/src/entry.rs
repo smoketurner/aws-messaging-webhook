@@ -91,6 +91,12 @@ pub async fn dispatch<T: Services>(
     // ever appears as a JSON *string field* inside the API Gateway envelope,
     // so it cannot fake this shape.
     if payload.get("Records").is_some() {
+        // Both DynamoDB streams and direct SNS deliver a `Records` array; the
+        // stream records carry `eventSource: aws:dynamodb` (and a `dynamodb`
+        // object), while SNS records carry `Sns`.
+        if is_dynamodb_stream(&payload) {
+            return crate::stream::handle_stream(&state, payload).await;
+        }
         let event = SnsEvent::deserialize(payload)
             .map_err(|e| format!("payload has Records but is not an SNS event: {e}"))?;
         handle_direct(&state, event).await?;
@@ -98,6 +104,19 @@ pub async fn dispatch<T: Services>(
     } else {
         serve_http(router, payload, context).await
     }
+}
+
+/// Distinguishes a DynamoDB Streams invocation from a direct SNS one — both
+/// arrive as a `Records` array.
+fn is_dynamodb_stream(payload: &Value) -> bool {
+    payload
+        .get("Records")
+        .and_then(Value::as_array)
+        .and_then(|records| records.first())
+        .is_some_and(|first| {
+            first.get("eventSource").and_then(Value::as_str) == Some("aws:dynamodb")
+                || first.get("dynamodb").is_some()
+        })
 }
 
 async fn serve_http(

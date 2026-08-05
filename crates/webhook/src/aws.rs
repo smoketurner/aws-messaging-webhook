@@ -1,19 +1,14 @@
 //! Production [`Services`](crate::state::Services) implementation wrapping
 //! the AWS SDK clients.
 
-use std::time::SystemTime;
-
 use anyhow::{Context as _, anyhow};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-use aws_sdk_dynamodb::types::{
-    AttributeValue, Put, ReturnValuesOnConditionCheckFailure, TransactWriteItem, Update,
-};
+use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem, Update};
 use aws_sdk_eventbridge::types::PutEventsRequestEntry;
 use aws_sdk_pinpointsmsvoicev2::types::MessageFeedbackStatus;
 use aws_sdk_sesv2::types::SuppressionListReason;
 use aws_smithy_types::Blob;
-use aws_smithy_types::date_time::{DateTime, Format};
 use aws_smithy_types::error::display::DisplayErrorContext;
 
 use crate::actions::{ActionError, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason};
@@ -83,7 +78,10 @@ fn aggregate_update(
         .expression_attribute_names("#source", "source")
         .expression_attribute_values(":source", AttributeValue::S(record.source_label().into()))
         .expression_attribute_values(":ts", AttributeValue::S(record.event_timestamp.clone()))
-        .expression_attribute_values(":expires", AttributeValue::N(record.expires_at.to_string()));
+        .expression_attribute_values(
+            ":expires",
+            AttributeValue::N(record.aggregate_expires_at.to_string()),
+        );
 
     let status_value = match event {
         DomainEvent::SmsInbound { .. } | DomainEvent::SesInbound { .. } => {
@@ -185,13 +183,11 @@ impl EventStore for AwsServices {
                 AttributeValue::S(record.event_timestamp.clone()),
             )
             .item("received_at", AttributeValue::S(record.received_at.clone()))
-            .item("status", AttributeValue::S("PERSISTED".to_owned()))
             .item(
                 "expires_at",
                 AttributeValue::N(record.expires_at.to_string()),
             )
             .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
-            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
             .build()
             .context("failed to build event put")?;
 
@@ -210,31 +206,11 @@ impl EventStore for AwsServices {
             Err(error) => duplicate_outcome(&error).map_err(StoreError),
         }
     }
-
-    async fn mark_published(&self, record: &EventRecord) -> Result<(), StoreError> {
-        let published_at = DateTime::from(SystemTime::now())
-            .fmt(Format::DateTime)
-            .context("failed to format published_at")?;
-        self.dynamo
-            .update_item()
-            .table_name(&self.config.table_name)
-            .key("pk", AttributeValue::S(partition_key(record)))
-            .key("sk", AttributeValue::S(event_sort_key(record)))
-            .update_expression("SET #status = :published, published_at = :at")
-            .expression_attribute_names("#status", "status")
-            .expression_attribute_values(":published", AttributeValue::S("PUBLISHED".to_owned()))
-            .expression_attribute_values(":at", AttributeValue::S(published_at))
-            .send()
-            .await
-            .map_err(|e| StoreError(anyhow!("{}", DisplayErrorContext(&e))))?;
-        Ok(())
-    }
 }
 
 /// Decides the dedup outcome from a `TransactWriteItems` failure. The Put is
-/// transaction entry 0: if (and only if) its condition check failed, the
-/// message was seen before, and the returned old item's `status` says how far
-/// the prior attempt got — no second read needed.
+/// transaction entry 0: if its condition check failed, the event was already
+/// persisted — an SNS redelivery.
 fn duplicate_outcome(error: &SdkError<TransactWriteItemsError>) -> anyhow::Result<PersistOutcome> {
     let cancellation = match &error {
         SdkError::ServiceError(ctx) => match ctx.err() {
@@ -257,17 +233,7 @@ fn duplicate_outcome(error: &SdkError<TransactWriteItemsError>) -> anyhow::Resul
             DisplayErrorContext(&error)
         ));
     }
-    let prior_status = reason
-        .item()
-        .and_then(|item| item.get("status"))
-        .and_then(|value| value.as_s().ok().cloned());
-    match prior_status.as_deref() {
-        Some("PUBLISHED") => Ok(PersistOutcome::DuplicatePublished),
-        // PERSISTED, or a missing/unreadable old item: resume. The bias is
-        // at-least-once — a spurious resume re-runs repeat-safe calls and at
-        // worst duplicates a bus event; the other direction loses events.
-        _ => Ok(PersistOutcome::DuplicatePersisted),
-    }
+    Ok(PersistOutcome::Duplicate)
 }
 
 impl PublishEvents for AwsServices {
@@ -446,6 +412,7 @@ mod tests {
             topic_arn: "arn:aws:sns:us-east-1:123456789012:t".to_owned(),
             received_at: "2026-08-03T19:12:53.000Z".to_owned(),
             expires_at: 1_800_000_000,
+            aggregate_expires_at: 1_900_000_000,
         }
     }
 
@@ -470,6 +437,21 @@ mod tests {
         assert!(expr.contains("last_event_at = :ts"));
         assert!(!expr.contains("current_status"));
         assert_eq!(keys, [":expires", ":source", ":ts"]);
+    }
+
+    #[test]
+    fn aggregate_ttl_uses_the_aggregate_expiry_not_the_raw_ttl() {
+        let event = DomainEvent::classify("not json");
+        let update = aggregate_update("t", &record(event.family(), "agg-1"), &event).unwrap();
+        let expires = update
+            .expression_attribute_values
+            .unwrap()
+            .get(":expires")
+            .cloned()
+            .unwrap();
+        // record() sets expires_at = 1_800_000_000 and
+        // aggregate_expires_at = 1_900_000_000; the aggregate must use the latter.
+        assert_eq!(expires, AttributeValue::N("1900000000".to_owned()));
     }
 
     #[test]

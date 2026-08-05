@@ -40,11 +40,13 @@ aws-sdk-sesv2 = { workspace = true, features = [
   "rt-tokio",
 ] }
 aws-smithy-types.workspace = true
+aws_lambda_events = { workspace = true, features = ["dynamodb"] }
 axum.workspace = true
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
 reqwest = { workspace = true, features = ["rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
+serde_dynamo = { workspace = true }
 sns-message-verifier.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

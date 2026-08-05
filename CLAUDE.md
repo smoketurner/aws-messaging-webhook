@@ -61,12 +61,14 @@ Two workspace crates:
    rejected (source `unknown`, null `webhookPath` in the outbound meta, `unclassified_payload`
    log/metric) — the pipeline degrades to pass-through for new AWS event shapes.
 5. `store.rs` persists to DynamoDB (event items + per-message aggregate). The conditional write
-   is the idempotency mechanism; `PersistOutcome` (`Fresh` / `DuplicatePersisted` /
-   `DuplicatePublished`) tells the handler whether to skip, resume, or run fully.
+   is the idempotency mechanism; `PersistOutcome` (`Fresh` / `Duplicate`) tells the request path
+   whether the aggregate was applied (idempotent actions run regardless).
 6. `actions/` runs inline lifecycle calls (delivery feedback, STOP/START opt-outs, bounce and
    complaint suppression). AWS-native lists are the source of truth.
-7. `publish.rs` + `build_outbound` in `sns/mod.rs` emit to EventBridge, capping detail size so
-   an oversized payload can never become a poison message that 5xx-loops forever.
+7. `stream.rs` is the **sole publisher**: a DynamoDB Streams consumer (same binary) rebuilds each
+   newly-persisted event via `publish.rs::build_outbound` and emits it to EventBridge, capping
+   detail size so an oversized payload can't become a poison record. The event-source mapping's
+   retries + on-failure DLQ make delivery durable independently of the request path.
 
 ### Invariants to preserve
 
@@ -80,11 +82,11 @@ Two workspace crates:
   subseconds — rebuilding the signed canonical string from it rejects every message published
   on a whole second. `entry.rs` deserializes the record straight into `SnsEnvelope` (which
   aliases the Lambda-shape `SigningCertUrl`/`UnsubscribeUrl` casing) so signed values stay
-  verbatim. The persist-before-act-before-publish
-  ordering plus `PERSISTED`/`PUBLISHED` status means a retry resumes exactly where it died
-  without duplicate bus events; action APIs must stay repeat-safe. `ActionErrorKind` splits
-  transient (5xx, retry) from permanent (log + metric, still publish) — a misconfigured
-  opt-out list must not become a retry storm.
+  verbatim. The request path persists (the outbox entry) before running idempotent actions; a
+  5xx redelivery re-runs only the repeat-safe actions, so action APIs must stay repeat-safe.
+  Publishing is decoupled — the stream relay is the sole publisher, with its own retries + DLQ.
+  `ActionErrorKind` splits transient (5xx, retry) from permanent (log + metric, still persist) —
+  a misconfigured opt-out list must not become a retry storm.
 - **No verification bypass in release builds.** `SNS_CERT_HOST_OVERRIDE` (for
   `cargo lambda watch` against a fake SNS) is compiled in under `#[cfg(debug_assertions)]`
   only. The HTTP clients never follow redirects — that's part of the trust model, not a nicety.

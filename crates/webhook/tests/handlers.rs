@@ -34,7 +34,6 @@ struct FakeServices {
     persist_outcome: Mutex<Option<PersistOutcome>>,
     fail_persist: AtomicBool,
     fail_publish: AtomicBool,
-    fail_mark: AtomicBool,
     action_error: Mutex<Option<ActionErrorKind>>,
 }
 
@@ -75,14 +74,6 @@ impl EventStore for FakeServices {
             .lock()
             .unwrap()
             .unwrap_or(PersistOutcome::Fresh))
-    }
-
-    async fn mark_published(&self, _record: &EventRecord) -> Result<(), StoreError> {
-        self.record("mark");
-        if self.fail_mark.load(Ordering::SeqCst) {
-            return Err(StoreError(anyhow!("simulated mark failure")));
-        }
-        Ok(())
     }
 }
 
@@ -197,6 +188,7 @@ async fn harness_with(options: HarnessOptions) -> Harness {
             auto_resubscribe: options.auto_resubscribe,
             opt_out_list_name: options.opt_out_list.then(|| "opt-out-list".to_owned()),
             raw_event_retention_days: 30,
+            aggregate_retention_days: 365,
         },
         dangerous_subscribe_url_prefix: Some(server.uri()),
     });
@@ -221,7 +213,7 @@ async fn post(state: Arc<AppState<FakeServices>>, route: &str, body: &Value) -> 
 }
 
 #[tokio::test]
-async fn valid_notification_persists_then_publishes_then_marks() {
+async fn valid_notification_persists() {
     let h = harness().await;
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
@@ -229,21 +221,11 @@ async fn valid_notification_persists_then_publishes_then_marks() {
     let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
+    // The request path persists only; the stream relay publishes.
     assert_eq!(
         h.fake().calls(),
-        vec![
-            "persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned(),
-            "publish:unknown".to_owned(),
-            "mark".to_owned(),
-        ]
+        vec!["persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned()]
     );
-    let published = h.fake().published.lock().unwrap();
-    let meta = &published[0].detail["meta"];
-    assert_eq!(meta["snsMessageId"], "165545c9-2a5c-472c-8df2-7ff2be2b3b1b");
-    assert_eq!(meta["messageId"], "165545c9-2a5c-472c-8df2-7ff2be2b3b1b");
-    // The payload matches no family, so it has no canonical path.
-    assert_eq!(meta["webhookPath"], Value::Null);
-    assert_eq!(published[0].detail["event"], json!({"hello": "world"}));
 }
 
 #[tokio::test]
@@ -257,12 +239,9 @@ async fn mis_wired_topic_still_classifies_correctly() {
     let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(h.fake().calls().contains(&"publish:sms.inbound".to_owned()));
-    let published = h.fake().published.lock().unwrap();
-    assert_eq!(
-        published[0].detail["meta"]["webhookPath"],
-        "/webhooks/sms/inbound"
-    );
+    // The family comes from the payload shape, so it persists under the
+    // sms.inbound aggregate id even though it arrived on the SES path.
+    assert!(h.fake().calls().contains(&"persist:in-msg-1".to_owned()));
 }
 
 #[tokio::test]
@@ -325,38 +304,23 @@ async fn non_json_body_is_bad_request() {
 }
 
 #[tokio::test]
-async fn duplicate_published_is_a_no_op() {
+async fn duplicate_delivery_still_runs_the_idempotent_action() {
     let h = harness().await;
-    *h.fake().persist_outcome.lock().unwrap() = Some(PersistOutcome::DuplicatePublished);
-    let mut body = notification(&h.cert_url);
-    h.fixture.sign(&mut body, "1");
+    *h.fake().persist_outcome.lock().unwrap() = Some(PersistOutcome::Duplicate);
+    let body = wrapped(&h, &inbound_sms("STOP"));
 
-    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
 
+    // A redelivery re-runs the (idempotent) action so a crash before the first
+    // attempt's action cannot lose it. Publishing is the stream relay's job.
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        h.fake().calls().len(),
-        1,
-        "only the persist attempt, no publish/mark"
+        h.fake().calls(),
+        vec![
+            "persist:in-msg-1".to_owned(),
+            "opt_out:+14255550182".to_owned(),
+        ]
     );
-}
-
-#[tokio::test]
-async fn duplicate_persisted_resumes_publish_and_mark() {
-    let h = harness().await;
-    *h.fake().persist_outcome.lock().unwrap() = Some(PersistOutcome::DuplicatePersisted);
-    let mut body = notification(&h.cert_url);
-    h.fixture.sign(&mut body, "1");
-
-    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let calls = h.fake().calls();
-    assert!(
-        calls[1].starts_with("publish:"),
-        "resume must re-publish, got {calls:?}"
-    );
-    assert_eq!(calls[2], "mark");
 }
 
 #[tokio::test]
@@ -370,36 +334,6 @@ async fn persist_failure_returns_500_for_redelivery() {
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(h.fake().calls().len(), 1);
-}
-
-#[tokio::test]
-async fn publish_failure_returns_500_and_never_marks() {
-    let h = harness().await;
-    h.fake().fail_publish.store(true, Ordering::SeqCst);
-    let mut body = notification(&h.cert_url);
-    h.fixture.sign(&mut body, "1");
-
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let calls = h.fake().calls();
-    assert!(
-        !calls.contains(&"mark".to_owned()),
-        "mark must not run, got {calls:?}"
-    );
-}
-
-#[tokio::test]
-async fn mark_failure_returns_500_after_successful_publish() {
-    let h = harness().await;
-    h.fake().fail_mark.store(true, Ordering::SeqCst);
-    let mut body = notification(&h.cert_url);
-    h.fixture.sign(&mut body, "1");
-
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(h.fake().published.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -522,7 +456,7 @@ fn inbound_sms(keyword: &str) -> Value {
 }
 
 #[tokio::test]
-async fn stop_keyword_opts_out_and_still_publishes() {
+async fn stop_keyword_opts_out() {
     let h = harness().await;
     let body = wrapped(&h, &inbound_sms("STOP"));
 
@@ -534,8 +468,6 @@ async fn stop_keyword_opts_out_and_still_publishes() {
         vec![
             "persist:in-msg-1".to_owned(),
             "opt_out:+14255550182".to_owned(),
-            "publish:sms.inbound".to_owned(),
-            "mark".to_owned(),
         ]
     );
 }
@@ -568,7 +500,7 @@ async fn keyword_without_opt_out_list_configured_is_forwarded_only() {
         !calls.iter().any(|c| c.starts_with("opt_out")),
         "no opt-out call: {calls:?}"
     );
-    assert!(calls.contains(&"publish:sms.inbound".to_owned()));
+    assert!(calls.contains(&"persist:in-msg-1".to_owned()));
 }
 
 #[tokio::test]
@@ -584,14 +516,7 @@ async fn ordinary_inbound_sms_takes_no_action() {
     let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.fake().calls(),
-        vec![
-            "persist:in-msg-2".to_owned(),
-            "publish:sms.inbound".to_owned(),
-            "mark".to_owned(),
-        ]
-    );
+    assert_eq!(h.fake().calls(), vec!["persist:in-msg-2".to_owned()]);
 }
 
 #[tokio::test]
@@ -608,7 +533,6 @@ async fn delivered_dlr_reports_received_feedback() {
         calls.contains(&"feedback:out-1:Received".to_owned()),
         "{calls:?}"
     );
-    assert!(calls.contains(&"publish:sms.delivery".to_owned()));
 }
 
 #[tokio::test]
@@ -673,7 +597,6 @@ async fn permanent_bounce_suppresses_every_recipient() {
         "{calls:?}"
     );
     assert!(calls.contains(&"suppress:b@example.com:Bounce".to_owned()));
-    assert!(calls.contains(&"publish:ses.bounce".to_owned()));
 }
 
 #[tokio::test]
@@ -689,7 +612,6 @@ async fn transient_bounce_is_not_suppressed() {
         !calls.iter().any(|c| c.starts_with("suppress")),
         "{calls:?}"
     );
-    assert!(calls.contains(&"publish:ses.bounce".to_owned()));
 }
 
 #[tokio::test]
@@ -729,20 +651,9 @@ fn ses_inbound(virus_status: &str, content: Option<&str>) -> Value {
 }
 
 #[tokio::test]
-async fn clean_inbound_email_publishes_ses_inbound() {
+async fn clean_inbound_email_persists() {
     let h = harness().await;
     let body = wrapped(&h, &ses_inbound("PASS", Some("Subject: hi\r\n\r\nhello")));
-
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert!(h.fake().calls().contains(&"publish:ses.inbound".to_owned()));
-}
-
-#[tokio::test]
-async fn virus_fail_publishes_quarantined_detail_type() {
-    let h = harness().await;
-    let body = wrapped(&h, &ses_inbound("FAIL", None));
 
     let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
 
@@ -750,29 +661,12 @@ async fn virus_fail_publishes_quarantined_detail_type() {
     assert!(
         h.fake()
             .calls()
-            .contains(&"publish:ses.inbound.quarantined".to_owned())
+            .contains(&"persist:inbound-msg-1".to_owned())
     );
 }
 
 #[tokio::test]
-async fn oversized_inbound_content_is_stripped_from_bus_event() {
-    let h = harness().await;
-    let big = "x".repeat(300_000);
-    let body = wrapped(&h, &ses_inbound("PASS", Some(&big)));
-
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let published = h.fake().published.lock().unwrap();
-    assert_eq!(published[0].detail["event"]["content"], Value::Null);
-    assert_eq!(
-        published[0].detail["event"]["mail"]["messageId"],
-        "inbound-msg-1"
-    );
-}
-
-#[tokio::test]
-async fn transient_action_failure_returns_500_before_publish() {
+async fn transient_action_failure_returns_500() {
     let h = harness().await;
     *h.fake().action_error.lock().unwrap() = Some(ActionErrorKind::Transient);
     let body = wrapped(&h, &inbound_sms("STOP"));
@@ -780,9 +674,11 @@ async fn transient_action_failure_returns_500_before_publish() {
     let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let calls = h.fake().calls();
-    assert!(calls.contains(&"opt_out:+14255550182".to_owned()));
-    assert!(!calls.iter().any(|c| c.starts_with("publish")), "{calls:?}");
+    assert!(
+        h.fake()
+            .calls()
+            .contains(&"opt_out:+14255550182".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -795,9 +691,9 @@ async fn redelivery_after_transient_action_failure_reruns_the_action() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
 
-    // SNS redelivers; the prior attempt persisted, so this resumes.
+    // SNS redelivers; the prior attempt persisted, so this is a duplicate.
     *h.fake().action_error.lock().unwrap() = None;
-    *h.fake().persist_outcome.lock().unwrap() = Some(PersistOutcome::DuplicatePersisted);
+    *h.fake().persist_outcome.lock().unwrap() = Some(PersistOutcome::Duplicate);
     assert_eq!(
         post(h.state.clone(), "/webhooks/sms/inbound", &body).await,
         StatusCode::OK
@@ -810,22 +706,22 @@ async fn redelivery_after_transient_action_failure_reruns_the_action() {
         .filter(|c| c.starts_with("opt_out"))
         .count();
     assert_eq!(opt_outs, 2, "action must run once per attempt");
-    assert!(h.fake().calls().contains(&"publish:sms.inbound".to_owned()));
 }
 
 #[tokio::test]
-async fn permanent_action_failure_still_publishes() {
+async fn permanent_action_failure_still_persists() {
     let h = harness().await;
     *h.fake().action_error.lock().unwrap() = Some(ActionErrorKind::Permanent);
     let body = wrapped(&h, &ses_bounce("Permanent", &["a@example.com"]));
 
     let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
+    // A permanent action failure is logged and swallowed; the event is still
+    // durably persisted (and will be published by the stream relay).
     assert_eq!(status, StatusCode::OK);
     let calls = h.fake().calls();
     assert!(calls.contains(&"suppress:a@example.com:Bounce".to_owned()));
-    assert!(calls.contains(&"publish:ses.bounce".to_owned()));
-    assert!(calls.contains(&"mark".to_owned()));
+    assert!(calls.contains(&"persist:ses-msg-1".to_owned()));
 }
 
 #[tokio::test]
@@ -856,6 +752,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
             auto_resubscribe: true,
             opt_out_list_name: Some("opt-out-list".to_owned()),
             raw_event_retention_days: 30,
+            aggregate_retention_days: 365,
         },
         dangerous_subscribe_url_prefix: Some(server.uri()),
     });
@@ -937,7 +834,7 @@ async fn invoke(
 }
 
 #[tokio::test]
-async fn direct_invoke_runs_the_full_pipeline() {
+async fn direct_invoke_persists() {
     let h = harness().await;
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
@@ -949,15 +846,8 @@ async fn direct_invoke_runs_the_full_pipeline() {
     assert_eq!(result, Value::Null);
     assert_eq!(
         h.fake().calls(),
-        vec![
-            "persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned(),
-            "publish:unknown".to_owned(),
-            "mark".to_owned(),
-        ]
+        vec!["persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned()]
     );
-    let published = h.fake().published.lock().unwrap();
-    // The fixture message matches no family; it still publishes as unknown.
-    assert_eq!(published[0].detail["meta"]["webhookPath"], Value::Null);
 }
 
 #[tokio::test]
@@ -1025,12 +915,7 @@ async fn direct_invoke_classifies_by_payload_shape() {
         .await
         .unwrap();
 
-    assert!(h.fake().calls().contains(&"publish:sms.inbound".to_owned()));
-    let published = h.fake().published.lock().unwrap();
-    assert_eq!(
-        published[0].detail["meta"]["webhookPath"],
-        "/webhooks/sms/inbound"
-    );
+    assert!(h.fake().calls().contains(&"persist:in-msg-1".to_owned()));
 }
 
 #[tokio::test]
@@ -1060,11 +945,7 @@ async fn function_url_payload_dispatches_through_the_router() {
     assert_eq!(response["statusCode"], 200);
     assert_eq!(
         h.fake().calls(),
-        vec![
-            "persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned(),
-            "publish:unknown".to_owned(),
-            "mark".to_owned(),
-        ]
+        vec!["persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned()]
     );
 }
 
@@ -1076,24 +957,76 @@ async fn unrecognized_invoke_payload_is_an_error() {
     assert!(h.fake().calls().is_empty());
 }
 
+/// A DynamoDB Streams INSERT event carrying one event item whose `raw_body`
+/// is the given (base64-encoded) SNS envelope bytes.
+fn dynamodb_insert_event(raw_body: &[u8], sk: &str, sequence: &str) -> Value {
+    json!({
+        "Records": [{
+            "awsRegion": "us-east-1",
+            "eventID": "evt-1",
+            "eventName": "INSERT",
+            "eventSource": "aws:dynamodb",
+            "dynamodb": {
+                "ApproximateCreationDateTime": 1_754_265_600.0,
+                "SequenceNumber": sequence,
+                "SizeBytes": 42,
+                "StreamViewType": "NEW_IMAGE",
+                "NewImage": {
+                    "pk": {"S": "MSG#agg-1"},
+                    "sk": {"S": sk},
+                    "received_at": {"S": "2026-08-04T00:00:00.000Z"},
+                    "raw_body": {"B": aws_smithy_types::base64::encode(raw_body)},
+                }
+            }
+        }]
+    })
+}
+
 #[tokio::test]
-async fn oversized_non_content_payload_publishes_a_pointer_not_a_poison_message() {
+async fn stream_publishes_persisted_event() {
     let h = harness().await;
-    // A large SES event with no `content` field to strip: must still publish
-    // (as a bounded pointer) rather than 5xx-loop forever.
-    let big_reason = "x".repeat(300_000);
-    let inner = json!({
-        "eventType": "Bounce",
-        "bounce": {"bounceType": "Transient", "bouncedRecipients": [], "note": big_reason},
-        "mail": {"messageId": "huge-1"}
-    });
-    let body = wrapped(&h, &inner);
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let event = dynamodb_insert_event(&raw, "EVT#2026-08-04T00:00:00.000Z#sns-1", "seq-1");
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let result = invoke(h.state.clone(), event).await.unwrap();
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.fake().published.lock().unwrap();
-    assert_eq!(published[0].detail["event"]["payloadOmitted"], json!(true));
-    // Meta is always preserved so consumers can fetch the full record.
-    assert_eq!(published[0].detail["meta"]["messageId"], "huge-1");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].detail["schemaVersion"], 1);
+}
+
+#[tokio::test]
+async fn stream_skips_aggregate_and_non_event_records() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let event = dynamodb_insert_event(&raw, "AGG", "seq-agg");
+
+    let result = invoke(h.state.clone(), event).await.unwrap();
+
+    assert_eq!(result, json!({ "batchItemFailures": [] }));
+    assert!(h.fake().published.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stream_reports_publish_failure_for_retry() {
+    let h = harness().await;
+    h.fake().fail_publish.store(true, Ordering::SeqCst);
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let event = dynamodb_insert_event(&raw, "EVT#t#sns-1", "seq-9");
+
+    let result = invoke(h.state.clone(), event).await.unwrap();
+
+    // The failed record's sequence number is returned so the ESM retries only
+    // it (and, past the retry limit, routes it to the DLQ).
+    assert_eq!(
+        result,
+        json!({ "batchItemFailures": [{ "itemIdentifier": "seq-9" }] })
+    );
 }

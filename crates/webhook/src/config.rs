@@ -14,6 +14,10 @@ pub struct Config {
     /// disables that action.
     pub opt_out_list_name: Option<String>,
     pub raw_event_retention_days: u64,
+    /// TTL for the per-message aggregate item. Kept separate from (and
+    /// typically longer than) `raw_event_retention_days` so a message's
+    /// rolled-up current state outlives its bulky raw event items.
+    pub aggregate_retention_days: u64,
 }
 
 impl Config {
@@ -68,6 +72,20 @@ impl Config {
             }
         };
 
+        let aggregate_retention_days = match optional("AGGREGATE_RETENTION_DAYS") {
+            None => 365,
+            Some(raw) => {
+                let days = raw.parse::<u64>().with_context(|| {
+                    format!("AGGREGATE_RETENTION_DAYS must be a positive integer, got {raw:?}")
+                })?;
+                anyhow::ensure!(
+                    days > 0,
+                    "AGGREGATE_RETENTION_DAYS must be at least 1, got 0"
+                );
+                days
+            }
+        };
+
         Ok((
             Self {
                 table_name,
@@ -76,6 +94,7 @@ impl Config {
                 auto_resubscribe,
                 opt_out_list_name,
                 raw_event_retention_days,
+                aggregate_retention_days,
             },
             allowlist,
         ))

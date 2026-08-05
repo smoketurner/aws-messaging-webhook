@@ -26,6 +26,6 @@ A single Rust AWS Lambda that receives AWS messaging events delivered over SNS a
 ## Key design goals
 
 - Security: public URL protected by signature verification AND topic allowlist (both are required)
-- Reliability: 5xx responses recruit SNS redelivery for transient failures; persist-before-act-before-publish ordering lets retries resume where they left off
+- Reliability: 5xx responses recruit SNS redelivery for transient failures; the persisted event item is an outbox entry that a DynamoDB Streams relay publishes with its own retries and on-failure DLQ
 - Observability: structured JSON logs, CloudWatch metrics via log metric filters
 - Testability: trait-based services allow full handler tests with properly signed envelopes against fake implementations, no AWS account needed

@@ -19,28 +19,28 @@ inclusion: auto
 
 ## Request flow through the webhook crate
 
-1. `entry.rs` - Dispatches by payload shape: top-level `Records` array = direct SNS event; otherwise = Function URL request served through Axum
+1. `entry.rs` - Dispatches by payload shape: `Records` with `eventSource: aws:dynamodb` = DynamoDB stream (the publish relay); other top-level `Records` = direct SNS event; otherwise = Function URL request served through Axum
 2. `app.rs` - Routes four `/webhooks/...` paths; path does NOT determine event family
 3. `sns/extractor.rs` (`VerifiedSns`) - Security boundary: enforces topic allowlist + signature verification; single constructor used by both ingress paths
 4. `model/` - `DomainEvent::classify` does shape-based try-parse, most specific first (SesInbound before Ses - ordering is load-bearing and pinned by fixture matrix)
-5. `sns/mod.rs` - Per-message state machine: auto-confirms subscriptions, auto-re-subscribes on abuse, runs notification pipeline
-6. `store.rs` - DynamoDB persistence with conditional writes for idempotency; `PersistOutcome` (Fresh/DuplicatePersisted/DuplicatePublished) determines next steps
-7. `actions/` - Inline lifecycle calls (delivery feedback, opt-outs, suppression)
-8. `publish.rs` + `build_outbound` - EventBridge emission with size capping
+5. `sns/mod.rs` - Per-message state machine: auto-confirms subscriptions, auto-re-subscribes on abuse, runs the request-path pipeline (persist + inline actions)
+6. `store.rs` - DynamoDB persistence with conditional writes for idempotency; `PersistOutcome` (Fresh/Duplicate) tells the request path whether the aggregate was applied
+7. `actions/` - Inline lifecycle calls (delivery feedback, opt-outs, suppression), run on both Fresh and Duplicate (idempotent)
+8. `stream.rs` + `publish.rs::build_outbound` - the DynamoDB Streams consumer is the **sole publisher**: it rebuilds each newly-persisted event from its stored SNS envelope and emits it to EventBridge with size capping
 
 ## Critical invariants
 
 - **Response codes are the retry protocol.** 4xx = permanent rejection; 5xx = deliberate, recruiting SNS redelivery for transient failures. `error.rs` is the single place that classifies failures.
 - **Never parse direct-invoke `Sns` records with `aws_lambda_events`' `SnsMessage`.** It parses `Timestamp` into `chrono::DateTime` which drops trailing `.000` subseconds, breaking signature verification. Use `SnsEnvelope` which keeps signed values verbatim.
 - **No verification bypass in release builds.** `SNS_CERT_HOST_OVERRIDE` is `#[cfg(debug_assertions)]` only.
-- **Persist-before-act-before-publish ordering** is load-bearing: a retry resumes exactly where it died without duplicate bus events.
-- **`ActionErrorKind` splits transient from permanent.** Transient = 5xx/retry; permanent = log + metric, still publish. A misconfigured opt-out list must not become a retry storm.
+- **Persist-before-act, publish-by-stream.** The request path persists the event item (the outbox entry) then runs idempotent actions; the DynamoDB Streams relay is the sole publisher. A 5xx redelivery re-runs only the repeat-safe actions, and the stream's event-source-mapping retries + DLQ make publishing durable independently.
+- **`ActionErrorKind` splits transient from permanent.** Transient = 5xx/retry; permanent = log + metric, still persist (the stream will publish it). A misconfigured opt-out list must not become a retry storm.
 - **HTTP clients never follow redirects** - part of the trust model for cert URL validation.
 
 ## DynamoDB data model
 
 Single table with two item types sharing the same partition key:
-- **Event items** - `pk = MSG#<messageId>`, `sk = EVT#<timestamp>#<snsMessageId>`: raw body, parse metadata, status (PERSISTED/PUBLISHED), TTL
+- **Event items** - `pk = MSG#<messageId>`, `sk = EVT#<timestamp>#<snsMessageId>`: raw body, parse metadata, TTL; each insert is what the stream relay publishes
 - **Aggregate item** - same `pk`, `sk = AGG`: current_status, first/last_event_at, open_count, click_count, bounce_type
 
 ## Services trait
