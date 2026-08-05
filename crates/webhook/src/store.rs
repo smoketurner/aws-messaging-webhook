@@ -31,6 +31,10 @@ pub struct EventRecord {
     pub received_at: String,
     /// Epoch seconds for the DynamoDB TTL attribute.
     pub expires_at: u64,
+    /// Epoch seconds for the aggregate item's TTL — derived from
+    /// `aggregate_retention_days`, so the rolled-up state can outlive the raw
+    /// event items.
+    pub aggregate_expires_at: u64,
 }
 
 impl EventRecord {
@@ -51,13 +55,15 @@ impl EventRecord {
         let received_at = DateTime::from(now)
             .fmt(Format::DateTime)
             .context("failed to format received_at timestamp")?;
-        let expires_at = now
-            .checked_add(Duration::from_secs(
-                config.raw_event_retention_days * 24 * 60 * 60,
-            ))
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .context("failed to compute expires_at")?
-            .as_secs();
+        let expiry_secs = |retention_days: u64| -> anyhow::Result<u64> {
+            Ok(now
+                .checked_add(Duration::from_secs(retention_days * 24 * 60 * 60))
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .context("failed to compute TTL expiry")?
+                .as_secs())
+        };
+        let expires_at = expiry_secs(config.raw_event_retention_days)?;
+        let aggregate_expires_at = expiry_secs(config.aggregate_retention_days)?;
 
         Ok(Self {
             aggregate_id: event.aggregate_id(&envelope.message_id),
@@ -69,6 +75,7 @@ impl EventRecord {
             topic_arn: envelope.topic_arn.clone(),
             received_at,
             expires_at,
+            aggregate_expires_at,
         })
     }
 
@@ -79,16 +86,17 @@ impl EventRecord {
     }
 }
 
-/// Result of the conditional persist, driving the dedup/resume state machine.
+/// Result of the conditional persist. The DynamoDB item is the outbox entry;
+/// the stream relay publishes it. All the request path needs to know is
+/// whether this was the first sighting (aggregate applied) or a redelivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistOutcome {
-    /// First time this SNS message was seen; aggregate updated atomically.
+    /// First time this SNS message was seen; the aggregate projection was
+    /// applied atomically with the event put.
     Fresh,
-    /// Already fully processed — skip everything and return 200.
-    DuplicatePublished,
-    /// A prior attempt persisted but died before publishing — resume the
-    /// actions + publish, skipping the aggregate update (already applied).
-    DuplicatePersisted,
+    /// Already persisted — an SNS redelivery. The aggregate was not
+    /// re-applied; idempotent lifecycle actions still re-run.
+    Duplicate,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,11 +112,4 @@ pub trait EventStore: Send + Sync {
         record: &EventRecord,
         event: &DomainEvent,
     ) -> impl Future<Output = Result<PersistOutcome, StoreError>> + Send;
-
-    /// Marks the event item as published after a successful EventBridge
-    /// `PutEvents`.
-    fn mark_published(
-        &self,
-        record: &EventRecord,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }

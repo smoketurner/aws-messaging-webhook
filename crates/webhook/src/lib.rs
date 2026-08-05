@@ -13,3 +13,4 @@ pub mod publish;
 pub mod sns;
 pub mod state;
 pub mod store;
+pub mod stream;

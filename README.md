@@ -33,12 +33,16 @@ SNS → Lambda invocation. Then it:
 
 ```
 EUM two-way SMS ──────► SNS ─┐  POST /webhooks/… (https)   ┌─► DynamoDB (events + aggregates)
-EUM config set (DLR) ─► SNS ─┤  ─► Lambda Function URL ─┐  │
-SES config set ───────► SNS ─┤  or direct invoke        ├──┼─► lifecycle actions (EUM/SES APIs)
-SES receipt rule ─────► SNS ─┘  (lambda protocol) ──────┘  │
-                                verify → persist →         └─► EventBridge bus ─► your apps
-                                act → publish
+EUM config set (DLR) ─► SNS ─┤  ─► Lambda Function URL ─┐  │        │ stream (NEW_IMAGE)
+SES config set ───────► SNS ─┤  or direct invoke        ├──┤        ▼
+SES receipt rule ─────► SNS ─┘  (lambda protocol) ──────┘  │   stream relay ─► EventBridge bus ─► your apps
+                                verify → persist → act     └─► lifecycle actions (EUM/SES APIs)
 ```
+
+The request path is a durable outbox writer: it verifies, persists the event item (the outbox
+entry), and runs inline lifecycle actions. A DynamoDB Streams consumer in the same function is
+the **sole publisher** — it reads each newly-persisted event and emits it to EventBridge, with
+the stream event-source mapping's retries and on-failure DLQ guaranteeing delivery.
 
 The event family is classified from each payload's shape, so no routing configuration exists.
 Wire each SNS topic to its matching path anyway — a topic delivering a different family than
@@ -135,6 +139,7 @@ destination (SQS) on the function.
 | `OptOutListName` | *(empty)* | EUM opt-out list updated by STOP/START keywords; empty disables that action |
 | `EventSource` | `aws-messaging-webhook` | `source` field on published EventBridge events |
 | `RawEventRetentionDays` | `30` | DynamoDB TTL for raw event items |
+| `AggregateRetentionDays` | `365` | DynamoDB TTL for the per-message aggregate item; kept longer than raw events so current state outlives them |
 | `LogLevel` | `INFO` | `TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR` |
 | `LogRetentionDays` | `30` | CloudWatch log retention |
 
@@ -172,6 +177,7 @@ Detail shape:
 
 ```json
 {
+  "schemaVersion": 1,       // detail contract version; bumped only on a breaking shape change
   "meta": {
     "snsMessageId": "…",
     "messageId": "…",        // aggregate id: query DynamoDB with pk = MSG#<messageId>
@@ -183,38 +189,51 @@ Detail shape:
 }
 ```
 
+`schemaVersion` is present on every published detail, including the `subscription.changed`
+event, so consumers have a stable field to switch on as the contract evolves.
+
 ## Data model
 
 One DynamoDB table (`TableName` output):
 
 - **Event items** — `pk = MSG#<messageId>`, `sk = EVT#<timestamp>#<snsMessageId>`: the exact
-  raw body received, parse metadata, `status` (`PERSISTED`/`PUBLISHED`), TTL via `expires_at`
-  (`RawEventRetentionDays`, default 30).
+  raw body received, parse metadata, TTL via `expires_at` (`RawEventRetentionDays`, default 30).
+  The insert of each event item is what the stream relay turns into an EventBridge publish.
 - **Aggregate item** — same `pk`, `sk = AGG`: `current_status`, `first/last_event_at`,
-  `open_count`, `last_opened_at`, `click_count`, `last_clicked_at`, `bounce_type`.
+  `open_count`, `last_opened_at`, `click_count`, `last_clicked_at`, `bounce_type`. Its TTL
+  (`AggregateRetentionDays`, default 365) is kept longer than the raw events' so the rolled-up
+  current state outlives them.
 
 A message's full timeline is one `Query` on `pk`; its current state is one `GetItem` on
 `pk` + `AGG`.
 
 ## Operations
 
-- Structured JSON logs; one INFO line per message with `outcome`
-  (`published|duplicate|resumed|confirmed|resubscribed`) and `action`.
+- Structured JSON logs; one INFO line per message. The request path logs an `outcome`
+  (`persisted|duplicate|confirmed|resubscribed`) and `action`; the stream relay logs
+  `outcome=published` per event emitted to EventBridge.
 - CloudWatch metrics (namespace = stack name) via log metric filters: `MessagesReceived`
-  (notification deliveries: published + resumed + duplicate), `SignatureRejections`,
+  (request-path deliveries: persisted + duplicate), `SignatureRejections`,
   `AllowlistRejections`, `UnclassifiedPayloads` (events forwarded as `unknown` — a sustained
-  rate means a new AWS event shape or junk on a topic), `Duplicates`, `EventsPublished`, `InternalErrors`,
+  rate means a new AWS event shape or junk on a topic), `Duplicates`, `EventsPublished` (from
+  the stream relay), `PublishFailures` (a relay publish that will be retried), `InternalErrors`,
   `ActionFailures`, `Resubscribes`, and `SubscriptionsLost` (alarm on this — a subscription was
-  cancelled and, with `AutoResubscribe=false`, not re-attached).
-- Transient downstream failures return 5xx on purpose: SNS redelivers, and the store's
-  `PERSISTED`/`PUBLISHED` status makes the retry resume exactly where it died. Consumers must
-  tolerate rare duplicate bus events (SNS is at-least-once end to end).
+  cancelled and, with `AutoResubscribe=false`, not re-attached). Also alarm on the native
+  Lambda stream `IteratorAge` and the `PublishDlq` queue depth (`PublishDlqUrl` output): a
+  non-empty DLQ means events exhausted their publish retries.
+- The request path and the stream relay have independent durability. A transient failure in the
+  request path (persist or a lifecycle action) returns 5xx so SNS redelivers; the conditional
+  write dedupes the redelivery and re-runs only the idempotent actions. Publishing is decoupled:
+  the event item is the outbox entry, and the stream event-source mapping retries the publish
+  (bisecting poison batches, reporting per-record failures) and routes anything past the retry
+  limit to the DLQ — so a publish can never be silently lost. Consumers must tolerate rare
+  duplicate bus events (at-least-once end to end).
 - End-to-end check on a deployed stack: send a probe through the SES mailbox simulator —
   `aws sesv2 send-email --from-email-address <verified-sender> --destination
   ToAddresses=bounce@simulator.amazonses.com --content
   "Simple={Subject={Data=probe},Body={Text={Data=probe}}}"` — then confirm a `ses.bounce`
-  event arrives on the bus (temporary rule → SQS, or CloudWatch), the event item in DynamoDB
-  reaches `status = PUBLISHED`, and the simulator address lands on the SES account
+  event arrives on the bus (temporary rule → SQS, or CloudWatch), an event item is written to
+  DynamoDB under `pk = MSG#<messageId>`, and the simulator address lands on the SES account
   suppression list.
 
 ## Development
