@@ -165,7 +165,8 @@ Events publish to the `<stack-name>-events` bus with `source` = `EventSource` pa
 `ses.reject`, `ses.open`, `ses.click`, `ses.rendering-failure`, `ses.delivery-delay`,
 `ses.subscription`, `ses.inbound`, `ses.inbound.quarantined` (spam/virus verdict FAIL —
 classification only, nothing dropped), `ses.unknown` (a valid SES event of a kind this version
-doesn't map yet), `subscription.changed` (auto-re-subscribe fired), `unknown` (unparseable
+doesn't map yet), `message.status.changed` (the per-message aggregate's `current_status`
+transitioned), `subscription.changed` (auto-re-subscribe fired), `unknown` (unparseable
 payload, forwarded verbatim).
 
 An event whose payload exceeds the EventBridge 256 KB entry limit is published with its `event`
@@ -191,6 +192,23 @@ Detail shape:
 
 `schemaVersion` is present on every published detail, including the `subscription.changed`
 event, so consumers have a stable field to switch on as the contract evolves.
+
+The stream relay also emits `message.status.changed` when a message's aggregate `current_status`
+transitions (e.g. `sent` → `delivered` → `bounced`) — not on count-only bumps like opens/clicks —
+so consumers can track the authoritative rolled-up status without re-deriving precedence:
+
+```json
+{
+  "schemaVersion": 1,
+  "meta": { "messageId": "…", "webhookPath": "/webhooks/ses/events" },
+  "status": {
+    "current": "delivered",   // bounced | complained | failed | received | sent | …
+    "bounceType": "…",         // present on a bounce
+    "firstEventAt": "…", "lastEventAt": "…",
+    "openCount": 0, "clickCount": 0
+  }
+}
+```
 
 ## Data model
 

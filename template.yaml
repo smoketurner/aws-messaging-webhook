@@ -102,11 +102,12 @@ Resources:
             MaximumRetryAttempts: 10
             FunctionResponseTypes:
               - ReportBatchItemFailures
-            # Aggregate MODIFYs and TTL REMOVEs are not published; the handler
-            # also skips non-event items defensively.
+            # Event-item INSERTs (the events) and aggregate INSERT/MODIFYs
+            # (status transitions). TTL REMOVEs are dropped. Event items are
+            # write-once, so they only ever INSERT.
             FilterCriteria:
               Filters:
-                - Pattern: '{"eventName":["INSERT"]}'
+                - Pattern: '{"eventName":["INSERT","MODIFY"]}'
             DestinationConfig:
               OnFailure:
                 Destination: !GetAtt PublishDlq.Arn
@@ -170,7 +171,7 @@ Resources:
         - AttributeName: sk
           KeyType: RANGE
       StreamSpecification:
-        StreamViewType: NEW_IMAGE
+        StreamViewType: NEW_AND_OLD_IMAGES
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
