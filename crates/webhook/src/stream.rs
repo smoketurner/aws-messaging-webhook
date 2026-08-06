@@ -25,8 +25,8 @@ use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
-use crate::model::DomainEvent;
-use crate::publish::build_outbound;
+use crate::model::{DomainEvent, Source};
+use crate::publish::{OutboundEvent, SCHEMA_VERSION, build_outbound};
 use crate::state::{AppState, Services};
 use crate::store::EventRecord;
 
@@ -34,6 +34,14 @@ use crate::store::EventRecord;
 fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
     match image.get(key) {
         Some(AttributeValue::S(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Reads a DynamoDB `Number` attribute (stored as a string) as an integer.
+fn image_num(image: &Item, key: &str) -> Option<i64> {
+    match image.get(key) {
+        Some(AttributeValue::N(value)) => value.parse().ok(),
         _ => None,
     }
 }
@@ -56,19 +64,29 @@ pub async fn handle_stream<T: Services>(
 
     let mut failures: Vec<Value> = Vec::new();
     for record in event.records {
-        if record.event_name != "INSERT" {
-            continue; // Aggregate MODIFYs and TTL REMOVEs are not published here.
-        }
-        let image = &record.change.new_image;
-        // Only event items are relayed; the aggregate (sk = AGG) is not.
-        if !image_str(image, "sk").is_some_and(|sk| sk.starts_with("EVT#")) {
+        let sequence_number = record.change.sequence_number.clone();
+        let new_image = &record.change.new_image;
+        let Some(sk) = image_str(new_image, "sk") else {
             continue;
-        }
-        // A transient publish failure returns the sequence number so the ESM
-        // retries only that record; reconstruction failures are logged and
-        // skipped inside publish_record (Ok).
-        if publish_record(state, image).await.is_err()
-            && let Some(sequence_number) = record.change.sequence_number
+        };
+        let published = if sk.starts_with("EVT#") {
+            // Event items are write-once, so only their INSERT publishes.
+            if record.event_name != "INSERT" {
+                continue;
+            }
+            publish_record(state, new_image).await
+        } else if sk == "AGG" {
+            // The per-message aggregate: publish a status delta when
+            // current_status transitions (INSERT of the first status, or a
+            // MODIFY that changes it) — not on count-only bumps.
+            publish_status_changed(state, new_image, &record.change.old_image).await
+        } else {
+            continue;
+        };
+        // Err(()) is a transient publish failure to retry; reconstruction /
+        // no-op cases return Ok and are skipped.
+        if published.is_err()
+            && let Some(sequence_number) = sequence_number
         {
             failures.push(json!({ "itemIdentifier": sequence_number }));
         }
@@ -135,6 +153,82 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Resul
                 sns_message_id = record.sns_message_id,
                 event = "publish_failure",
                 "failed to publish to EventBridge; will retry"
+            );
+            Err(())
+        }
+    }
+}
+
+/// Publishes a `message.status.changed` event when the per-message aggregate's
+/// `current_status` transitions — the first status (INSERT: no old value) or a
+/// MODIFY that changes it. Count-only bumps (opens/clicks leave `current_status`
+/// untouched) produce no event. Carries the rolled-up snapshot so consumers get
+/// the authoritative status without re-deriving precedence. Same retry contract
+/// as `publish_record`: `Err(())` = transient publish failure to retry.
+async fn publish_status_changed<T: Services>(
+    state: &AppState<T>,
+    new_image: &Item,
+    old_image: &Item,
+) -> Result<(), ()> {
+    let Some(current) = image_str(new_image, "current_status") else {
+        return Ok(()); // aggregate carries no status yet (e.g. only open/click counts)
+    };
+    if image_str(old_image, "current_status") == Some(current) {
+        return Ok(()); // not a status transition — skip the count-only change
+    }
+    let Some(message_id) = image_str(new_image, "pk").and_then(|pk| pk.strip_prefix("MSG#")) else {
+        tracing::error!(
+            event = "stream_agg_missing_pk",
+            "aggregate item has no MSG# pk"
+        );
+        return Ok(());
+    };
+
+    let mut status = json!({ "current": current });
+    if let Some(bounce_type) = image_str(new_image, "bounce_type") {
+        status["bounceType"] = json!(bounce_type);
+    }
+    if let Some(first_event_at) = image_str(new_image, "first_event_at") {
+        status["firstEventAt"] = json!(first_event_at);
+    }
+    if let Some(last_event_at) = image_str(new_image, "last_event_at") {
+        status["lastEventAt"] = json!(last_event_at);
+    }
+    if let Some(open_count) = image_num(new_image, "open_count") {
+        status["openCount"] = json!(open_count);
+    }
+    if let Some(click_count) = image_num(new_image, "click_count") {
+        status["clickCount"] = json!(click_count);
+    }
+
+    let webhook_path = image_str(new_image, "source")
+        .and_then(Source::from_label)
+        .map(Source::webhook_path);
+    let detail = json!({
+        "schemaVersion": SCHEMA_VERSION,
+        "meta": { "messageId": message_id, "webhookPath": webhook_path },
+        "status": status,
+    });
+    let outbound = OutboundEvent {
+        detail_type: "message.status.changed".to_owned(),
+        detail,
+    };
+    match state.services.publish(&outbound).await {
+        Ok(()) => {
+            tracing::info!(
+                message_id,
+                current_status = current,
+                outcome = "status_published",
+                "published message.status.changed"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                message_id,
+                event = "publish_failure",
+                "failed to publish status change; will retry"
             );
             Err(())
         }

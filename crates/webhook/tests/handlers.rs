@@ -1030,3 +1030,82 @@ async fn stream_reports_publish_failure_for_retry() {
         json!({ "batchItemFailures": [{ "itemIdentifier": "seq-9" }] })
     );
 }
+
+/// A DynamoDB Streams event for one aggregate (`sk = AGG`) record with the given
+/// new/old `current_status` values (None = attribute absent).
+fn dynamodb_agg_event(
+    event_name: &str,
+    new_status: Option<&str>,
+    old_status: Option<&str>,
+) -> Value {
+    let mut new_image = json!({
+        "pk": {"S": "MSG#agg-1"},
+        "sk": {"S": "AGG"},
+        "source": {"S": "ses-events"},
+        "open_count": {"N": "2"},
+    });
+    if let Some(status) = new_status {
+        new_image["current_status"] = json!({"S": status});
+    }
+    let mut old_image = json!({ "pk": {"S": "MSG#agg-1"}, "sk": {"S": "AGG"} });
+    if let Some(status) = old_status {
+        old_image["current_status"] = json!({"S": status});
+    }
+    json!({
+        "Records": [{
+            "awsRegion": "us-east-1",
+            "eventID": "evt-agg",
+            "eventName": event_name,
+            "eventSource": "aws:dynamodb",
+            "dynamodb": {
+                "ApproximateCreationDateTime": 1_754_265_600.0,
+                "SequenceNumber": "seq-agg",
+                "SizeBytes": 20,
+                "StreamViewType": "NEW_AND_OLD_IMAGES",
+                "NewImage": new_image,
+                "OldImage": old_image,
+            }
+        }]
+    })
+}
+
+#[tokio::test]
+async fn stream_publishes_status_change_on_transition() {
+    let h = harness().await;
+    let event = dynamodb_agg_event("MODIFY", Some("delivered"), Some("sent"));
+
+    let result = invoke(h.state.clone(), event).await.unwrap();
+
+    assert_eq!(result, json!({ "batchItemFailures": [] }));
+    let published = h.fake().published.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].detail_type, "message.status.changed");
+    assert_eq!(published[0].detail["schemaVersion"], 1);
+    assert_eq!(published[0].detail["meta"]["messageId"], "agg-1");
+    assert_eq!(published[0].detail["status"]["current"], "delivered");
+}
+
+#[tokio::test]
+async fn stream_publishes_initial_status_on_aggregate_insert() {
+    let h = harness().await;
+    let event = dynamodb_agg_event("INSERT", Some("sent"), None);
+
+    invoke(h.state.clone(), event).await.unwrap();
+
+    let published = h.fake().published.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].detail_type, "message.status.changed");
+    assert_eq!(published[0].detail["status"]["current"], "sent");
+}
+
+#[tokio::test]
+async fn stream_skips_status_event_when_status_unchanged() {
+    let h = harness().await;
+    // An open/click bumped counts but left current_status at "delivered".
+    let event = dynamodb_agg_event("MODIFY", Some("delivered"), Some("delivered"));
+
+    let result = invoke(h.state.clone(), event).await.unwrap();
+
+    assert_eq!(result, json!({ "batchItemFailures": [] }));
+    assert!(h.fake().published.lock().unwrap().is_empty());
+}
