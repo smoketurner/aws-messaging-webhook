@@ -48,10 +48,20 @@ Parameters:
       TTL (days) for the per-message aggregate item. Kept separate from — and
       typically longer than — RawEventRetentionDays so a message's rolled-up
       current state outlives its bulky raw event items.
+  ConsumerAccountIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      12-digit AWS account ids allowed to assume the read-only consumer role and
+      query the events table directly (e.g. to fetch a record whose EventBridge
+      payload was omitted for size). Empty (the default) creates no role and
+      grants no cross-account access.
 
 Conditions:
   IsProd: !Equals [!Ref Stage, prod]
   HasOptOutList: !Not [!Equals [!Ref OptOutListName, ""]]
+  # A CommaDelimitedList defaulting to "" yields a single empty-string element.
+  HasConsumers: !Not [!Equals [!Select [0, !Ref ConsumerAccountIds], ""]]
 
 Resources:
   WebhookFunction:
@@ -190,6 +200,36 @@ Resources:
       QueueName: !Sub "${AWS::StackName}-publish-dlq"
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
+
+  # Read-only role for downstream consumers in other AWS accounts: assume it,
+  # then GetItem the AGG item or Query pk = MSG#<messageId> to fetch a record
+  # whose EventBridge payload was omitted for size, or a message's full
+  # timeline. Base-table reads only — no write, no Scan, and no access to the
+  # internal ReconcileIndex (scoped to the table ARN, not index ARNs).
+  ConsumerReadRole:
+    Type: AWS::IAM::Role
+    Condition: HasConsumers
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-consumer-read"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref ConsumerAccountIds
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadEvents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadMessageItems
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                Resource: !GetAtt EventsTable.Arn
 
   # Notification deliveries (fresh or duplicate) accepted by the request path.
   MessagesReceivedFilter:
@@ -337,3 +377,7 @@ Outputs:
   PublishDlqUrl:
     Description: SQS DLQ for stream-relay events that exhausted their publish retries.
     Value: !Ref PublishDlq
+  ConsumerReadRoleArn:
+    Condition: HasConsumers
+    Description: Role ARN for downstream consumers to assume for read-only table access.
+    Value: !GetAtt ConsumerReadRole.Arn
