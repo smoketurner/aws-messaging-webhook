@@ -142,6 +142,7 @@ destination (SQS) on the function.
 | `AggregateRetentionDays` | `365` | DynamoDB TTL for the per-message aggregate item; kept longer than raw events so current state outlives them |
 | `LogLevel` | `INFO` | `TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR` |
 | `LogRetentionDays` | `30` | CloudWatch log retention |
+| `ConsumerAccountIds` | *(empty)* | Comma-separated 12-digit account ids allowed to assume the read-only consumer role (see [Consumer read access](#consumer-read-access)); empty grants none |
 
 ### Deployment contract
 
@@ -224,6 +225,22 @@ One DynamoDB table (`TableName` output):
 
 A message's full timeline is one `Query` on `pk`; its current state is one `GetItem` on
 `pk` + `AGG`.
+
+### Consumer read access
+
+When an EventBridge detail is published with `payloadOmitted` (over the 256 KB entry limit),
+or a consumer wants a message's full timeline, it fetches directly from DynamoDB. Cross-account
+consumers get read access through a role, not raw table grants: set `ConsumerAccountIds` to the
+12-digit account ids at deploy time and the stack creates `<stack-name>-consumer-read`
+(`ConsumerReadRoleArn` output), a role those accounts may assume. It allows `GetItem` /
+`BatchGetItem` / `Query` on the table only — no writes, no `Scan`, and no access to internal
+indexes. A consumer assumes the role, then:
+
+- current state: `GetItem` on `pk = MSG#<messageId>`, `sk = AGG`
+- full timeline: `Query` on `pk = MSG#<messageId>`
+
+`meta.messageId` on every published detail is the `<messageId>`. Empty `ConsumerAccountIds`
+(the default) creates no role and grants no cross-account access.
 
 ## Operations
 
