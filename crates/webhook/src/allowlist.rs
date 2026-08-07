@@ -74,25 +74,29 @@ fn arn_account(topic_arn: &str) -> Option<&str> {
 /// in order, anchored at both ends.
 pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     let segments: Vec<&str> = pattern.split('*').collect();
-    let [only] = segments.as_slice() else {
-        let mut rest = value;
-        let first = segments[0];
-        let Some(after_first) = rest.strip_prefix(first) else {
+    // `str::split` always yields at least one segment. Peel the anchored first
+    // and (when a `*` is present) last segment via split_first / split_last,
+    // so no manual index arithmetic can run off the ends.
+    let Some((first, tail)) = segments.split_first() else {
+        return pattern == value; // unreachable: split yields >= 1 segment
+    };
+    let Some((last, middles)) = tail.split_last() else {
+        return *first == value; // no `*`: a single literal segment
+    };
+    let Some(mut rest) = value.strip_prefix(*first) else {
+        return false;
+    };
+    // Interior fixed segments must appear in order between the anchors.
+    for middle in middles {
+        if middle.is_empty() {
+            continue;
+        }
+        let Some(index) = rest.find(*middle) else {
             return false;
         };
-        rest = after_first;
-        for middle in &segments[1..segments.len() - 1] {
-            if middle.is_empty() {
-                continue;
-            }
-            let Some(index) = rest.find(middle) else {
-                return false;
-            };
-            rest = &rest[index + middle.len()..];
-        }
-        return rest.ends_with(segments[segments.len() - 1]);
-    };
-    *only == value
+        rest = &rest[index + middle.len()..];
+    }
+    rest.ends_with(*last)
 }
 
 #[cfg(test)]

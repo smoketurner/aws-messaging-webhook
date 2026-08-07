@@ -46,6 +46,28 @@ fn image_num(image: &Item, key: &str) -> Option<i64> {
     }
 }
 
+/// Whether a stream record's outcome should recruit an `EventSourceMapping`
+/// retry. Names the two-state contract the per-record publishers return so the
+/// retry semantics are explicit at the call site rather than encoded in a
+/// unit `Result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayOutcome {
+    /// Published, or deterministically skipped (reconstruction failure, no-op,
+    /// not a status transition) — do not retry.
+    Settled,
+    /// Transient publish failure — return this record's sequence number in
+    /// `batchItemFailures` so only it is redelivered.
+    Retry,
+}
+
+/// Inserts `key: value` into a JSON object only when the value is present,
+/// keeping the status snapshot free of null fields.
+fn insert_opt(target: &mut Value, key: &str, value: Option<impl Into<Value>>) {
+    if let Some(value) = value {
+        target[key] = value.into();
+    }
+}
+
 /// Handles one DynamoDB stream invocation, publishing each newly-inserted
 /// event item. Returns the `ReportBatchItemFailures` response so the
 /// event-source mapping retries only the records whose publish failed.
@@ -83,9 +105,9 @@ pub async fn handle_stream<T: Services>(
         } else {
             continue;
         };
-        // Err(()) is a transient publish failure to retry; reconstruction /
-        // no-op cases return Ok and are skipped.
-        if published.is_err()
+        // Reconstruction / no-op cases settle without a retry; only a
+        // transient publish failure recruits redelivery of this record.
+        if published == RelayOutcome::Retry
             && let Some(sequence_number) = sequence_number
         {
             failures.push(json!({ "itemIdentifier": sequence_number }));
@@ -95,16 +117,17 @@ pub async fn handle_stream<T: Services>(
     Ok(json!({ "batchItemFailures": failures }))
 }
 
-/// Publishes one event-item image. `Err(())` means a transient publish failure
-/// to retry; a deterministic reconstruction failure is logged and returns `Ok`
-/// so it is skipped rather than retried forever.
-async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Result<(), ()> {
+/// Publishes one event-item image. Returns [`RelayOutcome::Retry`] on a
+/// transient publish failure; a deterministic reconstruction failure is logged
+/// and returns [`RelayOutcome::Settled`] so it is skipped rather than retried
+/// forever.
+async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
     let Some(AttributeValue::B(raw_body)) = image.get("raw_body") else {
         tracing::error!(
             event = "stream_missing_raw_body",
             "event item has no binary raw_body"
         );
-        return Ok(());
+        return RelayOutcome::Settled;
     };
     let envelope: SnsEnvelope = match serde_json::from_slice(raw_body) {
         Ok(envelope) => envelope,
@@ -114,7 +137,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Resul
                 event = "stream_bad_envelope",
                 "stored raw_body is not an SNS envelope"
             );
-            return Ok(());
+            return RelayOutcome::Settled;
         }
     };
 
@@ -145,7 +168,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Resul
                 outcome = "published",
                 "event published to EventBridge"
             );
-            Ok(())
+            RelayOutcome::Settled
         }
         Err(error) => {
             tracing::error!(
@@ -154,7 +177,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Resul
                 event = "publish_failure",
                 "failed to publish to EventBridge; will retry"
             );
-            Err(())
+            RelayOutcome::Retry
         }
     }
 }
@@ -164,48 +187,58 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Resul
 /// MODIFY that changes it. Count-only bumps (opens/clicks leave `current_status`
 /// untouched) produce no event. Carries the rolled-up snapshot so consumers get
 /// the authoritative status without re-deriving precedence. Same retry contract
-/// as `publish_record`: `Err(())` = transient publish failure to retry.
+/// as `publish_record`: [`RelayOutcome::Retry`] on a transient publish failure.
 async fn publish_status_changed<T: Services>(
     state: &AppState<T>,
     new_image: &Item,
     old_image: &Item,
-) -> Result<(), ()> {
+) -> RelayOutcome {
     let Some(current) = image_str(new_image, "current_status") else {
-        return Ok(()); // aggregate carries no status yet (e.g. only open/click counts)
+        return RelayOutcome::Settled; // no status yet (e.g. only open/click counts)
     };
     if image_str(old_image, "current_status") == Some(current) {
-        return Ok(()); // not a status transition — skip the count-only change
+        return RelayOutcome::Settled; // not a status transition — count-only change
     }
     let Some(message_id) = image_str(new_image, "pk").and_then(|pk| pk.strip_prefix("MSG#")) else {
         tracing::error!(
             event = "stream_agg_missing_pk",
             "aggregate item has no MSG# pk"
         );
-        return Ok(());
+        return RelayOutcome::Settled;
     };
 
     let mut status = json!({ "current": current });
-    if let Some(bounce_type) = image_str(new_image, "bounce_type") {
-        status["bounceType"] = json!(bounce_type);
-    }
-    if let Some(first_event_at) = image_str(new_image, "first_event_at") {
-        status["firstEventAt"] = json!(first_event_at);
-    }
-    if let Some(last_event_at) = image_str(new_image, "last_event_at") {
-        status["lastEventAt"] = json!(last_event_at);
-    }
-    if let Some(open_count) = image_num(new_image, "open_count") {
-        status["openCount"] = json!(open_count);
-    }
-    if let Some(click_count) = image_num(new_image, "click_count") {
-        status["clickCount"] = json!(click_count);
-    }
-    if let Some(bot_open_count) = image_num(new_image, "bot_open_count") {
-        status["botOpenCount"] = json!(bot_open_count);
-    }
-    if let Some(bot_click_count) = image_num(new_image, "bot_click_count") {
-        status["botClickCount"] = json!(bot_click_count);
-    }
+    insert_opt(
+        &mut status,
+        "bounceType",
+        image_str(new_image, "bounce_type"),
+    );
+    insert_opt(
+        &mut status,
+        "firstEventAt",
+        image_str(new_image, "first_event_at"),
+    );
+    insert_opt(
+        &mut status,
+        "lastEventAt",
+        image_str(new_image, "last_event_at"),
+    );
+    insert_opt(&mut status, "openCount", image_num(new_image, "open_count"));
+    insert_opt(
+        &mut status,
+        "clickCount",
+        image_num(new_image, "click_count"),
+    );
+    insert_opt(
+        &mut status,
+        "botOpenCount",
+        image_num(new_image, "bot_open_count"),
+    );
+    insert_opt(
+        &mut status,
+        "botClickCount",
+        image_num(new_image, "bot_click_count"),
+    );
 
     let webhook_path = image_str(new_image, "source")
         .and_then(Source::from_label)
@@ -227,7 +260,7 @@ async fn publish_status_changed<T: Services>(
                 outcome = "status_published",
                 "published message.status.changed"
             );
-            Ok(())
+            RelayOutcome::Settled
         }
         Err(error) => {
             tracing::error!(
@@ -236,7 +269,7 @@ async fn publish_status_changed<T: Services>(
                 event = "publish_failure",
                 "failed to publish status change; will retry"
             );
-            Err(())
+            RelayOutcome::Retry
         }
     }
 }
