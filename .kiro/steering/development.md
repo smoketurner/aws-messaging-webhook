@@ -54,7 +54,7 @@ In debug builds, set `SNS_CERT_HOST_OVERRIDE` to point at a local fake SNS for t
 sam build --config-env dev && sam deploy --config-env dev
 ```
 
-Key parameters: `Stage`, `AllowedTopics`, `AutoResubscribe`, `OptOutListName`, `EventSource`, `RawEventRetentionDays`, `LogLevel`, `LogRetentionDays`.
+Key parameters: `Stage`, `AllowedTopics`, `AutoResubscribe`, `OptOutListName`, `EventSource`, `RawEventRetentionDays`, `AggregateRetentionDays`, `LogLevel`, `LogRetentionDays`, `ConsumerAccountIds`. See the README parameter table for defaults and notes.
 
 ## End-to-end verification (deployed stack)
 
