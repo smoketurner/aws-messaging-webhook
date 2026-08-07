@@ -41,7 +41,7 @@ inclusion: auto
 
 Single table with two item types sharing the same partition key:
 - **Event items** - `pk = MSG#<messageId>`, `sk = EVT#<timestamp>#<snsMessageId>`: raw body, parse metadata, TTL; each insert is what the stream relay publishes
-- **Aggregate item** - same `pk`, `sk = AGG`: current_status, first/last_event_at, open_count, click_count, bounce_type
+- **Aggregate item** - same `pk`, `sk = AGG`: current_status, first/last_event_at, open_count, click_count, bot_open_count, bot_click_count (opens/clicks SES flags isBotEvent=Likely), bounce_type
 
 ## Services trait
 
