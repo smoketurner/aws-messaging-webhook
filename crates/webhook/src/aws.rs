@@ -14,7 +14,7 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use crate::actions::{ActionError, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason};
 use crate::config::Config;
 use crate::model::DomainEvent;
-use crate::model::ses_notification::SesBounce;
+use crate::model::ses_notification::{SesBounce, SesEngagement};
 use crate::publish::{OutboundEvent, PublishError, PublishEvents};
 use crate::store::{EventRecord, EventStore, PersistOutcome, StoreError};
 
@@ -124,12 +124,22 @@ fn aggregate_update(
             }
             "Open" => {
                 set_clauses.push("last_opened_at = :ts");
-                add_clause = Some("open_count :one");
+                // SES's isBotEvent (Likely) routes automated opens to a
+                // separate counter so human engagement stays uncontaminated.
+                add_clause = Some(if event.open.as_ref().is_some_and(SesEngagement::is_bot) {
+                    "bot_open_count :one"
+                } else {
+                    "open_count :one"
+                });
                 None
             }
             "Click" => {
                 set_clauses.push("last_clicked_at = :ts");
-                add_clause = Some("click_count :one");
+                add_clause = Some(if event.click.as_ref().is_some_and(SesEngagement::is_bot) {
+                    "bot_click_count :one"
+                } else {
+                    "click_count :one"
+                });
                 None
             }
             _ => None,
@@ -463,9 +473,38 @@ mod tests {
     }
 
     #[test]
+    fn bot_open_routes_to_bot_counter() {
+        let (expr, _) = expression_for(
+            r#"{"eventType":"Open","mail":{"messageId":"m"},"open":{"isBotEvent":"Likely"}}"#,
+        );
+        assert!(expr.contains("ADD bot_open_count :one"));
+        assert!(!expr.contains("ADD open_count"));
+        assert!(expr.contains("last_opened_at = :ts"));
+    }
+
+    #[test]
+    fn unlikely_open_stays_on_the_human_counter() {
+        let (expr, _) = expression_for(
+            r#"{"eventType":"Open","mail":{"messageId":"m"},"open":{"isBotEvent":"Unlikely"}}"#,
+        );
+        assert!(expr.contains("ADD open_count :one"));
+        assert!(!expr.contains("bot_open_count"));
+    }
+
+    #[test]
     fn click_event_increments_click_count() {
         let (expr, _) = expression_for(r#"{"eventType":"Click","mail":{"messageId":"m"}}"#);
         assert!(expr.contains("ADD click_count :one"));
+        assert!(expr.contains("last_clicked_at = :ts"));
+    }
+
+    #[test]
+    fn bot_click_routes_to_bot_counter() {
+        let (expr, _) = expression_for(
+            r#"{"eventType":"Click","mail":{"messageId":"m"},"click":{"isBotEvent":"Likely"}}"#,
+        );
+        assert!(expr.contains("ADD bot_click_count :one"));
+        assert!(!expr.contains("ADD click_count"));
         assert!(expr.contains("last_clicked_at = :ts"));
     }
 

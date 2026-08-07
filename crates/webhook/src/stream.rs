@@ -200,6 +200,12 @@ async fn publish_status_changed<T: Services>(
     if let Some(click_count) = image_num(new_image, "click_count") {
         status["clickCount"] = json!(click_count);
     }
+    if let Some(bot_open_count) = image_num(new_image, "bot_open_count") {
+        status["botOpenCount"] = json!(bot_open_count);
+    }
+    if let Some(bot_click_count) = image_num(new_image, "bot_click_count") {
+        status["botClickCount"] = json!(bot_click_count);
+    }
 
     let webhook_path = image_str(new_image, "source")
         .and_then(Source::from_label)

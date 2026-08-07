@@ -206,10 +206,19 @@ so consumers can track the authoritative rolled-up status without re-deriving pr
     "current": "delivered",   // bounced | complained | failed | received | sent | …
     "bounceType": "…",         // present on a bounce
     "firstEventAt": "…", "lastEventAt": "…",
-    "openCount": 0, "clickCount": 0
+    "openCount": 0, "clickCount": 0,
+    "botOpenCount": 0, "botClickCount": 0
   }
 }
 ```
+
+Open and click counts are split by SES's `isBotEvent` signal: an interaction SES
+flags `Likely` bot-generated (Apple Mail Privacy Protection prefetch, security
+scanners) accrues to `botOpenCount` / `botClickCount`, and everything else —
+including events that predate the feature and carry no `isBotEvent` — accrues to
+the human `openCount` / `clickCount`. Consumers wanting the raw signal per event
+read `detail.event.open.isBotEvent` (or `.click.isBotEvent`) off the `ses.open` /
+`ses.click` detail, which is forwarded verbatim.
 
 ## Data model
 
@@ -219,7 +228,8 @@ One DynamoDB table (`TableName` output):
   raw body received, parse metadata, TTL via `expires_at` (`RawEventRetentionDays`, default 30).
   The insert of each event item is what the stream relay turns into an EventBridge publish.
 - **Aggregate item** — same `pk`, `sk = AGG`: `current_status`, `first/last_event_at`,
-  `open_count`, `last_opened_at`, `click_count`, `last_clicked_at`, `bounce_type`. Its TTL
+  `open_count`, `last_opened_at`, `click_count`, `last_clicked_at`, `bot_open_count`,
+  `bot_click_count` (opens/clicks SES flags `isBotEvent=Likely`), `bounce_type`. Its TTL
   (`AggregateRetentionDays`, default 365) is kept longer than the raw events' so the rolled-up
   current state outlives them.
 
