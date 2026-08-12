@@ -257,13 +257,16 @@ indexes. A consumer assumes the role, then:
 - Structured JSON logs; one INFO line per message. The request path logs an `outcome`
   (`persisted|duplicate|confirmed|resubscribed`) and `action`; the stream relay logs
   `outcome=published` per event emitted to EventBridge.
-- CloudWatch metrics (namespace = stack name) via log metric filters: `MessagesReceived`
-  (request-path deliveries: persisted + duplicate), `SignatureRejections`,
-  `AllowlistRejections`, `UnclassifiedPayloads` (events forwarded as `unknown` — a sustained
-  rate means a new AWS event shape or junk on a topic), `Duplicates`, `EventsPublished` (from
-  the stream relay), `PublishFailures` (a relay publish that will be retried), `InternalErrors`,
-  `ActionFailures`, `Resubscribes`, and `SubscriptionsLost` (alarm on this — a subscription was
-  cancelled and, with `AutoResubscribe=false`, not re-attached). Also alarm on the native
+- CloudWatch metrics (namespace = stack name) emitted inline via CloudWatch Embedded Metrics
+  Format (EMF): `MessagesReceived` (request-path deliveries: persisted + duplicate),
+  `SignatureRejections`, `AllowlistRejections`, `UnclassifiedPayloads` (events forwarded as
+  `unknown` — a sustained rate means a new AWS event shape or junk on a topic), `Duplicates`,
+  `EventsPublished` (from the stream relay), `PublishFailures` (a relay publish that will be
+  retried), `InternalErrors`, `ActionFailures`, `Resubscribes`, `SubscriptionsLost` (alarm on
+  this — a subscription was cancelled and, with `AutoResubscribe=false`, not re-attached),
+  `ColdStart` (Count = 1 on the first invocation of a new execution environment), and
+  `Latency` (histogram, milliseconds per invocation — CloudWatch derives p50/p90/p99). All
+  metrics carry a `function` dimension (the Lambda function name). Also alarm on the native
   Lambda stream `IteratorAge` and the `PublishDlq` queue depth (`PublishDlqUrl` output): a
   non-empty DLQ means events exhausted their publish retries.
 - The request path and the stream relay have independent durability. A transient failure in the

@@ -52,6 +52,10 @@ base64 = { version = "=0.23.0", default-features = false }
 url = { version = "=2.5.8", default-features = false }
 reqwest = { version = "=0.13.4", default-features = false }
 
+# Observability
+metrics = { version = "=0.24.6", default-features = false }
+metrics_cloudwatch_embedded = { version = "=0.10.0", default-features = false }
+
 # Errors and logging
 thiserror = { version = "=2.0.19", default-features = false }
 anyhow = { version = "=1.0.104", default-features = false }

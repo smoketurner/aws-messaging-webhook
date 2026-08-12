@@ -50,3 +50,34 @@ Cross-account consumers read the store through an assumable role, not raw table 
 ## Services trait
 
 `state.rs` defines the `Services` trait aggregating `EventStore + PublishEvents + SmsVoiceApi + SesApi`. All downstream calls go through this trait so handler tests stay AWS-free using `FakeServices`.
+
+## Observability (metrics)
+
+Metrics are emitted via CloudWatch Embedded Metrics Format (EMF) using the [`metrics`](https://crates.io/crates/metrics) facade backed by [`metrics_cloudwatch_embedded`](https://crates.io/crates/metrics_cloudwatch_embedded). The collector is initialized once in `main.rs` and flushed to stdout at the end of every Lambda invocation in `entry.rs`; CloudWatch extracts metric datapoints directly from the structured JSON log line.
+
+- **Module:** `metrics.rs` — `init()` sets up the global recorder; `names` submodule holds all metric name constants
+- **Namespace:** the deployed stack name (`STACK_NAME` env var), matching the namespace previously used by log metric filters
+- **Dimension:** `function` (the Lambda function name) on every metric
+- **Flush:** end of each invocation in `entry::run`, before the execution environment freezes
+
+### Metric catalog
+
+| Name | Type | Emitted from | Meaning |
+|---|---|---|---|
+| `ColdStart` | Count | library (first invocation only) | New execution environment started |
+| `Latency` | Histogram (ms) | `entry.rs` | Wall-clock time of `dispatch()` per invocation |
+| `MessagesReceived` | Count | `sns/mod.rs` | Request-path deliveries (persisted + duplicate) |
+| `Duplicates` | Count | `sns/mod.rs` | SNS redeliveries (subset of MessagesReceived) |
+| `SignatureRejections` | Count | `error.rs` | Permanent verification failures (4xx) |
+| `AllowlistRejections` | Count | `error.rs` | Topic not in allowlist |
+| `InternalErrors` | Count | `error.rs` | Transient infra failures (5xx, recruits retry) |
+| `UnclassifiedPayloads` | Count | `sns/mod.rs` | Payload matched no known family (forwarded as `unknown`) |
+| `ActionFailures` | Count | `sns/mod.rs` | Permanent lifecycle action failure |
+| `EventsPublished` | Count | `stream.rs` | Successful EventBridge publishes (relay) |
+| `PublishFailures` | Count | `stream.rs` | Failed publishes (will retry via stream ESM) |
+| `Resubscribes` | Count | `sns/mod.rs` | Auto-re-subscribe after abuse |
+| `SubscriptionsLost` | Count | `sns/mod.rs` | Subscription cancelled, not re-attached (alarm on this) |
+
+### Testing note
+
+In tests, no global recorder is installed. `metrics::counter!` / `metrics::histogram!` calls no-op when the recorder is absent — this is by design in the `metrics` facade, so no test code changes are needed.

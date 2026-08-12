@@ -25,6 +25,7 @@
 //! keeping all signed field values verbatim.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -33,10 +34,12 @@ use lambda_http::aws_lambda_events::apigw::ApiGatewayV2httpRequest;
 use lambda_http::request::LambdaRequest;
 use lambda_http::tower::ServiceExt as _;
 use lambda_http::{Adapter, Context, LambdaEvent, lambda_runtime, service_fn};
+use metrics_cloudwatch_embedded::Collector;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::app;
+use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
 use crate::state::{AppState, Services};
@@ -62,12 +65,28 @@ pub struct SnsRecord {
 /// # Errors
 ///
 /// Returns an error if the runtime cannot start or its event loop fails.
-pub async fn run<T: Services>(state: Arc<AppState<T>>) -> Result<(), lambda_http::Error> {
+pub async fn run<T: Services>(
+    state: Arc<AppState<T>>,
+    collector: &'static Collector,
+) -> Result<(), lambda_http::Error> {
     let router = app(Arc::clone(&state));
     // Boxing keeps the per-invoke future off the stack and caps the type
     // nesting the compiler must lay out (runtime → dispatch → router).
     lambda_runtime::run(service_fn(move |event: LambdaEvent<Value>| {
-        Box::pin(dispatch(Arc::clone(&state), router.clone(), event))
+        let state = Arc::clone(&state);
+        let router = router.clone();
+        Box::pin(async move {
+            let start = Instant::now();
+            let result = dispatch(state, router, event).await;
+            // Record per-invocation latency as a histogram (milliseconds).
+            // CloudWatch will compute p50/p90/p99 from the EMF values.
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            metrics::histogram!(names::LATENCY).record(elapsed_ms);
+            // Flush EMF metrics to stdout at the end of every invocation so
+            // CloudWatch extracts them before the execution environment freezes.
+            let _flush = collector.flush(std::io::stdout());
+            result
+        })
     }))
     .await
 }
