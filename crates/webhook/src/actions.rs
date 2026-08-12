@@ -7,6 +7,7 @@
 use std::future::Future;
 
 use crate::model::DomainEvent;
+use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Services};
 
 /// How an action failure affects the request, per the SNS retry contract.
@@ -135,6 +136,42 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
     }
 }
 
+/// Suppresses each recipient independently. `PutSuppressedDestination` is
+/// called once per recipient, so a failure for one address (e.g. SES
+/// `BadRequestException` for a malformed email in the bounce metadata) does
+/// not imply the same failure for the others. A transient failure (throttling,
+/// 5xx) still fails fast so SNS redelivery re-runs the idempotent action for
+/// every recipient; a permanent failure is logged with recipient context and
+/// the remaining recipients are still attempted.
+async fn suppress_recipients<T: Services>(
+    state: &AppState<T>,
+    recipients: &[SesRecipient],
+    reason: SuppressionReason,
+) -> Result<(), ActionError> {
+    for recipient in recipients {
+        match state
+            .services
+            .put_suppressed_destination(&recipient.email_address, reason)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => match error.kind {
+                ActionErrorKind::Transient => return Err(error),
+                ActionErrorKind::Permanent => {
+                    tracing::error!(
+                        email = %recipient.email_address,
+                        reason = ?reason,
+                        error = ?error.source,
+                        event = "suppression_failure",
+                        "permanent error suppressing recipient; continuing"
+                    );
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Dispatches whatever lifecycle action the event calls for. Returns the name
 /// of the action taken, for the outcome log line.
 ///
@@ -201,27 +238,17 @@ pub async fn run<T: Services>(
                 if !bounce.is_permanent() {
                     return Ok("none");
                 }
-                for recipient in &bounce.bounced_recipients {
-                    state
-                        .services
-                        .put_suppressed_destination(
-                            &recipient.email_address,
-                            SuppressionReason::Bounce,
-                        )
-                        .await?;
-                }
+                suppress_recipients(state, &bounce.bounced_recipients, SuppressionReason::Bounce)
+                    .await?;
                 return Ok("suppression");
             }
             if let Some(complaint) = &event.complaint {
-                for recipient in &complaint.complained_recipients {
-                    state
-                        .services
-                        .put_suppressed_destination(
-                            &recipient.email_address,
-                            SuppressionReason::Complaint,
-                        )
-                        .await?;
-                }
+                suppress_recipients(
+                    state,
+                    &complaint.complained_recipients,
+                    SuppressionReason::Complaint,
+                )
+                .await?;
                 return Ok("suppression");
             }
             Ok("none")
