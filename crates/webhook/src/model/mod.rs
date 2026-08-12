@@ -167,6 +167,17 @@ impl DomainEvent {
         }
     }
 
+    /// The id of the outbound message this event is replying to, if any.
+    /// Currently only populated for inbound SMS that carries a
+    /// `previousPublishedMessageId`.
+    #[must_use]
+    pub fn previous_message_id(&self) -> Option<&str> {
+        match self {
+            Self::SmsInbound { event, .. } => event.previous_published_message_id.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The event payload as forwarded to EventBridge.
     #[must_use]
     pub fn payload(&self) -> &Value {
@@ -246,6 +257,27 @@ mod tests {
         assert_eq!(event.family(), None);
         assert_eq!(event.detail_type(), "unknown");
         assert_eq!(event.aggregate_id("sns-9"), "sns-9");
+    }
+
+    #[test]
+    fn previous_message_id_present_on_sms_reply() {
+        let event = DomainEvent::classify(
+            r#"{"originationNumber":"+1","inboundMessageId":"in-1","previousPublishedMessageId":"out-99"}"#,
+        );
+        assert_eq!(event.previous_message_id(), Some("out-99"));
+    }
+
+    #[test]
+    fn previous_message_id_absent_on_unsolicited_sms() {
+        let event =
+            DomainEvent::classify(r#"{"originationNumber":"+1","inboundMessageId":"in-2"}"#);
+        assert_eq!(event.previous_message_id(), None);
+    }
+
+    #[test]
+    fn previous_message_id_absent_on_non_sms_events() {
+        let event = DomainEvent::classify(r#"{"eventType":"Delivery","mail":{"messageId":"m-1"}}"#);
+        assert_eq!(event.previous_message_id(), None);
     }
 
     #[test]

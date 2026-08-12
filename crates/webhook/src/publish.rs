@@ -46,7 +46,7 @@ fn detail_bytes(detail: &Value) -> usize {
 /// always remains in the DynamoDB raw record.
 #[must_use]
 pub fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
-    let meta = json!({
+    let mut meta = json!({
         "snsMessageId": record.sns_message_id,
         "messageId": record.aggregate_id,
         "topicArn": record.topic_arn,
@@ -56,6 +56,12 @@ pub fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEven
         // SNS → Lambda delivery never had one.
         "webhookPath": record.source.map(Source::webhook_path),
     });
+    // Conversation threading: if the inbound event is a reply to a previously
+    // sent message, surface the correlation id so consumers can link the two
+    // without parsing the event payload.
+    if let Some(prev) = event.previous_message_id() {
+        meta["previousMessageId"] = Value::String(prev.to_owned());
+    }
     let mut detail =
         json!({ "schemaVersion": SCHEMA_VERSION, "meta": meta, "event": event.payload() });
 
@@ -179,5 +185,46 @@ mod tests {
         assert_eq!(out.detail["event"]["payloadOmitted"], json!(true));
         // Meta is always preserved so consumers can fetch the full record.
         assert_eq!(out.detail["meta"]["messageId"], "agg-1");
+    }
+
+    #[test]
+    fn sms_inbound_reply_includes_previous_message_id_in_meta() {
+        let message = json!({
+            "originationNumber": "+14255550182",
+            "destinationNumber": "+12125550101",
+            "messageKeyword": "REPLY",
+            "messageBody": "Got it, thanks",
+            "inboundMessageId": "cae173d2-66b9-564c-8309-21f858e9fb84",
+            "previousPublishedMessageId": "outbound-msg-001"
+        })
+        .to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&record(Some(Source::SmsInbound), "sms.inbound"), &event);
+        assert_eq!(out.detail["meta"]["previousMessageId"], "outbound-msg-001");
+    }
+
+    #[test]
+    fn sms_inbound_without_previous_message_has_no_previous_in_meta() {
+        let message = json!({
+            "originationNumber": "+14255550182",
+            "inboundMessageId": "abc-123"
+        })
+        .to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&record(Some(Source::SmsInbound), "sms.inbound"), &event);
+        // previousMessageId should be absent (not null) when there's no prior message.
+        assert!(out.detail["meta"].get("previousMessageId").is_none());
+    }
+
+    #[test]
+    fn non_sms_events_have_no_previous_message_id_in_meta() {
+        let message = json!({
+            "eventType": "Delivery",
+            "mail": {"messageId": "m-1"}
+        })
+        .to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&record(Some(Source::SesEvents), "ses.delivery"), &event);
+        assert!(out.detail["meta"].get("previousMessageId").is_none());
     }
 }
