@@ -1,0 +1,19 @@
+{
+  "Records": [
+    {
+      "EventSource": "aws:sns",
+      "EventVersion": "1.0",
+      "Sns": {
+        "Type": "Notification",
+        "MessageId": "example-sns-message-id-001",
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:sms-inbound",
+        "Timestamp": "2026-08-12T12:00:00.000Z",
+        "Message": "{\"messageBody\":\"Hello from a phone\",\"destinationPhoneNumber\":\"+15555550100\",\"originationPhoneNumber\":\"+15555550199\",\"messageKeyword\":\"KEYWORD\",\"previousPublishedMessageId\":\"example-previous-id\"}",
+        "SignatureVersion": "2",
+        "Signature": "EXAMPLE",
+        "SigningCertUrl": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-example.pem",
+        "Subject": null
+      }
+    }
+  ]
+}

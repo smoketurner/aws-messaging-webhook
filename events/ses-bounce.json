@@ -1,0 +1,19 @@
+{
+  "Records": [
+    {
+      "EventSource": "aws:sns",
+      "EventVersion": "1.0",
+      "Sns": {
+        "Type": "Notification",
+        "MessageId": "example-sns-message-id-002",
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:ses-events",
+        "Timestamp": "2026-08-12T12:01:00.000Z",
+        "Message": "{\"eventType\":\"Bounce\",\"bounce\":{\"bounceType\":\"Permanent\",\"bounceSubType\":\"General\",\"bouncedRecipients\":[{\"emailAddress\":\"bounce@simulator.amazonses.com\",\"action\":\"failed\",\"status\":\"5.1.1\",\"diagnosticCode\":\"smtp; 550 5.1.1 user unknown\"}],\"timestamp\":\"2026-08-12T12:01:00.000Z\",\"feedbackId\":\"example-feedback-id\"},\"mail\":{\"timestamp\":\"2026-08-12T12:00:00.000Z\",\"messageId\":\"example-ses-message-id\",\"source\":\"sender@example.com\",\"sourceArn\":\"arn:aws:ses:us-east-1:123456789012:identity/example.com\",\"destination\":[\"bounce@simulator.amazonses.com\"]}}",
+        "SignatureVersion": "2",
+        "Signature": "EXAMPLE",
+        "SigningCertUrl": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-example.pem",
+        "Subject": null
+      }
+    }
+  ]
+}

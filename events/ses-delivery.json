@@ -1,0 +1,19 @@
+{
+  "Records": [
+    {
+      "EventSource": "aws:sns",
+      "EventVersion": "1.0",
+      "Sns": {
+        "Type": "Notification",
+        "MessageId": "example-sns-message-id-003",
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:ses-events",
+        "Timestamp": "2026-08-12T12:02:00.000Z",
+        "Message": "{\"eventType\":\"Delivery\",\"delivery\":{\"timestamp\":\"2026-08-12T12:02:00.000Z\",\"processingTimeMillis\":1200,\"recipients\":[\"success@simulator.amazonses.com\"],\"smtpResponse\":\"250 2.0.0 OK\",\"reportingMTA\":\"a1-2.smtp-out.us-east-1.amazonses.com\"},\"mail\":{\"timestamp\":\"2026-08-12T12:00:00.000Z\",\"messageId\":\"example-ses-message-id-2\",\"source\":\"sender@example.com\",\"sourceArn\":\"arn:aws:ses:us-east-1:123456789012:identity/example.com\",\"destination\":[\"success@simulator.amazonses.com\"]}}",
+        "SignatureVersion": "2",
+        "Signature": "EXAMPLE",
+        "SigningCertUrl": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-example.pem",
+        "Subject": null
+      }
+    }
+  ]
+}

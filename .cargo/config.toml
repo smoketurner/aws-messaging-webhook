@@ -1,0 +1,17 @@
+# Dev-build acceleration for macOS (does not affect CI linux builds).
+#
+# Fast linker: uncomment ONE of these after installing the linker.
+# The default Apple linker works fine — these just speed up incremental links.
+#
+# Option A: LLVM lld (brew install llvm)
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
+#
+# Option B: mold (brew install mold) — experimental on macOS
+# [target.aarch64-apple-darwin]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Split debuginfo speeds up linking by not merging DWARF into the binary.
+[profile.dev]
+split-debuginfo = "unpacked"
