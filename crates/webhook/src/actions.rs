@@ -6,6 +6,7 @@
 
 use std::future::Future;
 
+use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Services};
@@ -141,8 +142,9 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
 /// `BadRequestException` for a malformed email in the bounce metadata) does
 /// not imply the same failure for the others. A transient failure (throttling,
 /// 5xx) still fails fast so SNS redelivery re-runs the idempotent action for
-/// every recipient; a permanent failure is logged with recipient context and
-/// the remaining recipients are still attempted.
+/// every recipient; a permanent failure is logged and counted (per recipient,
+/// since these errors never reach the action-level handler that normally
+/// records `ActionFailures`) and the remaining recipients are still attempted.
 async fn suppress_recipients<T: Services>(
     state: &AppState<T>,
     recipients: &[SesRecipient],
@@ -158,6 +160,7 @@ async fn suppress_recipients<T: Services>(
             Err(error) => match error.kind {
                 ActionErrorKind::Transient => return Err(error),
                 ActionErrorKind::Permanent => {
+                    metrics::counter!(names::ACTION_FAILURES).increment(1);
                     tracing::error!(
                         email = %recipient.email_address,
                         reason = ?reason,
