@@ -25,6 +25,7 @@ use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
+use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
 use crate::publish::{OutboundEvent, SCHEMA_VERSION, build_outbound};
 use crate::state::{AppState, Services};
@@ -161,6 +162,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
     let outbound = build_outbound(&record, &event);
     match state.services.publish(&outbound).await {
         Ok(()) => {
+            metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
             tracing::info!(
                 source = record.source_label(),
                 sns_message_id = record.sns_message_id,
@@ -171,6 +173,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
             RelayOutcome::Settled
         }
         Err(error) => {
+            metrics::counter!(names::PUBLISH_FAILURES).increment(1);
             tracing::error!(
                 ?error,
                 sns_message_id = record.sns_message_id,
@@ -254,6 +257,7 @@ async fn publish_status_changed<T: Services>(
     };
     match state.services.publish(&outbound).await {
         Ok(()) => {
+            metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
             tracing::info!(
                 message_id,
                 current_status = current,
@@ -263,6 +267,7 @@ async fn publish_status_changed<T: Services>(
             RelayOutcome::Settled
         }
         Err(error) => {
+            metrics::counter!(names::PUBLISH_FAILURES).increment(1);
             tracing::error!(
                 ?error,
                 message_id,

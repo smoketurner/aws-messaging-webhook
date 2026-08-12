@@ -8,6 +8,7 @@ pub mod aws;
 pub mod config;
 pub mod entry;
 pub mod error;
+pub mod metrics;
 pub mod model;
 pub mod publish;
 pub mod sns;

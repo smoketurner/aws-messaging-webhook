@@ -12,6 +12,7 @@ use sns_message_verifier::{MessageType, SnsEnvelope};
 
 use crate::actions::{self, ActionErrorKind};
 use crate::error::AppError;
+use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
 use crate::publish::{OutboundEvent, SCHEMA_VERSION};
 use crate::sns::extractor::VerifiedSns;
@@ -97,6 +98,7 @@ async fn handle_unsubscribe<T: Services>(
     envelope: &SnsEnvelope,
 ) -> Result<Response, AppError> {
     if !state.config.auto_resubscribe {
+        metrics::counter!(names::SUBSCRIPTIONS_LOST).increment(1);
         tracing::warn!(
             ingress = ingress.as_str(),
             topic_arn = envelope.topic_arn,
@@ -117,6 +119,7 @@ async fn handle_unsubscribe<T: Services>(
         state.dangerous_subscribe_url_prefix.as_deref(),
     )?;
     confirm::get_subscribe_url(&state.http, url).await?;
+    metrics::counter!(names::RESUBSCRIBES).increment(1);
     tracing::warn!(
         ingress = ingress.as_str(),
         topic_arn = envelope.topic_arn,
@@ -163,6 +166,7 @@ async fn process_notification<T: Services>(
             );
         }
     } else {
+        metrics::counter!(names::UNCLASSIFIED_PAYLOADS).increment(1);
         tracing::warn!(
             ingress = ingress.as_str(),
             topic_arn = envelope.topic_arn,
@@ -199,6 +203,7 @@ async fn process_notification<T: Services>(
                 ));
             }
             ActionErrorKind::Permanent => {
+                metrics::counter!(names::ACTION_FAILURES).increment(1);
                 tracing::error!(
                     error = ?error.source,
                     event = "action_failure",
@@ -208,6 +213,11 @@ async fn process_notification<T: Services>(
             }
         },
     };
+
+    metrics::counter!(names::MESSAGES_RECEIVED).increment(1);
+    if outcome == PersistOutcome::Duplicate {
+        metrics::counter!(names::DUPLICATES).increment(1);
+    }
 
     tracing::info!(
         source = record.source_label(),

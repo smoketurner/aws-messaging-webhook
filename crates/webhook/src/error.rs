@@ -2,6 +2,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sns_message_verifier::VerifyError;
 
+use crate::metrics::names;
+
 /// Request-handling failure, mapped onto the SNS retry contract: SNS retries
 /// deliveries on 5xx and treats other 4xx as permanent, so transient
 /// downstream failures MUST be 5xx (to recruit redelivery) and
@@ -65,6 +67,7 @@ impl IntoResponse for AppError {
         let status = self.status();
         match &self {
             Self::TopicNotAllowed(topic_arn) => {
+                metrics::counter!(names::ALLOWLIST_REJECTIONS).increment(1);
                 tracing::warn!(
                     topic_arn,
                     event = "allowlist_rejection",
@@ -75,6 +78,7 @@ impl IntoResponse for AppError {
             // permanent 4xx; a transient cert-fetch 5xx is infrastructure, and
             // must not inflate the signature-rejection metric.
             Self::Verification(error) if status.is_client_error() => {
+                metrics::counter!(names::SIGNATURE_REJECTIONS).increment(1);
                 tracing::error!(
                     error = %error,
                     event = "signature_rejection",
@@ -82,6 +86,7 @@ impl IntoResponse for AppError {
                 );
             }
             Self::Verification(error) => {
+                metrics::counter!(names::INTERNAL_ERRORS).increment(1);
                 tracing::error!(
                     error = %error,
                     event = "internal_error",
@@ -89,6 +94,7 @@ impl IntoResponse for AppError {
                 );
             }
             Self::Internal(error) => {
+                metrics::counter!(names::INTERNAL_ERRORS).increment(1);
                 tracing::error!(
                     error = ?error,
                     event = "internal_error",
