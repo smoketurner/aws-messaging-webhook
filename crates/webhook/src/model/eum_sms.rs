@@ -6,9 +6,9 @@
 use serde::Deserialize;
 
 /// Two-way inbound SMS. Only the fields the pipeline reads are typed; the rest
-/// (destination number, prior message id, …) ride along in the raw JSON that
-/// is persisted and forwarded verbatim. `messageKeyword` carries the matched
-/// registered keyword VERBATIM (e.g. "STOP", "JOIN") — no `KEYWORD_` prefix.
+/// (destination number, …) ride along in the raw JSON that is persisted and
+/// forwarded verbatim. `messageKeyword` carries the matched registered keyword
+/// VERBATIM (e.g. "STOP", "JOIN") — no `KEYWORD_` prefix.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmsInboundMessage {
@@ -18,6 +18,11 @@ pub struct SmsInboundMessage {
     #[serde(default)]
     pub message_body: Option<String>,
     pub inbound_message_id: String,
+    /// The message id of the outbound message this reply is responding to.
+    /// Present only when the inbound is a reply to a previously sent message;
+    /// absent on unsolicited (MO-initiated) contacts.
+    #[serde(default)]
+    pub previous_published_message_id: Option<String>,
 }
 
 /// A configuration-set event (delivery receipt) for SMS (`TEXT_*`), MMS
@@ -89,6 +94,10 @@ mod tests {
             event.inbound_message_id,
             "cae173d2-66b9-564c-8309-21f858e9fb84"
         );
+        assert_eq!(
+            event.previous_published_message_id.as_deref(),
+            Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        );
     }
 
     #[test]
@@ -99,6 +108,7 @@ mod tests {
         .unwrap();
         assert!(event.message_keyword.is_none());
         assert!(event.message_body.is_none());
+        assert!(event.previous_published_message_id.is_none());
     }
 
     #[test]

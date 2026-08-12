@@ -183,6 +183,7 @@ Detail shape:
   "meta": {
     "snsMessageId": "…",
     "messageId": "…",        // aggregate id: query DynamoDB with pk = MSG#<messageId>
+    "previousMessageId": "…", // present only on sms.inbound replies; the outbound message this reply answers
     "topicArn": "…",
     "receivedAt": "…",
     "webhookPath": "/webhooks/ses/events"
@@ -190,6 +191,12 @@ Detail shape:
   "event": { /* the inner AWS payload, verbatim */ }
 }
 ```
+
+`previousMessageId` is present only on `sms.inbound` events where the inbound message is a
+reply to a previously sent outbound message (i.e. the EUM payload carries a
+`previousPublishedMessageId`). Consumers can use it to correlate a reply with the sent message
+that triggered it without parsing the event payload. It is absent (not null) on unsolicited
+inbound contacts and on all other event families.
 
 `schemaVersion` is present on every published detail, including the `subscription.changed`
 event, so consumers have a stable field to switch on as the contract evolves.
