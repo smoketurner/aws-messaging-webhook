@@ -35,6 +35,10 @@ struct FakeServices {
     fail_persist: AtomicBool,
     fail_publish: AtomicBool,
     action_error: Mutex<Option<ActionErrorKind>>,
+    /// Email addresses whose suppression call fails with a permanent error,
+    /// simulating SES `BadRequestException` for a malformed recipient. Other
+    /// recipients still succeed — the action must continue past these.
+    permanent_suppression_failures: Mutex<Vec<String>>,
 }
 
 impl FakeServices {
@@ -124,6 +128,17 @@ impl SesApi for FakeServices {
         reason: SuppressionReason,
     ) -> Result<(), ActionError> {
         self.record(format!("suppress:{email_address}:{reason:?}"));
+        if self
+            .permanent_suppression_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == email_address)
+        {
+            return Err(ActionError::permanent(anyhow!(
+                "simulated permanent suppression failure for {email_address}"
+            )));
+        }
         self.action_result()
     }
 }
@@ -632,6 +647,112 @@ async fn complaint_suppresses_recipients() {
             .calls()
             .contains(&"suppress:c@example.com:Complaint".to_owned())
     );
+}
+
+fn ses_complaint(recipients: &[&str]) -> Value {
+    let complained: Vec<Value> = recipients
+        .iter()
+        .map(|r| json!({"emailAddress": r}))
+        .collect();
+    json!({
+        "notificationType": "Complaint",
+        "complaint": {"complainedRecipients": complained},
+        "mail": {"messageId": "ses-msg-2"}
+    })
+}
+
+/// A permanent per-recipient failure (e.g. SES `BadRequestException` for a
+/// malformed address in the bounce metadata) must not skip the remaining
+/// recipients — each `PutSuppressedDestination` call is independent.
+#[tokio::test]
+async fn permanent_suppression_failure_for_one_bounce_recipient_continues_to_others() {
+    let h = harness().await;
+    h.fake()
+        .permanent_suppression_failures
+        .lock()
+        .unwrap()
+        .push("bad-address".to_owned());
+    let body = wrapped(
+        &h,
+        &ses_bounce(
+            "Permanent",
+            &["a@example.com", "bad-address", "b@example.com"],
+        ),
+    );
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    // A permanent per-recipient failure is logged and swallowed; the event
+    // is still persisted (and published by the stream relay).
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        calls.contains(&"suppress:a@example.com:Bounce".to_owned()),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&"suppress:bad-address:Bounce".to_owned()),
+        "the failing recipient must still be attempted: {calls:?}"
+    );
+    assert!(
+        calls.contains(&"suppress:b@example.com:Bounce".to_owned()),
+        "the recipient after the failure must not be skipped: {calls:?}"
+    );
+    assert!(calls.contains(&"persist:ses-msg-1".to_owned()));
+}
+
+/// The complaint path shares the same per-recipient failure mode as bounces.
+#[tokio::test]
+async fn permanent_suppression_failure_for_one_complaint_recipient_continues_to_others() {
+    let h = harness().await;
+    h.fake()
+        .permanent_suppression_failures
+        .lock()
+        .unwrap()
+        .push("bad-address".to_owned());
+    let body = wrapped(
+        &h,
+        &ses_complaint(&["c@example.com", "bad-address", "d@example.com"]),
+    );
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(calls.contains(&"suppress:c@example.com:Complaint".to_owned()));
+    assert!(calls.contains(&"suppress:bad-address:Complaint".to_owned()));
+    assert!(
+        calls.contains(&"suppress:d@example.com:Complaint".to_owned()),
+        "the recipient after the failure must not be skipped: {calls:?}"
+    );
+}
+
+/// A transient suppression failure (throttling, 5xx) must still fail fast so
+/// SNS redelivery re-runs the idempotent action for every recipient. The
+/// recipient that failed is attempted, but later ones are not — redelivery
+/// will re-attempt the whole batch.
+#[tokio::test]
+async fn transient_suppression_failure_fails_fast_and_returns_500() {
+    let h = harness().await;
+    *h.fake().action_error.lock().unwrap() = Some(ActionErrorKind::Transient);
+    let body = wrapped(
+        &h,
+        &ses_bounce("Permanent", &["a@example.com", "b@example.com"]),
+    );
+
+    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let calls = h.fake().calls();
+    assert!(
+        calls.contains(&"suppress:a@example.com:Bounce".to_owned()),
+        "the first recipient is attempted: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&"suppress:b@example.com:Bounce".to_owned()),
+        "the loop must bail out on the transient error, not continue: {calls:?}"
+    );
+    assert!(calls.contains(&"persist:ses-msg-1".to_owned()));
 }
 
 fn ses_inbound(virus_status: &str, content: Option<&str>) -> Value {
