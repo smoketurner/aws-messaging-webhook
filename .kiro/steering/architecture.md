@@ -72,7 +72,7 @@ Metrics are emitted via CloudWatch Embedded Metrics Format (EMF) using the [`met
 | `AllowlistRejections` | Count | `error.rs` | Topic not in allowlist |
 | `InternalErrors` | Count | `error.rs` | Transient infra failures (5xx, recruits retry) |
 | `UnclassifiedPayloads` | Count | `sns/mod.rs` | Payload matched no known family (forwarded as `unknown`) |
-| `ActionFailures` | Count | `sns/mod.rs` | Permanent lifecycle action failure |
+| `ActionFailures` | Count | `sns/mod.rs`, `actions.rs` | Permanent lifecycle action failure (counted per failed recipient for suppression) |
 | `EventsPublished` | Count | `stream.rs` | Successful EventBridge publishes (relay) |
 | `PublishFailures` | Count | `stream.rs` | Failed publishes (will retry via stream ESM) |
 | `Resubscribes` | Count | `sns/mod.rs` | Auto-re-subscribe after abuse |
