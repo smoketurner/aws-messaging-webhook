@@ -1,0 +1,7 @@
+[check]
+allTargets = true
+allFeatures = true
+command = "clippy"
+
+[diagnostics]
+disabled = ["inactive-code"]

@@ -1,7 +1,7 @@
-# aws-messaging-webhook — developer commands
+# aws-messaging-webhook -- developer commands
 # Run `make help` (or just `make`) to list available targets.
 
-.PHONY: help fmt fmt-check clippy test test-handlers test-verifier deny lint check watch build deploy-dev deploy-prod validate coverage clean prek
+.PHONY: help fmt fmt-check clippy test test-handlers test-verifier deny lint check watch build deploy-dev deploy-prod validate coverage clean install-tools doc prek
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -54,6 +54,24 @@ coverage: ## Generate code coverage report (HTML)
 
 clean: ## Remove build artifacts
 	cargo clean
+
+install-tools: ## Install dev toolchain (cargo-lambda, cargo-deny, cargo-llvm-cov, prek)
+	@echo "Installing cargo-lambda..."
+	cargo install cargo-lambda
+	@echo "Installing cargo-deny..."
+	cargo install cargo-deny
+	@echo "Installing cargo-llvm-cov..."
+	cargo install cargo-llvm-cov
+	@echo "Installing prek..."
+	cargo install prek
+	@echo "Checking for actionlint..."
+	@command -v actionlint >/dev/null 2>&1 || echo "  ⚠ actionlint not found -- install via: brew install actionlint"
+	@echo "Checking for zizmor..."
+	@command -v zizmor >/dev/null 2>&1 || echo "  ⚠ zizmor not found -- install via: cargo install zizmor"
+	@echo "Done. Run 'prek install' to set up git hooks."
+
+doc: ## Generate and open rustdoc
+	cargo doc --workspace --no-deps --open
 
 prek: ## Run pre-commit hooks
 	prek run

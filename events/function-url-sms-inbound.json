@@ -1,0 +1,33 @@
+{
+  "version": "2.0",
+  "routeKey": "$default",
+  "rawPath": "/webhooks/sms/inbound",
+  "rawQueryString": "",
+  "headers": {
+    "content-type": "text/plain; charset=UTF-8",
+    "x-amz-sns-message-type": "Notification",
+    "x-amz-sns-topic-arn": "arn:aws:sns:us-east-1:123456789012:sms-inbound",
+    "host": "abcdef1234.lambda-url.us-east-1.on.aws",
+    "user-agent": "Amazon Simple Notification Service Agent"
+  },
+  "requestContext": {
+    "accountId": "123456789012",
+    "apiId": "abcdef1234",
+    "domainName": "abcdef1234.lambda-url.us-east-1.on.aws",
+    "domainPrefix": "abcdef1234",
+    "http": {
+      "method": "POST",
+      "path": "/webhooks/sms/inbound",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "72.21.198.64",
+      "userAgent": "Amazon Simple Notification Service Agent"
+    },
+    "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "routeKey": "$default",
+    "stage": "$default",
+    "time": "15/Jan/2026:12:00:00 +0000",
+    "timeEpoch": 1768507200000
+  },
+  "body": "{\"Type\":\"Notification\",\"MessageId\":\"a1b2c3d4-e5f6-7890-abcd-111111111111\",\"TopicArn\":\"arn:aws:sns:us-east-1:123456789012:sms-inbound\",\"Subject\":null,\"Message\":\"{\\\"originationNumber\\\":\\\"+15551234567\\\",\\\"destinationNumber\\\":\\\"+15559876543\\\",\\\"messageBody\\\":\\\"Hello from SMS\\\",\\\"messageKeyword\\\":\\\"KEYWORD\\\"}\",\"Timestamp\":\"2026-01-15T12:00:00.000Z\",\"SignatureVersion\":\"2\",\"Signature\":\"EXAMPLE\",\"SigningCertURL\":\"https://sns.us-east-1.amazonaws.com/SimpleNotificationService-xxx.pem\",\"UnsubscribeURL\":\"https://sns.us-east-1.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:us-east-1:123456789012:sms-inbound:a1b2c3d4-e5f6-7890-abcd-222222222222\"}",
+  "isBase64Encoded": false
+}
