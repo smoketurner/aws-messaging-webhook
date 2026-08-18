@@ -234,8 +234,20 @@ Resources:
 
 Outputs:
   WebhookUrl:
-    Description: Base Function URL; append /webhooks/<source> per topic.
+    Description: Base Function URL (trailing slash included).
     Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  SmsInboundEndpoint:
+    Description: Subscribe your EUM two-way SMS inbound topic to this URL.
+    Value: !Sub "${WebhookFunctionUrl.FunctionUrl}webhooks/sms/inbound"
+  SmsEventsEndpoint:
+    Description: Subscribe your EUM configuration-set event destination topic to this URL.
+    Value: !Sub "${WebhookFunctionUrl.FunctionUrl}webhooks/sms/events"
+  SesEventsEndpoint:
+    Description: Subscribe your SES configuration-set event destination topic to this URL.
+    Value: !Sub "${WebhookFunctionUrl.FunctionUrl}webhooks/ses/events"
+  SesInboundEndpoint:
+    Description: Subscribe your SES receipt-rule SNS topic to this URL.
+    Value: !Sub "${WebhookFunctionUrl.FunctionUrl}webhooks/ses/inbound"
   WebhookFunctionArn:
     Description: Function ARN for direct SNS -> Lambda subscriptions.
     Value: !GetAtt WebhookFunction.Arn

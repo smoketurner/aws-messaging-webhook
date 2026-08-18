@@ -90,15 +90,23 @@ sam deploy --config-env dev --parameter-overrides \
 ### Wire up topics
 
 Topics and subscriptions live outside the stack, next to your EUM/SES configuration. To wire
-a topic to the Function URL (the HTTPS pathway), subscribe it to the matching webhook path:
+a topic to the Function URL (the HTTPS pathway), subscribe it to the matching webhook
+endpoint. The stack outputs each endpoint as a ready-to-use URL:
+
+| Output | Subscribe this topic |
+|---|---|
+| `SmsInboundEndpoint` | EUM two-way SMS inbound topic |
+| `SmsEventsEndpoint` | EUM configuration-set event destination topic (delivery receipts) |
+| `SesEventsEndpoint` | SES configuration-set event destination topic (bounce/complaint/…) |
+| `SesInboundEndpoint` | SES receipt-rule SNS topic (inbound email notifications) |
 
 ```bash
-webhook_url=$(aws cloudformation describe-stacks --stack-name aws-messaging-webhook-dev \
-  --query "Stacks[0].Outputs[?OutputKey=='WebhookUrl'].OutputValue" --output text)
+endpoint=$(aws cloudformation describe-stacks --stack-name aws-messaging-webhook-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='SesEventsEndpoint'].OutputValue" --output text)
 aws sns set-topic-attributes --topic-arn <topic-arn> \
   --attribute-name SignatureVersion --attribute-value 2
 aws sns subscribe --topic-arn <topic-arn> --protocol https \
-  --notification-endpoint "${webhook_url%/}/webhooks/<path>"
+  --notification-endpoint "$endpoint"
 ```
 
 The function auto-confirms the subscription: `PendingConfirmation` on the new subscription
