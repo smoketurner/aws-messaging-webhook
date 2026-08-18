@@ -2,11 +2,14 @@
 
 ## Prerequisites
 
-- **Rust** — auto-installed via `rustup` from `rust-toolchain.toml` (1.97.1, edition 2024)
-- **cargo-lambda** — local Lambda execution and SAM builds ([install](https://cargo-lambda.info))
-- **AWS SAM CLI** — deployment ([install](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
-- **prek** — pre-commit hooks ([install](https://github.com/nicholasgasior/prek))
-- **cargo-deny** — supply chain auditing (`cargo install cargo-deny`)
+- **Rust** -- auto-installed via `rustup` from `rust-toolchain.toml` (1.97.1, edition 2024)
+- **cargo-lambda** -- local Lambda execution and SAM builds ([install](https://cargo-lambda.info))
+- **AWS SAM CLI** -- deployment ([install](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
+- **prek** -- pre-commit hooks ([install](https://github.com/nicholasgasior/prek))
+- **cargo-deny** -- supply chain auditing (`cargo install cargo-deny`)
+- **cargo-llvm-cov** -- code coverage (`cargo install cargo-llvm-cov`)
+
+> **Tip:** `make install-tools` installs all required cargo tools (`cargo-deny`, `cargo-llvm-cov`, etc.) at once.
 
 ## Getting started
 
@@ -18,7 +21,7 @@ make check   # fmt + clippy + deny + tests
 
 ## Running tests
 
-No AWS account needed — handler tests use properly signed test fixtures.
+No AWS account needed -- handler tests use properly signed test fixtures.
 
 ```bash
 make test              # all tests
@@ -53,7 +56,7 @@ make lint   # fmt-check + clippy + deny
 
 1. Create a feature branch off `main`
 2. Make changes, run `make check`
-3. Open a PR — CI must pass (lint, test, deny, sam validate, actionlint, zizmor)
+3. Open a PR -- CI must pass (lint, test, deny, sam validate, actionlint, zizmor)
 4. Squash merge to `main`
 
 Never push directly to `main`.
@@ -73,6 +76,16 @@ cargo lambda invoke aws-messaging-webhook --data-file events/sms-inbound.json
 
 In debug builds, set `SNS_CERT_HOST_OVERRIDE` in `.env` to point at a local fake SNS
 (e.g., LocalStack). This env var is compiled out in release builds.
+
+> **Note:** `samconfig.toml` does not set a region. Export `AWS_DEFAULT_REGION` in your
+> shell (e.g., `export AWS_DEFAULT_REGION=us-east-1`) or pass `--region` explicitly to
+> SAM commands (`sam build --region us-east-1`, `sam deploy --region us-east-1`).
+
+## Generating docs
+
+```bash
+make doc   # opens rustdoc in your browser
+```
 
 ## Pre-commit hooks
 

@@ -1,5 +1,28 @@
+# Build
 /target
 .aws-sam/
+
+# Environment
 .env
+
+# Mutation testing
 mutants.out/
 mutants.out.old/
+
+# Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Coverage intermediates
+lcov.info
+*.profraw
+*.profdata
+
+# Codegraph
+.codegraph/
