@@ -64,7 +64,7 @@ Metrics are emitted via CloudWatch Embedded Metrics Format (EMF) using the [`met
 
 | Name | Type | Emitted from | Meaning |
 |---|---|---|---|
-| `ColdStart` | Count | library (first invocation only) | New execution environment started |
+| `ColdStart` | Count | `entry.rs` (first invocation only) | New execution environment started |
 | `Latency` | Histogram (ms) | `entry.rs` | Wall-clock time of `dispatch()` per invocation |
 | `MessagesReceived` | Count | `sns/mod.rs` | Request-path deliveries (persisted + duplicate) |
 | `Duplicates` | Count | `sns/mod.rs` | SNS redeliveries (subset of MessagesReceived) |

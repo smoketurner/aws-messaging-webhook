@@ -25,6 +25,7 @@
 //! keeping all signed field values verbatim.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use axum::Router;
@@ -43,6 +44,13 @@ use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
 use crate::state::{AppState, Services};
+
+/// Tracks whether the `ColdStart` metric has been emitted for this execution
+/// environment. The first invocation flips it from `false` to `true` and emits
+/// the metric; every subsequent invocation skips it. Lambda processes
+/// invocations sequentially within a single execution environment, so there is
+/// no contention in practice.
+static COLD_START_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// A direct SNS → Lambda invocation (`Records[].Sns`). Each record's `Sns`
 /// object is the same envelope SNS posts over HTTPS (with `SigningCertUrl` /
@@ -76,6 +84,11 @@ pub async fn run<T: Services>(
         let state = Arc::clone(&state);
         let router = router.clone();
         Box::pin(async move {
+            // Emit `ColdStart` once per execution environment, before any work,
+            // as a standalone EMF document. The `metrics_cloudwatch_embedded`
+            // library only emits it through its own tower middleware, which this
+            // handler does not use, so it is emitted explicitly here.
+            crate::metrics::emit_cold_start(&COLD_START_EMITTED, collector, std::io::stdout());
             let start = Instant::now();
             let result = dispatch(state, router, event).await;
             // Record per-invocation latency as a histogram (milliseconds).
