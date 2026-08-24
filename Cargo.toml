@@ -23,11 +23,11 @@ tower-http = { version = "=0.7.0", default-features = false }
 
 # AWS SDK — defaults off also drops the legacy rustls 0.21 connector
 # (RUSTSEC-2026-0098/0099/0104); crates enable default-https-client (hyper 1).
-aws-config = { version = "=1.10.1", default-features = false }
-aws-sdk-dynamodb = { version = "=1.120.0", default-features = false }
-aws-sdk-eventbridge = { version = "=1.112.0", default-features = false }
-aws-sdk-pinpointsmsvoicev2 = { version = "=1.116.0", default-features = false }
-aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
+aws-config = { version = "=1.11.0", default-features = false }
+aws-sdk-dynamodb = { version = "=1.122.0", default-features = false }
+aws-sdk-eventbridge = { version = "=1.114.0", default-features = false }
+aws-sdk-pinpointsmsvoicev2 = { version = "=1.118.0", default-features = false }
+aws-sdk-sesv2 = { version = "=1.130.0", default-features = false }
 aws-smithy-types = { version = "=1.6.2", default-features = false }
 
 # Serialization
@@ -47,7 +47,7 @@ serde_dynamo = { version = "=4.3.0", default-features = false }
 rsa = { version = "=0.9.10", default-features = false }
 sha1 = { version = "=0.10.7", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
-x509-cert = { version = "=0.2.5", default-features = false }
+x509-cert = { version = "=0.3.0", default-features = false }
 base64 = { version = "=0.23.1", default-features = false }
 url = { version = "=2.5.8", default-features = false }
 reqwest = { version = "=0.13.4", default-features = false }
@@ -65,7 +65,7 @@ tracing = { version = "=0.1.44", default-features = false }
 proptest = { version = "=1.11.0", default-features = false }
 wiremock = { version = "=0.6.5", default-features = false }
 # rand 0.8 is the last line implementing the rand_core 0.6 traits rsa 0.9 needs
-rand = { version = "=0.8.7", default-features = false }
+rand = { version = "=0.10.2", default-features = false }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
