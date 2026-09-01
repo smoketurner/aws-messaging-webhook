@@ -194,7 +194,14 @@ Detail shape:
     "previousMessageId": "…", // present only on sms.inbound replies; the outbound message this reply answers
     "topicArn": "…",
     "receivedAt": "…",
-    "webhookPath": "/webhooks/ses/events"
+    "webhookPath": "/webhooks/ses/events",
+    "s3": {                   // present only on ses.inbound receipts stored via the S3 action
+      "bucket": "…", "key": "…"
+    },
+    "inbound": {              // present only on ses.inbound receipts, when SES supplied either piece
+      "headers": { "from": ["…"], "to": ["…"], "subject": "…", "date": "…", "messageId": "<…>" },
+      "auth": { "spf": "PASS", "dkim": "PASS", "dmarc": "FAIL", "spam": "PASS", "virus": "PASS", "dmarcPolicy": "reject" }
+    }
   },
   "event": { /* the inner AWS payload, verbatim */ }
 }
@@ -205,6 +212,18 @@ reply to a previously sent outbound message (i.e. the EUM payload carries a
 `previousPublishedMessageId`). Consumers can use it to correlate a reply with the sent message
 that triggered it without parsing the event payload. It is absent (not null) on unsolicited
 inbound contacts and on all other event families.
+
+`meta.s3` and `meta.inbound` appear only on `ses.inbound` (and `ses.inbound.quarantined`)
+events. `meta.s3` `{ bucket, key }` is the pointer to the stored raw MIME, present when the
+receipt rule used the S3 action and SES populated both the bucket and the object key — the
+recommended SES → S3 receipt path. It **survives the oversized-payload content-strip**: when an
+inbound message is too large and its embedded `content` is dropped, the pointer stays, so a
+consumer can still `GetObject` the message from S3. `meta.inbound` carries a summary lifted out
+of the receipt so consumers can route without fetching from S3: `headers` (the SES-parsed
+`commonHeaders` — `from`/`to`/`subject`/`date`/`messageId`) and `auth` (the `spf`/`dkim`/`dmarc`/
+`spam`/`virus` verdict statuses plus `dmarcPolicy`). Every sub-field is omitted (not null) when
+SES did not supply it, and the whole `inbound` block is absent when the receipt carried neither
+headers nor verdicts. All three additions are meta-only and additive, so `schemaVersion` stays 1.
 
 `schemaVersion` is present on every published detail, including the `subscription.changed`
 event, so consumers have a stable field to switch on as the contract evolves.
