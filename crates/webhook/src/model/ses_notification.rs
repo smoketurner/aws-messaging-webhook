@@ -3,7 +3,7 @@
 //! notifications (top-level `notificationType`). Only the fields the pipeline
 //! acts on are typed; the full payload is persisted and forwarded verbatim.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +32,38 @@ pub struct SesMail {
     /// The SES message id — the aggregate id tying every event of one sent
     /// email together.
     pub message_id: String,
+    /// Envelope sender. Present on inbound receipts and most sending events.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Envelope recipients.
+    #[serde(default)]
+    pub destination: Vec<String>,
+    /// SES-assigned receipt/send timestamp.
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    /// SES-parsed well-known headers (from/to/subject/date/messageId). Present
+    /// on inbound receipts and on sending events when header inclusion is on.
+    #[serde(default)]
+    pub common_headers: Option<SesCommonHeaders>,
+}
+
+/// The subset of `commonHeaders` worth surfacing for routing/filtering.
+/// Every field is optional — SES omits headers the message didn't carry.
+/// `Serialize` so it can be borrowed straight into the `meta.inbound` summary.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SesCommonHeaders {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// The RFC 5322 `Message-ID` header — distinct from the SES `messageId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

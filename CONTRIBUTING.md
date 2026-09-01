@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust** -- auto-installed via `rustup` from `rust-toolchain.toml` (1.97.1, edition 2024)
+- **Rust** -- auto-installed via `rustup` from `rust-toolchain.toml` (1.98.0, edition 2024)
 - **cargo-lambda** -- local Lambda execution and SAM builds ([install](https://cargo-lambda.info))
 - **AWS SAM CLI** -- deployment ([install](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
 - **prek** -- pre-commit hooks ([install](https://github.com/nicholasgasior/prek))

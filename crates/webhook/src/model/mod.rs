@@ -178,6 +178,34 @@ impl DomainEvent {
         }
     }
 
+    /// The S3 pointer `(bucket, key)` to the stored raw message, when this is
+    /// an inbound receipt whose rule used the S3 action. `None` for every
+    /// other family and for inbound receipts delivered without an S3 action.
+    #[must_use]
+    pub fn s3_pointer(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::SesInbound { event, .. } => event.receipt.s3_pointer(),
+            _ => None,
+        }
+    }
+
+    /// A compact summary of an inbound receipt for `meta.inbound` — parsed
+    /// headers (from/to/subject/date/messageId) and the SPF/DKIM/DMARC auth
+    /// verdicts — so consumers can route without pulling the message from S3.
+    /// `None` for every other family. Absent sub-fields are omitted, not null.
+    #[must_use]
+    pub fn inbound_meta(&self) -> Option<Value> {
+        let Self::SesInbound { event, .. } = self else {
+            return None;
+        };
+        let summary = ses_inbound::InboundSummary::from_receipt(&event.mail, &event.receipt);
+        if summary.is_empty() {
+            return None;
+        }
+        // Infallible: the summary is plain owned strings/vecs.
+        serde_json::to_value(summary).ok()
+    }
+
     /// The event payload as forwarded to EventBridge.
     #[must_use]
     pub fn payload(&self) -> &Value {
@@ -278,6 +306,60 @@ mod tests {
     fn previous_message_id_absent_on_non_sms_events() {
         let event = DomainEvent::classify(r#"{"eventType":"Delivery","mail":{"messageId":"m-1"}}"#);
         assert_eq!(event.previous_message_id(), None);
+    }
+
+    #[test]
+    fn s3_pointer_surfaces_on_inbound_s3_action() {
+        let event = DomainEvent::classify(
+            r#"{"notificationType":"Received","mail":{"messageId":"m"},
+                "receipt":{"action":{"type":"S3","bucketName":"b","objectKey":"k"}}}"#,
+        );
+        assert_eq!(event.s3_pointer(), Some(("b", "k")));
+    }
+
+    #[test]
+    fn s3_pointer_absent_on_non_inbound_and_non_s3() {
+        let sns_receipt = DomainEvent::classify(
+            r#"{"notificationType":"Received","mail":{"messageId":"m"},
+                "receipt":{"action":{"type":"SNS"}}}"#,
+        );
+        assert_eq!(sns_receipt.s3_pointer(), None);
+
+        let ses = DomainEvent::classify(r#"{"eventType":"Delivery","mail":{"messageId":"m"}}"#);
+        assert_eq!(ses.s3_pointer(), None);
+    }
+
+    #[test]
+    fn inbound_meta_carries_headers_and_auth() {
+        let event = DomainEvent::classify(
+            r#"{"notificationType":"Received",
+                "mail":{"messageId":"m","commonHeaders":{"from":["a@b.c"],"subject":"Hi"}},
+                "receipt":{"spfVerdict":{"status":"PASS"},"dmarcVerdict":{"status":"FAIL"},
+                           "dmarcPolicy":"reject"}}"#,
+        );
+        let meta = event.inbound_meta().expect("inbound meta present");
+        assert_eq!(meta["headers"]["subject"], "Hi");
+        assert_eq!(meta["headers"]["from"][0], "a@b.c");
+        assert_eq!(meta["auth"]["spf"], "PASS");
+        assert_eq!(meta["auth"]["dmarc"], "FAIL");
+        assert_eq!(meta["auth"]["dmarcPolicy"], "reject");
+        // Absent sub-fields are omitted, not null.
+        assert!(meta["headers"].get("to").is_none());
+        assert!(meta["auth"].get("dkim").is_none());
+    }
+
+    #[test]
+    fn inbound_meta_absent_without_headers_or_verdicts() {
+        let event = DomainEvent::classify(
+            r#"{"notificationType":"Received","mail":{"messageId":"m"},"receipt":{}}"#,
+        );
+        assert_eq!(event.inbound_meta(), None);
+    }
+
+    #[test]
+    fn inbound_meta_absent_on_non_inbound() {
+        let event = DomainEvent::classify(r#"{"eventType":"Open","mail":{"messageId":"m"}}"#);
+        assert_eq!(event.inbound_meta(), None);
     }
 
     #[test]

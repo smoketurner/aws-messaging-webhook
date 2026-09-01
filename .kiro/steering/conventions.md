@@ -7,7 +7,7 @@ inclusion: auto
 
 ## Language and edition
 
-- Rust edition 2024, MSRV 1.97.1 (pinned in `rust-toolchain.toml`)
+- Rust edition 2024, MSRV 1.98.0 (pinned in `rust-toolchain.toml`)
 - Target: `aarch64-unknown-linux-gnu` (Lambda provided.al2023 arm64)
 
 ## Dependency management
