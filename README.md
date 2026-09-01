@@ -1,7 +1,7 @@
 # aws-messaging-webhook
 
 [![CI](https://img.shields.io/github/actions/workflow/status/smoketurner/aws-messaging-webhook/ci.yml?branch=main)](https://github.com/smoketurner/aws-messaging-webhook/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.97.1-blue)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.98.0-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
 
 One Rust Lambda function that receives AWS messaging events delivered over SNS — End User

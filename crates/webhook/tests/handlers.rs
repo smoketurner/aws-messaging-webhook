@@ -1,5 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -64,82 +65,91 @@ impl FakeServices {
 }
 
 impl EventStore for FakeServices {
-    async fn persist_new(
+    fn persist_new(
         &self,
         record: &EventRecord,
         _event: &DomainEvent,
-    ) -> Result<PersistOutcome, StoreError> {
+    ) -> impl Future<Output = Result<PersistOutcome, StoreError>> + Send {
         self.record(format!("persist:{}", record.aggregate_id));
-        if self.fail_persist.load(Ordering::SeqCst) {
-            return Err(StoreError(anyhow!("simulated persist failure")));
-        }
-        Ok(self
-            .persist_outcome
-            .lock()
-            .unwrap()
-            .unwrap_or(PersistOutcome::Fresh))
+        let result = if self.fail_persist.load(Ordering::SeqCst) {
+            Err(StoreError(anyhow!("simulated persist failure")))
+        } else {
+            Ok(self
+                .persist_outcome
+                .lock()
+                .unwrap()
+                .unwrap_or(PersistOutcome::Fresh))
+        };
+        std::future::ready(result)
     }
 }
 
 impl PublishEvents for FakeServices {
-    async fn publish(&self, event: &OutboundEvent) -> Result<(), PublishError> {
+    fn publish(
+        &self,
+        event: &OutboundEvent,
+    ) -> impl Future<Output = Result<(), PublishError>> + Send {
         self.record(format!("publish:{}", event.detail_type));
-        if self.fail_publish.load(Ordering::SeqCst) {
-            return Err(PublishError(anyhow!("simulated publish failure")));
-        }
-        self.published.lock().unwrap().push(event.clone());
-        Ok(())
+        let result = if self.fail_publish.load(Ordering::SeqCst) {
+            Err(PublishError(anyhow!("simulated publish failure")))
+        } else {
+            self.published.lock().unwrap().push(event.clone());
+            Ok(())
+        };
+        std::future::ready(result)
     }
 }
 
 impl SmsVoiceApi for FakeServices {
-    async fn put_message_feedback(
+    fn put_message_feedback(
         &self,
         message_id: &str,
         status: FeedbackStatus,
-    ) -> Result<(), ActionError> {
+    ) -> impl Future<Output = Result<(), ActionError>> + Send {
         self.record(format!("feedback:{message_id}:{status:?}"));
-        self.action_result()
+        std::future::ready(self.action_result())
     }
 
-    async fn put_opted_out_number(
+    fn put_opted_out_number(
         &self,
         _opt_out_list_name: &str,
         phone_number: &str,
-    ) -> Result<(), ActionError> {
+    ) -> impl Future<Output = Result<(), ActionError>> + Send {
         self.record(format!("opt_out:{phone_number}"));
-        self.action_result()
+        std::future::ready(self.action_result())
     }
 
-    async fn delete_opted_out_number(
+    fn delete_opted_out_number(
         &self,
         _opt_out_list_name: &str,
         phone_number: &str,
-    ) -> Result<(), ActionError> {
+    ) -> impl Future<Output = Result<(), ActionError>> + Send {
         self.record(format!("opt_in:{phone_number}"));
-        self.action_result()
+        std::future::ready(self.action_result())
     }
 }
 
 impl SesApi for FakeServices {
-    async fn put_suppressed_destination(
+    fn put_suppressed_destination(
         &self,
         email_address: &str,
         reason: SuppressionReason,
-    ) -> Result<(), ActionError> {
+    ) -> impl Future<Output = Result<(), ActionError>> + Send {
         self.record(format!("suppress:{email_address}:{reason:?}"));
-        if self
+        let result = if self
             .permanent_suppression_failures
             .lock()
             .unwrap()
             .iter()
             .any(|e| e == email_address)
         {
-            return Err(ActionError::permanent(anyhow!(
+            Err(ActionError::permanent(anyhow!(
                 "simulated permanent suppression failure for {email_address}"
-            )));
-        }
-        self.action_result()
+            )))
+        } else {
+            self.action_result()
+        };
+        std::future::ready(result)
     }
 }
 

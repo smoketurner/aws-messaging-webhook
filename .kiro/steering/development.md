@@ -7,7 +7,7 @@ inclusion: auto
 
 ## Prerequisites
 
-- Rust toolchain: pinned in `rust-toolchain.toml` (1.97.1 with rustfmt and clippy)
+- Rust toolchain: pinned in `rust-toolchain.toml` (1.98.0 with rustfmt and clippy)
 - `cargo-lambda` for local Lambda execution and SAM builds
 - AWS SAM CLI for deployment
 - `prek` for pre-commit hooks (optional but recommended)

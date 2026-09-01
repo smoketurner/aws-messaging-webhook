@@ -62,6 +62,17 @@ pub fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEven
     if let Some(prev) = event.previous_message_id() {
         meta["previousMessageId"] = Value::String(prev.to_owned());
     }
+    // Inbound email: surface the S3 pointer to the stored raw MIME so a
+    // consumer can GetObject it without parsing the payload — the point of
+    // the recommended SES → S3 receipt path. Absent for non-S3 receipts.
+    if let Some((bucket, key)) = event.s3_pointer() {
+        meta["s3"] = json!({ "bucket": bucket, "key": key });
+    }
+    // Inbound email: parsed headers + auth verdicts, so consumers can route on
+    // subject/from/DMARC without fetching from S3. Absent for other families.
+    if let Some(inbound) = event.inbound_meta() {
+        meta["inbound"] = inbound;
+    }
     let mut detail =
         json!({ "schemaVersion": SCHEMA_VERSION, "meta": meta, "event": event.payload() });
 
@@ -226,5 +237,62 @@ mod tests {
         let event = DomainEvent::classify(&message);
         let out = build_outbound(&record(Some(Source::SesEvents), "ses.delivery"), &event);
         assert!(out.detail["meta"].get("previousMessageId").is_none());
+    }
+
+    #[test]
+    fn inbound_s3_action_surfaces_pointer_and_headers_in_meta() {
+        let message = json!({
+            "notificationType": "Received",
+            "mail": {
+                "messageId": "in-9",
+                "commonHeaders": {"from": ["a@b.c"], "subject": "Invoice"}
+            },
+            "receipt": {
+                "spfVerdict": {"status": "PASS"},
+                "dmarcVerdict": {"status": "PASS"},
+                "action": {"type": "S3", "bucketName": "inbound-mail", "objectKey": "p/in-9"}
+            }
+        })
+        .to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&record(Some(Source::SesInbound), "ses.inbound"), &event);
+        assert_eq!(out.detail["meta"]["s3"]["bucket"], "inbound-mail");
+        assert_eq!(out.detail["meta"]["s3"]["key"], "p/in-9");
+        assert_eq!(
+            out.detail["meta"]["inbound"]["headers"]["subject"],
+            "Invoice"
+        );
+        assert_eq!(out.detail["meta"]["inbound"]["auth"]["spf"], "PASS");
+    }
+
+    #[test]
+    fn non_inbound_events_have_no_s3_or_inbound_meta() {
+        let message = json!({"eventType": "Open", "mail": {"messageId": "m-1"}}).to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&record(Some(Source::SesEvents), "ses.open"), &event);
+        assert!(out.detail["meta"].get("s3").is_none());
+        assert!(out.detail["meta"].get("inbound").is_none());
+    }
+
+    #[test]
+    fn oversized_inbound_keeps_s3_pointer_after_content_stripped() {
+        // The whole point of the S3 path: even when the raw MIME is too big
+        // and gets stripped, the pointer to where it lives stays in meta.
+        let big = "x".repeat(300_000);
+        let message = json!({
+            "notificationType": "Received",
+            "mail": {"messageId": "big-in", "commonHeaders": {"subject": "Big"}},
+            "receipt": {
+                "action": {"type": "S3", "bucketName": "b", "objectKey": "k"}
+            },
+            "content": big
+        })
+        .to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&record(Some(Source::SesInbound), "ses.inbound"), &event);
+        assert_eq!(out.detail["event"]["content"], Value::Null);
+        assert_eq!(out.detail["meta"]["s3"]["bucket"], "b");
+        assert_eq!(out.detail["meta"]["s3"]["key"], "k");
+        assert_eq!(out.detail["meta"]["inbound"]["headers"]["subject"], "Big");
     }
 }
