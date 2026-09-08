@@ -18,6 +18,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// `PutEvents` caps an entry at 256 KB; leave headroom for the envelope.
 const MAX_DETAIL_BYTES: usize = 250_000;
 
+/// The hard `PutEvents` limit on a single entry's `detail` (256 KiB).
+/// [`MAX_DETAIL_BYTES`] starts reduction below this boundary; Step 3 drops
+/// `meta.inbound` when reducing `event` alone can't keep the detail under
+/// this cap (e.g. an attacker-controlled `commonHeaders.subject` duplicated
+/// into `meta.inbound.headers` exceeds it on its own).
+const PUT_EVENTS_DETAIL_CAP_BYTES: usize = 262_144;
+
 /// One event ready for `PutEvents`.
 #[derive(Debug, Clone)]
 pub struct OutboundEvent {
@@ -42,8 +49,10 @@ fn detail_bytes(detail: &Value) -> usize {
 
 /// Builds the EventBridge detail for a persisted event, guaranteeing it stays
 /// under the `PutEvents` entry cap so an oversized payload can never become a
-/// poison record. Oversized events are reduced in two steps; the full payload
-/// always remains in the DynamoDB raw record.
+/// poison record. Oversized events are reduced in up to three steps — raw MIME
+/// is stripped, then `event` is replaced with a pointer, then `meta.inbound`
+/// is dropped if the duplicated parsed headers alone still exceed the cap; the
+/// full payload always remains in the DynamoDB raw record.
 #[must_use]
 pub fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEvent {
     let mut meta = json!({
@@ -112,6 +121,27 @@ pub fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEven
         );
     }
 
+    // Step 3: hard-cap safety net. Step 2 buys headroom by replacing `event`
+    // with a pointer, but `meta.inbound.headers` (parsed `commonHeaders`) is
+    // copied verbatim and never reduced — an attacker-controlled ~261 KiB
+    // `subject` alone can keep the detail over the `PutEvents` 256 KiB cap
+    // even after the payload is dropped. Drop the inbound summary so the bus
+    // event stays publishable; `detail_type` still signals any quarantine
+    // routing, `meta.s3` still locates the raw MIME, and the full record
+    // (headers + verdicts) remains in DynamoDB. A published event without
+    // routing metadata is strictly better than a poison record that reaches
+    // no consumer, and this path only fires on the oversized edge case.
+    if detail_bytes(&detail) > PUT_EVENTS_DETAIL_CAP_BYTES
+        && let Some(meta) = detail.get_mut("meta").and_then(Value::as_object_mut)
+    {
+        meta.remove("inbound");
+        tracing::warn!(
+            sns_message_id = record.sns_message_id,
+            event = "inbound_meta_dropped",
+            "dropped meta.inbound to keep the EventBridge detail under the PutEvents entry cap"
+        );
+    }
+
     OutboundEvent {
         detail_type: record.detail_type.clone(),
         detail,
@@ -121,6 +151,7 @@ pub fn build_outbound(record: &EventRecord, event: &DomainEvent) -> OutboundEven
 #[cfg(test)]
 mod tests {
     use axum::body::Bytes;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::model::{DomainEvent, Source};
@@ -139,6 +170,55 @@ mod tests {
             expires_at: 1_800_000_000,
             aggregate_expires_at: 1_900_000_000,
         }
+    }
+
+    /// A DynamoDB-stream record with production-length meta fields (UUID SNS
+    /// message id, 28-char SES message id, full topic ARN), used by the
+    /// cap-bounding tests to reproduce the SNS-conformant oversize window where
+    /// `meta.inbound` alone can exceed the `PutEvents` cap.
+    fn realistic_inbound_record() -> EventRecord {
+        EventRecord {
+            aggregate_id: "d6iitobk75ur44p8kdnnp7g2n800".to_owned(),
+            event_timestamp: "2026-08-03T19:12:52.000Z".to_owned(),
+            sns_message_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_owned(),
+            raw_body: Bytes::from_static(b"{}"),
+            source: Some(Source::SesInbound),
+            detail_type: "ses.inbound".to_owned(),
+            topic_arn: "arn:aws:sns:us-east-1:123456789012:my-ses-inbound-topic".to_owned(),
+            received_at: "2026-08-03T19:12:53.456Z".to_owned(),
+            expires_at: 1_800_000_000,
+            aggregate_expires_at: 1_900_000_000,
+        }
+    }
+
+    /// Builds an SES inbound notification (S3 action, no `headers` array) whose
+    /// `commonHeaders.subject` is sized so the JSON is exactly 262,144 bytes —
+    /// the SNS `Message` cap. The subject fills the slack left by the fixed
+    /// overhead, computed by measuring the empty-subject template.
+    fn sns_conformant_inbound_with_max_subject() -> String {
+        let mut notification = json!({
+            "notificationType": "Received",
+            "mail": {
+                "messageId": "d6iitobk75ur44p8kdnnp7g2n800",
+                "commonHeaders": {"subject": ""}
+            },
+            "receipt": {
+                "action": {
+                    "type": "S3",
+                    "bucketName": "prod-inbound-mail",
+                    "objectKey": "ses-receipts/d6iitobk75ur44p8kdnnp7g2n800"
+                },
+                "spfVerdict": {"status": "PASS"},
+                "dkimVerdict": {"status": "PASS"},
+                "dmarcVerdict": {"status": "FAIL"},
+                "dmarcPolicy": "reject",
+                "virusVerdict": {"status": "PASS"},
+                "spamVerdict": {"status": "PASS"}
+            }
+        });
+        let overhead = notification.to_string().len();
+        notification["mail"]["commonHeaders"]["subject"] = json!("x".repeat(262_144 - overhead));
+        notification.to_string()
     }
 
     #[test]
@@ -180,6 +260,9 @@ mod tests {
         let out = build_outbound(&record(Some(Source::SesInbound), "ses.inbound"), &event);
         assert_eq!(out.detail["event"]["content"], Value::Null);
         assert_eq!(out.detail["event"]["mail"]["messageId"], "in-1");
+        // The reduced detail must fit under the PutEvents entry cap, not just
+        // change shape — the guarantee that keeps oversized records off the DLQ.
+        assert!(detail_bytes(&out.detail) <= 262_144);
     }
 
     #[test]
@@ -196,6 +279,8 @@ mod tests {
         assert_eq!(out.detail["event"]["payloadOmitted"], json!(true));
         // Meta is always preserved so consumers can fetch the full record.
         assert_eq!(out.detail["meta"]["messageId"], "agg-1");
+        // The reduced detail must fit under the PutEvents entry cap.
+        assert!(detail_bytes(&out.detail) <= 262_144);
     }
 
     #[test]
@@ -294,5 +379,130 @@ mod tests {
         assert_eq!(out.detail["meta"]["s3"]["bucket"], "b");
         assert_eq!(out.detail["meta"]["s3"]["key"], "k");
         assert_eq!(out.detail["meta"]["inbound"]["headers"]["subject"], "Big");
+        // The reduced detail must fit under the PutEvents entry cap.
+        assert!(detail_bytes(&out.detail) <= 262_144);
+    }
+
+    /// Regression for the `meta.inbound` size-bounding bug: an SNS-conformant
+    /// inbound receipt (Message exactly 262,144 bytes) with an
+    /// attacker-controlled `commonHeaders.subject` near the SNS cap yields an
+    /// EventBridge detail that exceeds the `PutEvents` 256 KiB entry cap *after*
+    /// Step 2 reduces `event` to a pointer — because `meta.inbound.headers`
+    /// duplicates the subject verbatim and is never bounded by Step 1/2. Step 3
+    /// drops `meta.inbound` so the detail stays publishable.
+    #[test]
+    fn sns_conformant_oversized_subject_fits_under_putevents_cap() {
+        let message = sns_conformant_inbound_with_max_subject();
+        assert_eq!(
+            message.len(),
+            262_144,
+            "notification is exactly at the SNS cap"
+        );
+
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&realistic_inbound_record(), &event);
+
+        // The fix's guarantee: the detail always fits under the PutEvents cap.
+        assert!(
+            detail_bytes(&out.detail) <= 262_144,
+            "detail is {} bytes; exceeds the PutEvents 262,144-byte cap",
+            detail_bytes(&out.detail)
+        );
+        // The bug scenario is real: had Step 3 NOT dropped `meta.inbound`, the
+        // post-Step-2 detail would still exceed the cap. Re-insert the inbound
+        // summary (the same one build_outbound built) and assert that.
+        let mut without_step3 = out.detail.clone();
+        without_step3["meta"]["inbound"] = event
+            .inbound_meta()
+            .expect("inbound meta present before Step 3");
+        assert!(
+            detail_bytes(&without_step3) > 262_144,
+            "post-Step-2 detail is {} bytes; bug scenario not reproduced",
+            detail_bytes(&without_step3)
+        );
+        // Step 3 dropped `meta.inbound`; Step 2 replaced `event` with a pointer.
+        assert!(out.detail["meta"].get("inbound").is_none());
+        assert_eq!(out.detail["event"]["payloadOmitted"], json!(true));
+        // The S3 pointer survives so a consumer can still GetObject the raw MIME,
+        // and the detail_type still routes the receipt (DMARC FAIL here).
+        assert_eq!(out.detail_type, "ses.inbound");
+        assert_eq!(out.detail["meta"]["s3"]["bucket"], "prod-inbound-mail");
+        assert_eq!(
+            out.detail["meta"]["s3"]["key"],
+            "ses-receipts/d6iitobk75ur44p8kdnnp7g2n800"
+        );
+    }
+
+    /// Step 3 only drops `meta.inbound` when the detail genuinely exceeds the
+    /// `PutEvents` cap; if Step 2's pointer already brings it under the cap,
+    /// the routing metadata (headers + auth) is preserved so consumers can
+    /// route without fetching from S3.
+    #[test]
+    fn inbound_meta_preserved_when_reduction_fits_under_cap() {
+        // A subject large enough to trigger Step 2 (the duplicated headers push
+        // the pre-Step-2 detail past MAX_DETAIL_BYTES) but small enough that the
+        // post-Step-2 detail still fits under the 256 KiB cap.
+        let subject = "x".repeat(200_000);
+        let message = json!({
+            "notificationType": "Received",
+            "mail": {
+                "messageId": "d6iitobk75ur44p8kdnnp7g2n800",
+                "commonHeaders": {"subject": subject}
+            },
+            "receipt": {
+                "action": {
+                    "type": "S3",
+                    "bucketName": "prod-inbound-mail",
+                    "objectKey": "ses-receipts/d6iitobk75ur44p8kdnnp7g2n800"
+                },
+                "spfVerdict": {"status": "PASS"},
+                "dmarcVerdict": {"status": "FAIL"},
+                "dmarcPolicy": "reject"
+            }
+        })
+        .to_string();
+        let event = DomainEvent::classify(&message);
+        let out = build_outbound(&realistic_inbound_record(), &event);
+        assert_eq!(out.detail["event"]["payloadOmitted"], json!(true));
+        assert!(detail_bytes(&out.detail) <= 262_144);
+        // Step 3 did NOT fire: the full routing metadata survives.
+        assert_eq!(
+            out.detail["meta"]["inbound"]["headers"]["subject"],
+            "x".repeat(200_000)
+        );
+        assert_eq!(out.detail["meta"]["inbound"]["auth"]["dmarc"], "FAIL");
+        assert_eq!(out.detail["meta"]["s3"]["bucket"], "prod-inbound-mail");
+    }
+
+    proptest! {
+        /// For any attacker-controlled subject length (including beyond the SNS
+        /// cap), `build_outbound` must keep the EventBridge detail under the
+        /// `PutEvents` 256 KiB entry cap — the guarantee that prevents a poison
+        /// record. Exercises the Step 2 / Step 3 boundary across the whole range.
+        #[test]
+        fn build_outbound_never_exceeds_putevents_cap(subject_len in 0usize..270_000) {
+            let subject = "x".repeat(subject_len);
+            let message = json!({
+                "notificationType": "Received",
+                "mail": {
+                    "messageId": "d6iitobk75ur44p8kdnnp7g2n800",
+                    "commonHeaders": {"subject": subject}
+                },
+                "receipt": {
+                    "action": {
+                        "type": "S3",
+                        "bucketName": "prod-inbound-mail",
+                        "objectKey": "ses-receipts/d6iitobk75ur44p8kdnnp7g2n800"
+                    },
+                    "spfVerdict": {"status": "PASS"},
+                    "dmarcVerdict": {"status": "FAIL"},
+                    "dmarcPolicy": "reject"
+                }
+            })
+            .to_string();
+            let event = DomainEvent::classify(&message);
+            let out = build_outbound(&realistic_inbound_record(), &event);
+            prop_assert!(detail_bytes(&out.detail) <= 262_144);
+        }
     }
 }
