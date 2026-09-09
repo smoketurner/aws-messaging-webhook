@@ -179,8 +179,8 @@ transitioned), `subscription.changed` (auto-re-subscribe fired), `unknown` (unpa
 payload, forwarded verbatim).
 
 An event whose payload exceeds the EventBridge 256 KB entry limit is published with its `event`
-replaced by `{ "payloadOmitted": true, ... }`; `meta` is always preserved, so consumers fetch the
-full record from DynamoDB by `meta.messageId`. (SES inbound raw MIME is dropped first; this
+replaced by `{ "payloadOmitted": true, ... }`; `meta.messageId` is always preserved, so
+consumers fetch the full record from DynamoDB. (SES inbound raw MIME is dropped first; this
 pointer form is the fallback.)
 
 Detail shape:
