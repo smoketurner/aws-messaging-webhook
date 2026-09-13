@@ -42,7 +42,6 @@ impl SnsVerifier {
     #[must_use]
     pub fn builder() -> SnsVerifierBuilder {
         SnsVerifierBuilder {
-            http: None,
             dangerous_allow_prefix: None,
         }
     }
@@ -89,18 +88,10 @@ impl SnsVerifier {
 
 /// Builder for [`SnsVerifier`].
 pub struct SnsVerifierBuilder {
-    http: Option<reqwest::Client>,
     dangerous_allow_prefix: Option<String>,
 }
 
 impl SnsVerifierBuilder {
-    /// Overrides the HTTP client used to fetch signing certificates.
-    #[must_use]
-    pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http = Some(client);
-        self
-    }
-
     /// DANGEROUS: additionally accepts any `SigningCertURL` starting with the
     /// given prefix, bypassing the SNS host policy for those URLs. This
     /// disables the scheme's trust anchor for matching URLs — never enable it
@@ -112,24 +103,21 @@ impl SnsVerifierBuilder {
         self
     }
 
-    /// Builds the verifier. Without a custom client, uses one with a 5 second
-    /// overall timeout.
+    /// Builds the verifier. Uses an HTTP client with a 5 second overall
+    /// timeout.
     ///
     /// # Errors
     ///
     /// Returns [`VerifyError::CertFetch`] if the default HTTP client cannot
     /// be constructed.
     pub fn build(self) -> Result<SnsVerifier, VerifyError> {
-        let http = match self.http {
-            Some(client) => client,
-            None => reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                // Never follow redirects: the SigningCertURL host policy is the
-                // trust anchor, and a redirect off an allowed host to an
-                // attacker would defeat it and let a forged certificate verify.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
-        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            // Never follow redirects: the SigningCertURL host policy is the
+            // trust anchor, and a redirect off an allowed host to an
+            // attacker would defeat it and let a forged certificate verify.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(SnsVerifier {
             http,
             cache: cert::CertCache::default(),
