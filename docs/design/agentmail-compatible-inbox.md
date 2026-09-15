@@ -7,9 +7,10 @@ Status: **proposal** — nothing in this document is implemented yet.
 Replace an [AgentMail](https://agentmail.to) inbox (concretely `hello@mail.smoketurner.com`)
 with this project, so that:
 
-1. A Terraform module takes a **hostname** and one or more **inbound addresses** and provisions
-   everything AWS-side: the SES domain identity, DNS, an S3 bucket for raw mail, the receipt
-   rule set, the SNS topic, and the wiring into the webhook.
+1. The existing SAM template takes a **hostname** and one or more **inbound addresses** as
+   parameters and provisions everything AWS-side: the SES domain identity, DNS, an S3 bucket
+   for raw mail, the receipt rule set, the SNS topics, and the wiring into the webhook. No
+   second tool: `sam deploy` remains the whole deployment.
 2. The Lambda **ingests** each received email: parses the MIME from S3, stores message, thread,
    and attachment metadata, and emits AgentMail-shaped `message.*` events on the EventBridge bus.
 3. The Lambda exposes an **AgentMail-compatible HTTP API** (`/v0/...`, bearer auth) so existing
@@ -42,11 +43,11 @@ persists to the events table, and already publishes `ses.inbound` with the S3 po
   so replies thread correctly and delivery events join up.
 
 ```
-                          Terraform module `ses-inbox`
+                     template.yaml (Condition: HasMailDomain)
    ┌───────────────────────────────────────────────────────────────────────┐
    │ MX/DKIM/SPF/DMARC ─► SES receipt rule ─► S3 (raw MIME)                │
    │                                      └─► SNS topic ─► webhook          │
-   │ SESv2 configuration set (outbound) ─► SNS topic ─► webhook             │
+   │ SES configuration set (outbound) ─► SNS topic ─► webhook               │
    └───────────────────────────────────────────────────────────────────────┘
                                              │
    SNS notification ──► verify ──► persist (events table) ──► act ──► (relay ► ses.inbound)
@@ -62,102 +63,136 @@ persists to the events table, and already publishes `ses.inbound` with the S3 po
    Agent ──► POST /v0/inboxes/{id}/messages/{id}/reply ──► SESv2 SendEmail(Raw) ─► S3 + mail table
 ```
 
-## Terraform module: `terraform/modules/ses-inbox`
-
-Lives in this repo (a sibling of `template.yaml`), and keeps the existing rule that SNS topics
-and subscriptions live *outside* the SAM stack: the module owns the mail-side resources and
-reads the SAM stack's outputs to wire them in.
-
-### Inputs
-
-| Variable | Example | Notes |
-|---|---|---|
-| `hostname` | `mail.smoketurner.com` | The receiving domain; also the sending identity |
-| `addresses` | `["hello"]` | Local parts (or full addresses) to receive; each becomes an inbox |
-| `catch_all` | `false` | Receive `*@hostname`; unknown recipients are still stored (see [Inbox resolution](#inbox-resolution)) |
-| `bucket_name` | `smoketurner-mail` | Raw MIME + extracted attachments; must match the SAM `MailBucketName` parameter |
-| `webhook_stack_name` | `aws-messaging-webhook-prod` | Read via `data.aws_cloudformation_stack` for the function ARN/URL and mail table name |
-| `subscription_protocol` | `lambda` | `lambda` (recommended for ingest, see [Timeouts](#timeouts-and-the-delivery-pathway)) or `https` |
-| `route53_zone_id` | `Z…` | Optional; when set, the module publishes MX, DKIM CNAMEs, MAIL FROM, SPF and DMARC records |
-| `dmarc_policy` | `quarantine` | `none` / `quarantine` / `reject` for the published `_dmarc` TXT |
-| `retention_days` | `365` | S3 lifecycle expiration for raw MIME and attachments |
-| `tls_policy` | `Optional` | Receipt rule TLS policy; `Require` rejects plaintext SMTP senders |
-
-### Resources
-
-- `aws_sesv2_email_identity` for `hostname` with Easy DKIM, plus
-  `aws_sesv2_email_identity_mail_from_attributes` (`bounce.<hostname>`) so bounces return to SES.
-- `aws_s3_bucket` (`bucket_name`): public access blocked, SSE-S3 (or a KMS key input), versioning
-  off, lifecycle expiration at `retention_days`, and a bucket policy that lets `ses.amazonaws.com`
-  `PutObject` under `inbound/*` only when `aws:SourceAccount` is this account and `aws:SourceArn`
-  is the receipt rule.
-- `aws_sns_topic` `inbound` with `SignatureVersion = 2` and a policy allowing `ses.amazonaws.com`
-  to publish from this account.
-- `aws_ses_receipt_rule_set` + `aws_ses_active_receipt_rule_set` + `aws_ses_receipt_rule`:
-  recipients = the full addresses (or `hostname` when `catch_all`), `scan_enabled = true`, one
-  `s3_action { bucket_name, object_key_prefix = "inbound/", topic_arn }`. The S3 action's own
-  `topic_arn` is what produces the receipt notification with `receipt.action.type = "S3"` and the
-  bucket/key pointer that `model/ses_inbound.rs` already parses.
-- Subscription to the webhook. `lambda` protocol: `aws_sns_topic_subscription` plus
-  `aws_lambda_permission` scoped with `source_arn` to the topic (the per-topic gate the README
-  describes). `https` protocol: subscribe to the stack's `SesInboundEndpoint`; the function
-  auto-confirms.
-- Outbound: `aws_sesv2_configuration_set` (name = an input, default `<stack>-mail`) with an
-  event destination for `SEND, DELIVERY, BOUNCE, COMPLAINT, REJECT, OPEN` to a second SNS topic
-  `events`, subscribed to the stack's `SesEventsEndpoint`. This is what turns SES delivery
-  events for sent mail into `message.delivered` / `message.bounced` / … (see [Events](#events)).
-- One `aws_dynamodb_table_item` per address in the mail table: the inbox record. Terraform is the
-  inbox control plane in v1; `POST /v0/inboxes` is a later phase.
-- Route 53 records when `route53_zone_id` is set: `MX 10 inbound-smtp.<region>.amazonaws.com`,
-  three DKIM CNAMEs, MAIL FROM `MX`/`TXT`, `TXT "v=spf1 include:amazonses.com -all"`, and
-  `_dmarc TXT`. Without a zone id the module outputs the records for manual publication.
-
-Two constraints to state in the module README: SES email receiving is only offered in a subset of
-regions and there is exactly **one active receipt rule set per region** — the module must be
-told when to adopt an existing rule set instead of creating and activating a new one
-(`existing_rule_set_name` input).
-
-### Outputs
-
-`bucket_name`, `inbound_topic_arn`, `events_topic_arn`, `configuration_set_name`, `inbox_ids`
-(`["hello@mail.smoketurner.com"]`), `dns_records` (for the no-Route-53 case), `api_base_url`
-(`<FunctionUrl>v0`).
-
-### Ordering
-
-1. `sam deploy` with the new parameters (below). IAM statements name the bucket and domain by
-   string, so the bucket does not need to exist yet.
-2. `terraform apply` the module; it reads the stack outputs, creates the mail resources, and
-   subscribes them. The topics are in the same account, so the existing `AllowedTopics` account
-   id entry already admits them.
-
 ## SAM template changes
 
-New parameters, all mapped to env vars read by `config.rs`:
+Everything lives in `template.yaml`, gated by one condition, `HasMailDomain` (`MailDomain`
+non-empty), so a stack deployed without the mail parameters is byte-for-byte what it is today.
+This relaxes the current "topics and subscriptions live outside the stack" rule for the two
+**mail** topics only: an SES receipt rule and a configuration-set event destination must name
+their topic, and the topic must exist before the rule, so the stack owns them. The EUM and
+SES-sending topics operators already wire by hand are unaffected.
+
+### Parameters
 
 | Parameter | Env var | Purpose |
 |---|---|---|
-| `MailBucketName` | `MAIL_BUCKET` | Grants `s3:GetObject` on `inbound/*` and `s3:PutObject`/`GetObject` on `attachments/*`, `sent/*` of `arn:aws:s3:::<bucket>` |
-| `MailDomains` | `MAIL_DOMAINS` | Comma-separated hostnames the API may send from and create inboxes under; scopes `ses:SendEmail`/`ses:SendRawEmail` with a `ses:FromAddress` `StringLike` condition of `*@<domain>` |
-| `SesConfigurationSet` | `SES_CONFIGURATION_SET` | Config set stamped on every send; the IAM resource list includes its ARN |
+| `MailDomain` | `MAIL_DOMAIN` | e.g. `mail.smoketurner.com`; the receiving domain and the sending identity. Empty (default) disables every mail resource |
+| `MailAddresses` | `MAIL_INBOXES` | `CommaDelimitedList` of local parts, e.g. `hello`; each becomes an inbox (`hello@mail.smoketurner.com`) |
+| `MailCatchAll` | `MAIL_CATCH_ALL` | `false` (default) receives only `MailAddresses`; `true` makes the receipt rule match the whole domain |
+| `MailAutoCreateInboxes` | `MAIL_AUTO_CREATE_INBOXES` | `false` (default); with catch-all on, whether an unknown recipient creates an inbox |
+| `MailBucketName` | `MAIL_BUCKET` | Empty (default) derives `<stack-name>-mail`; set it to control the name |
+| `MailRetentionDays` | — | S3 lifecycle expiration for raw MIME and attachments (default 365) |
+| `HostedZoneId` | — | Optional Route 53 zone; when set, the stack publishes every DNS record itself |
+| `DmarcPolicy` | — | `none` / `quarantine` (default) / `reject` for the `_dmarc` TXT |
+| `ReceiptTlsPolicy` | — | `Optional` (default) / `Require` on the receipt rule |
+| `ExistingReceiptRuleSetName` | — | Empty (default) creates a rule set; set it to add the rule to a rule set that already exists and is active in this region |
+| `ApiKeysParameterName` | `API_KEYS_PARAMETER` | Name of the SecureString SSM parameter holding the API key hashes (see [Authentication](#authentication)) |
+| `ApiKeysKmsKeyArn` | — | Optional customer-managed key the parameter is encrypted with; empty means the AWS-managed `aws/ssm` key |
 | `AttachmentUrlTtlSeconds` | `ATTACHMENT_URL_TTL_SECONDS` | Presigned URL lifetime (default 900) |
 
-New resources:
+`MAIL_INBOXES` is the inbox control plane in v1: the function treats every configured address
+as an inbox, upserting its `META` item on first use, and `GET /v0/inboxes` returns configured
+inboxes plus any created through the API in a later phase. No table seeding step exists.
 
-- **`MailTable`** (`AWS::DynamoDB::Table`, on-demand, `pk`/`sk`, three GSIs below, stream
-  `NEW_AND_OLD_IMAGES`, deletion protection in prod, **no TTL** — mailbox data is not an audit
-  buffer; retention is the operator's S3 lifecycle plus explicit deletes).
-- **`ApiKeysSecret`** (`AWS::SecretsManager::Secret`) seeded with one generated key. Value is a
-  JSON document `{"keys":[{"id":"key_…","sha256":"…","created_at":"…"}]}`; the function is
-  granted `secretsmanager:GetSecretValue` on it only. Operators add a second key, roll clients,
-  then remove the first.
-- A second **stream event-source mapping** on `MailTable` into the same function, same settings
-  as the events-table one (bisect, `ReportBatchItemFailures`, on-failure DLQ). Filter to
-  `INSERT` and to `MODIFY` where the image's `sk` begins with `MSG#` (label/status changes).
+### Resources (all under `HasMailDomain`)
+
+- **`MailIdentity`** (`AWS::SES::EmailIdentity`): `EmailIdentity: !Ref MailDomain`, Easy DKIM
+  on (`DkimAttributes.SigningEnabled`), `MailFromAttributes.MailFromDomain: bounce.<domain>`,
+  and `ConfigurationSetAttributes.ConfigurationSetName` pointing at the outbound set below so
+  every send from the identity is stamped even if a caller forgets. The identity exposes
+  `DkimDNSTokenName1..3` / `DkimDNSTokenValue1..3` as attributes, which is what makes fully
+  in-template DNS possible.
+- **`MailBucket`** (`AWS::S3::Bucket`): all public access blocked, SSE-S3, versioning off,
+  lifecycle expiration at `MailRetentionDays` on `inbound/`, `attachments/`, `sent/`,
+  `DeletionPolicy: Retain` (mail outlives a stack teardown).
+- **`MailBucketPolicy`**: `ses.amazonaws.com` may `s3:PutObject` under `inbound/*` when
+  `aws:SourceAccount` is this account and `aws:SourceArn` is the receipt rule. The rule ARN is
+  built with `!Sub` from the rule-set and rule *names*, not `!Ref` — a `!Ref` to the rule
+  while the rule references the bucket would be a circular dependency.
+- **`MailInboundTopic`** (`AWS::SNS::Topic`, `SignatureVersion: "2"`) plus a topic policy
+  allowing `ses.amazonaws.com` (`aws:SourceAccount` condition) to publish.
+- **`MailReceiptRuleSet`** (`AWS::SES::ReceiptRuleSet`, only when `ExistingReceiptRuleSetName`
+  is empty) and **`MailReceiptRule`** (`AWS::SES::ReceiptRule`): `Recipients` = the full
+  addresses, or `[MailDomain]` when `MailCatchAll`; `ScanEnabled: true`; `TlsPolicy`; one
+  `S3Action { BucketName, ObjectKeyPrefix: inbound/, TopicArn }`. `DependsOn: MailBucketPolicy`
+  — SES verifies it can write to the bucket when the rule is created. The S3 action's
+  `TopicArn` is what produces the receipt notification with `receipt.action.type = "S3"` and the
+  bucket/key pointer that `model/ses_inbound.rs` already parses.
+- **Inbound subscription** as a SAM event on the function: `Events.MailInbound: { Type: SNS,
+  Topic: !Ref MailInboundTopic }` — SAM emits the `AWS::SNS::Subscription` (`lambda` protocol)
+  and the `AWS::Lambda::Permission` scoped to that topic, the same per-topic gate the README's
+  manual `add-permission` step provides today. The direct pathway is deliberate; see
+  [Timeouts](#timeouts-and-the-delivery-pathway). The function also gets an async-invoke
+  on-failure destination (`EventInvokeConfig` → `MailIngestDlq`, SQS) for durability past the
+  async queue's two retries.
+- **`MailConfigurationSet`** (`AWS::SES::ConfigurationSet`) and
+  **`MailEventDestination`** (`AWS::SES::ConfigurationSetEventDestination`) for `SEND`,
+  `DELIVERY`, `BOUNCE`, `COMPLAINT`, `REJECT`, `OPEN` to **`MailEventsTopic`** (SNS,
+  `SignatureVersion: "2"`), subscribed to the function the same way. This is what turns SES
+  delivery events for sent mail into `message.delivered` / `message.bounced` / …
+- **Route 53** (when `HostedZoneId` is set): `AWS::Route53::RecordSet` for
+  `MX 10 inbound-smtp.${AWS::Region}.amazonaws.com`, the three DKIM CNAMEs from the identity's
+  attributes, MAIL FROM `MX`/`TXT` on `bounce.<domain>`, `TXT "v=spf1 include:amazonses.com
+  -all"`, and `_dmarc.<domain> TXT` with `DmarcPolicy`. Without a zone id, a `DnsRecords`
+  output lists the same records for manual publication.
+- **`MailTable`** (`AWS::DynamoDB::Table`, on-demand, `pk`/`sk`, the three GSIs in the data
+  model, stream `NEW_AND_OLD_IMAGES`, deletion protection in prod, **no TTL** — mailbox data
+  is not an audit buffer; retention is the S3 lifecycle plus explicit deletes).
+- A second **stream event-source mapping** on `MailTable` into the same function, same
+  settings as the events-table one (bisect, `ReportBatchItemFailures`, on-failure to the
+  existing `PublishDlq`). Filter to `INSERT` and to `MODIFY` where the image's `sk` begins with
+  `MSG#` (label/status changes).
+- **IAM** additions to the function role: `s3:GetObject` on `inbound/*`, `s3:PutObject` /
+  `GetObject` on `attachments/*` and `sent/*` of the bucket; `ses:SendEmail` /
+  `ses:SendRawEmail` on the identity and configuration-set ARNs with a `ses:FromAddress`
+  `StringLike` condition of `*@${MailDomain}`; DynamoDB read/write on `MailTable` and its
+  indexes; `ssm:GetParameter` on `arn:…:parameter/${ApiKeysParameterName}` plus `kms:Decrypt`
+  on `ApiKeysKmsKeyArn` when set (the AWS-managed `aws/ssm` key needs no explicit statement);
+  `sqs:SendMessage` on `MailIngestDlq`.
 - Function `Timeout` raised from 10 to **60 s** (ingest of a 40 MB message; see below) and
-  `MemorySize` to 512 to give the parser headroom.
+  `MemorySize` to 512 to give the parser headroom. Both apply stack-wide, which is harmless for
+  the existing paths.
 
-New outputs: `MailTableName`, `ApiBaseUrl` (`<FunctionUrl>v0`), `ApiKeysSecretArn`.
+New outputs: `MailTableName`, `MailBucketName`, `MailInboundTopicArn`, `MailEventsTopicArn`,
+`MailConfigurationSetName`, `InboxIds`, `ApiBaseUrl` (`<FunctionUrl>v0`), `DnsRecords`, and
+`ReceiptRuleSetName`.
+
+### Two things CloudFormation cannot do
+
+Both are one CLI command after the first deploy, documented next to the README's existing
+wiring commands:
+
+1. **Activate the receipt rule set.** There is exactly one active rule set per region and no
+   CloudFormation resource or property activates one:
+
+   ```bash
+   aws ses set-active-receipt-rule-set --rule-set-name "$(aws cloudformation describe-stacks \
+     --stack-name aws-messaging-webhook-prod \
+     --query "Stacks[0].Outputs[?OutputKey=='ReceiptRuleSetName'].OutputValue" --output text)"
+   ```
+
+   Operators who already have an active rule set pass its name as
+   `ExistingReceiptRuleSetName` instead, and the stack only adds its rule.
+
+2. **Create the encrypted API-key parameter.** `AWS::SSM::Parameter` supports only `String`
+   and `StringList`; `SecureString` must be created outside the template. The value is a JSON
+   document of key ids and SHA-256 hashes (never the keys themselves):
+
+   ```bash
+   key="am_$(openssl rand -hex 24)"
+   hash=$(printf '%s' "$key" | sha256sum | cut -d' ' -f1)
+   aws ssm put-parameter --name /aws-messaging-webhook/prod/api-keys --type SecureString \
+     --value "{\"keys\":[{\"id\":\"key_1\",\"sha256\":\"$hash\"}]}"
+   echo "$key"   # hand this to the agent; it is not stored anywhere
+   ```
+
+   Rotation is `put-parameter --overwrite` with a second entry, roll clients, then remove the
+   first. The parameter name is passed as `ApiKeysParameterName`. Standard tier (4 KB) holds
+   dozens of keys.
+
+Two constraints to state in the README: SES email receiving is offered in a subset of regions,
+so the stack must live in one of them; and the identity must show DKIM `SUCCESS` before mail is
+sent from it.
 
 ## Data model: the mail table
 
@@ -225,7 +260,7 @@ The new `actions::run` arm for `DomainEvent::SesInbound`:
 
 Failure classification follows `ActionErrorKind`: S3/DynamoDB throttling, 5xx, and timeouts are
 `Transient` (→ 5xx → SNS redelivery re-runs the idempotent ingest); a MIME that fails to parse,
-an object that is missing, or an unknown recipient with `catch_all` off are `Permanent` (log,
+an object that is missing, or an unknown recipient with `MailCatchAll` off are `Permanent` (log,
 `IngestFailures` metric, the `ses.inbound` event still publishes with the S3 pointer so nothing
 is lost).
 
@@ -235,9 +270,10 @@ running with `FakeServices` and MIME fixtures (`tests/fixtures/mail/*.eml`).
 ### Inbox resolution
 
 - Recipient has an inbox item → ingest into it.
-- Recipient has no inbox item and `catch_all` is off → the receipt rule would not have matched,
+- Recipient is in `MAIL_INBOXES` but has no `META` item yet → upsert the item, then ingest.
+- Recipient has no inbox and `MailCatchAll` is off → the receipt rule would not have matched,
   so this only happens if the operator edited the rule by hand; treat as permanent skip.
-- Recipient has no inbox item and `MAIL_AUTO_CREATE_INBOXES=true` (default `false`) → create the
+- Recipient has no inbox and `MAIL_AUTO_CREATE_INBOXES=true` (default `false`) → create the
   inbox item and ingest. Off by default so a catch-all domain does not become an unbounded
   inbox factory for spam.
 - Otherwise → skip with `unknown_inbox`, and the message stays discoverable through the
@@ -248,11 +284,12 @@ running with `FakeServices` and MIME fixtures (`tests/fixtures/mail/*.eml`).
 A 40 MB message (the SES receiving ceiling) means one `GetObject`, a parse, and several
 `PutObject`s inside the request. Over HTTPS, SNS applies a short, fixed response timeout to the
 endpoint (AWS documents it as 15 seconds; it is not configurable) before it counts the delivery
-as failed and retries, which would make a slow ingest look like a failure loop. The module
-therefore defaults inbox topics to the **`lambda` protocol** (async invoke, no response
-timeout, function timeout 60 s), with an on-failure SQS destination configured on the function
-for durability beyond the async queue's two retries. The `https` option remains for operators
-who want the longer SNS retry policy and can accept the ceiling.
+as failed and retries, which would make a slow ingest look like a failure loop. The template
+therefore subscribes the mail topics with the **`lambda` protocol** (async invoke, no response
+timeout, function timeout 60 s), with an on-failure SQS destination on the function for
+durability beyond the async queue's two retries. An operator who prefers the longer SNS HTTPS
+retry policy can still subscribe the topic to `SesInboundEndpoint` by hand and accept the
+ceiling.
 
 ## The `/v0` API
 
@@ -264,11 +301,16 @@ limit); the 1 MiB `DefaultBodyLimit` stays on every other route.
 ### Authentication
 
 `Authorization: Bearer <key>`. The middleware SHA-256-hashes the presented key and compares it
-in constant time (`subtle::ConstantTimeEq`) against every hash in the cached secret. The cache
-refreshes every 5 minutes and on any miss (so a freshly added key works immediately at the cost
-of one `GetSecretValue`). Missing or wrong key → `401` with the AgentMail error body. The header
-is redacted from `TraceLayer` logs. Keys never appear in logs or metrics; `ApiAuthFailures` is a
-counter only.
+in constant time (`subtle::ConstantTimeEq`) against every hash in the cached parameter, read
+with `ssm:GetParameter` (`WithDecryption: true`) from the SecureString named by
+`API_KEYS_PARAMETER`. The cache refreshes every 5 minutes and on any miss (so a freshly added
+key works immediately at the cost of one `GetParameter`); a `GetParameter` failure keeps the
+last good cache rather than failing open or locking everyone out, and an empty cache rejects
+everything. Missing or wrong key → `401` with the AgentMail error body. The header is redacted
+from `TraceLayer` logs. Keys never appear in logs or metrics; `ApiAuthFailures` is a counter
+only. Parameter Store rather than Secrets Manager: no per-secret charge, the same KMS
+encryption, and the rotation story (overwrite with two hashes, roll, drop one) needs none of
+Secrets Manager's rotation machinery.
 
 Deliberately not IAM SigV4: the AgentMail SDKs send a bearer token, and drop-in compatibility is
 the point. A second `AuthType: AWS_IAM` URL is impossible on the same function, and API Gateway
@@ -283,7 +325,7 @@ Paths and field names follow AgentMail's v0 reference exactly; snake_case JSON; 
 |---|---|---|
 | `GET /v0/inboxes` | ✅ | `count`, `inboxes[]`, `limit`, `next_page_token`; Query `sk = META` via a `ByTime` variant (`gsi1pk = INBOXES`) |
 | `GET /v0/inboxes/{inbox_id}` | ✅ | `pod_id` is a fixed `"pod_default"` |
-| `POST /v0/inboxes` | phase 4 | `username` + `domain ∈ MAIL_DOMAINS` → inbox item; requires `catch_all` on the domain |
+| `POST /v0/inboxes` | phase 4 | `username` + `domain == MAIL_DOMAIN` → inbox item; requires `MailCatchAll` so the receipt rule already matches the new address |
 | `DELETE /v0/inboxes/{inbox_id}` | phase 4 | |
 | `GET /v0/inboxes/{inbox_id}/threads` | ✅ | `limit`, `page_token`, `labels`, `before`, `after`, `ascending`, `include_spam`, `include_blocked`, `include_unauthenticated`, `include_trash`, `senders`, `recipients`, `subject` (the last three as post-filters) |
 | `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | ✅ | Embedded `messages[]` in ascending order from `ByThread`; thread-level `count`/`limit`/`next_page_token` for long threads |
@@ -386,7 +428,7 @@ New metrics (same EMF namespace): `MessagesIngested`, `IngestFailures`, `IngestS
 - Presigned URLs are short-lived (`ATTACHMENT_URL_TTL_SECONDS`, default 15 min) and scoped to
   one object. `download_url` is the only way the API hands out S3 access.
 - S3 pointers from a receipt are followed only when the bucket equals `MAIL_BUCKET`.
-- Sending is scoped by IAM to `*@<MAIL_DOMAINS>` and the named configuration set; the API can
+- Sending is scoped by IAM to `*@<MailDomain>` and the stack's configuration set; the API can
   only ever send as an inbox it stores.
 - No WAF is attachable to a Function URL directly. If abuse becomes a concern, CloudFront in
   front (with the `/webhooks/*` paths bypassing auth) is the documented next step, not part of v1.
@@ -394,24 +436,26 @@ New metrics (same EMF namespace): `MessagesIngested`, `IngestFailures`, `IngestS
 ## Testing
 
 - `tests/handlers.rs` grows a `/v0` section driving the real router with a fake key in a fake
-  `SecretsProvider`; `FakeServices` implements the new `MailStore`, `ObjectStore`,
-  `SesSend`, and `SecretsProvider` traits with in-memory maps.
+  `ApiKeySource`; `FakeServices` implements the new `MailStore`, `ObjectStore`, `SesSend`, and
+  `ApiKeySource` traits with in-memory maps.
 - `tests/fixtures/mail/` holds `.eml` fixtures: plain text, multipart alternative, attachments
   with `Content-ID`, a reply with `References`, a 30 MB synthetic to pin memory use, and a
   malformed message to prove the permanent-failure path.
 - Property tests: thread resolution never merges messages whose id chains do not intersect;
   `page_token` round-trips; every AgentMail response type serializes with exactly the documented
   field names (a golden JSON test per type).
-- `cargo deny` gates the new crates: `aws-sdk-s3`, `aws-sdk-secretsmanager`, `mail-parser`,
+- `cargo deny` gates the new crates: `aws-sdk-s3`, `aws-sdk-ssm`, `mail-parser`,
   `mail-builder`, `subtle`, `ulid` — all MIT/Apache, pinned per the workspace rule.
+- `sam validate --lint` covers the template; a `cfn-lint` run with the mail parameters set and
+  unset proves the `HasMailDomain` condition leaves the no-mail stack unchanged.
 
 ## Phasing
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| 0 | Terraform module + SAM parameters/resources (mail table, secret, IAM, stream mapping) | Mail to `hello@<staging host>` lands in S3 and a `ses.inbound` event carries `meta.s3` |
+| 0 | Template: mail parameters, identity, DNS, bucket, topics, receipt rule, configuration set, mail table, IAM, stream mapping; README post-deploy steps | Mail to `hello@<staging host>` lands in S3 and a `ses.inbound` event carries `meta.s3` |
 | 1 | Ingest action, mail table writes, `message.received*` on the bus | A reply email threads under its parent; a spam-verdict message publishes `message.received.spam` |
-| 2 | Read API + auth: inboxes, threads, messages, raw, attachment, PATCH labels | The AgentMail Python SDK, pointed at `api_base_url`, lists threads and reads a message unmodified |
+| 2 | Read API + auth: inboxes, threads, messages, raw, attachment, PATCH labels | The AgentMail Python SDK, pointed at the `ApiBaseUrl` output, lists threads and reads a message unmodified |
 | 3 | Send + reply, `message.sent/delivered/bounced/complained/rejected/opened` | A reply sent through the API appears in the thread, and its SES delivery event adds `delivered` |
 | 4 | Create/delete inbox, delete-as-trash, `extracted_text`, webhooks via API destinations guide | Optional; each independently shippable |
 
@@ -419,14 +463,16 @@ New metrics (same EMF namespace): `MessagesIngested`, `IngestFailures`, `IngestS
 
 1. Stand up phases 0–3 on `mail-staging.smoketurner.com` and run the SDK smoke test.
 2. Lower the `mail.smoketurner.com` MX TTL to 300 s at least a day ahead.
-3. Deploy the module for `mail.smoketurner.com` with `addresses = ["hello"]`; verify the SES
-   identity (DKIM `SUCCESS`) *before* touching MX — receiving and sending identities are the
-   same domain, and an unverified identity cannot send.
+3. Deploy the prod stack with `MailDomain=mail.smoketurner.com MailAddresses=hello`, activate
+   the rule set, create the API-key parameter, and wait for the SES identity to show DKIM
+   `SUCCESS` *before* touching MX — receiving and sending identities are the same domain, and an
+   unverified identity cannot send.
 4. Flip MX to `inbound-smtp.<region>.amazonaws.com`; replace AgentMail's DKIM/SPF records with
    SES's. From this moment AgentMail stops receiving; keep its inbox readable for history until
    the old thread context is no longer needed.
-5. Point the agent at `api_base_url` with a key from `ApiKeysSecret`. Thread ids and message ids
-   are new; anything the agent stored about AgentMail ids is stale.
+5. Point the agent at the `ApiBaseUrl` output with the key generated when the parameter was
+   created. Thread ids and message ids are new; anything the agent stored about AgentMail ids
+   is stale.
 6. Watch `IngestFailures`, `SendFailures`, the two DLQs, and SES reputation metrics for a week,
    then restore the MX TTL.
 
@@ -438,10 +484,10 @@ New metrics (same EMF namespace): `MessagesIngested`, `IngestFailures`, `IngestS
    encoding and is sender-controlled).
 2. **Catch-all vs explicit addresses** for `mail.smoketurner.com`, and whether `POST
    /v0/inboxes` (phase 4) matters for the workflow that replaces AgentMail.
-3. **API keys in Secrets Manager** (bearer, SDK-compatible) vs. IAM SigV4 (no secret to
-   rotate, but no SDK compatibility). The design assumes bearer.
-4. **DNS ownership.** Is `smoketurner.com` in Route 53, so the module can publish records, or
-   does the module only output them?
+3. **Bearer keys in Parameter Store** (SDK-compatible) vs. IAM SigV4 (nothing to rotate, but
+   no SDK compatibility). The design assumes bearer.
+4. **DNS ownership.** Is `smoketurner.com` in Route 53, so the stack can publish records via
+   `HostedZoneId`, or does the stack only output them?
 5. **SDK host override.** The official SDKs are Fern-generated; the Python client's constructor
    takes an `environment` (an enum whose `PROD` member is the AgentMail host) rather than a plain
    `base_url`. Fern clients generally accept a custom environment value or a `base_url`, but this
