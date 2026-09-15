@@ -140,8 +140,8 @@ inboxes plus any created through the API in a later phase. No table seeding step
   is not an audit buffer; retention is the S3 lifecycle plus explicit deletes).
 - A second **stream event-source mapping** on `MailTable` into the same function, same
   settings as the events-table one (bisect, `ReportBatchItemFailures`, on-failure to the
-  existing `PublishDlq`). Filter to `INSERT` and to `MODIFY` where the image's `sk` begins with
-  `MSG#` (label/status changes).
+  existing `PublishDlq`). Filter to `INSERT` and `MODIFY` records whose image `sk` begins with
+  `MSG#`; thread items, inbox items, and the label pointer items below never reach the relay.
 - **IAM** additions to the function role: `s3:GetObject` on `inbound/*`, `s3:PutObject` /
   `GetObject` on `attachments/*` and `sent/*` of the bucket; `ses:SendEmail` /
   `ses:SendRawEmail` on the identity and configuration-set ARNs with a `ses:FromAddress`
@@ -208,14 +208,29 @@ bounce, and complaint event. `thread_id` is the message id of the thread's first
 | Inbox | `INBOX#<inbox_id>` | `META` | `email`, `display_name`, `metadata`, `created_at`, `updated_at` |
 | Message | `INBOX#<inbox_id>` | `MSG#<message_id>` | `thread_id`, `timestamp`, `labels` (SS), `from`, `to`, `cc`, `bcc`, `reply_to`, `subject`, `preview` (first 256 chars of text), `size`, `text`, `html`, `headers` (M), `in_reply_to`, `references` (L), `attachments` (L of M), `rfc_message_id`, `raw_s3_key`, `verdicts` (M), `created_at`, `updated_at` |
 | Thread | `INBOX#<inbox_id>` | `THR#<thread_id>` | `timestamp`, `subject`, `preview`, `senders` (SS), `recipients` (SS), `labels` (SS, union of member labels), `last_message_id`, `message_count`, `size`, `received_timestamp`, `sent_timestamp`, `attachments` (L) |
+| Message label pointer | `INBOX#<inbox_id>#LABEL#<label>` | `MSGAT#<timestamp>#<message_id>` | One per label on the message: the list-view projection (`thread_id`, `timestamp`, `from`, `to`, `cc`, `subject`, `preview`, `size`, `attachments` summary, `labels`) |
+| Thread label pointer | `INBOX#<inbox_id>#LABEL#<label>` | `THRAT#<timestamp>#<thread_id>` | One per label in the thread's union: the thread list-view projection |
 
 Global secondary indexes (all project `ALL`; the table is small and reads dominate):
 
 | Index | Key | Serves |
 |---|---|---|
-| `ByTime` | `gsi1pk = INBOX#<inbox_id>#MSG` or `#THR`, `gsi1sk = <timestamp>#<id>` | List messages / list threads with `before`/`after`/`ascending` as a sort-key range, `page_token` = base64 of `LastEvaluatedKey` |
+| `ByTime` | `gsi1pk = INBOX#<inbox_id>#MSG` or `#THR`, `gsi1sk = <timestamp>#<id>` | Unfiltered list messages / list threads with `before`/`after`/`ascending` as a sort-key range, `page_token` = base64 of `LastEvaluatedKey` |
 | `ByThread` | `gsi2pk = THREAD#<inbox_id>#<thread_id>`, `gsi2sk = <timestamp>#<message_id>` | Get thread: the embedded `messages` array |
 | `ByRfcId` | `gsi3pk = RFC#<inbox_id>#<rfc-message-id>` | Thread resolution from `In-Reply-To` / `References` |
+
+**Labels are the folders.** There is no folder attribute: a message's location is whatever its
+labels say (`received`, `sent`, `spam`, `trash`, `unread`, and anything an agent adds such as
+`needs-reply`). A global secondary index key must be one scalar attribute, so it cannot index
+membership in the `labels` set; the label pointer items are how every label gets a direct query.
+`GET …/messages?labels=sent` is one bounded `Query` on `INBOX#<inbox_id>#LABEL#sent` with the
+same `before`/`after`/`ascending` sort-key range as `ByTime`, and it behaves exactly like a Sent
+folder; `labels=unread` is an unread view for free. Pointers are written in the same
+transaction as the message (ingest step 7, send step 5) and maintained by `PATCH` (below), so
+they are never out of step with the message item. The cost is one extra write per label per
+message, bounded by a cap of 20 labels per message, and duplication of the list-view fields,
+which never change after ingest except `labels` itself. Multiple `labels` in one request are
+served by querying the smallest label and intersecting with the message items' sets.
 
 Bodies live on the message item, capped: `text` and `html` are each stored up to 200 KB (an item
 is 400 KB max); a body over the cap is truncated in the item and flagged `body_truncated = true`,
@@ -253,10 +268,12 @@ The new `actions::run` arm for `DomainEvent::SesInbound`:
    `include_spam` / `include_unauthenticated` filters.
 7. **Persist** with one `TransactWriteItems` per inbox: `Put` message
    (`attribute_not_exists(pk) AND attribute_not_exists(sk)`), `Update` thread (`ADD
-   message_count :one`, `ADD senders/recipients`, `SET last_message_id, timestamp, size` guarded
-   by `timestamp >= if_not_exists(...)`, `SET subject/preview = if_not_exists(...)`). A
-   `ConditionalCheckFailed` on the put is the idempotency signal (`Duplicate`): the whole
-   transaction cancels, the thread is not double-counted, and the action returns `Ok`.
+   message_count :one`, `ADD senders/recipients`, `ADD labels`, `SET last_message_id,
+   timestamp, size` guarded by `timestamp >= if_not_exists(...)`, `SET subject/preview =
+   if_not_exists(...)`), one `Put` message label pointer per label, and one `Put` thread label
+   pointer per label newly added to the thread's union. A `ConditionalCheckFailed` on the
+   message put is the idempotency signal (`Duplicate`): the whole transaction cancels, the
+   thread is not double-counted, no pointer is duplicated, and the action returns `Ok`.
 
 Failure classification follows `ActionErrorKind`: S3/DynamoDB throttling, 5xx, and timeouts are
 `Transient` (→ 5xx → SNS redelivery re-runs the idempotent ingest); a MIME that fails to parse,
@@ -327,14 +344,14 @@ Paths and field names follow AgentMail's v0 reference exactly; snake_case JSON; 
 | `GET /v0/inboxes/{inbox_id}` | ✅ | `pod_id` is a fixed `"pod_default"` |
 | `POST /v0/inboxes` | phase 4 | `username` + `domain == MAIL_DOMAIN` → inbox item; requires `MailCatchAll` so the receipt rule already matches the new address |
 | `DELETE /v0/inboxes/{inbox_id}` | phase 4 | |
-| `GET /v0/inboxes/{inbox_id}/threads` | ✅ | `limit`, `page_token`, `labels`, `before`, `after`, `ascending`, `include_spam`, `include_blocked`, `include_unauthenticated`, `include_trash`, `senders`, `recipients`, `subject` (the last three as post-filters) |
+| `GET /v0/inboxes/{inbox_id}/threads` | ✅ | `limit`, `page_token`, `before`, `after`, `ascending` on `ByTime`; `labels` switches to the thread label pointer partition (a direct query per label); `include_spam` / `include_blocked` / `include_unauthenticated` / `include_trash` default to false and drop threads carrying that label; `senders`, `recipients`, `subject` are post-filters on the page |
 | `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | ✅ | Embedded `messages[]` in ascending order from `ByThread`; thread-level `count`/`limit`/`next_page_token` for long threads |
 | `DELETE /v0/inboxes/{inbox_id}/threads/{thread_id}` | phase 4 | |
-| `GET /v0/inboxes/{inbox_id}/messages` | ✅ | Same filters as threads plus `from`/`to`/`subject` post-filters |
+| `GET /v0/inboxes/{inbox_id}/messages` | ✅ | Same shape as threads: `ByTime` unfiltered, the message label pointer partition for `labels` (so `labels=sent` is the Sent folder and `labels=unread` the unread view), `include_*` exclusions, `from`/`to`/`subject` post-filters |
 | `GET /v0/inboxes/{inbox_id}/messages/{message_id}` | ✅ | Full message: `text`, `html`, `headers`, `attachments`, `in_reply_to`, `references`; `extracted_text`/`extracted_html` absent in v1 (phase 4: quote stripping) |
 | `GET …/messages/{message_id}/raw` | ✅ | `{ message_id, size, download_url, expires_at }` — presigned `GetObject` on the raw key |
 | `GET …/messages/{message_id}/attachments/{attachment_id}` | ✅ | `{ attachment_id, size, filename, content_type, content_disposition, content_id, download_url, expires_at }` — presigned GET with `response-content-disposition` |
-| `PATCH …/messages/{message_id}` | ✅ | `add_labels` / `remove_labels` → `ADD`/`DELETE` on the string set; response `{ message_id, labels }`. Removing `unread` is how a client marks read |
+| `PATCH …/messages/{message_id}` | ✅ | One `TransactWriteItems`: `ADD`/`DELETE` on the message's set, `Put` a pointer per added label, `Delete` one per removed label, refresh `labels` on the pointers that remain, and `ADD` to the thread's union (a thread label is removed only when no member message still carries it). Response `{ message_id, labels }`. Removing `unread` is how a client marks read |
 | `DELETE …/messages/{message_id}` | phase 4 | Adds the `trash` label rather than deleting; a purge is a separate operator concern |
 | `POST …/messages/send` | ✅ | See [Sending](#sending) |
 | `POST …/messages/{message_id}/reply` | ✅ | See [Sending](#sending) |
@@ -348,8 +365,9 @@ default 404, as today.
 ### Pagination
 
 `page_token` is the base64url-encoded `LastEvaluatedKey`. It is not signed: the partition key is
-always re-derived from the path's `inbox_id`, so a token from another inbox can only ever yield
-an empty page, never another inbox's data. Default `limit` 20, maximum 100.
+always re-derived from the path's `inbox_id` and the request's `labels`, so a token from another
+inbox or label can only ever yield an empty page, never another inbox's data. Default `limit`
+20, maximum 100.
 
 ### Sending
 
@@ -370,7 +388,8 @@ implementation:
    `FromEmailAddressIdentityArn` of the domain identity. A `MessageRejected` /
    `MailFromDomainNotVerified` / `AccountSendingPaused` is `400`/`403` with the SES message in
    `message`; throttling is `429`; anything else `502`.
-5. Persist the sent message (labels `["sent"]`) into the mail table and the raw MIME to
+5. Persist the sent message (labels `["sent"]`) into the mail table with its `sent` label
+   pointers (message and thread) in the same transaction as ingest uses, and the raw MIME to
    `sent/<message_id>`, in the sender's inbox, in the original's thread for a reply.
 6. Respond `{ message_id, thread_id }`. The mail-table insert makes the relay publish
    `message.sent`.
@@ -381,8 +400,10 @@ not per message); `message.opened` events still arrive if the config set has it 
 ## Events
 
 The mail table's stream is a second source for the existing relay. `stream.rs` distinguishes
-the two tables by the `pk` prefix (`MSG#` vs `INBOX#`) and, for `INBOX#` records, builds an
-AgentMail-shaped detail:
+the two tables by the `pk` prefix (`MSG#` vs `INBOX#`) and, for `INBOX#` message records,
+builds an AgentMail-shaped detail. A `MODIFY` publishes only when a *delivery* label
+(`delivered`, `bounced`, `complained`, `rejected`, `opened`) was added; a client's own label
+edits through `PATCH` change the item but emit nothing, since AgentMail has no event for them.
 
 ```json
 {
