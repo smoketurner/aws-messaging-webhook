@@ -159,7 +159,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
         aggregate_expires_at: 0,
     };
 
-    let outbound = build_outbound(&record, &event);
+    let outbound = build_outbound(&record, &event, &state.config.event_source);
     match state.services.publish(&outbound).await {
         Ok(()) => {
             metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
