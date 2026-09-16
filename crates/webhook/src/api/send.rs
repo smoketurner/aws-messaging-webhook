@@ -13,18 +13,32 @@
 //! inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::api::error::{ApiError, FieldError};
+use crate::config::MailConfig;
+use crate::mail::objects::ObjectError;
+use crate::mail::send::{
+    self as send_mod, Envelope, SendKey, SendSpec, SendState, SendStatus, SpecAttachment,
+};
+use crate::mail::store::EnqueueOutcome;
 use crate::mail::url_policy::{self, AttachmentUrl};
 use crate::mail::{
-    ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, HEADER_NAME_MAX, HEADER_VALUE_MAX,
-    HEADERS_BUDGET, LABEL_MAX_BYTES, MAX_OUTBOUND_DECODED_BYTES, MESSAGE_USER_LABEL_CAP,
-    OUTBOUND_RECIPIENTS_MAX, SUBJECT_MAX_BYTES, labels,
+    ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, AttachmentMeta, Direction,
+    HEADER_NAME_MAX, HEADER_VALUE_MAX, HEADERS_BUDGET, InboxId, LABEL_MAX_BYTES,
+    MAX_OUTBOUND_DECODED_BYTES, MESSAGE_USER_LABEL_CAP, MailMessage, OUTBOUND_RECIPIENTS_MAX,
+    PREVIEW_CHARS, SUBJECT_MAX_BYTES, ids, keys, labels, time,
 };
+use crate::state::{AppState, Services};
 
 /// Headers the service sets itself. A caller-supplied value for any of these
 /// is refused rather than ignored, so a request never appears to have been
@@ -538,6 +552,381 @@ fn attachments(
     }
 
     out
+}
+
+/// How long an `Idempotency-Key` is remembered.
+const KEY_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// The longest `Idempotency-Key` accepted.
+const IDEMPOTENCY_KEY_MAX_BYTES: usize = 255;
+
+/// The response both send routes return.
+#[derive(Debug, Serialize)]
+pub struct SendAccepted {
+    pub message_id: String,
+    pub thread_id: String,
+}
+
+/// `POST /v0/inboxes/{inbox_id}/messages/send`
+///
+/// Queues the message and returns as soon as it is durably committed; a
+/// separate sender calls SES. The response therefore means "this will be
+/// sent", not "this has been sent".
+///
+/// # Errors
+///
+/// [`ApiError::Validation`] for a request that breaks any rule,
+/// [`ApiError::NotFound`] when the inbox does not exist,
+/// [`ApiError::Conflict`] when an `Idempotency-Key` is reused with a
+/// different request, and a store or object failure otherwise.
+pub async fn send<T: Services>(
+    State(state): State<Arc<AppState<T>>>,
+    Path(inbox_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SendRequest>,
+) -> Result<Json<SendAccepted>, ApiError> {
+    let inbox = InboxId(inbox_id);
+    let key_hash = idempotency_key_hash(&headers)?;
+
+    let Some(config) = state.config.mail.as_ref() else {
+        return Err(ApiError::NotImplemented);
+    };
+    // An inbox that does not exist cannot send: the address would not be one
+    // this domain owns.
+    if state
+        .services
+        .get_inbox(&inbox)
+        .await
+        .map_err(crate::api::read::store_failure)?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    let validated = validate(request)?;
+    let request_hash = fingerprint(&inbox, &validated);
+
+    // A live key for this request is answered from what it recorded, without
+    // queuing anything a second time.
+    if let Some(hash) = &key_hash
+        && let Some(existing) = state
+            .services
+            .get_send_key(hash)
+            .await
+            .map_err(crate::api::read::store_failure)?
+    {
+        return if existing.request_hash == request_hash {
+            Ok(Json(SendAccepted {
+                message_id: existing.message_id,
+                thread_id: existing.thread_id,
+            }))
+        } else {
+            Err(ApiError::Conflict(
+                "this Idempotency-Key was used for a different request".to_owned(),
+            ))
+        };
+    }
+
+    let now_ms = time::now_ms();
+    let now = time::format(now_ms);
+    let message_id = ids::outbound_message_id();
+    // A send with no reply context starts its own thread.
+    let thread_id = message_id.to_string();
+    let message_id = message_id.to_string();
+
+    let spec = build_spec(&inbox, config, &validated, &message_id, &thread_id, &now);
+    upload_spec(&state.services, &spec, &validated).await?;
+
+    let state_item = SendState::queued(
+        inbox.clone(),
+        message_id.clone(),
+        thread_id.clone(),
+        Envelope {
+            to: validated.to.clone(),
+            cc: validated.cc.clone(),
+            bcc: validated.bcc.clone(),
+        },
+        key_hash.as_ref().map(|hash| keys::send_key_pk(hash)),
+        &now,
+    );
+    let message = queued_message(&inbox, &validated, &spec, &now);
+    let key = key_hash.map(|hash| SendKey {
+        key_hash: hash,
+        inbox_id: inbox,
+        message_id: message_id.clone(),
+        thread_id: thread_id.clone(),
+        request_hash,
+        route: "send".to_owned(),
+        created_at: now.clone(),
+        expires_at: now_ms / 1_000 + KEY_TTL_SECONDS,
+    });
+
+    match state
+        .services
+        .enqueue_send(&message, &state_item, key.as_ref(), now_ms / 1_000)
+        .await
+        .map_err(crate::api::read::store_failure)?
+    {
+        EnqueueOutcome::Committed | EnqueueOutcome::AlreadyQueued => Ok(Json(SendAccepted {
+            message_id,
+            thread_id,
+        })),
+        // Another request won the key between the read above and the commit.
+        EnqueueOutcome::KeyExists => Err(ApiError::Conflict(
+            "this Idempotency-Key is already in use".to_owned(),
+        )),
+    }
+}
+
+/// Hashes the `Idempotency-Key` header, if one was sent.
+///
+/// The header value itself is never stored or logged: another caller who
+/// learned it could replay someone else's send.
+fn idempotency_key_hash(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::field("Idempotency-Key", "must be printable ASCII"))?
+        .trim();
+    if value.is_empty() || value.len() > IDEMPOTENCY_KEY_MAX_BYTES {
+        return Err(ApiError::field(
+            "Idempotency-Key",
+            format!("must be 1 to {IDEMPOTENCY_KEY_MAX_BYTES} characters"),
+        ));
+    }
+    Ok(Some(sha256_hex(value.as_bytes())))
+}
+
+/// A fingerprint of what a request asked for, so the same key presented with
+/// a different request can be told apart. Attachment bytes are included, so
+/// swapping a file while reusing a key is a conflict rather than a replay.
+fn fingerprint(inbox: &InboxId, send: &ValidatedSend) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(inbox.as_str().as_bytes());
+    for list in [&send.to, &send.cc, &send.bcc, &send.reply_to, &send.labels] {
+        for value in list {
+            hasher.update(b"\x00");
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\x01");
+    }
+    hasher.update(send.subject.as_bytes());
+    hasher.update(send.text.as_deref().unwrap_or_default().as_bytes());
+    hasher.update(send.html.as_deref().unwrap_or_default().as_bytes());
+    for (name, value) in &send.headers {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(value.as_bytes());
+    }
+    for attachment in &send.attachments {
+        match &attachment.source {
+            AttachmentSource::Inline(bytes) => hasher.update(bytes),
+            AttachmentSource::Url(url) => hasher.update(url.as_str().as_bytes()),
+        }
+    }
+    hex(&hasher.finalize())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex(&hasher.finalize())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+/// Builds the spec the sender will assemble the message from.
+fn build_spec(
+    inbox: &InboxId,
+    config: &MailConfig,
+    send: &ValidatedSend,
+    message_id: &str,
+    thread_id: &str,
+    now: &str,
+) -> SendSpec {
+    let uuid = uuid::Uuid::parse_str(message_id).unwrap_or_else(|_| uuid::Uuid::nil());
+    let attachments = send
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(ordinal, attachment)| {
+            let attachment_id = ids::attachment_id(&uuid, ordinal);
+            let (object_key, url, size) = match &attachment.source {
+                // Inline bytes are uploaded under the id before the send is
+                // queued, so the sender finds them already there.
+                AttachmentSource::Inline(bytes) => (
+                    Some(send_mod::part_key(message_id, &attachment_id)),
+                    None,
+                    bytes.len() as u64,
+                ),
+                AttachmentSource::Url(url) => (None, Some(url.as_str().to_owned()), 0),
+            };
+            SpecAttachment {
+                attachment_id,
+                object_key,
+                url,
+                filename: attachment.filename.clone(),
+                content_type: attachment.content_type.clone(),
+                content_disposition: attachment.content_disposition.clone(),
+                content_id: attachment.content_id.clone(),
+                size,
+            }
+        })
+        .collect();
+
+    SendSpec {
+        message_id: message_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        inbox_id: inbox.clone(),
+        from: format!("{}@{}", inbox.as_str(), config.domain),
+        display_name: None,
+        envelope: Envelope {
+            to: send.to.clone(),
+            cc: send.cc.clone(),
+            bcc: send.bcc.clone(),
+        },
+        reply_to: send.reply_to.clone(),
+        subject: send.subject.clone(),
+        text: send.text.clone(),
+        html: send.html.clone(),
+        rfc_message_id: ids::our_rfc_message_id(message_id, &config.domain),
+        in_reply_to: None,
+        references: Vec::new(),
+        headers: send.headers.clone(),
+        attachments,
+        created_at: now.to_owned(),
+    }
+}
+
+/// Uploads every inline part, then the spec.
+///
+/// The spec goes last on purpose: the sender treats it as the signal that a
+/// send is ready to build, so it must never be visible before the parts it
+/// refers to.
+async fn upload_spec<T: Services>(
+    services: &T,
+    spec: &SendSpec,
+    send: &ValidatedSend,
+) -> Result<(), ApiError> {
+    for (attachment, spec_attachment) in send.attachments.iter().zip(&spec.attachments) {
+        let AttachmentSource::Inline(bytes) = &attachment.source else {
+            continue;
+        };
+        let Some(key) = &spec_attachment.object_key else {
+            continue;
+        };
+        services
+            .put_object_if_absent(
+                key,
+                Bytes::from(bytes.clone()),
+                &spec_attachment.content_type,
+            )
+            .await
+            .map_err(object_failure)?;
+    }
+
+    let body = serde_json::to_vec(spec)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing the send spec: {e}")))?;
+    services
+        .put_object_if_absent(
+            &send_mod::spec_key(&spec.message_id),
+            Bytes::from(body),
+            "application/json",
+        )
+        .await
+        .map_err(object_failure)?;
+    Ok(())
+}
+
+/// The message item a queued send writes: everything a reader needs, with the
+/// body kept as the caller gave it. `size` is zero until the sender has built
+/// the real MIME.
+fn queued_message(
+    inbox: &InboxId,
+    send: &ValidatedSend,
+    spec: &SendSpec,
+    now: &str,
+) -> MailMessage {
+    let mut labels = send.labels.clone();
+    labels.push("queued".to_owned());
+    labels.sort();
+    labels.dedup();
+
+    MailMessage {
+        inbox_id: inbox.clone(),
+        thread_id: spec.thread_id.clone(),
+        message_id: spec.message_id.clone(),
+        ses_message_id: None,
+        direction: Direction::Outbound,
+        rfc_message_id: spec.rfc_message_id.clone(),
+        in_reply_to: spec.in_reply_to.clone(),
+        references: spec.references.clone(),
+        labels,
+        timestamp: now.to_owned(),
+        from: spec.from.clone(),
+        reply_to: send.reply_to.clone(),
+        to: send.to.clone(),
+        cc: send.cc.clone(),
+        bcc: send.bcc.clone(),
+        subject: send.subject.clone(),
+        preview: preview_of(send),
+        size: 0,
+        text: send.text.clone(),
+        html: send.html.clone(),
+        body_truncated: false,
+        headers: send.headers.clone(),
+        attachments: spec
+            .attachments
+            .iter()
+            .map(|attachment| AttachmentMeta {
+                attachment_id: attachment.attachment_id.clone(),
+                object_key: attachment.object_key.clone(),
+                size: attachment.size,
+                filename: attachment.filename.clone(),
+                content_type: attachment.content_type.clone(),
+                content_disposition: attachment.content_disposition.clone(),
+                content_id: attachment.content_id.clone(),
+            })
+            .collect(),
+        attachments_truncated: false,
+        raw_s3_key: None,
+        verdicts: None,
+        thread_snapshot: None,
+        delivery: BTreeMap::new(),
+        send_status: Some(SendStatus::Queued.as_str().to_owned()),
+        sent_at: None,
+        version: 0,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    }
+}
+
+fn preview_of(send: &ValidatedSend) -> String {
+    send.text
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .take(PREVIEW_CHARS)
+        .collect()
+}
+
+fn object_failure(error: ObjectError) -> ApiError {
+    match error {
+        ObjectError::Transient(source) => ApiError::BadGateway(source),
+        ObjectError::NotFound | ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
+            ApiError::Internal(anyhow::anyhow!("{error}"))
+        }
+    }
 }
 
 #[cfg(test)]

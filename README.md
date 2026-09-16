@@ -286,6 +286,7 @@ answers `501` with a parseable body.
 | `GET …/messages/{message_id}/raw` | `{message_id, size, download_url, expires_at}` for the stored raw MIME |
 | `GET …/messages/{message_id}/attachments/{attachment_id}` | the same, plus `filename`, `content_type`, `content_disposition` and `content_id` |
 | `PATCH /v0/inboxes/{inbox_id}/messages/{message_id}` | `{message_id, labels}` after applying `add_labels`/`remove_labels` |
+| `POST /v0/inboxes/{inbox_id}/messages/send` | `{message_id, thread_id}` once the send is durably queued |
 
 Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streamed through the
 function. The URL carries its own authorization — the API key is not needed to follow it, and
@@ -314,6 +315,33 @@ List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (defau
   explicitly overrides the flag that would hide it, so `?labels=trash` returns trashed mail.
 - `page_token` is opaque and bound to the partition it was issued for: presenting one to a
   different inbox is a `400`, not another inbox's data.
+
+### Sending
+
+`POST …/messages/send` takes `to`/`cc`/`bcc` (one address or a list), `subject`, `text` and/or
+`html`, and optionally `reply_to`, `labels`, `headers` and `attachments`. Each attachment gives
+exactly one of `content` (base64) or `url`.
+
+**It queues; it does not send.** The response means the message is durably recorded, not that
+SES has accepted it. A separate sender function consumes the mail table's stream and makes the
+SES call. This exists because SESv2 `SendEmail` has no idempotency token and the AWS SDKs retry
+5xx on their own, so a synchronous send could deliver the same mail more than once.
+
+Send `Idempotency-Key` to make a retry safe. The same key with the same request returns the
+original ids; the same key with a *different* request is a `409`, since silently sending
+something the caller didn't ask for is worse than refusing. Keys are remembered for 24 hours.
+Without a key, a retry after a lost response can queue the message twice.
+
+Headers the service controls — `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`,
+`Date`, `Message-ID`, `In-Reply-To`, `References`, `Return-Path`, `MIME-Version` and every
+`Content-*` — are rejected rather than ignored, so a caller cannot send as another inbox. Any CR
+or LF in an address, header name or header value is refused: all three end up in a MIME document
+where a newline would start a new header.
+
+An attachment `url` must be `https`, on the default port, with no embedded credentials, and must
+not resolve to a private or link-local address. That is checked here and again on every redirect
+hop when the sender fetches it; the sender is the only HTTP client in this service that follows
+redirects at all.
 
 Because labels live on the items rather than in per-label index rows, a filtered list reads a
 page and filters it, re-reading up to five times to fill the page. A response can therefore come

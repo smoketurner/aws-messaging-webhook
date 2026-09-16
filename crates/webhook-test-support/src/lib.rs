@@ -39,7 +39,7 @@ use aws_messaging_webhook::actions::{
 use aws_messaging_webhook::allowlist::TopicAllowlist;
 use aws_messaging_webhook::api::keys::{ApiKeyError, ApiKeySource, KeyCache};
 use aws_messaging_webhook::app::app;
-use aws_messaging_webhook::config::{Config, FunctionMode};
+use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
@@ -408,6 +408,56 @@ pub async fn harness_with(options: HarnessOptions) -> Harness {
 
 pub async fn harness() -> Harness {
     harness_with(HarnessOptions::default()).await
+}
+
+/// The mail domain [`mail_harness`] configures.
+pub const MAIL_DOMAIN: &str = "example.com";
+
+/// The mail bucket [`mail_harness`] configures.
+pub const MAIL_BUCKET: &str = "mail-bucket";
+
+/// The `MailConfig` the mailbox tests run against.
+#[must_use]
+pub fn test_mail_config() -> MailConfig {
+    MailConfig {
+        domain: MAIL_DOMAIN.to_owned(),
+        table_name: "mail-table".to_owned(),
+        bucket: MAIL_BUCKET.to_owned(),
+        inboxes: vec!["support".to_owned(), "sales".to_owned()],
+        catch_all: false,
+        auto_create_inboxes: false,
+        configuration_set: "config-set".to_owned(),
+        identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
+        api_keys_parameter: "/example/api-keys".to_owned(),
+        attachment_url_ttl: std::time::Duration::from_secs(3600),
+        region: "us-east-1".to_owned(),
+        send_rate: 1,
+        unknown_outbox_retention_days: 30,
+    }
+}
+
+/// A harness with the mailbox configured. [`harness`] leaves `mail` unset,
+/// which is what a stack without `MailDomain` looks like, so every mailbox
+/// test needs this instead.
+pub async fn mail_harness() -> Harness {
+    let mut harness = harness_with(HarnessOptions::default()).await;
+    let state = Arc::new(AppState {
+        services: FakeServices::default(),
+        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
+        verifier: SnsVerifier::builder()
+            .dangerous_allow_cert_url_prefix(harness.server.uri())
+            .build()
+            .unwrap(),
+        allowlist: TopicAllowlist::parse(ALLOWED_ACCOUNT),
+        http: reqwest::Client::new(),
+        config: Config {
+            mail: Some(test_mail_config()),
+            ..harness.state.config.clone()
+        },
+        dangerous_subscribe_url_prefix: Some(harness.server.uri()),
+    });
+    harness.state = state;
+    harness
 }
 
 pub async fn post(state: Arc<AppState<FakeServices>>, route: &str, body: &Value) -> StatusCode {

@@ -79,8 +79,8 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
             "/inboxes/{inbox_id}/messages/{message_id}",
             delete(not_implemented),
         )
-        // Send and reply are not implemented yet.
-        .route("/inboxes/{inbox_id}/messages/send", post(not_implemented))
+        .route("/inboxes/{inbox_id}/messages/send", post(send::send::<T>))
+        // Reply is not implemented yet.
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/reply",
             post(not_implemented),

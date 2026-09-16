@@ -115,6 +115,13 @@ impl MailMemoryStore {
         (pk.to_owned(), sk.to_owned())
     }
 
+    /// The raw item at `pk`/`sk`, for tests asserting on an item the
+    /// `MailStore` trait has no reader for.
+    #[must_use]
+    pub fn raw_item(&self, pk: &str, sk: &str) -> Option<Item> {
+        self.get_item(pk, sk)
+    }
+
     fn string_attr(item: &Item, name: &str) -> Option<String> {
         match item.inner().get(name) {
             Some(AttributeValue::S(s)) => Some(s.clone()),
