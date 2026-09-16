@@ -55,6 +55,7 @@ axum = { workspace = true, features = ["json", "query"] }
 # Page tokens (mail::keys) are base64url-encoded.
 base64 = { workspace = true, features = ["std"] }
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
+mail-builder.workspace = true
 mail-parser.workspace = true
 metrics.workspace = true
 metrics_cloudwatch_embedded = { workspace = true, features = ["lambda"] }

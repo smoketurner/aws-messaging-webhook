@@ -163,6 +163,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "lambda_http",
+ "mail-builder",
  "mail-parser",
  "metrics",
  "metrics_cloudwatch_embedded",
@@ -1827,6 +1828,12 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "mail-builder"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccbc27cb02a58a311a404769a22f5abf63fe3173b290d80be7c534f9c7023151"
 
 [[package]]
 name = "mail-parser"
