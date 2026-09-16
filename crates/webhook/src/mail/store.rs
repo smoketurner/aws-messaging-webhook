@@ -75,6 +75,12 @@ pub enum MarkOutcome<'a> {
     Unknown,
     /// Hand it back for another attempt.
     Released,
+    /// An operator decided this send did go out, without SES telling us so.
+    /// There is no SES id to record, which is the difference from `Sent`.
+    ClosedSent,
+    /// An operator asked for an `unknown` send to be attempted again,
+    /// accepting the risk that SES already has it.
+    Resumed,
 }
 
 /// A thread plus one page of its messages, ascending.

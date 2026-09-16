@@ -123,9 +123,16 @@ pub async fn dispatch<T: Services>(
     // Function URL payload never does — an attacker-controlled HTTP body only
     // ever appears as a JSON *string field* inside the API Gateway envelope,
     // so it cannot fake this shape.
-    // The sweep is the one invocation with no records at all: a scheduled
-    // rule sends a bare event, which no other pathway produces.
+    // Neither the sweep nor an operator command carries records: a scheduled
+    // rule sends a bare event and an operator invokes with a command object,
+    // and no other pathway produces either shape.
     if state.config.mode == FunctionMode::Sender && payload.get("Records").is_none() {
+        if payload.get("command").is_some() {
+            let command: crate::mail::sender::Command = serde_json::from_value(payload)
+                .map_err(|e| format!("not a sender command: {e}"))?;
+            crate::mail::sender::handle_command(&state, &command).await?;
+            return Ok(serde_json::json!({ "ok": true }));
+        }
         let report = crate::mail::sender::sweep(&state).await?;
         return Ok(serde_json::json!({
             "released": report.released,

@@ -2,8 +2,10 @@
 //! send specs. The bucket is always `MailConfig.bucket` — never a parameter,
 //! so no caller can address another bucket.
 //!
-//! Objects are written once and never modified, so there is no update or
-//! delete here: retention removes them on the bucket's own schedule.
+//! Objects are written once and never modified. The one deletion is
+//! [`ObjectStore::delete_object`], which the sender uses to clear an outbox
+//! entry after its message has gone out; everything else expires on the
+//! bucket's own schedule.
 
 use std::future::Future;
 use std::time::Duration;
@@ -43,6 +45,10 @@ pub trait ObjectStore: Send + Sync {
         body: Bytes,
         content_type: &str,
     ) -> impl Future<Output = Result<PutOutcome, ObjectError>> + Send;
+
+    /// Removes `key`. A key that is already gone is not an error: the caller
+    /// wanted it absent, and it is.
+    fn delete_object(&self, key: &str) -> impl Future<Output = Result<(), ObjectError>> + Send;
 
     /// A presigned `GET` URL for `key`, valid for [`DOWNLOAD_URL_TTL`].
     ///

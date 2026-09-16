@@ -175,6 +175,28 @@ impl ObjectStore for AwsServices {
         }
     }
 
+    async fn delete_object(&self, key: &str) -> Result<(), ObjectError> {
+        let bucket = self.mail_bucket()?;
+        let result = self
+            .s3
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .customize()
+            .config_override(timeout_override())
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            // S3 reports deleting a missing key as success, but a 404 from a
+            // bucket policy path is the same outcome for the caller.
+            Err(error) => match classify_object_error("DeleteObject", &error) {
+                ObjectError::NotFound => Ok(()),
+                other => Err(other),
+            },
+        }
+    }
+
     async fn presign_get(
         &self,
         key: &str,

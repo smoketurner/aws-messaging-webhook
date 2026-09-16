@@ -415,14 +415,59 @@ needed, but mail to the mailbox addresses then matches no rule. The mail bucket 
 are retained, so delete them by hand if you don't need them. If you re-enable the mailbox with
 the same explicit `MailBucketName`, delete the retained bucket first.
 
-### Known follow-ups
+### Operator runbook
 
-- Re-ingesting permanently failed ingests. Deliveries in `MailIngestDlq` aren't replayed
-  automatically; their raw MIME stays under `inbound/` until `MailRetentionDays`.
-- Resolving a send whose outcome is `unknown`. The sweep reports them; deciding whether to
-  resend or close one is an operator judgement and has no command yet.
-- Cleaning up `outbox/` objects once a send is finished. They expire with `MailRetentionDays`
-  rather than being removed promptly.
+Two situations need a person. Both are driven by invoking the sender function directly rather
+than through the API: they are rare, destructive and account-scoped, so `lambda:InvokeFunction`
+is a better gate than a bearer key.
+
+**A send whose outcome is `unknown`.** SES was called and no usable answer came back, so it may
+or may not hold the message. Nothing automatic will touch it — resending risks delivering twice.
+Find them in the sweep's log line (`sends_outcome_unknown`) or by querying `ByStatus`, then
+decide:
+
+```bash
+sender=aws-messaging-webhook-dev-mail-sender
+
+# Send it again, accepting that the recipient may get two copies.
+aws lambda invoke --function-name "$sender" --payload \
+  '{"command":"resend","message_id":"<id>"}' /dev/stdout
+
+# Or record the outcome without sending anything.
+aws lambda invoke --function-name "$sender" --payload \
+  '{"command":"close_sent","message_id":"<id>"}' /dev/stdout
+aws lambda invoke --function-name "$sender" --payload \
+  '{"command":"close_failed","message_id":"<id>"}' /dev/stdout
+```
+
+Only a send in `unknown` can be resolved; anything else is refused, because resolving a send
+still in flight would race the sender holding it and resolving a finished one would rewrite a
+settled outcome. Closing as sent labels the message `sent` without an SES id; closing as failed
+labels it `rejected` with reason `closed_by_operator`.
+
+**Mail that failed to ingest.** Deliveries that exhausted their retries land in `MailIngestDlq`
+carrying the original event, so replaying one is re-invoking the webhook function with it:
+
+```bash
+queue=$(output MailIngestDlqUrl)
+msg=$(aws sqs receive-message --queue-url "$queue" --max-number-of-messages 1)
+echo "$msg" | jq -r '.Messages[0].Body' | jq '.requestPayload' > /tmp/replay.json
+
+aws lambda invoke --function-name aws-messaging-webhook-dev-webhook \
+  --payload file:///tmp/replay.json /dev/stdout
+
+# Once it succeeds, drop the DLQ message.
+aws sqs delete-message --queue-url "$queue" \
+  --receipt-handle "$(echo "$msg" | jq -r '.Messages[0].ReceiptHandle')"
+```
+
+Ingest is idempotent — the message id is derived from the SES message id and receipt timestamp,
+so a replay that partly succeeded before resolves to the same ids rather than duplicating. The
+signature is re-verified on replay, which works as long as the signing certificate is still
+valid; that holds comfortably within the queue's 14-day retention.
+
+`MailSenderDlq` holds sends that exhausted their retries. Replay one the same way, against the
+sender function.
 
 ## EventBridge contract
 

@@ -354,6 +354,26 @@ impl SendState {
         }
     }
 
+    /// The state after an operator asks for an `unknown` send to go out
+    /// again.
+    ///
+    /// The transient-failure count resets: the operator has looked at this
+    /// send and decided, so the attempts that led to `unknown` should not
+    /// count against the fresh one.
+    #[must_use]
+    pub fn resumed(&self, now: &str) -> Self {
+        Self {
+            send_status: SendStatus::Queued,
+            version: self.version + 1,
+            sending_at: None,
+            requeued_at: Some(now.to_owned()),
+            transient_failures: 0,
+            operator_resend_at: Some(now.to_owned()),
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+
     /// The state after handing the record back for another attempt.
     #[must_use]
     pub fn released(&self, now: &str) -> Self {
@@ -413,6 +433,10 @@ pub fn mark_transition<'a>(
         // claiming either would be a statement this service cannot support.
         MarkOutcome::Unknown => (state.unknown(now), msg.labels.clone(), None),
         MarkOutcome::Released => (state.released(now), msg.labels.clone(), None),
+        // The operator is asserting the outcome SES never gave us, so the
+        // message is labelled as if it had.
+        MarkOutcome::ClosedSent => (state.sent(now), relabel("queued", "sent"), None),
+        MarkOutcome::Resumed => (state.resumed(now), msg.labels.clone(), None),
     }
 }
 

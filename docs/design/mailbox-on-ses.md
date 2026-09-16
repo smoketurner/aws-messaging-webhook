@@ -303,9 +303,9 @@ or sends sit stuck.
 
 ## Status and what is left
 
-Receiving, reading, labelling, downloading and sending are implemented and tested. The routes
-still answering `501` are the out-of-scope resource groups above, plus `POST /v0/inboxes` and
-the `DELETE` routes.
+Receiving, reading, labelling, downloading, sending and the operator paths are implemented and
+tested. The routes still answering `501` are the out-of-scope resource groups above, plus
+`POST /v0/inboxes` and the `DELETE` routes.
 
 **Nothing here has been deployed.** Every guarantee above is verified against in-memory doubles.
 Two of the bugs found while building this — a continuation key missing its table half, and a
@@ -313,11 +313,16 @@ status query routed to the wrong index — are exactly the class that only real 
 and both returned plausible-looking empty results rather than errors. Deploying to staging and
 watching real mail move in both directions is the next step, and it outranks everything below.
 
-Known gaps, in priority order:
+The two situations that need a person — a send stuck in `unknown`, and mail that failed to
+ingest — are driven by invoking a function directly rather than through the API, because they
+are rare, destructive and account-scoped: `lambda:InvokeFunction` gates them better than a
+bearer key, and the public surface stays the contract it mirrors. The README carries the
+commands.
 
-1. A send marked `unknown` has no operator command. The sweep reports them and deliberately
-   refuses to touch them, but there is no way to resend or close one.
-2. `outbox/` objects for a finished send are not cleaned up promptly; they expire with
-   `MailRetentionDays`.
-3. Inbound mail that failed ingest permanently is not replayed. The raw MIME survives in S3 and
-   the `ses.inbound` event still fires, but nothing re-runs it.
+Deliberate remaining limits, none of which is unfinished work:
+
+- A filtered list gives up after five store round-trips and returns a short page with a
+  continuation token, so a rare label over a large inbox costs the client several requests.
+- `GET /v0/inboxes` reads one index partition. Fine at the inbox counts this targets; it would
+  need sharding well beyond them.
+- Nothing pages. Metrics are emitted and alarms are the operator's to build.

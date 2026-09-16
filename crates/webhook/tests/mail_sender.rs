@@ -8,7 +8,9 @@
 
 use aws_messaging_webhook::actions::SendOutcome;
 use aws_messaging_webhook::mail::send::{SendState, SendStatus};
-use aws_messaging_webhook::mail::sender::{Handled, handle_send, sweep};
+use aws_messaging_webhook::mail::sender::{
+    Handled, Resolution, handle_send, resolve_unknown, sweep,
+};
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, send};
 use axum::body::Body;
@@ -508,4 +510,142 @@ async fn the_sweep_reports_unknown_sends_without_touching_them() {
     assert_eq!(report.released, 0);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
     assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
+}
+
+/// Drives a send to `unknown`, which is the only state an operator resolves.
+async fn stuck_unknown(h: &Harness) -> String {
+    let message_id = queued(h, &body()).await;
+    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+        reason: "connection reset".to_owned(),
+    });
+    handle_send(&h.state, &message_id).await.unwrap();
+    assert_eq!(state_of(h, &message_id).send_status, SendStatus::Unknown);
+    message_id
+}
+
+#[tokio::test]
+async fn an_operator_can_send_an_unknown_message_again() {
+    let h = seeded().await;
+    let message_id = stuck_unknown(&h).await;
+
+    resolve_unknown(&h.state, &message_id, Resolution::Resend)
+        .await
+        .unwrap();
+
+    // Back in the queue, with the count of failed attempts reset: the
+    // operator has looked at it and decided.
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Queued);
+    assert_eq!(state.transient_failures, 0);
+    assert!(state.requeued_at.is_some());
+    assert!(state.operator_resend_at.is_some());
+
+    // And the sender will now pick it up.
+    assert_eq!(
+        handle_send(&h.state, &message_id).await.unwrap(),
+        Handled::Sent
+    );
+    assert_eq!(h.state.services.sent.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_operator_can_close_an_unknown_message_as_sent() {
+    let h = seeded().await;
+    let message_id = stuck_unknown(&h).await;
+
+    resolve_unknown(&h.state, &message_id, Resolution::CloseSent)
+        .await
+        .unwrap();
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
+    let message = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.labels, vec!["sent"]);
+    // Nothing was sent to close it.
+    assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_operator_can_close_an_unknown_message_as_failed() {
+    let h = seeded().await;
+    let message_id = stuck_unknown(&h).await;
+
+    resolve_unknown(&h.state, &message_id, Resolution::CloseFailed)
+        .await
+        .unwrap();
+
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Failed);
+    assert_eq!(
+        state
+            .failure
+            .map(aws_messaging_webhook::mail::send::SendFailure::as_str),
+        Some("closed_by_operator")
+    );
+}
+
+#[tokio::test]
+async fn only_an_unknown_send_can_be_resolved() {
+    // Resolving a send that is still in flight would race the sender holding
+    // it, and resolving a finished one would rewrite a settled outcome.
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+    handle_send(&h.state, &message_id).await.unwrap();
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
+
+    let error = resolve_unknown(&h.state, &message_id, Resolution::Resend)
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:?}").contains("not unknown"), "{error:?}");
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
+}
+
+#[tokio::test]
+async fn a_sent_message_leaves_no_outbox_objects_behind() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    handle_send(&h.state, &message_id).await.unwrap();
+
+    assert!(
+        !h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "the spec should be gone once the message has gone out"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the attachment should be removed too: {deleted:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
+    // Clearing these would make an operator resend impossible.
+    let h = seeded().await;
+    let message_id = stuck_unknown(&h).await;
+
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "an unresolved send must keep what it would be rebuilt from"
+    );
 }

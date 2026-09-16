@@ -306,6 +306,10 @@ impl ObjectStore for FakeServices {
             .await
     }
 
+    async fn delete_object(&self, key: &str) -> Result<(), ObjectError> {
+        self.objects.delete_object(key).await
+    }
+
     async fn presign_get(
         &self,
         key: &str,

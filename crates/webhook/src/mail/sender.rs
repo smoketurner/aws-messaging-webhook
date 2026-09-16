@@ -129,6 +129,118 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<S
     }
 }
 
+/// An operator instruction, sent by invoking the sender function directly.
+///
+/// Deliberately not an HTTP route: these are rare, destructive and
+/// account-scoped, so `lambda:InvokeFunction` is a better gate than a bearer
+/// key, and the public API surface stays the contract it mirrors.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum Command {
+    /// Send an `unknown` message again.
+    Resend { message_id: String },
+    /// Record an `unknown` message as having gone out.
+    CloseSent { message_id: String },
+    /// Record an `unknown` message as not having gone out.
+    CloseFailed { message_id: String },
+}
+
+impl Command {
+    fn message_id(&self) -> &str {
+        match self {
+            Self::Resend { message_id }
+            | Self::CloseSent { message_id }
+            | Self::CloseFailed { message_id } => message_id,
+        }
+    }
+
+    fn resolution(&self) -> Resolution {
+        match self {
+            Self::Resend { .. } => Resolution::Resend,
+            Self::CloseSent { .. } => Resolution::CloseSent,
+            Self::CloseFailed { .. } => Resolution::CloseFailed,
+        }
+    }
+}
+
+/// Runs one operator instruction.
+///
+/// # Errors
+///
+/// [`SenderError`] when the send is missing, is not `unknown`, or the store
+/// cannot be written.
+pub async fn handle_command<T: Services>(
+    state: &AppState<T>,
+    command: &Command,
+) -> Result<(), SenderError> {
+    resolve_unknown(state, command.message_id(), command.resolution()).await
+}
+
+/// What an operator decided about a send whose outcome SES never confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// Send it again, accepting that SES may already have it.
+    Resend,
+    /// It did go out; record it as sent without sending anything.
+    CloseSent,
+    /// It did not go out; record it as failed.
+    CloseFailed,
+}
+
+/// Applies an operator's decision to a send stuck in `unknown`.
+///
+/// This is the one place that can move a send out of `unknown`, and it exists
+/// because nothing automatic should: SES may hold the message, so resending
+/// risks delivering it twice and closing it asserts an outcome this service
+/// never observed. Both are judgements only a person can make.
+///
+/// # Errors
+///
+/// [`SenderError::Store`] when the send does not exist or is not `unknown` —
+/// resolving a send that is still in flight would race the sender holding it.
+pub async fn resolve_unknown<T: Services>(
+    state: &AppState<T>,
+    message_id: &str,
+    resolution: Resolution,
+) -> Result<(), SenderError> {
+    let now = time::format(time::now_ms());
+    let Some(send) = state
+        .services
+        .get_send_state(message_id)
+        .await
+        .map_err(|e| store_error(&e))?
+    else {
+        return Err(SenderError::Store(anyhow::anyhow!(
+            "no send state for {message_id}"
+        )));
+    };
+    if send.send_status != SendStatus::Unknown {
+        return Err(SenderError::Store(anyhow::anyhow!(
+            "send {message_id} is {}, not unknown; only an unknown send can be resolved",
+            send.send_status.as_str()
+        )));
+    }
+
+    let outcome = match resolution {
+        Resolution::Resend => MarkOutcome::Resumed,
+        Resolution::CloseSent => MarkOutcome::ClosedSent,
+        Resolution::CloseFailed => MarkOutcome::Failed(SendFailure::ClosedByOperator),
+    };
+    state
+        .services
+        .mark_send(&send, outcome, &now)
+        .await
+        .map_err(|e| store_error(&e))?;
+
+    tracing::warn!(
+        message_id,
+        resolution = ?resolution,
+        event = "send_resolved_by_operator",
+        "an operator resolved a send whose outcome SES never confirmed"
+    );
+    Ok(())
+}
+
 /// How long a send may sit claimed before the sweep assumes its sender died.
 ///
 /// Comfortably longer than the sender's own timeout, so a send that is merely
@@ -340,6 +452,7 @@ async fn record_outcome<T: Services>(
                 event = "message_sent",
                 "sent"
             );
+            clear_outbox(state, claimed).await;
             Ok(Handled::Sent)
         }
         SendOutcome::Failed { reason } => {
@@ -388,6 +501,44 @@ async fn record_outcome<T: Services>(
 
 /// How many times a send may be handed back before it is abandoned.
 const MAX_TRANSIENT_FAILURES: u32 = 5;
+
+/// Removes the outbox objects for a finished send.
+///
+/// Best effort, and deliberately after the outcome is recorded: the send has
+/// already happened, so a failure here must not undo it or make the record be
+/// retried. Anything left behind expires with the bucket's retention rule.
+///
+/// Only ever called for a send that is finished and will not be rebuilt. A
+/// send in `unknown` keeps its objects, because an operator may yet ask for it
+/// to go out again.
+async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
+    let message_id = &finished.message_id;
+    let mut keys = vec![send::spec_key(message_id)];
+
+    // The spec names the parts, so it is read before it is removed.
+    if let Ok(bytes) = state
+        .services
+        .get_object(&send::spec_key(message_id), MAX_OUTBOUND_RAW_BYTES)
+        .await
+        && let Ok(spec) = serde_json::from_slice::<SendSpec>(&bytes)
+    {
+        for attachment in &spec.attachments {
+            keys.push(send::part_key(message_id, &attachment.attachment_id));
+        }
+    }
+
+    for key in keys {
+        if let Err(error) = state.services.delete_object(&key).await {
+            tracing::warn!(
+                message_id,
+                key,
+                error = %error,
+                event = "outbox_cleanup_failed",
+                "could not remove an outbox object; it will expire with retention"
+            );
+        }
+    }
+}
 
 /// Why a spec or part could not be loaded.
 enum LoadError {

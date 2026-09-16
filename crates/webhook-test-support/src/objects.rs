@@ -43,6 +43,7 @@ struct CallLog {
     get_object: Vec<String>,
     head_object: Vec<String>,
     put_object_if_absent: Vec<String>,
+    delete_object: Vec<String>,
 }
 
 #[derive(Default)]
@@ -137,6 +138,12 @@ impl FakeObjectStore {
     #[must_use]
     pub fn head_object_calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().head_object.clone()
+    }
+
+    /// The ordered sequence of every key `delete_object` was called with.
+    #[must_use]
+    pub fn delete_object_calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().delete_object.clone()
     }
 
     /// The ordered sequence of every key `put_object_if_absent` was called
@@ -243,6 +250,32 @@ impl ObjectStore for FakeObjectStore {
             },
         );
         Ok(PutOutcome::Created)
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<(), ObjectError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .delete_object
+            .push(key.to_owned());
+        match self.injected(key) {
+            Some(ObjectFailure::Hang) => future::pending().await,
+            Some(ObjectFailure::Permanent) => {
+                return Err(ObjectError::Permanent(anyhow!(
+                    "injected permanent delete_object failure for {key}"
+                )));
+            }
+            Some(ObjectFailure::Transient) => {
+                return Err(ObjectError::Transient(anyhow!(
+                    "injected transient delete_object failure for {key}"
+                )));
+            }
+            // Deleting something already absent is the outcome the caller
+            // wanted.
+            Some(ObjectFailure::NotFound) | None => {}
+        }
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
     }
 
     /// A recognizable stand-in for a presigned URL, carrying the key and the
