@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-//! Bearer auth on the `/v0` surface (D20), driven through the real router.
+//! Bearer auth on the `/v0` surface, driven through the real router.
 //!
 //! These tests pin the three rules an SDK client depends on: an unknown key
 //! is rejected, a parameter-store outage is retryable rather than a
@@ -83,7 +83,7 @@ async fn an_authenticated_call_to_an_unimplemented_route_answers_501() {
 }
 
 #[tokio::test]
-async fn an_unknown_v0_path_answers_the_agentmail_404_body() {
+async fn an_unknown_v0_path_answers_the_contract_404_body() {
     let h = harness().await;
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
 

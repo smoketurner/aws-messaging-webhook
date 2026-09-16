@@ -1,5 +1,5 @@
 //! The production [`ApiKeySource`]: the SSM `SecureString` holding the API
-//! key hashes (D20).
+//! key hashes.
 //!
 //! The parameter name comes from configuration and is never caller-supplied,
 //! and the decrypted value is passed straight to the cache — it is never

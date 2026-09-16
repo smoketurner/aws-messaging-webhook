@@ -1,14 +1,14 @@
-//! The `AgentMail`-compatible `/v0` HTTP API (plan §8).
+//! The `/v0` mailbox HTTP API.
 //!
 //! Mounted on the same Function URL as the `/webhooks/...` paths. Every route
 //! is behind bearer auth, and every response body — success or failure —
-//! matches `AgentMail`'s documented shape, so an `AgentMail` SDK works
+//! follows the published mailbox API contract, so an existing client works
 //! against this service with only the base URL and key changed.
 //!
-//! Routes that `AgentMail` documents but this service does not implement
-//! answer `501` with a parseable body rather than a bare status line, and
-//! unknown `/v0` paths answer `AgentMail`'s `404`. Paths outside `/v0` keep
-//! axum's default `404`.
+//! Routes the contract defines but this service does not implement answer
+//! `501` with a parseable body rather than a bare status line, and unknown
+//! `/v0` paths answer the contract's `404`. Paths outside `/v0` keep axum's
+//! default `404`.
 
 pub mod auth;
 pub mod error;
@@ -28,7 +28,7 @@ use crate::state::{AppState, Services};
 /// exist.
 pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
     Router::new()
-        // Resource groups this service does not implement (D13).
+        // Resource groups this service does not implement.
         .route("/inboxes/{inbox_id}/drafts", any(not_implemented))
         .route("/inboxes/{inbox_id}/drafts/{*rest}", any(not_implemented))
         .route("/inboxes/{inbox_id}/labels", any(not_implemented))
@@ -51,7 +51,7 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
             "/inboxes/{inbox_id}/messages/{message_id}",
             delete(not_implemented),
         )
-        // Sending arrives in phase 3.
+        // Send and reply are not implemented yet.
         .route("/inboxes/{inbox_id}/messages/send", post(not_implemented))
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/reply",

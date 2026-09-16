@@ -1,4 +1,4 @@
-//! Message, attachment and event ids (D38, D23).
+//! Message, attachment and event ids.
 //!
 //! Every id in the mail feature is a `UUIDv7` (`Builder::from_unix_timestamp_millis`,
 //! hyphenated lowercase): sortable by creation time, but with a
@@ -34,20 +34,20 @@ pub fn inbound_message_id(ses_id: &str, received_ms: u64) -> Uuid {
 
 /// A fresh outbound message id: randomly seeded (nothing to derive
 /// determinism from at enqueue time), computed once per API request and
-/// reused across retries of that request (D17 m6).
+/// reused across retries of that request.
 #[must_use]
 pub fn outbound_message_id() -> Uuid {
     Uuid::now_v7()
 }
 
 /// A deterministic attachment id for the `ordinal`-th kept part of
-/// `message_id` (AT4, N17): `"att_"` + 32 lowercase hex (a simple-form
-/// `UUIDv7`), timestamped at the message id's own embedded creation time so
-/// attachment ids sort next to their message. `ordinal` is the 0-based
-/// position in the kept attachment list (AT11 selection order for inbound,
-/// the request's `attachments` array index for outbound) — not a raw MIME
-/// part index. Determinism (same message, same ordinal, same id) is what
-/// lets ingest's resume check (D48 m2) and the outbound object puts
+/// `message_id`: `"att_"` + 32 lowercase hex (a simple-form `UUIDv7`),
+/// timestamped at the message id's own embedded creation time so attachment
+/// ids sort next to their message. `ordinal` is the 0-based position in the
+/// kept attachment list (selection order for inbound, the request's
+/// `attachments` array index for outbound) — not a raw MIME part index.
+/// Determinism (same message, same ordinal, same id) is what lets ingest's
+/// resume check and the outbound object puts
 /// (`put_object_if_absent`) treat a redelivery or a retried request as a
 /// no-op rather than a duplicate write.
 #[must_use]
@@ -65,7 +65,7 @@ pub fn attachment_id(message_id: &Uuid, ordinal: usize) -> String {
     format!("att_{}", uuid.simple())
 }
 
-/// The sort-key time prefix (D38): `ms` split into an 8-hex-digit high half
+/// The sort-key time prefix: `ms` split into an 8-hex-digit high half
 /// and a 4-hex-digit low half, so `ByTime`/`ByThread`-style range bounds
 /// (`before`/`after`) can be built as plain string comparisons against a
 /// `UUIDv7` sort key, which begins with the same encoding of its timestamp.
@@ -74,14 +74,14 @@ pub fn time_prefix(ms: u64) -> String {
     format!("{:08x}-{:04x}", ms >> 16, ms & 0xffff)
 }
 
-/// This inbox's RFC `Message-ID` for a message we sent (D2): the message id
+/// This inbox's RFC `Message-ID` for a message we sent: the message id
 /// wrapped in angle brackets on our mail domain.
 #[must_use]
 pub fn our_rfc_message_id(message_id: &str, domain: &str) -> String {
     format!("<{message_id}@{domain}>")
 }
 
-/// The two RFC `Message-ID` forms SES may address a sent message by (D2),
+/// The two RFC `Message-ID` forms SES may address a sent message by,
 /// registered as aliases at `mark_sent` so a reply referencing either one
 /// resolves back to it.
 #[must_use]
@@ -92,7 +92,7 @@ pub fn ses_rfc_ids(ses_message_id: &str, region: &str) -> [String; 2] {
     ]
 }
 
-/// The EventBridge `event_id` (D23): `evt_` followed by a deterministic
+/// The EventBridge `event_id`: `evt_` followed by a deterministic
 /// simple-form `UUIDv7` seeded from `(inbox, message_id, event_type)`, so
 /// redelivery of the same underlying event produces the same `event_id`.
 /// `ts_ms` is the message timestamp for a received event, `sent_at` for
@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(ts_ms, 1_700_000_000_000);
     }
 
-    /// A golden vector computed from the N17 formula, pinned so a change to
+    /// A golden vector, pinned so a change to
     /// the seed shape or the UUID encoding is caught rather than silently
     /// re-deriving a new "correct" value.
     #[test]

@@ -1,7 +1,7 @@
 //! Production [`Services`](crate::state::Services) implementation wrapping
 //! the AWS SDK clients.
 
-// Mail (AgentMail-compatible inbox) trait implementations.
+// Mail inbox trait implementations.
 pub mod api_keys;
 pub mod mail_store;
 pub mod objects;
@@ -33,7 +33,7 @@ pub struct AwsServices {
     /// unconditionally since it is cheap and `MailConfig` is per-invocation
     /// optional, not per-client.
     s3: aws_sdk_s3::Client,
-    /// Reads the `SecureString` holding the API key hashes (D20).
+    /// Reads the `SecureString` holding the API key hashes.
     ssm: aws_sdk_ssm::Client,
     config: Config,
 }

@@ -19,7 +19,7 @@
 //! images with `serde_dynamo`, so the typed `AttributeValue`s (including the
 //! base64 binary `raw_body`) are decoded by the library rather than by hand.
 //!
-//! The same consumer also relays the mail table's stream (D6, §6.6): its
+//! The same consumer also relays the mail table's stream: its
 //! items are told apart from the events-table's by `sk` prefix (`MSG#` for a
 //! message item; every other mail-table `sk` — `STATE`, `META`, `THR#…`,
 //! `MSGAT#…`, `THRAT#…`, `RFC`, `SESMSG#…`, `SENDKEY#…`, `SESCALL#…` — never
@@ -115,7 +115,7 @@ pub async fn handle_stream<T: Services>(
             // MODIFY that changes it) — not on count-only bumps.
             publish_status_changed(state, new_image, &record.change.old_image).await
         } else if sk.starts_with("MSG#") {
-            // Mail-table message item (D6). Only an INSERT with a `received`
+            // Mail-table message item. Only an INSERT with a `received`
             // label publishes in P1; a MODIFY (labels-only, promotion
             // repoints, metadata writes) never diffs `labels`, so it settles
             // without publishing.
@@ -126,7 +126,7 @@ pub async fn handle_stream<T: Services>(
         } else {
             // Every other mail-table item (STATE, META, THR#…, MSGAT#…,
             // THRAT#…, RFC, SESMSG#…, SENDKEY#…, SESCALL#…) never matches the
-            // relay filter in production (D6 rev5) and never publishes here.
+            // relay filter in production and never publishes here.
             continue;
         };
         // Reconstruction / no-op cases settle without a retry; only a
@@ -212,7 +212,7 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
 /// INSERT image. Returns [`RelayOutcome::Retry`] on a transient publish
 /// failure; a deserialization failure is a deterministic bug (not a
 /// transient fault), so it is logged and returns [`RelayOutcome::Settled`]
-/// (M10: an INSERT's absent/empty `OldImage` is never read here, so it can't
+/// (an INSERT's absent or empty `OldImage` is never read here, so it can't
 /// cause this).
 async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
     let msg: MailMessage = match serde_dynamo::from_item(image.clone()) {

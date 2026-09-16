@@ -1,16 +1,12 @@
-//! The transactional write model (§4 "Write model", D27): every mail-table
-//! transaction is planned as a `Vec<PlannedOp>` up front, then executed and
-//! its cancellation decoded uniformly by `mail::txn::decode_cancellation`.
+//! The transactional write model: every mail-table transaction is planned as
+//! a `Vec<PlannedOp>` up front, then executed and its cancellation decoded
+//! uniformly by `mail::txn::decode_cancellation`.
 //!
-//! `plan_insert` (ingest, P1) plans the D26 71-op ingest transaction: the
-//! message, its versioned thread (D3/D4), message/thread label pointers, and
-//! the `Message-ID` alias (D2). It is pure — every input (the message and
-//! the thread state before/after) is computed by the caller from consistent
-//! reads; this module only turns that data into `WriteOp`s.
-//!
-//! `plan_label_patch` (PATCH, P2) is added to this file when phase 2 lands —
-//! see the `mail::store` deviation note on why this file, like `mail::store`,
-//! is revisited outside the plan's literal shared-files list.
+//! `plan_insert` plans the ingest transaction: the message, its versioned
+//! thread, message and thread label pointers, and the `Message-ID` alias. It
+//! is pure — every input (the message and the thread state before and after)
+//! is computed by the caller from consistent reads; this module only turns
+//! that data into `WriteOp`s.
 
 use serde_dynamo::AttributeValue;
 
@@ -18,8 +14,9 @@ use crate::mail::store::MailStoreError;
 use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
 use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys, size};
 
-/// The ingest transaction's op-count ceiling (D26): message + thread + 4
-/// message pointers + 32 thread-pointer deletes + 32 puts + 1 alias.
+/// The ingest transaction's op-count ceiling, well inside DynamoDB's limit of
+/// 100: message + thread + 4 message pointers + 32 thread-pointer deletes +
+/// 32 puts + 1 alias.
 const INGEST_TXN_OP_CAP: usize = 71;
 
 /// Which role a planned op plays in its transaction — used by
@@ -37,7 +34,7 @@ pub enum OpRole {
     SesRef,
 }
 
-/// Which flow this transaction belongs to (D27); `decode_cancellation`
+/// Which flow this transaction belongs to; `decode_cancellation`
 /// branches on it (e.g. only `Enqueue` produces `TxnDecision::KeyExists`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnKind {
@@ -94,7 +91,7 @@ pub enum WriteOp {
         pk: String,
         sk: String,
     },
-    /// The RFC-alias first-writer-wins put (D2): unconditioned by version,
+    /// The RFC-alias first-writer-wins put: unconditioned by version,
     /// just `NotExists` on the alias key.
     AliasFirstWriter {
         pk: String,
@@ -111,8 +108,8 @@ pub struct PlannedOp {
 }
 
 /// Builds a `serde_dynamo::Item` from `value`, inserting `pk`/`sk` (and any
-/// extra key attributes) alongside the serialized fields (N18): the struct
-/// itself carries no key attributes, so every planner adds them here.
+/// extra key attributes) alongside the serialized fields: the struct itself
+/// carries no key attributes, so every planner adds them here.
 fn item_with_keys<T: serde::Serialize>(
     value: &T,
     keys: impl IntoIterator<Item = (&'static str, AttributeValue)>,
@@ -126,7 +123,7 @@ fn item_with_keys<T: serde::Serialize>(
 }
 
 /// Builds the label pointer item for a thread (`INBOX#<inbox>#LABEL#<label>`
-/// / `THRAT#<timestamp>#<thread_id>`, §4).
+/// / `THRAT#<timestamp>#<thread_id>`).
 fn thread_pointer_item(thread: &ThreadState, label: &str) -> serde_dynamo::Item {
     let mut item = serde_dynamo::Item::default();
     item.inner_mut().insert(
@@ -148,7 +145,7 @@ fn thread_pointer_item(thread: &ThreadState, label: &str) -> serde_dynamo::Item 
 }
 
 /// Builds the message pointer item for a label
-/// (`INBOX#<inbox>#LABEL#<label>` / `MSGAT#<message_id>`, §4).
+/// (`INBOX#<inbox>#LABEL#<label>` / `MSGAT#<message_id>`).
 fn message_pointer_item(msg: &MailMessage, label: &str) -> serde_dynamo::Item {
     let mut item = serde_dynamo::Item::default();
     item.inner_mut().insert(
@@ -174,13 +171,12 @@ fn strip_angle_brackets(rfc_id: &str) -> &str {
         .unwrap_or(rfc_id)
 }
 
-/// Aliases skip ids over this many bytes (D2), keeping the alias pk under
+/// Aliases skip ids over this many bytes, keeping the alias pk under
 /// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
 const ALIAS_ID_MAX_BYTES: usize = 900;
 
-/// Plans the ingest transaction (§6.1 step 7, D2, D3, D4, D26, D30): the
-/// message, its versioned thread, message/thread label pointers, and the
-/// `Message-ID` alias.
+/// Plans the ingest transaction: the message, its versioned thread, message
+/// and thread label pointers, and the `Message-ID` alias.
 ///
 /// `thread_before` is the thread's state from a consistent read, or `None`
 /// for a brand-new thread; `thread_after` is the caller-computed result of
@@ -190,10 +186,9 @@ const ALIAS_ID_MAX_BYTES: usize = 900;
 /// # Errors
 ///
 /// Returns [`MailStoreError::LabelLimit`] when `thread_after`'s label union
-/// exceeds [`THREAD_LABEL_TOTAL_CAP`] (D26), and
-/// [`MailStoreError::Permanent`] if the planned transaction would exceed the
-/// [`INGEST_TXN_OP_CAP`] (D26) — both planner-detected cap violations, per
-/// the action-path error mapping in §5.
+/// exceeds [`THREAD_LABEL_TOTAL_CAP`], and [`MailStoreError::Permanent`] if
+/// the planned transaction would exceed [`INGEST_TXN_OP_CAP`]. Both are
+/// permanent: a retry would plan the same oversized transaction.
 pub fn plan_insert(
     msg: &MailMessage,
     thread_before: Option<&ThreadState>,
@@ -233,12 +228,12 @@ pub fn plan_insert(
     Ok(ops)
 }
 
-/// Builds the message item's `Put`. N19: for an inbound message, the
+/// Builds the message item's `Put`. For an inbound message the
 /// `thread_snapshot` is populated here from `thread_after` — the
 /// caller-computed thread state that already includes this message — on a
-/// clone of `msg`, then `fit_item` is re-run since the injected snapshot can
-/// push the item back over the D5 budget after ingest already fit it without
-/// one. `msg` itself (and every other planned op) is unaffected.
+/// clone of `msg`, then `fit_item` is re-run, since the injected snapshot can
+/// push the item back over the size budget after ingest already fit it
+/// without one. `msg` itself, and every other planned op, is unaffected.
 fn message_put(msg: &MailMessage, thread_after: &ThreadState) -> Result<PlannedOp, MailStoreError> {
     let mut item_source = msg.clone();
     if matches!(msg.direction, Direction::Inbound) {
@@ -318,7 +313,7 @@ fn thread_put(
 }
 
 /// Deletes every label pointer at the thread's old timestamp, then puts one
-/// at its new timestamp for every label in the union (D3: the pointer's sort
+/// at its new timestamp for every label in the union (the pointer's sort
 /// key embeds the thread's last-activity timestamp, so it moves on every
 /// message even when the label set itself doesn't change).
 fn push_thread_pointer_ops(
@@ -360,7 +355,7 @@ fn push_message_pointer_ops(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
     }
 }
 
-/// Pushes the `Message-ID` alias op (D2), skipping ids over
+/// Pushes the `Message-ID` alias op, skipping ids over
 /// [`ALIAS_ID_MAX_BYTES`].
 fn push_rfc_alias_op(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
     let stripped = strip_angle_brackets(&msg.rfc_message_id);
@@ -550,7 +545,7 @@ mod tests {
 
     proptest! {
         /// At maxima (4 message labels, a 32-label thread before and after),
-        /// the ingest plan never exceeds the D26 op cap of 71.
+        /// the ingest plan never exceeds the op cap of 71.
         #[test]
         fn plan_insert_never_exceeds_the_op_cap_at_maxima(
             message_label_count in 0usize..=4,

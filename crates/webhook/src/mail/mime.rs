@@ -1,6 +1,4 @@
-//! MIME parsing (AT11) and, in phase 3, outbound MIME building.
-//!
-//! `build_outbound` (P3, AT7) is added when track K lands.
+//! Inbound MIME parsing. Outbound MIME building is not implemented yet.
 
 use std::collections::BTreeMap;
 
@@ -22,8 +20,8 @@ pub enum ParseError {
     Malformed,
 }
 
-/// One kept attachment part extracted from the raw MIME (AT11 selection and
-/// normalization), ready to be persisted to `attachments/<mid>/<att_id>`.
+/// One kept attachment part extracted from the raw MIME, normalized and
+/// ready to be persisted to `attachments/<mid>/<att_id>`.
 #[derive(Debug, Clone)]
 pub struct ParsedAttachment {
     pub filename: Option<String>,
@@ -41,8 +39,8 @@ pub struct ParsedAttachment {
 /// `thread_id`, `message_id`, `labels`, `timestamp`, `attachments`,
 /// `raw_s3_key`, `verdicts`, `thread_snapshot`, `delivery`, `version`,
 /// `created_at`, `updated_at`, …) are placeholders — ingest resolves one
-/// per matching inbox (§6.1 step 7) and overwrites them; only the
-/// content fields this doc lists on [`parse_inbound`] are meaningful here.
+/// per matching inbox and overwrites them; only the content fields
+/// [`parse_inbound`] documents are meaningful here.
 #[derive(Debug, Clone)]
 pub struct ParsedInbound {
     pub message: MailMessage,
@@ -50,14 +48,16 @@ pub struct ParsedInbound {
 }
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
-/// AT11: "normalized to a lowercase `type/subtype` token ≤ 127 bytes".
+/// A normalized content type is a lowercase `type/subtype` token, at most
+/// this many bytes.
 const NORMALIZED_CONTENT_TYPE_MAX_BYTES: usize = 127;
 
-/// Parses a raw MIME message (§6.1 step 5, AT11): addresses, subject, date,
-/// `Message-ID`/`In-Reply-To`/`References`, concatenated text/html body
-/// parts, headers within the caps, and attachment selection/normalization.
-/// Runs inside `tokio::task::spawn_blocking` at the ingest call site (D48,
-/// N1): the raw bytes and the borrowed `mail_parser::Message` are dropped
+/// Parses a raw MIME message: addresses, subject, date,
+/// `Message-ID`/`In-Reply-To`/`References`, concatenated text and html body
+/// parts, headers within the caps, and attachment selection and
+/// normalization. Runs inside `tokio::task::spawn_blocking` at the ingest
+/// call site: the raw bytes and the borrowed `mail_parser::Message` are
+/// dropped
 /// when this function returns, since every field is copied into owned
 /// `String`/`Bytes` before then.
 ///
@@ -68,8 +68,8 @@ const NORMALIZED_CONTENT_TYPE_MAX_BYTES: usize = 127;
 /// # Errors
 ///
 /// Returns [`ParseError`] when `mail-parser` cannot construct a message from
-/// `raw` at all (a permanent ingest failure per the action-path error
-/// mapping in §5).
+/// `raw` at all — a permanent ingest failure, since a retry would parse the
+/// same bytes.
 pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     let parsed = MessageParser::default()
         .parse(raw)
@@ -91,8 +91,8 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     let in_reply_to = id_list(parsed.in_reply_to()).into_iter().next();
     let mut references = id_list(parsed.references());
     if references.len() > REFERENCES_MAX {
-        // Keep the nearest (last) ids — D2's thread resolution walks
-        // References nearest-first.
+        // Keep the nearest (last) ids — thread resolution walks References
+        // nearest-first.
         let start = references.len() - REFERENCES_MAX;
         references = references.split_off(start);
     }
@@ -245,7 +245,7 @@ fn collect_headers(message: &MimeMessage<'_>) -> BTreeMap<String, String> {
 }
 
 /// Normalizes a `Content-Type` to a lowercase `type/subtype` token within
-/// the AT11 cap, falling back to [`DEFAULT_CONTENT_TYPE`] for anything
+/// the size cap, falling back to [`DEFAULT_CONTENT_TYPE`] for anything
 /// missing, oversized, or containing whitespace/control characters — so a
 /// hostile inbound content type can never make a later `PutObject` fail to
 /// build.
@@ -269,7 +269,7 @@ fn normalize_content_type(content_type: Option<&ContentType<'_>>) -> String {
 }
 
 /// `inline` when the `Content-Disposition` says so (case-insensitively),
-/// else `attachment` — AT3's disposition default, applied to inbound too.
+/// else `attachment`, the disposition default.
 fn normalized_disposition(part: &MessagePart<'_>) -> String {
     let is_inline = part
         .content_disposition()
@@ -277,7 +277,7 @@ fn normalized_disposition(part: &MessagePart<'_>) -> String {
     if is_inline { "inline" } else { "attachment" }.to_owned()
 }
 
-/// A filename for a nested `message/rfc822` part (AT11): the inner
+/// A filename for a nested `message/rfc822` part: the inner
 /// message's own subject, sanitized to strip control characters and capped
 /// at `ATTACHMENT_FIELD_MAX` bytes (leaving room for the `.eml` suffix),
 /// else `"message"` when the inner subject is absent or blank.
@@ -294,7 +294,7 @@ fn nested_message_filename(inner: Option<&MimeMessage<'_>>) -> String {
     )
 }
 
-/// Builds one kept attachment's metadata and bytes (AT11). A nested
+/// Builds one kept attachment's metadata and bytes. A nested
 /// `message/rfc822` part is stored as its own raw bytes under a synthesized
 /// filename and content type; inner parts are never flattened.
 fn build_attachment(part: &MessagePart<'_>) -> ParsedAttachment {
@@ -442,7 +442,7 @@ mod tests {
         assert!(matches!(error, ParseError::Malformed));
     }
 
-    /// AT11: only the first 100 attachment parts are kept; the rest are
+    /// Only the first 100 attachment parts are kept; the rest are
     /// signaled by `attachments_truncated` and reachable only in the raw MIME.
     #[test]
     fn more_than_100_attachments_are_truncated_at_selection() {
@@ -471,7 +471,7 @@ mod tests {
         assert!(parsed.message.headers.contains_key("From"));
     }
 
-    /// AT11 fixture list: "a 1 MB body", generated at test time.
+    /// A 1 MB body, generated at test time.
     #[test]
     fn one_megabyte_body_is_preserved_without_truncation() {
         let body = "A".repeat(1_000_000);
@@ -483,7 +483,7 @@ mod tests {
         assert!(!parsed.message.body_truncated);
     }
 
-    /// AT11 fixture list: "a ≈ 30 MB message", generated at test time.
+    /// A ≈ 30 MB message, generated at test time.
     #[test]
     fn thirty_megabyte_attachment_parses_without_panicking() {
         let payload = "A".repeat(30_000_000);

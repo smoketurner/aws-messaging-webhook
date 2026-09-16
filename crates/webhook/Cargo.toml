@@ -52,8 +52,7 @@ aws-sdk-ssm = { workspace = true, features = [
 aws-smithy-types.workspace = true
 aws_lambda_events = { workspace = true, features = ["dynamodb"] }
 axum = { workspace = true, features = ["json", "query"] }
-# rev5 addition, ahead of §9's phase-2 listing: mail::keys::PageToken (D11) is
-# an F1 (phase 1) deliverable and needs base64url now.
+# Page tokens (mail::keys) are base64url-encoded.
 base64 = { workspace = true, features = ["std"] }
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
 mail-parser.workspace = true

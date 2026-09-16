@@ -1,5 +1,5 @@
-//! Inbound ingest (§6.1, D48): fetch → parse (`spawn_blocking`) → extract
-//! attachments → per-inbox thread resolution and insert, all under the D48
+//! Inbound ingest: fetch → parse (`spawn_blocking`) → extract attachments →
+//! per-inbox thread resolution and insert, all bounded by the invocation
 //! deadline.
 
 use std::future::Future;
@@ -21,21 +21,21 @@ use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
 use crate::state::{AppState, Services};
 
-/// The D48 time-boxing margin: the deadline passed to `tokio::time::timeout`
-/// is `deadline − now − DEADLINE_MARGIN`, leaving headroom for the timeout's
-/// own bookkeeping and for a bounded `JoinSet`/task-tree teardown.
+/// Headroom held back from the invocation deadline: ingest runs under
+/// `deadline − now − DEADLINE_MARGIN`, leaving room for the timeout's own
+/// bookkeeping and for tearing down in-flight uploads.
 const DEADLINE_MARGIN: Duration = Duration::from_secs(10);
 
 /// Runs the full ingest flow for one SES inbound receipt.
 ///
 /// # Errors
 ///
-/// Returns [`ActionError`] per the action-path error mapping in plan §5:
-/// `Transient` for an S3/store transient failure or a D48 deadline elapse
-/// (5xx, so SNS or the async-invoke queue redelivers); `Permanent` for a
-/// missing/malformed object, a planner cap violation, or persistent
-/// throttling past the D27 retry budget (logged and counted, event still
-/// published).
+/// Returns [`ActionError::Transient`] for an S3 or store transient failure,
+/// or when the deadline elapses — a 5xx, so SNS or the async-invoke queue
+/// redelivers. Returns [`ActionError::Permanent`] for a missing or malformed
+/// object, a size or label cap violation, or throttling that outlasts the
+/// transaction retry budget; those are logged and counted, and the inbound
+/// event still publishes.
 pub fn ingest_inbound<T: Services>(
     state: &AppState<T>,
     event: &SesInboundNotification,
@@ -63,8 +63,8 @@ async fn run<T: Services>(
             event = "ingest_skipped",
             reason = "no_timestamp",
             "none of mail.timestamp, receipt.timestamp or the SNS envelope Timestamp parsed \
-             (N24: never falls back to wall-clock time, since that would make the \
-             deterministic message id non-deterministic across a redelivery)"
+             (wall-clock time is never a fallback: it would make the message id \
+             differ across a redelivery)"
         );
         return Ok("ingest_skipped");
     };
@@ -116,17 +116,16 @@ async fn run<T: Services>(
         tracing::warn!(
             event = "ingest_deadline",
             message_id = %message_id_str,
-            "ingest exceeded its D48 deadline budget"
+            "ingest exceeded its deadline budget"
         );
         Err(ActionError::transient(anyhow::anyhow!(
-            "ingest exceeded its D48 deadline budget"
+            "ingest exceeded its deadline budget"
         )))
     }
 }
 
-/// The two message-level skip guards (§6.1 step 1): no S3 pointer, or a
-/// bucket other than `MailConfig.bucket`. Returns the inbound object key on
-/// success.
+/// The two message-level skip guards: no S3 pointer, or a bucket other than
+/// `MailConfig.bucket`. Returns the inbound object key on success.
 fn guarded_s3_pointer<'a>(
     event: &'a SesInboundNotification,
     mail_config: &MailConfig,
@@ -153,8 +152,8 @@ fn guarded_s3_pointer<'a>(
     Some(key)
 }
 
-/// §6.1 step 3: drops inboxes where `message_exists` is already true (a
-/// redelivery), aggregating any store error into `resolution` the same way
+/// Drops inboxes where `message_exists` is already true (a redelivery),
+/// aggregating any store error into `resolution` the same way
 /// [`resolve_recipient`] does.
 async fn fresh_targets<T: Services>(
     state: &AppState<T>,
@@ -174,8 +173,8 @@ async fn fresh_targets<T: Services>(
 }
 
 /// Combines the per-recipient resolution outcome with the fetch/parse/insert
-/// outcome: a transient failure anywhere in the action wins (D30), even when
-/// every inbox that did complete succeeded.
+/// outcome: a transient failure anywhere in the action wins, even when every
+/// inbox that did complete succeeded.
 fn finish(had_transient: bool, outcome: &'static str) -> Result<&'static str, ActionError> {
     if had_transient {
         return Err(ActionError::transient(anyhow::anyhow!(
@@ -192,8 +191,8 @@ struct InboxResolution {
     had_permanent: bool,
 }
 
-/// Normalizes `receipt.recipients` (§6.1 step 2): lowercase, deduplicated,
-/// in their original order.
+/// Normalizes `receipt.recipients`: lowercase, deduplicated, in their
+/// original order.
 fn normalized_recipients(receipt: &SesReceipt) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     receipt
@@ -204,12 +203,12 @@ fn normalized_recipients(receipt: &SesReceipt) -> Vec<String> {
         .collect()
 }
 
-/// Resolves one normalized recipient address to an inbox (§6.1 step 2),
-/// appending it to `resolution.inboxes` on success. A domain mismatch, an
-/// unknown/non-catch-all local part, or an invalid catch-all local part is
-/// skipped rather than failing the message, logged at WARN with a `reason`
-/// (N22): a recipient SES accepted but we don't store is a configuration
-/// error worth seeing in a default INFO deployment. This is a per-recipient
+/// Resolves one normalized recipient address to an inbox, appending it to
+/// `resolution.inboxes` on success. A domain mismatch, an unknown
+/// non-catch-all local part, or an invalid catch-all local part is skipped
+/// rather than failing the message, logged at WARN with a `reason`: a
+/// recipient SES accepted but we don't store is a configuration error worth
+/// seeing in a default INFO deployment. This is a per-recipient
 /// skip, so unlike the whole-message skips above it does not increment
 /// `IngestSkipped` — that metric keeps meaning "a message we didn't store".
 async fn resolve_recipient<T: Services>(
@@ -284,7 +283,7 @@ fn record_resolution_error(resolution: &mut InboxResolution, error: MailStoreErr
     }
 }
 
-/// D38/N24: `received_ms` = `mail.timestamp`, else `receipt.timestamp`, else
+/// `received_ms` = `mail.timestamp`, else `receipt.timestamp`, else
 /// `envelope_ts_ms` (the verified SNS envelope's `Timestamp`, parsed and
 /// threaded in from `sns::mod::process_notification` via `actions::run`).
 /// [`time::now_ms`] is never a fallback: `received_ms` seeds
@@ -305,7 +304,7 @@ fn received_ms(event: &SesInboundNotification, envelope_ts_ms: Option<u64>) -> O
 }
 
 /// Fetches, parses and extracts the raw MIME once, then inserts the built
-/// item into every target inbox (§6.1 steps 4–7, D30).
+/// item into every target inbox.
 async fn ingest_into_targets<T: Services>(
     state: &AppState<T>,
     key: &str,
@@ -350,9 +349,9 @@ async fn ingest_into_targets<T: Services>(
     Ok("ingested")
 }
 
-/// §6.1 steps 4–6: `GetObject`, `spawn_blocking` parse (N1), then extract the
-/// kept attachment parts (D48), returning the parsed content template and
-/// its attachments' persisted metadata.
+/// `GetObject`, then a `spawn_blocking` parse, then extraction of the kept
+/// attachment parts, returning the parsed content template and its
+/// attachments' persisted metadata.
 async fn fetch_parse_and_extract<T: Services>(
     state: &AppState<T>,
     key: &str,
@@ -398,8 +397,8 @@ async fn fetch_parse_and_extract<T: Services>(
     Ok((parsed.message, attachment_metas))
 }
 
-/// §6.1 step 7 over every target inbox (D30): every inbox is attempted
-/// regardless of an earlier permanent failure; a transient failure anywhere
+/// Inserts into every target inbox: each is attempted regardless of an
+/// earlier permanent failure; a transient failure anywhere
 /// fails the whole action once every inbox has been attempted. Returns
 /// whether at least one inbox succeeded.
 #[expect(
@@ -464,8 +463,8 @@ async fn insert_into_all_targets<T: Services>(
     Ok(inserted_any)
 }
 
-/// Builds and inserts this message's item for one target inbox (§6.1 step
-/// 7): thread resolution (D2), label assignment, `fit_item` (D5), then
+/// Builds and inserts this message's item for one target inbox: thread
+/// resolution, label assignment, `fit_item` to the item budget, then
 /// `insert_message` (`Duplicate` counts as success).
 #[expect(
     clippy::too_many_arguments,
@@ -512,7 +511,7 @@ async fn insert_into_inbox<T: Services>(
     msg.attachments = attachment_metas.to_vec();
     msg.raw_s3_key = Some(raw_key.to_owned());
     msg.verdicts = Some(verdicts_json(&event.receipt));
-    // N19: `thread_snapshot` is left `None` here — `plan_insert` populates it
+    // `thread_snapshot` is left `None` here — `plan_insert` populates it
     // from `thread_after` (the thread's full state including this message,
     // computed from the versioned retry loop's consistent read), so a reply
     // publishes the thread's real `message_count` rather than 1.
@@ -530,8 +529,8 @@ async fn insert_into_inbox<T: Services>(
         .map_err(map_store_error)
 }
 
-/// The four verdict labels an inbound message can carry beyond `received`
-/// (D16), sorted (matching `plan_insert`'s sorted-labels invariant).
+/// The labels an inbound message carries, sorted (matching `plan_insert`'s
+/// sorted-labels invariant).
 fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<String> {
     match verdict {
         labels::InboundVerdict::Spam => {
@@ -550,7 +549,7 @@ fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<String> {
     }
 }
 
-/// SPF/DKIM/DMARC `FAIL` (D16).
+/// Whether SPF, DKIM or DMARC returned `FAIL`.
 fn auth_failed(receipt: &SesReceipt) -> bool {
     let failed = |verdict: &Option<Verdict>| verdict.as_ref().is_some_and(|v| v.status == "FAIL");
     failed(&receipt.spf_verdict) || failed(&receipt.dkim_verdict) || failed(&receipt.dmarc_verdict)
@@ -584,19 +583,18 @@ fn object_key(message_id: &str, attachment_id: &str) -> String {
     format!("attachments/{message_id}/{attachment_id}")
 }
 
-/// Extracts the kept attachment parts (D48, AT11) into
-/// `attachments/<mid>/<att_id>`, resuming a redelivery by skipping parts a
-/// prior attempt already put (D48 m2), in chunks of 4 concurrent puts.
+/// Extracts the kept attachment parts into `attachments/<mid>/<att_id>`,
+/// resuming a redelivery by skipping parts a prior attempt already put, in
+/// chunks of 4 concurrent puts.
 ///
-/// Deviates from the plan's literal `tokio::task::JoinSet`: a `JoinSet`
-/// requires its spawned futures to be `'static`, which is incompatible with
-/// this function's borrowed `&AppState<T>` (the pipeline never passes an
-/// `Arc<AppState<T>>` down to this depth). `tokio::join!` gives the same
-/// bounded (4-way) concurrent polling and, because it holds no independent
-/// task handles, an even stronger cancellation guarantee on the surrounding
-/// `tokio::time::timeout` elapsing: every pending put is dropped
-/// synchronously with the future tree, so no `JoinSet::shutdown` step is
-/// needed to guarantee "no put still pending". Flagged in the handoff.
+/// `tokio::join!` rather than a `JoinSet`: a `JoinSet` requires its spawned
+/// futures to be `'static`, which this function's borrowed `&AppState<T>` is
+/// not (the pipeline never passes an `Arc<AppState<T>>` down to this depth).
+/// `join!` gives the same bounded 4-way concurrency and, holding no
+/// independent task handles, a stronger cancellation guarantee when the
+/// surrounding `tokio::time::timeout` elapses: every pending put is dropped
+/// synchronously with the future tree, so no separate shutdown step is
+/// needed to be sure no put is still running.
 async fn put_kept_parts<T: Services>(
     state: &AppState<T>,
     message_id: &str,
@@ -613,8 +611,8 @@ async fn put_kept_parts<T: Services>(
     Ok(())
 }
 
-/// D48 m2: if the first kept part is already present, this is a redelivery —
-/// HEAD every part and skip the ones already stored. Otherwise, put
+/// If the first kept part is already present, this is a redelivery — HEAD
+/// every part and skip the ones already stored. Otherwise, put
 /// everything (a race with a concurrent attempt still gets a harmless 412,
 /// surfaced as `PutOutcome::AlreadyExists`).
 async fn resume_filtered<'a, T: Services>(
@@ -813,11 +811,11 @@ mod tests {
         .unwrap()
     }
 
-    /// N24: `mail.timestamp` beats `receipt.timestamp` beats the envelope
+    /// `mail.timestamp` beats `receipt.timestamp` beats the envelope
     /// timestamp; `time::now_ms()` is never consulted, so all three missing
     /// is `None` rather than a wall-clock value.
     #[test]
-    fn received_ms_follows_the_n24_fallback_order_and_never_falls_back_to_now() {
+    fn received_ms_follows_the_fallback_order_and_never_falls_back_to_now() {
         let both = notification_with_timestamps(
             Some("2026-01-01T00:00:00.000Z"),
             Some("2026-01-02T00:00:00.000Z"),

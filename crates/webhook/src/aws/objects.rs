@@ -1,5 +1,5 @@
 //! [`ObjectStore`] for [`AwsServices`](crate::aws::AwsServices): S3 access
-//! for mail bodies, attachments and send specs, with the D48 client
+//! for mail bodies, attachments and send specs, with the client
 //! timeouts (`operation_attempt_timeout` 20 s, `operation_timeout` 45 s).
 
 use std::time::Duration;
@@ -17,7 +17,7 @@ use crate::mail::ObjectMeta;
 use crate::mail::PutOutcome;
 use crate::mail::objects::{ObjectError, ObjectStore};
 
-/// The D48 per-attempt and per-operation S3 timeouts, applied to every call
+/// The per-attempt and per-operation S3 timeouts, applied to every call
 /// via `.customize().config_override(...)` since the shared `s3` client
 /// (`aws.rs`) is built without them.
 fn timeout_override() -> S3ConfigBuilder {
@@ -32,7 +32,7 @@ fn timeout_override() -> S3ConfigBuilder {
 /// DynamoDB/Pinpoint/SES actions and mail store (`aws::THROTTLING_CODES`).
 const THROTTLING_CODES: [&str; 2] = ["ThrottlingException", "SlowDown"];
 
-/// Maps an S3 SDK failure onto [`ObjectError`]: a 404 (missing key — N14's
+/// Maps an S3 SDK failure onto [`ObjectError`]: a 404 (missing key — the
 /// `s3:ListBucket` grant is what makes this a real 404 rather than a 403) is
 /// [`ObjectError::NotFound`]; a 403 is [`ObjectError::Permanent`]; timeouts,
 /// dispatch/response failures, throttling and 5xx are

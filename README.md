@@ -182,7 +182,7 @@ sam deploy --config-env dev --parameter-overrides "Stage=dev LogLevel=DEBUG"
 
 ## Mailbox
 
-Setting `MailDomain` also makes the stack an AgentMail-compatible mailbox on SES. The stack
+Setting `MailDomain` also makes the stack a mailbox on SES. The stack
 creates the SES identity and configuration set, a receipt rule that stores inbound mail in S3,
 the mail bucket and mail table, two SNS topics subscribed to the function, and (with
 `HostedZoneId`) the DNS records.
@@ -405,11 +405,10 @@ read `detail.event.open.isBotEvent` (or `.click.isBotEvent`) off the `ses.open` 
 
 ### Mailbox events
 
-A mailbox stack's mail table stream additionally publishes AgentMail-compatible detail-types on
-the same bus, `source` and `schemaVersion` contract as above. Phase 1 emits only the inbound
-side; `message.sent`, `message.delivered`, `message.bounced`, `message.complained`,
-`message.rejected` and `message.opened` are phase 3 additions the sender and SES-event pipeline
-publish once implemented.
+A mailbox stack's mail table stream additionally publishes mailbox detail-types on the same
+bus, `source` and `schemaVersion` contract as above. Only the inbound side is implemented;
+`message.sent`, `message.delivered`, `message.bounced`, `message.complained`,
+`message.rejected` and `message.opened` arrive with the sender and SES-event pipeline.
 
 `message.received`, `message.received.spam` (spam/virus verdict `FAIL`) or
 `message.received.unauthenticated` (SPF/DKIM/DMARC `FAIL`, spam/virus clean) fires once per
@@ -439,7 +438,7 @@ classified. Shape:
 }
 ```
 
-`message` is the same AgentMail-shaped `Message` object the `/v0` read API (phase 2) returns.
+`message` is the same `Message` object the `/v0` read API returns.
 `thread` is the compact snapshot taken as of this message's arrival (`thread_id`, `subject`,
 `message_count`, `recipients`), not a full thread fetch — a consumer wanting the thread's current
 state re-reads it, since the snapshot is only ever as fresh as the message that carries it. An
@@ -470,23 +469,22 @@ A message's full timeline is one `Query` on `pk`; its current state is one `GetI
 ### Mail table
 
 A mailbox stack additionally creates a second, separate DynamoDB table (`MailTableName`
-output) holding the AgentMail-compatible inbox — a distinct partition space from the messaging
+output) holding the mailbox — a distinct partition space from the messaging
 events table above, keyed by inbox and message rather than by SNS message id:
 
 | Item | `pk` | `sk` | Holds |
 |---|---|---|---|
 | Inbox | `INBOX#<inbox>` | `META` | email, display name, metadata, timestamps |
-| Message | `INBOX#<inbox>` | `MSG#<messageId>` | the full AgentMail message: addresses, subject, body, labels, attachments, headers |
+| Message | `INBOX#<inbox>` | `MSG#<messageId>` | the full message: addresses, subject, body, labels, attachments, headers |
 | Thread | `INBOX#<inbox>` | `THR#<threadId>` | rolled-up subject/preview/senders/recipients/labels, message count, size, newest attachments |
 | Message pointer | `INBOX#<inbox>#LABEL#<label>` | `MSGAT#<messageId>` | the per-label message list view |
 | Thread pointer | `INBOX#<inbox>#LABEL#<label>` | `THRAT#<timestamp>#<threadId>` | the per-label thread list view |
 | RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps an inbound or outbound `Message-ID` to the message/thread it belongs to, for reply threading |
 
-Phase 1 (this release) populates only the Inbox, Message, Thread and pointer items from inbound
-ingest; the send-state, send-key and SES-reference items phase 3 (`/v0` send, the sender
-function) adds live on the same table under their own `pk`s (`OUTBOX#<messageId>`,
-`SENDKEY#<sha256>`, `SESMSG#<sesMessageId>`, `SESCALL#<messageId>`) and are not written by this
-release. `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from
+This release populates only the Inbox, Message, Thread and pointer items from inbound ingest.
+The send-state, send-key and SES-reference items the send path adds live on the same table
+under their own `pk`s (`OUTBOX#<messageId>`, `SENDKEY#<sha256>`, `SESMSG#<sesMessageId>`,
+`SESCALL#<messageId>`) and are not written by this release. `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from
 the SES message id and receipt timestamp), so a redelivered SES notification always resolves to
 the same message rather than creating a duplicate. A message's raw MIME and attachments live in
 the mail bucket, not the table; the message item's `raw_s3_key`/attachment `object_key`s point at

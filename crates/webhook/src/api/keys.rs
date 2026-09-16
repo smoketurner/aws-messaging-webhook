@@ -1,5 +1,4 @@
-//! Bearer API keys: the key document, its cache, and constant-time matching
-//! (D20).
+//! Bearer API keys: the key document, its cache, and constant-time matching.
 //!
 //! The operator stores SHA-256 hashes of the keys in an SSM `SecureString`,
 //! never the keys themselves:

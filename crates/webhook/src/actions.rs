@@ -185,11 +185,11 @@ async fn suppress_recipients<T: Services>(
 pub async fn run<T: Services>(
     state: &AppState<T>,
     event: &DomainEvent,
-    // Threaded through for `D48` inbound-ingest time-boxing; only the
+    // Threaded through for inbound-ingest time-boxing; only the
     // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
     deadline: tokio::time::Instant,
     // The verified SNS envelope `Timestamp`, parsed to epoch ms by the
-    // caller; N24's third `received_ms` fallback, threaded to the
+    // caller; the third `received_ms` fallback, threaded to the
     // `SesInbound` arm only.
     envelope_ts_ms: Option<u64>,
 ) -> Result<&'static str, ActionError> {

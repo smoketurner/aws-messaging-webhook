@@ -1,18 +1,59 @@
-//! The mail table store trait (§5). Only the P1 methods ingest needs are
-//! defined here (`get_inbox`, `ensure_inbox`, `message_exists`,
-//! `resolve_rfc_ids`, `insert_message`, `get_message`); the P2 read-API and
-//! P3 send/outbox methods are layered on by the phase that implements them.
+//! The mail table store trait.
 //!
-//! `mail/store.rs` is not on the plan's `§12` shared-files list, so unlike
-//! `state.rs`/`config.rs` it is not revisited by a later phase's foundation
-//! step in the plan as written — but the P2 and P3 method groups documented
-//! in plan §5 belong on this same trait, so a later phase will need to
-//! extend it regardless. Flagged to the architect as a deviation (see the F1
-//! handoff); not resolved here since it is out of phase-1 scope.
+//! Holds the methods ingest needs (`get_inbox`, `ensure_inbox`,
+//! `message_exists`, `resolve_rfc_ids`, `insert_message`, `get_message`) and
+//! the read-API queries (`list_messages`, `list_threads`, `get_thread`). The
+//! send/outbox methods arrive with the sending phase.
+//!
+//! The list queries read the time-ordered index rather than per-label
+//! partitions: one inbox's volume doesn't justify the write amplification of
+//! maintaining a pointer row per label, so a `labels` filter is served by
+//! filtering the page. See [`ListQuery`] for how the bounds are encoded.
 
 use std::future::Future;
 
+use crate::mail::keys::PageKey;
+use crate::mail::thread::ThreadState;
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
+
+/// Default page size when the caller doesn't ask for one.
+pub const DEFAULT_LIMIT: usize = 20;
+
+/// Largest page size a caller may ask for.
+pub const MAX_LIMIT: usize = 100;
+
+/// One page of results, plus the key that continues it. `next` is `None` on
+/// the last page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next: Option<PageKey>,
+}
+
+/// A time-ordered list query over one inbox.
+///
+/// `before`/`after` are exclusive bounds on the sort key, already translated
+/// from the request's RFC 3339 values: message lists compare `UUIDv7` ids
+/// (which order by time), thread lists compare `<timestamp>#<thread_id>`
+/// because threads order by last activity.
+#[derive(Debug, Clone)]
+pub struct ListQuery {
+    pub inbox: InboxId,
+    pub limit: usize,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    /// Oldest first when true; newest first (the default) when false.
+    pub ascending: bool,
+    /// Where to resume, from a page token the caller presented.
+    pub start: Option<PageKey>,
+}
+
+/// A thread plus one page of its messages, ascending.
+#[derive(Debug, Clone)]
+pub struct ThreadView {
+    pub thread: ThreadState,
+    pub messages: Page<MailMessage>,
+}
 
 pub trait MailStore: Send + Sync {
     fn get_inbox(
@@ -32,7 +73,7 @@ pub trait MailStore: Send + Sync {
         message_id: &str,
     ) -> impl Future<Output = Result<bool, MailStoreError>> + Send;
 
-    /// Resolves an `In-Reply-To`/`References` candidate list (D2) to the
+    /// Resolves an `In-Reply-To`/`References` candidate list to the
     /// thread it belongs to, nearest id first.
     fn resolve_rfc_ids(
         &self,
@@ -50,6 +91,30 @@ pub trait MailStore: Send + Sync {
         inbox: &InboxId,
         message_id: &str,
     ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send;
+
+    /// Lists an inbox's messages newest-first by default, from the time-ordered
+    /// index. Label and substring filters are applied by the caller on the
+    /// returned page, so this returns whatever the bounds select.
+    fn list_messages(
+        &self,
+        query: &ListQuery,
+    ) -> impl Future<Output = Result<Page<MailMessage>, MailStoreError>> + Send;
+
+    /// Lists an inbox's threads by last activity, newest-first by default.
+    fn list_threads(
+        &self,
+        query: &ListQuery,
+    ) -> impl Future<Output = Result<Page<ThreadState>, MailStoreError>> + Send;
+
+    /// One thread with a page of its messages in ascending order. `None` when
+    /// the thread doesn't exist in this inbox.
+    fn get_thread(
+        &self,
+        inbox: &InboxId,
+        thread_id: &str,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> impl Future<Output = Result<Option<ThreadView>, MailStoreError>> + Send;
 }
 
 #[derive(Debug, thiserror::Error)]

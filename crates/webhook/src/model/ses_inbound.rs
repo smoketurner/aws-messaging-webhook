@@ -21,7 +21,7 @@ pub struct SesReceipt {
     /// The envelope recipients SES matched this receipt rule against.
     #[serde(default)]
     pub recipients: Vec<String>,
-    /// SES's receipt timestamp — one of the `received_ms` fallbacks (D38):
+    /// SES's receipt timestamp — one of the `received_ms` fallbacks:
     /// `mail.timestamp`, else this, else the SNS envelope `Timestamp`.
     #[serde(default)]
     pub timestamp: Option<String>,

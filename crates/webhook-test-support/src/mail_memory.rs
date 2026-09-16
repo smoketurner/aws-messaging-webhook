@@ -1,7 +1,7 @@
 //! In-memory `MailStore` test double.
 //!
-//! Executes the same `PlannedOp`s the real store executes (§4 write model),
-//! with the same condition semantics and D27 cancellation decoding, so
+//! Executes the same `PlannedOp`s the real store executes, with the same
+//! condition semantics and cancellation decoding, so
 //! higher-level tests exercise the real planner (`mail::plan::plan_insert`)
 //! and decoder (`mail::txn::decode_cancellation`) rather than a shortcut.
 //! Wired into `FakeServices` by delegation.
@@ -10,8 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Mutex;
 
+use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, TxnKind, WriteOp};
-use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
+use aws_messaging_webhook::mail::store::{ListQuery, MailStore, MailStoreError, Page, ThreadView};
 use aws_messaging_webhook::mail::thread::{ThreadState, apply_message, new_thread};
 use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use aws_messaging_webhook::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
@@ -36,7 +37,7 @@ pub enum Injected {
 enum Commit {
     /// Every condition held; the writes were applied.
     Applied,
-    /// At least one condition failed; decoded per D27.
+    /// At least one condition failed.
     Cancelled(TxnDecision),
 }
 
@@ -46,7 +47,7 @@ struct Inner {
     injected: VecDeque<Injected>,
 }
 
-/// D27: `Retry`/`VersionConflict` loop at most this many times before giving
+/// `Retry`/`VersionConflict` loops at most this many times before giving
 /// up with `MailStoreError::Conflict`.
 const MAX_RETRIES: u32 = 3;
 
@@ -237,6 +238,77 @@ impl MailMemoryStore {
         Ok(Commit::Applied)
     }
 
+    /// One page of an index partition, mirroring the real store's query: the
+    /// items carrying `pk_attr == partition`, ordered by `sk_attr`, bounded
+    /// exclusively by `before`/`after` and resumed after `start`.
+    fn query_page<T: serde::de::DeserializeOwned>(
+        &self,
+        partition: &str,
+        pk_attr: &str,
+        sk_attr: &str,
+        query: &ListQuery,
+    ) -> Result<Page<T>, MailStoreError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: a poisoned lock is a test bug"
+        )]
+        let guard = self.inner.lock().unwrap();
+
+        let mut rows: Vec<(String, Item)> = Vec::new();
+        for item in guard.items.values() {
+            let matches_partition =
+                Self::string_attr(item, pk_attr).is_some_and(|value| value == partition);
+            if !matches_partition {
+                continue;
+            }
+            let Some(sort) = Self::string_attr(item, sk_attr) else {
+                continue;
+            };
+            if query.after.as_ref().is_some_and(|after| sort <= *after) {
+                continue;
+            }
+            if query.before.as_ref().is_some_and(|before| sort >= *before) {
+                continue;
+            }
+            if let Some(start) = &query.start {
+                let seen = if query.ascending {
+                    sort <= start.sort
+                } else {
+                    sort >= start.sort
+                };
+                if seen {
+                    continue;
+                }
+            }
+            rows.push((sort, item.clone()));
+        }
+
+        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+        if !query.ascending {
+            rows.reverse();
+        }
+        let more = rows.len() > query.limit;
+        rows.truncate(query.limit);
+
+        let next = more.then(|| {
+            rows.last().map(|(sort, _)| PageKey {
+                partition: partition.to_owned(),
+                sort: sort.clone(),
+            })
+        });
+        let mut items = Vec::with_capacity(rows.len());
+        for (_, item) in rows {
+            items.push(
+                serde_dynamo::from_item(item)
+                    .map_err(|e| MailStoreError::Permanent(anyhow::anyhow!("query page: {e}")))?,
+            );
+        }
+        Ok(Page {
+            items,
+            next: next.flatten(),
+        })
+    }
+
     fn get_item(&self, pk: &str, sk: &str) -> Option<Item> {
         #[expect(
             clippy::unwrap_used,
@@ -409,6 +481,58 @@ impl MailStore for MailMemoryStore {
                 MailStoreError::Permanent(anyhow::anyhow!("deserializing message: {e}"))
             }),
         })
+    }
+
+    fn list_messages(
+        &self,
+        query: &ListQuery,
+    ) -> impl Future<Output = Result<Page<MailMessage>, MailStoreError>> + Send {
+        let partition = format!("INBOX#{}#MSG", query.inbox.as_str());
+        std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
+    }
+
+    fn list_threads(
+        &self,
+        query: &ListQuery,
+    ) -> impl Future<Output = Result<Page<ThreadState>, MailStoreError>> + Send {
+        let partition = format!("INBOX#{}#THR", query.inbox.as_str());
+        std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
+    }
+
+    fn get_thread(
+        &self,
+        inbox: &InboxId,
+        thread_id: &str,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> impl Future<Output = Result<Option<ThreadView>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        let thread = self.get_item(&keys::inbox_pk(inbox.as_str()), &keys::thread_sk(thread_id));
+        let Some(thread) = thread else {
+            return std::future::ready(Ok(None));
+        };
+        let thread: ThreadState = match serde_dynamo::from_item(thread) {
+            Ok(thread) => thread,
+            Err(e) => {
+                return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
+                    "deserializing thread: {e}"
+                ))));
+            }
+        };
+        let messages = self.query_page(
+            &format!("THREAD#{}#{}", inbox.as_str(), thread_id),
+            "gsi2pk",
+            "gsi2sk",
+            &ListQuery {
+                inbox: inbox.clone(),
+                limit,
+                before: None,
+                after: None,
+                ascending: true,
+                start,
+            },
+        );
+        std::future::ready(messages.map(|messages| Some(ThreadView { thread, messages })))
     }
 }
 

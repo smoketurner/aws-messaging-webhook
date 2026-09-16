@@ -1,9 +1,9 @@
-# Mail parse fixtures (AT11, §11 P1)
+# Mail parse fixtures
 
 Synthetic `.eml` messages hand-written for `mail::mime::parse_inbound` tests
-— not sourced from any external documentation. `plan.md` §11 lists the
-scenarios these cover; large messages (150 tiny parts, a ~30 MB message, a
-1 MB body) are generated at test time rather than committed here.
+— not sourced from any external documentation. Large messages (150 tiny
+parts, a ~30 MB message, a 1 MB body) are generated at test time rather than
+committed here.
 
 | File | Scenario |
 |---|---|

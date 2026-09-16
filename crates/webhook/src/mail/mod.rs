@@ -1,15 +1,13 @@
-//! The AgentMail-compatible mail inbox: caps, core storage types, size/id/key
-//! helpers, the transactional write model, and the store/object-store traits
-//! every mail flow is built on.
+//! The mail inbox: caps, core storage types, size/id/key helpers, the
+//! transactional write model, and the store and object-store traits every
+//! mail flow is built on.
 //!
-//! Every field below that carries `skip_serializing_if` also carries
-//! `default`: `serde_dynamo::to_item` omits the attribute when the predicate
-//! holds, and without a matching `default`, `serde_dynamo::from_item`
-//! (track C's stream relay, and every store read) fails with "missing
-//! field" for that item rather than reconstructing the omitted value. Track
-//! C added `default` to every field here except `labels`, which N18
-//! reserves for track A's `serde_dynamo::string_set` change (that change's
-//! own attribute list already includes `default`).
+//! Every field below that carries `skip_serializing_if` must also carry
+//! `default`. `serde_dynamo::to_item` omits the attribute when the predicate
+//! holds, and without a matching `default`, `serde_dynamo::from_item` fails
+//! with "missing field" when reading that item back rather than
+//! reconstructing the omitted value — which would break the stream relay and
+//! every store read.
 
 pub mod ids;
 pub mod keys;
@@ -21,7 +19,6 @@ pub mod time;
 pub mod txn;
 pub mod wire;
 
-// Stubs for tracks A-D (§12 Phase 1), implemented by their owning track.
 pub mod events;
 pub mod ingest;
 pub mod labels;
@@ -33,7 +30,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Caps (§4)
+// Caps
 // ---------------------------------------------------------------------------
 
 pub const MESSAGE_USER_LABEL_CAP: usize = 20;
@@ -99,7 +96,7 @@ pub enum Direction {
     Outbound,
 }
 
-/// The `Inbox` item (§4).
+/// The `Inbox` item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inbox {
     pub inbox_id: InboxId,
@@ -112,7 +109,7 @@ pub struct Inbox {
     pub updated_at: String,
 }
 
-/// A first-writer-wins RFC alias hit (D2): the message the alias points to.
+/// A first-writer-wins RFC alias hit: the message the alias points to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RfcHit {
     pub message_id: String,
@@ -134,11 +131,11 @@ pub struct AttachmentMeta {
     pub content_id: Option<String>,
 }
 
-/// The inbound-only `thread_snapshot` (§4): a compact view of the thread as
+/// The inbound-only `thread_snapshot`: a compact view of the thread as
 /// of this message's arrival, so a reader of the message alone (e.g. an
 /// EventBridge consumer) doesn't need a second read to show thread context.
 ///
-/// N19: populated by [`plan::plan_insert`] from the caller-computed
+/// Populated by [`plan::plan_insert`] from the caller-computed
 /// `thread_after` state (`mail::thread::ThreadState`), so it always reflects
 /// the thread **including** the message it's attached to — a reply's
 /// `message_count` is the thread's real count, not 1. `senders`/`recipients`
@@ -162,7 +159,7 @@ pub struct ThreadSnapshot {
     pub updated_at: String,
 }
 
-/// The `Message` item (§4). Field shrinking to fit [`ITEM_BUDGET_BYTES`] is
+/// The `Message` item. Field shrinking to fit [`ITEM_BUDGET_BYTES`] is
 /// [`size::fit_item`]'s job, not this type's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailMessage {
@@ -225,7 +222,7 @@ pub struct MailMessage {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivery: BTreeMap<String, serde_json::Value>,
 
-    // Outbound-only mirror (D51).
+    // Outbound-only mirror of the send state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,7 +236,7 @@ pub struct MailMessage {
 
 /// Outcome of [`store::MailStore::insert_message`]. A redelivered ingest
 /// (same deterministic message id) is a `Duplicate`, which the ingest flow
-/// counts as success (D30).
+/// counts as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
     Fresh,
@@ -259,7 +256,7 @@ pub enum PutOutcome {
     AlreadyExists,
 }
 
-/// A local part valid for an inbound mail address (N13, N20):
+/// A local part valid for an inbound mail address:
 /// `^[a-z0-9._+-]{1,64}$`. The single definition `config.rs` (parsing
 /// `MAIL_INBOXES`) and the catch-all check in `mail::ingest` both use —
 /// previously duplicated in each.

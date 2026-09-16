@@ -1,13 +1,13 @@
-//! `AgentMail`-shaped error responses.
+//! Error responses for the `/v0` API.
 //!
-//! `AgentMail` returns two body shapes: `{name, message, code?, fix?, docs?}`
-//! for most failures, and a validation variant carrying a per-field `errors`
-//! array. SDK clients match on `name`, so the names here are part of the wire
-//! contract and must not be renamed casually.
+//! Two body shapes: `{name, message, code?, fix?, docs?}` for most failures,
+//! and a validation variant carrying a per-field `errors` array. Clients
+//! match on `name`, so the names here are part of the wire contract and must
+//! not be renamed casually.
 //!
-//! Status codes carry the same retry meaning the SDKs assume: 401 is never
-//! retried (so a cold key cache must not use it — see [`ApiError::Unavailable`]),
-//! 429 and 5xx are retried, and 4xx otherwise is permanent.
+//! Status codes carry the retry meaning clients assume: 401 is never retried
+//! (so a cold key cache must not use it — see [`ApiError::Unavailable`]), 429
+//! and 5xx are retried, and 4xx otherwise is permanent.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -16,8 +16,8 @@ use serde::Serialize;
 
 use crate::metrics::names;
 
-/// The standard `AgentMail` error body. `code`, `fix` and `docs` are omitted
-/// rather than null when absent, matching `AgentMail`'s own responses.
+/// The standard error body. `code`, `fix` and `docs` are omitted rather than
+/// serialized as null when absent, matching the wire contract.
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub name: &'static str,
@@ -81,7 +81,7 @@ pub enum ApiError {
     #[error("too many requests")]
     Throttled,
 
-    /// A route that exists in `AgentMail` but is not implemented here.
+    /// A route the API contract defines but this service does not implement.
     #[error("not implemented")]
     NotImplemented,
 
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_found_matches_agentmail_shape() {
+    async fn not_found_matches_the_wire_shape() {
         let (status, body) = body_of(ApiError::NotFound).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(

@@ -1,4 +1,4 @@
-//! Bearer authentication for the `/v0` surface (D20).
+//! Bearer authentication for the `/v0` surface.
 //!
 //! Every `/v0` route sits behind this middleware. Three rules are
 //! load-bearing:

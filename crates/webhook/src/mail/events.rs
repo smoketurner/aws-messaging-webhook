@@ -1,10 +1,9 @@
-//! Builds the AgentMail-compatible EventBridge details for mail-table stream
-//! records (D6) and caps them to the `PutEvents` entry size, mirroring
-//! `crate::publish::build_outbound`'s size-reduction ladder for the SMS/SES
-//! pipeline.
+//! Builds the EventBridge details for mail-table stream records and caps
+//! them to the `PutEvents` entry size, mirroring the size-reduction ladder
+//! `crate::publish::build_outbound` applies to the SMS and SES pipeline.
 //!
-//! Stub: the `sent`/delivery (P3) event builders are implemented by track C
-//! in phase 3.
+//! Only received-mail events are built here; sent and delivery events are
+//! not implemented yet.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -29,9 +28,9 @@ fn to_json<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
-/// D16 precedence: a spam/virus quarantine verdict beats an authentication
+/// Precedence: a spam/virus quarantine verdict beats an authentication
 /// failure, which beats a plain receipt. `spam` and `unauthenticated`
-/// co-exist with the `received` system label (§6.1 step 7) rather than
+/// co-exist with the `received` system label rather than
 /// replacing it, so the event type is chosen from the label set.
 fn received_event_type(labels: &[String]) -> &'static str {
     if labels.iter().any(|label| label == "spam") {
@@ -44,17 +43,17 @@ fn received_event_type(labels: &[String]) -> &'static str {
 }
 
 /// Builds the `message.received*` events for a newly-inserted message item
-/// (D6 INSERT trigger): plain, `.spam`, or `.unauthenticated` depending on
+/// on an INSERT: plain, `.spam`, or `.unauthenticated` depending on
 /// the message's labels. Returns an empty list for any other INSERT (e.g. a
-/// `queued` outbound message, D6) — only a `received` label produces an event
-/// in phase 1.
+/// `queued` outbound message) — only a `received` label produces an event
+/// today.
 #[must_use]
 pub fn build_mail_events(msg: &MailMessage, event_source: &str) -> Vec<MailEvent> {
     if !msg.labels.iter().any(|label| label == "received") {
         return Vec::new();
     }
     let event_type = received_event_type(&msg.labels);
-    // D23: ts_ms is the message's own timestamp for a received event.
+    // ts_ms is the message's own timestamp for a received event.
     let ts_ms = time::parse(&msg.timestamp).unwrap_or(0);
     let event_id = ids::event_id(msg.inbox_id.as_str(), &msg.message_id, event_type, ts_ms);
 
@@ -67,8 +66,8 @@ pub fn build_mail_events(msg: &MailMessage, event_source: &str) -> Vec<MailEvent
         meta["sesMessageId"] = json!(ses_message_id);
     }
 
-    // The stored thread_snapshot as of this message's arrival (D6); a
-    // received message always carries one (§6.1 step 7), so an absent
+    // The stored thread_snapshot as of this message's arrival; a
+    // received message always carries one, so an absent
     // snapshot falls back to its empty Default rather than failing the
     // whole relay record over a data shape that shouldn't occur.
     let thread = msg.thread_snapshot.clone().unwrap_or_default();
@@ -90,7 +89,7 @@ pub fn build_mail_events(msg: &MailMessage, event_source: &str) -> Vec<MailEvent
     }]
 }
 
-/// Reduces an oversized mail detail to fit the `PutEvents` entry cap (D6):
+/// Reduces an oversized mail detail to fit the `PutEvents` entry cap:
 /// drops `message.html`, `message.text` and `message.headers`, reduces
 /// `thread` to `{thread_id}`, then falls back to
 /// `message = {payloadOmitted, ids}`. Never drops `meta`. Mirrors
@@ -135,7 +134,7 @@ pub fn cap_mail_detail(detail: &mut Value, detail_type: &str, event_source: &str
         return;
     }
 
-    // ASSUMPTION: D6 specifies `message = {payloadOmitted, ids}` without
+    // The reduced payload is `message = {payloadOmitted, ids}` without
     // naming `ids`' fields; `messageId`/`threadId` mirror `meta`'s keys so a
     // consumer that only reads `message` still gets both identifiers.
     let ids = json!({
@@ -230,7 +229,7 @@ mod tests {
         assert_eq!(event.detail["thread"]["message_count"], 1);
     }
 
-    /// N19: the relay publishes whatever `thread_snapshot` the message item
+    /// The relay publishes whatever `thread_snapshot` the message item
     /// carries verbatim, so a reply (whose snapshot `plan_insert` populated
     /// from the thread's full post-insert state) publishes the thread's real
     /// `message_count` and accumulated senders/recipients, not a

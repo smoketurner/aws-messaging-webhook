@@ -1,10 +1,10 @@
-//! Handlers for routes that exist in `AgentMail` but not here, and for
-//! requests that match no route at all (D13).
+//! Handlers for routes the API contract defines but this service does not
+//! implement, and for requests that match no route at all.
 //!
-//! These matter for SDK compatibility: a client that calls an endpoint this
+//! These matter for client compatibility: a client calling an endpoint this
 //! service doesn't implement must still get a body it can parse, not axum's
 //! bare status line. Unknown paths *outside* `/v0` keep axum's default 404 —
-//! only the `/v0` surface promises `AgentMail`'s shape.
+//! only the `/v0` surface promises the contract's shape.
 
 use std::future::{Ready, ready};
 
@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 
 use crate::api::error::{ApiError, ErrorBody};
 
-/// A route `AgentMail` documents that this service does not implement:
-/// drafts, labels, pods, domains, webhooks, and the phase-4 inbox and
+/// A route the API contract defines that this service does not implement:
+/// drafts, labels, pods, domains, webhooks, and the inbox-management and
 /// delete routes.
 pub fn not_implemented() -> Ready<ApiError> {
     ready(ApiError::NotImplemented)

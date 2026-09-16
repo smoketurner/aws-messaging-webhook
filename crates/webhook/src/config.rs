@@ -29,21 +29,21 @@ pub struct Config {
     ///
     /// [`mail`]: Config::mail
     pub mode: FunctionMode,
-    /// The AgentMail-compatible mail inbox feature. `None` disables every
+    /// The mail inbox feature. `None` disables every
     /// mail feature (ingest, the `/v0` API, and the sender).
     pub mail: Option<MailConfig>,
 }
 
 /// Which half of the single binary is running (`FUNCTION_MODE`). The sender
-/// dispatch this drives lands in phase 3; phase 1 always constructs
-/// [`FunctionMode::Webhook`].
+/// half is not implemented yet, so this is always
+/// [`FunctionMode::Webhook`] today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionMode {
     Webhook,
     Sender,
 }
 
-/// The AgentMail-compatible mail inbox configuration, present only when
+/// The mail inbox configuration, present only when
 /// `MAIL_DOMAIN` is set.
 #[derive(Debug, Clone)]
 pub struct MailConfig {
@@ -60,9 +60,9 @@ pub struct MailConfig {
     pub configuration_set: String,
     pub identity_arn: String,
     /// SSM parameter name holding the bearer API key hashes; must start with
-    /// `/` (D8).
+    /// `/`.
     pub api_keys_parameter: String,
-    /// Presigned attachment URL lifetime; 60 s – 3,600 s (D37).
+    /// Presigned attachment URL lifetime; 60 s – 3,600 s.
     pub attachment_url_ttl: Duration,
     pub region: String,
     /// `MailSenderMaxSendRate`: minimum spacing between sends in one
@@ -239,13 +239,13 @@ fn parse_function_mode(raw: Option<&str>) -> anyhow::Result<FunctionMode> {
     }
 }
 
-/// Maximum `MAIL_INBOXES` entries (N13): the template expands the list into
+/// Maximum `MAIL_INBOXES` entries: the template expands the list into
 /// 10 conditional `!Select` slots (`Fn::Join`'s delimiter must be a literal,
 /// so `CloudFormation` can't map over an arbitrary-length list).
 const MAX_INBOXES: usize = 10;
 
 /// Splits a comma-separated `MAIL_INBOXES` value into validated local parts
-/// (N13): at most 10 entries, each matching `^[a-z0-9._+-]{1,64}$` exactly —
+/// at most 10 entries, each matching `^[a-z0-9._+-]{1,64}$` exactly —
 /// no trimming, so a whitespace-padded or empty entry is a hard error rather
 /// than silently dropped, matching the template's `AllowedPattern`.
 fn parse_inbox_list(raw: &str) -> anyhow::Result<Vec<String>> {
@@ -284,7 +284,7 @@ fn parse_bool_flag(name: &str, raw: Option<&str>) -> anyhow::Result<bool> {
     }
 }
 
-/// `ApiKeysParameterName` must be an absolute SSM parameter path (D8).
+/// `ApiKeysParameterName` must be an absolute SSM parameter path.
 fn validate_api_keys_parameter(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         name.starts_with('/'),
@@ -293,7 +293,7 @@ fn validate_api_keys_parameter(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parses `ATTACHMENT_URL_TTL_SECONDS`, bounded to 60–3,600 s (D37).
+/// Parses `ATTACHMENT_URL_TTL_SECONDS`, bounded to 60–3,600 s.
 fn parse_ttl_seconds(raw: &str) -> anyhow::Result<Duration> {
     let seconds: u64 = raw.parse().with_context(|| {
         format!("ATTACHMENT_URL_TTL_SECONDS must be a positive integer, got {raw:?}")
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(inboxes, vec!["support", "billing", "sales"]);
     }
 
-    /// N13: an empty entry (a stray or trailing comma) is a hard error, not
+    /// An empty entry (a stray or trailing comma) is a hard error, not
     /// silently dropped.
     #[test]
     fn inbox_list_rejects_a_blank_entry() {
@@ -376,7 +376,7 @@ mod tests {
         assert!(parse_inbox_list("support,billing,").is_err());
     }
 
-    /// N13: entries are not trimmed, so surrounding whitespace is a local-part
+    /// Entries are not trimmed, so surrounding whitespace is a local-part
     /// validation failure rather than being silently stripped.
     #[test]
     fn inbox_list_rejects_whitespace_padded_entries() {
@@ -405,7 +405,7 @@ mod tests {
         assert!(parse_inbox_list("support,Not Valid").is_err());
     }
 
-    /// N13: at most 10 entries; the template expands into 10 `!Select` slots.
+    /// At most 10 entries; the template expands into 10 `!Select` slots.
     #[test]
     fn inbox_list_accepts_ten_entries_and_rejects_eleven() {
         let ten = (0..10)

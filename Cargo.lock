@@ -3343,6 +3343,7 @@ dependencies = [
  "axum",
  "lambda_http",
  "reqwest",
+ "serde",
  "serde_dynamo",
  "serde_json",
  "sha2 0.10.9",

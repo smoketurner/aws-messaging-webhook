@@ -30,7 +30,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// fallback is a test-only path, never a production one.
 const FALLBACK_DEADLINE_SECS: u64 = 60;
 
-/// The invocation deadline (D48), read from the Lambda context Function URL
+/// The invocation deadline, read from the Lambda context Function URL
 /// requests carry as a request extension. Falls back to now + 60 s when the
 /// extension is absent (only handler tests that build a plain axum
 /// `Request`).

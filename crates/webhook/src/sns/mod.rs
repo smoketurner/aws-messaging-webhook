@@ -198,7 +198,7 @@ async fn process_notification<T: Services>(
     // if a prior attempt persisted but died before acting. Publishing the event
     // to EventBridge is the stream relay's job (see `crate::stream`), not the
     // request path's: the persisted item is the outbox entry.
-    // N24: the verified envelope's own `Timestamp` is `received_ms`'s third
+    // The verified envelope's own `Timestamp` is `received_ms`'s third
     // fallback (after `mail.timestamp`/`receipt.timestamp`), so a redelivery
     // never has to fall back to wall-clock time to compute the same
     // deterministic inbound message id.

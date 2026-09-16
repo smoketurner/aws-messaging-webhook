@@ -1,4 +1,4 @@
-//! The object store trait (§5): S3 access for mail bodies, attachments and
+//! The object store trait: S3 access for mail bodies, attachments and
 //! send specs. The bucket is always `MailConfig.bucket` — never a parameter,
 //! so no caller can address another bucket.
 //!
@@ -23,7 +23,7 @@ pub trait ObjectStore: Send + Sync {
     ) -> impl Future<Output = Result<Bytes, ObjectError>> + Send;
 
     /// `None` for a missing object — not an error, since ingest's resume
-    /// check (D48 m2) uses this to distinguish "already put" from "not yet".
+    /// check uses this to distinguish "already put" from "not yet".
     fn head_object(
         &self,
         key: &str,

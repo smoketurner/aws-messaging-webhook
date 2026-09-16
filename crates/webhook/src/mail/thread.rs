@@ -1,4 +1,4 @@
-//! Thread resolution and the versioned read-modify-write state (D2, D3, D4).
+//! Thread resolution and the versioned read-modify-write state.
 //!
 //! Reply derivation (`Re:` subjects, `reply_all` exclusion, `ses_rfc_ids`
 //! composition) is P3 and added when track K lands.
@@ -11,29 +11,29 @@ use crate::mail::{
     AttachmentMeta, Direction, InboxId, MailMessage, THREAD_ATTACHMENT_SUMMARIES, ThreadSnapshot,
 };
 
-/// The maximum candidate ids [`candidate_ids`] returns (D2).
+/// The maximum candidate ids [`candidate_ids`] returns.
 const CANDIDATE_ID_CAP: usize = 20;
 
-/// The thread's `senders`/`recipients` string-set cap (§4 Thread item).
+/// The thread's `senders`/`recipients` string-set cap.
 const THREAD_ADDRESS_SET_CAP: usize = 50;
 
 /// The message-embedded [`ThreadSnapshot`]'s `senders`/`recipients` cap
-/// (N19): lower than [`THREAD_ADDRESS_SET_CAP`], since the snapshot is
+/// lower than [`THREAD_ADDRESS_SET_CAP`], since the snapshot is
 /// duplicated onto every message item rather than held once per thread.
 const THREAD_SNAPSHOT_ADDRESS_CAP: usize = 20;
 
-/// The thread's total label-union cap (D26: "a thread union holds ≤ 32").
+/// The thread's total label-union cap.
 pub const THREAD_LABEL_TOTAL_CAP: usize = 32;
 
-/// The in-memory thread state a read-modify-write cycle computes (D3, D4):
+/// The in-memory thread state a read-modify-write cycle computes:
 /// read the thread consistently, apply this message's effect in Rust, then
 /// `Put` it version-conditioned in the same transaction as the label pointer
 /// deletes/puts.
 ///
-/// Mirrors the Thread item's attributes (§4) one-to-one, plus `inbox_id` and
+/// Mirrors the Thread item's attributes one-to-one, plus `inbox_id` and
 /// `thread_id` (redundant with the item's key, same pattern `MailMessage`
 /// uses for `inbox_id`/`message_id`), so it round-trips through
-/// `serde_dynamo::to_item`/`from_item` (N18).
+/// `serde_dynamo::to_item`/`from_item`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadState {
     pub inbox_id: InboxId,
@@ -80,7 +80,7 @@ pub struct ThreadState {
 
 /// Resolves an `In-Reply-To`/`References` header set to the ordered
 /// candidate RFC ids a thread lookup should try, nearest first, capped at 20
-/// (D2): `In-Reply-To` first, then `References` nearest-to-farthest (i.e.
+/// `In-Reply-To` first, then `References` nearest-to-farthest (i.e.
 /// `references` reversed, since RFC 5322 orders `References` oldest-first).
 /// Duplicates (the same id appearing in both headers) are kept at their
 /// first, nearest occurrence.
@@ -174,14 +174,12 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
 }
 
 /// Applies `msg`'s effect to `existing`, returning the new thread state
-/// (D3: computed in Rust from a consistent read, then `Put` version-checked
+/// (computed in Rust from a consistent read, then `Put` version-checked
 /// in the same transaction as the label pointer updates).
 ///
 /// Received/sent timestamps: `received_timestamp` is set once, at the first
 /// inbound message, and never moves; `sent_timestamp` tracks the most recent
-/// outbound message. Neither is specified precisely by the plan beyond their
-/// presence — this is the most conservative reading (first-received,
-/// last-sent) and is flagged here for review.
+/// outbound message.
 #[must_use]
 pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     let mut next = existing.clone();
@@ -219,7 +217,7 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     next
 }
 
-/// Builds the message-embedded snapshot from the thread's full state (N19),
+/// Builds the message-embedded snapshot from the thread's full state,
 /// capping `senders`/`recipients` at [`THREAD_SNAPSHOT_ADDRESS_CAP`] (lower
 /// than the thread's own [`THREAD_ADDRESS_SET_CAP`]).
 impl From<&ThreadState> for ThreadSnapshot {

@@ -43,7 +43,7 @@ impl<T> Services for T where
 /// Shared application state; the router holds it behind one `Arc`.
 pub struct AppState<T: Services> {
     pub services: T,
-    /// Bearer API keys (D20), cached for the life of this execution
+    /// Bearer API keys, cached for the life of this execution
     /// environment and shared by every `/v0` request.
     pub api_keys: KeyCache,
     pub verifier: SnsVerifier,

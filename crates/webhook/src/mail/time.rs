@@ -8,7 +8,7 @@
 //! trims trailing zero digits otherwise — so it is not reused here. Calendar
 //! conversion uses Howard Hinnant's `days_from_civil` / `civil_from_days`
 //! algorithm (a small, well-known, dependency-free proleptic-Gregorian
-//! calendar), avoiding a `chrono` dependency the plan does not call for.
+//! calendar), avoiding a `chrono` dependency for two conversions.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

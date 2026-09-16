@@ -33,7 +33,7 @@ pub mod names {
     pub const COLD_START: &str = "ColdStart";
     pub const LATENCY: &str = "Latency";
 
-    // Mail (AgentMail-compatible inbox).
+    // Mail inbox.
     pub const MESSAGES_INGESTED: &str = "MessagesIngested";
     pub const INGEST_FAILURES: &str = "IngestFailures";
     pub const INGEST_SKIPPED: &str = "IngestSkipped";
@@ -49,9 +49,9 @@ pub mod names {
     pub const SEND_MARK_DEFERRED: &str = "SendMarkDeferred";
     pub const OUTBOX_CLEANUP_FAILED: &str = "OutboxCleanupFailed";
     pub const UNKNOWN_OUTBOX_EXPIRED: &str = "UnknownOutboxExpired";
-    /// rev5 N2: the expired-but-not-yet-closed `unknown` outbox count.
+    /// Sends whose outbox has expired but which no operator has closed.
     pub const SEND_EXPIRED_OUTSTANDING: &str = "SendExpiredOutstanding";
-    /// rev5 N11: an expiry sweep run whose delete/finish step failed.
+    /// An expiry sweep whose delete or finish step failed.
     pub const OUTBOX_EXPIRE_FAILED: &str = "OutboxExpireFailed";
 }
 

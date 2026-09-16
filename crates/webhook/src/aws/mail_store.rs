@@ -1,14 +1,14 @@
 //! [`MailStore`] for [`AwsServices`](crate::aws::AwsServices): the mail
 //! table's DynamoDB access.
 //!
-//! Every write goes through the D27 transaction model
+//! Every write goes through the transaction model
 //! ([`crate::mail::plan`]/[`crate::mail::txn`]): a planner builds
 //! role-tagged [`PlannedOp`]s from a pure, in-memory computation, this module
 //! renders them to a `TransactWriteItems` call, and
 //! [`decode_cancellation`] turns a cancellation into one of a handful of
 //! decisions the caller retries or surfaces. Reads and writes use
 //! `serde_dynamo::to_item`/`from_item` on the same structs the planner
-//! builds (N18); this module only adds the key attributes those structs
+//! builds; this module only adds the key attributes those structs
 //! don't carry themselves.
 
 use std::collections::HashMap;
@@ -23,20 +23,19 @@ use aws_sdk_dynamodb::types::{
 use aws_smithy_types::error::display::DisplayErrorContext;
 
 use crate::aws::{self, AwsServices};
-use crate::mail::keys;
+use crate::mail::keys::{self, PageKey};
 use crate::mail::plan::{Check, Cond, PlannedOp, TxnKind, WriteOp};
-use crate::mail::store::{MailStore, MailStoreError};
+use crate::mail::store::{ListQuery, MailStore, MailStoreError, Page, ThreadView};
 use crate::mail::thread::{ThreadState, apply_message, new_thread};
 use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
-/// D27: `Retry`/`VersionConflict` loop at most this many times before giving
+/// `Retry`/`VersionConflict` loops at most this many times before giving
 /// up with `MailStoreError::Conflict`.
 const MAX_TXN_RETRIES: u32 = 3;
 
-/// M11: `BatchGetItem` loops on `UnprocessedKeys` at most this many times
-/// (matching D19's `ByThread` `BatchGetItem` loop) before surfacing a
-/// transient error.
+/// `BatchGetItem` loops on `UnprocessedKeys` at most this many times before
+/// surfacing a transient error.
 const MAX_BATCH_GET_ATTEMPTS: u32 = 5;
 
 impl AwsServices {
@@ -44,13 +43,105 @@ impl AwsServices {
     /// every `MailStore` method is only ever called when it is enabled, but
     /// this keeps that assumption from becoming a panic if it's ever
     /// violated.
+    /// One page of a time-ordered index partition, deserialized into `T`.
+    ///
+    /// Both list indexes are keyed the same way — a partition string plus a
+    /// sort key that orders by time — so messages, threads and thread
+    /// membership share this. `before`/`after` become an exclusive sort-key
+    /// range, and the returned `next` is the last item's key so the caller's
+    /// post-filtering can stop mid-page.
+    async fn query_page<T: serde::de::DeserializeOwned>(
+        &self,
+        partition: &str,
+        query: &ListQuery,
+        context: &'static str,
+    ) -> Result<Page<T>, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let index = if partition.starts_with("THREAD#") {
+            "ByThread"
+        } else {
+            "ByTime"
+        };
+        let (pk_attr, sk_attr) = if index == "ByThread" {
+            ("gsi2pk", "gsi2sk")
+        } else {
+            ("gsi1pk", "gsi1sk")
+        };
+
+        let mut condition = "#pk = :pk".to_owned();
+        let mut values = std::collections::HashMap::from([(
+            ":pk".to_owned(),
+            DynamoAv::S(partition.to_owned()),
+        )]);
+        match (&query.after, &query.before) {
+            (Some(after), Some(before)) => {
+                condition.push_str(" AND #sk BETWEEN :after AND :before");
+                values.insert(":after".to_owned(), DynamoAv::S(after.clone()));
+                values.insert(":before".to_owned(), DynamoAv::S(before.clone()));
+            }
+            (Some(after), None) => {
+                condition.push_str(" AND #sk > :after");
+                values.insert(":after".to_owned(), DynamoAv::S(after.clone()));
+            }
+            (None, Some(before)) => {
+                condition.push_str(" AND #sk < :before");
+                values.insert(":before".to_owned(), DynamoAv::S(before.clone()));
+            }
+            (None, None) => {}
+        }
+
+        let mut request = self
+            .dynamo
+            .query()
+            .table_name(&table_name)
+            .index_name(index)
+            .key_condition_expression(condition)
+            .expression_attribute_names("#pk", pk_attr)
+            .expression_attribute_names("#sk", sk_attr)
+            .set_expression_attribute_values(Some(values))
+            .scan_index_forward(query.ascending)
+            .limit(i32::try_from(query.limit).unwrap_or(i32::MAX));
+        if let Some(start) = &query.start {
+            request = request
+                .exclusive_start_key("pk", DynamoAv::S(keys::inbox_pk(query.inbox.as_str())))
+                .exclusive_start_key("sk", DynamoAv::S(start.sort.clone()))
+                .exclusive_start_key(pk_attr, DynamoAv::S(start.partition.clone()))
+                .exclusive_start_key(sk_attr, DynamoAv::S(start.sort.clone()));
+        }
+
+        let output = request
+            .send()
+            .await
+            .map_err(|e| store_error_from_sdk(context, &e))?;
+
+        let mut items = Vec::new();
+        let mut last_sort = None;
+        for item in output.items.unwrap_or_default() {
+            if let Some(DynamoAv::S(sort)) = item.get(sk_attr) {
+                last_sort = Some(sort.clone());
+            }
+            items.push(
+                serde_dynamo::from_item(item)
+                    .map_err(|e| MailStoreError::Permanent(anyhow!("{context}: {e}")))?,
+            );
+        }
+        // Only hand back a continuation when DynamoDB says there is more.
+        let next = output.last_evaluated_key.and_then(|_| {
+            last_sort.map(|sort| PageKey {
+                partition: partition.to_owned(),
+                sort,
+            })
+        });
+        Ok(Page { items, next })
+    }
+
     fn mail_table_name(&self) -> Result<&str, MailStoreError> {
         self.mail_config()
             .map(|config| config.table_name.as_str())
             .ok_or_else(|| MailStoreError::Permanent(anyhow!("mail is not configured")))
     }
 
-    /// Reads the thread's current state, consistently (D3: "read the thread
+    /// Reads the thread's current state, consistently ("read the thread
     /// consistently, compute its new state in Rust").
     async fn get_thread_state(
         &self,
@@ -93,7 +184,7 @@ where
     }
 }
 
-/// Maps a `CancellationReason`'s `code()` (D27) to our enum.
+/// Maps a `CancellationReason`'s `code()` to our enum.
 fn map_cancellation_reason(code: Option<&str>) -> CancellationReason {
     match code {
         Some("ConditionalCheckFailed") => CancellationReason::ConditionalCheckFailed,
@@ -327,7 +418,7 @@ fn alias_transact_item(
 enum Attempt {
     /// Every condition held; the writes were applied.
     Committed,
-    /// The transaction was cancelled or is in progress; decoded per D27.
+    /// The transaction was cancelled or is in progress.
     Decision(TxnDecision),
 }
 
@@ -555,7 +646,7 @@ impl MailStore for AwsServices {
 
     async fn insert_message(&self, msg: &MailMessage) -> Result<InsertOutcome, MailStoreError> {
         for _attempt in 0..=MAX_TXN_RETRIES {
-            // D3: read the thread consistently, compute its new state in
+            // Read the thread consistently, compute its new state in
             // Rust, then plan the whole transaction fresh — re-read on every
             // retry, since a concurrent writer may have moved the thread's
             // version.
@@ -604,5 +695,58 @@ impl MailStore for AwsServices {
                 .map(Some)
                 .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing message: {e}"))),
         }
+    }
+
+    async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
+        let partition = format!("INBOX#{}#MSG", query.inbox.as_str());
+        self.query_page(&partition, query, "listing messages").await
+    }
+
+    async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
+        let partition = format!("INBOX#{}#THR", query.inbox.as_str());
+        self.query_page(&partition, query, "listing threads").await
+    }
+
+    async fn get_thread(
+        &self,
+        inbox: &InboxId,
+        thread_id: &str,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> Result<Option<ThreadView>, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let thread = self
+            .dynamo
+            .get_item()
+            .table_name(&table_name)
+            .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
+            .key("sk", DynamoAv::S(keys::thread_sk(thread_id)))
+            .send()
+            .await
+            .map_err(|e| store_error_from_sdk("GetItem(thread)", &e))?
+            .item;
+        let Some(thread) = thread else {
+            return Ok(None);
+        };
+        let thread: ThreadState = serde_dynamo::from_item(thread)
+            .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}")))?;
+
+        // Messages of one thread, oldest first: ByThread is keyed by the
+        // message id, which orders by time.
+        let messages = self
+            .query_page(
+                &format!("THREAD#{}#{}", inbox.as_str(), thread_id),
+                &ListQuery {
+                    inbox: inbox.clone(),
+                    limit,
+                    before: None,
+                    after: None,
+                    ascending: true,
+                    start,
+                },
+                "listing thread messages",
+            )
+            .await?;
+        Ok(Some(ThreadView { thread, messages }))
     }
 }

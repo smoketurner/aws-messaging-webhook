@@ -1,5 +1,5 @@
-//! Mail table key builders (§4) and the opaque page token used by every list
-//! endpoint (D11).
+//! Mail table key builders, and the opaque page token every list endpoint
+//! returns.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,7 +21,7 @@ pub fn message_sk(message_id: &str) -> String {
     format!("MSG#{message_id}")
 }
 
-/// The send-state item's `pk` (D51): a message's send-state lives outside its
+/// The send-state item's `pk`: a message's send state lives outside its
 /// inbox partition so the sender never needs the inbox id to find it.
 #[must_use]
 pub fn outbox_pk(message_id: &str) -> String {
@@ -55,7 +55,7 @@ pub fn thread_pointer_sk(timestamp: &str, thread_id: &str) -> String {
 }
 
 /// The RFC alias item's `pk`: `rfc_id` is the `Message-ID` value with the
-/// surrounding `<`/`>` stripped, matching D2.
+/// surrounding `<`/`>` stripped.
 #[must_use]
 pub fn rfc_alias_pk(inbox_id: &str, rfc_id: &str) -> String {
     format!("RFC#{inbox_id}#{rfc_id}")
@@ -77,7 +77,7 @@ pub fn ses_ref_sk() -> &'static str {
 }
 
 /// The `Idempotency-Key` item's `pk`: `key_hash` is the lowercase hex
-/// SHA-256 of the header value (D32).
+/// SHA-256 of the header value.
 #[must_use]
 pub fn send_key_pk(key_hash: &str) -> String {
     format!("SENDKEY#{key_hash}")
@@ -88,7 +88,7 @@ pub fn send_key_sk() -> &'static str {
     "KEY"
 }
 
-/// The SES-call marker's `pk` (D43).
+/// The SES-call marker's `pk`.
 #[must_use]
 pub fn ses_call_pk(message_id: &str) -> String {
     format!("SESCALL#{message_id}")
@@ -107,7 +107,7 @@ pub struct PageKey {
     pub sort: String,
 }
 
-/// The opaque page token (D11): base64url JSON of the last *returned* item's
+/// The opaque page token: base64url JSON of the last *returned* item's
 /// key. Its partition is re-validated against the request that presents it;
 /// a mismatch is the caller's 400.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +147,7 @@ pub fn encode_page_token(key: &PageKey) -> String {
 /// # Errors
 ///
 /// Returns [`PageTokenError`] for malformed base64/JSON, or a token issued
-/// for a different partition (D11's cross-partition 400).
+/// for a different partition, which the caller sees as a 400.
 pub fn decode_page_token(token: &str, expected_partition: &str) -> Result<PageKey, PageTokenError> {
     let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| PageTokenError)?;
     let payload: PageTokenPayload = serde_json::from_slice(&bytes).map_err(|_| PageTokenError)?;

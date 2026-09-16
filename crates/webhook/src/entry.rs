@@ -204,7 +204,7 @@ async fn process_record<T: Services>(
 }
 
 /// Converts a Lambda invocation's execution deadline (`Context::deadline()`,
-/// a [`SystemTime`]) into a [`tokio::time::Instant`] so `D48` time-boxing can
+/// a [`SystemTime`]) into a [`tokio::time::Instant`] so time-boxing can
 /// use `tokio::time::timeout_at` directly. Saturates to zero (an
 /// already-elapsed deadline) rather than panicking when the deadline has
 /// already passed by the time this runs.

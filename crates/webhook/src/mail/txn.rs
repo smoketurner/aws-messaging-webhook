@@ -1,4 +1,4 @@
-//! Cancellation decoding for `TransactWriteItems` (D27): turns a
+//! Cancellation decoding for `TransactWriteItems`: turns a
 //! transaction's per-item cancellation reasons into one decision, so every
 //! flow that runs a transaction shares one retry/conflict policy instead of
 //! re-deriving it from raw DynamoDB error codes.
@@ -12,7 +12,7 @@ pub enum TxnDecision {
     KeyExists,
     /// A `NotExists`-conditioned `Message`/`SendState` op lost its check —
     /// a redelivery (`Insert`) or this request's own earlier commit
-    /// (`Enqueue`, D17 m6); both count as success.
+    /// (`Enqueue`); both count as success.
     Duplicate,
     /// Worth retrying with jitter (throttling, a transaction conflict, a
     /// transient service error).
@@ -25,7 +25,7 @@ pub enum TxnDecision {
 }
 
 /// One transaction item's raw cancellation reason, as reported by
-/// `TransactWriteItemsError`'s `CancellationReason` (D27's non-cancellation
+/// `TransactWriteItemsError`'s `CancellationReason` (the non-cancellation
 /// errors — `TransactionInProgressException` etc. — are handled by the
 /// caller before this, since they carry no per-item reasons).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub enum CancellationReason {
     ItemCollectionSizeLimitExceeded,
 }
 
-/// Whether `reason` is one of D27 step 3's always-retry reasons.
+/// Whether `reason` is one of the always-retry reasons.
 fn is_retryable(reason: CancellationReason) -> bool {
     matches!(
         reason,
@@ -53,7 +53,7 @@ fn is_retryable(reason: CancellationReason) -> bool {
     )
 }
 
-/// Whether `op` is conditioned `NotExists` (D27 step 2: `Message`/`SendState`
+/// Whether `op` is conditioned `NotExists` (`Message`/`SendState`
 /// only).
 fn is_not_exists_conditioned(op: &WriteOp) -> bool {
     matches!(
@@ -65,7 +65,7 @@ fn is_not_exists_conditioned(op: &WriteOp) -> bool {
     )
 }
 
-/// Whether `op` carries a version- or status-conditioned check (D27 step 4:
+/// Whether `op` carries a version- or status-conditioned check (
 /// `Message`, `SendState` or `Thread`).
 fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
     match op {
@@ -85,7 +85,7 @@ fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
     }
 }
 
-/// Whether `op` carries any condition at all (D27 step 5: an unconditioned
+/// Whether `op` carries any condition at all (an unconditioned
 /// op's failed check is always `Permanent`, never reached in practice since
 /// DynamoDB only cancels a conditioned item, but checked defensively).
 fn is_conditioned(op: &WriteOp) -> bool {
@@ -97,7 +97,7 @@ fn is_conditioned(op: &WriteOp) -> bool {
 }
 
 /// Decodes a transaction's cancellation into one [`TxnDecision`], per the
-/// precedence D27 documents. `ops` and `reasons` are parallel: one
+/// precedence documented above. `ops` and `reasons` are parallel: one
 /// cancellation reason per planned transaction item.
 #[must_use]
 pub fn decode_cancellation(

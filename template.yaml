@@ -4,7 +4,7 @@ Description: >-
   Webhook receiver for AWS End User Messaging and SES events delivered over
   SNS: verifies signatures, persists an event-sourced record to DynamoDB,
   performs lifecycle actions, and re-publishes to an EventBridge bus.
-  Optionally hosts an AgentMail-compatible mailbox on SES (MailDomain).
+  Optionally hosts a mailbox on SES (MailDomain).
 
 Parameters:
   Stage:
@@ -1008,7 +1008,7 @@ Outputs:
       - !Sub "none configured (catch-all on ${MailDomain})"
   ApiBaseUrl:
     Condition: HasMailDomain
-    Description: Base URL of the AgentMail-compatible API.
+    Description: Base URL of the mailbox API.
     Value: !Sub "${WebhookFunctionUrl.FunctionUrl}v0"
   ReceiptRuleSetName:
     Condition: HasMailDomain

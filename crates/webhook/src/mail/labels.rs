@@ -1,6 +1,6 @@
-//! System/reserved label sets and inbound verdict classification (D16, D26).
+//! System and reserved label sets, and inbound verdict classification.
 
-/// The 12 system labels (D26): applied by the pipeline itself, never
+/// The 12 system labels: applied by the pipeline itself, never
 /// directly settable by a PATCH request (except `unread`/`spam`/`trash`,
 /// which are user-toggleable).
 pub const SYSTEM_LABELS: [&str; 12] = [
@@ -19,14 +19,14 @@ pub const SYSTEM_LABELS: [&str; 12] = [
 ];
 
 /// Every system label except `unread`, `spam` and `trash` — rejected on a
-/// PATCH request and in a send's `labels` (D26).
+/// PATCH request and in a send's `labels`.
 #[must_use]
 pub fn is_reserved(label: &str) -> bool {
     SYSTEM_LABELS.contains(&label) && !matches!(label, "unread" | "spam" | "trash")
 }
 
 /// The inbound classification label an ingested message gets beyond
-/// `received`/`unread` (D16): spam takes precedence over an authentication
+/// `received`/`unread`: spam takes precedence over an authentication
 /// failure, which takes precedence over neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundVerdict {
@@ -35,7 +35,7 @@ pub enum InboundVerdict {
     Clean,
 }
 
-/// Classifies an inbound receipt's verdicts (D16): spam/virus `FAIL` → spam
+/// Classifies an inbound receipt's verdicts: spam/virus `FAIL` → spam
 /// (quarantined); SPF/DKIM/DMARC `FAIL` → unauthenticated; otherwise clean.
 /// Nothing is ever dropped — this only selects the label and detail-type.
 /// Event precedence: spam > unauthenticated > received.
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn classify_inbound_verdict_matrix() {
-        // Precedence (D16): spam > unauthenticated > clean, over every
+        // Precedence: spam > unauthenticated > clean, over every
         // combination of the two inputs.
         assert_eq!(classify_inbound(false, false), InboundVerdict::Clean);
         assert_eq!(

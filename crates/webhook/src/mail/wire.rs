@@ -1,13 +1,12 @@
-//! `AgentMail`-compatible wire structs (D31): the exact JSON shapes the
-//! `/v0` API (P2) and the EventBridge relay (D6) both serialize, verified
-//! against `AgentMail`'s own documented schema
-//! (<https://docs.agentmail.to/api-reference/inboxes/messages/get>,
-//! `.../threads/get`, `.../inboxes/get>`) so a client written against the
-//! real `AgentMail` API works unmodified against this one.
+//! The wire structs: the exact JSON shapes both the `/v0` API and the
+//! EventBridge relay serialize. They follow the published mailbox API
+//! contract field for field, so a client written against that contract works
+//! unmodified against this service. Renaming or reordering a field here is a
+//! breaking change for those clients.
 //!
-//! [`MessageItem`]/[`ThreadItem`] are the D34 list views: the same shape
+//! [`MessageItem`] and [`ThreadItem`] are the list views: the same shapes
 //! minus the fields a list response omits (`headers`, `references`, body
-//! content, the embedded `messages[]`).
+//! content, and the embedded `messages[]`).
 
 use std::collections::BTreeMap;
 
@@ -124,7 +123,7 @@ impl From<&MailMessage> for Message {
     }
 }
 
-/// The D34 list view: the same fields as [`Message`] minus `headers`,
+/// The list view: the same fields as [`Message`] minus `headers`,
 /// `references`, `reply_to` and the body content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageItem {
@@ -202,7 +201,7 @@ pub struct Thread {
     pub attachments: Vec<Attachment>,
 }
 
-/// The D34 list view: the same fields as [`Thread`] minus the embedded
+/// The list view: the same fields as [`Thread`] minus the embedded
 /// `messages[]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadItem {
@@ -223,6 +222,27 @@ pub struct ThreadItem {
     pub preview: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+}
+
+impl From<&crate::mail::thread::ThreadState> for ThreadItem {
+    fn from(thread: &crate::mail::thread::ThreadState) -> Self {
+        Self {
+            inbox_id: thread.inbox_id.as_str().to_owned(),
+            thread_id: thread.thread_id.clone(),
+            labels: thread.labels.clone(),
+            timestamp: thread.timestamp.clone(),
+            senders: thread.senders.clone(),
+            recipients: thread.recipients.clone(),
+            last_message_id: thread.last_message_id.clone(),
+            message_count: thread.message_count,
+            size: thread.size,
+            created_at: thread.created_at.clone(),
+            updated_at: thread.updated_at.clone(),
+            subject: (!thread.subject.is_empty()).then(|| thread.subject.clone()),
+            preview: (!thread.preview.is_empty()).then(|| thread.preview.clone()),
+            attachments: thread.attachments.iter().map(Attachment::from).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -360,7 +380,7 @@ mod tests {
         assert_eq!(value["subject"], "Hello");
     }
 
-    /// D34: `MessageItem` must serialize identically whether the source was
+    /// `MessageItem` must serialize identically whether the source was
     /// a `ByTime` query or a message pointer — since both convert from the
     /// same `MailMessage`, the conversion is trivially deterministic.
     #[test]

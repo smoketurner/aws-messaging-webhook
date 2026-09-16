@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
-//! Integration tests for inbound ingest (§6.1, §11 P1): the real router,
-//! `FakeServices` (`MailMemoryStore` + `FakeObjectStore`), and track B's
+//! Integration tests for inbound ingest: the real router,
+//! `FakeServices` (`MailMemoryStore` + `FakeObjectStore`), and the
 //! `.eml` fixtures.
 //!
 //! `webhook_test_support::harness()` always builds a harness with
@@ -100,7 +100,7 @@ async fn mail_harness() -> Harness {
 }
 
 /// A `notificationType: "Received"` SNS payload with an S3 action pointer
-/// (§1 verified-facts example shape), the fields ingest reads.
+/// the fields ingest reads.
 #[expect(clippy::too_many_arguments, reason = "one test-fixture builder")]
 fn ses_inbound_s3(
     ses_message_id: &str,
@@ -560,7 +560,7 @@ async fn multi_recipient_inserts_into_every_target_inbox() {
 }
 
 /// A direct `mail::ingest::ingest_inbound` call — see the module doc for why
-/// this test cannot drive the D48 deadline through the router.
+/// this test cannot drive the deadline through the router.
 fn direct_state(bucket: &str) -> AppState<FakeServices> {
     AppState {
         services: FakeServices::default(),
@@ -599,7 +599,7 @@ fn notification(
 }
 
 /// A receipt with neither `mail.timestamp` nor `receipt.timestamp` set, for
-/// the N24 tests: `received_ms` must fall back to the caller-supplied
+/// the timestamp tests: `received_ms` must fall back to the caller-supplied
 /// envelope timestamp, and never to wall-clock time.
 fn notification_without_timestamps(
     ses_id: &str,
@@ -674,7 +674,7 @@ async fn resume_skips_an_already_present_part() {
     // The pre-seeded content is untouched — `put_object_if_absent` never ran
     // against a differing body for this key.
     assert_eq!(state.services.objects.get(&object_key), Some(original));
-    // N23: direct call-count assertions rather than outcome-only. The part
+    // Direct call-count assertions rather than outcome-only. The part
     // is HEADed (once to detect a redelivery, once more in the per-part
     // resume check) but never put, since it was already present.
     assert_eq!(
@@ -710,7 +710,7 @@ fn two_attachment_email() -> Vec<u8> {
         .to_vec()
 }
 
-/// N23/D48: converts the "no put still pending after the deadline" test from
+/// Converts the "no put still pending after the deadline" test from
 /// outcome-only (just a transient error) to direct — the hung attachment's
 /// put call count freezes the moment the deadline elapses and never grows
 /// again, because the whole future tree (including the pending put) is
@@ -770,7 +770,7 @@ async fn no_put_still_pending_after_the_deadline() {
     );
 }
 
-/// N24: when `mail.timestamp` and `receipt.timestamp` are both absent, the
+/// When `mail.timestamp` and `receipt.timestamp` are both absent, the
 /// envelope timestamp fallback still produces the same deterministic id
 /// across a redelivery, so the second delivery is a duplicate rather than a
 /// second stored copy.
@@ -809,7 +809,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     );
 }
 
-/// N24: with no usable timestamp on any of the three D38 fallbacks, ingest
+/// With no usable timestamp on any of the three fallbacks, ingest
 /// skips the message (`no_timestamp`) rather than inventing one via
 /// `time::now_ms()` — never fetching the raw object, since a wall-clock
 /// value would make the id non-deterministic across a redelivery.

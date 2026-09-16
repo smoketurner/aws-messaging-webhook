@@ -1,10 +1,10 @@
-//! The mail table's DynamoDB Streams relay (D6, §6.6, §11): `message.received*`
+//! The mail table's DynamoDB Streams relay: `message.received*`
 //! on a `MSG#` INSERT, nothing on any other mail-table item or on a MODIFY,
 //! and the existing events-table relay left unaffected.
 //!
 //! Stream images are built with `serde_dynamo::to_item` on
-//! [`aws_messaging_webhook::mail::MailMessage`] (N18 — never hand-parsed
-//! attribute JSON), matching what track A's store will actually write.
+//! [`aws_messaging_webhook::mail::MailMessage`] — never hand-parsed
+//! attribute JSON — matching what the store actually writes.
 
 // This binary's own helper functions never fail except on a bug in the test
 // itself (mirrors `webhook_test_support`'s file-level expectation, which
@@ -69,7 +69,7 @@ fn sample_message() -> MailMessage {
 
 /// Builds a `MailMessage`'s stream `NewImage` the way the real store writes
 /// it: `serde_dynamo::to_item` on the struct, plus the `pk`/`sk` key
-/// attributes the store adds separately (N18). Serializing the resulting
+/// attributes the store adds separately. Serializing the resulting
 /// `Item` reproduces the DynamoDB JSON wire shape (`{"S": "..."}`, …) a real
 /// stream record carries.
 fn message_new_image(msg: &MailMessage) -> Value {
@@ -87,7 +87,7 @@ fn message_new_image(msg: &MailMessage) -> Value {
 
 /// One DynamoDB Streams record for a mail-table item. `new_image` is omitted
 /// (`None`) for a MODIFY/REMOVE test that only needs the key attributes to
-/// route on `sk`; `OldImage` is never included (M10: an INSERT's absent old
+/// route on `sk`; `OldImage` is never included (an INSERT's absent old
 /// image must not fail deserialization, and the P1 relay never reads it).
 fn mail_stream_event(event_name: &str, new_image: &Value, sequence: &str) -> Value {
     json!({
@@ -149,7 +149,7 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
     );
 }
 
-/// N19: the relay publishes the stored `thread_snapshot` verbatim, so a
+/// The relay publishes the stored `thread_snapshot` verbatim, so a
 /// reply into an existing thread publishes the thread's real accumulated
 /// state, not a single-message stub.
 #[tokio::test]

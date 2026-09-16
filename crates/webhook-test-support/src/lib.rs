@@ -1,12 +1,8 @@
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
-// Pedantic doc/must_use lints assume a public API with its own contract to
-// document; every item here exists only for a `#[tokio::test]` body to call
-// directly and unwrap, so these three add no signal. Previously silent
-// because this code lived inside a `--test` binary crate, where clippy
-// exempts pedantic lints outright; promoting it to a library crate (so its
-// `pub` items don't trip per-binary dead-code checks — see below) lost that
-// exemption, so it's restated explicitly here. Applies workspace-wide via
-// crate-root scope, covering `mail_memory` and `objects` too.
+// Pedantic doc and must_use lints assume a public API with its own contract
+// to document; every item here exists only for a `#[tokio::test]` body to
+// call directly and unwrap, so they add no signal. Declared at the crate
+// root so they cover `mail_memory` and `objects` too.
 #![expect(
     clippy::missing_panics_doc,
     reason = "test harness helpers: an internal unwrap is the intended fast-fail on setup failure, not documented API"
@@ -19,7 +15,7 @@
     clippy::must_use_candidate,
     reason = "test harness helpers: callers always use the return value directly"
 )]
-//! Shared handler-test infrastructure (D24): `FakeServices`, the request
+//! Shared handler-test infrastructure: `FakeServices`, the request
 //! harness, and the SNS-envelope / Lambda-invocation builders every handler
 //! test suite drives. A dev-dependency crate (not a `tests/support` module)
 //! so a test binary that doesn't use every helper isn't flagged for dead
@@ -45,8 +41,11 @@ use aws_messaging_webhook::api::keys::{ApiKeyError, ApiKeySource, KeyCache};
 use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::{Config, FunctionMode};
 use aws_messaging_webhook::entry::dispatch;
+use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
+use aws_messaging_webhook::mail::store::{ListQuery, Page, ThreadView};
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
+use aws_messaging_webhook::mail::thread::ThreadState;
 use aws_messaging_webhook::mail::{
     Inbox, InboxId, InsertOutcome, MailMessage, ObjectMeta, PutOutcome, RfcHit,
 };
@@ -81,11 +80,9 @@ pub struct FakeServices {
     /// simulating SES `BadRequestException` for a malformed recipient. Other
     /// recipients still succeed — the action must continue past these.
     pub permanent_suppression_failures: Mutex<Vec<String>>,
-    /// Track A's in-memory mail store fake (currently a stub); `MailStore`
-    /// is delegated to it below.
+    /// In-memory mail store; `MailStore` is delegated to it below.
     pub mail: MailMemoryStore,
-    /// Track B's fake object store (currently a stub); `ObjectStore` is
-    /// delegated to it below.
+    /// Fake object store; `ObjectStore` is delegated to it below.
     pub objects: FakeObjectStore,
     /// The bearer keys the `/v0` surface authenticates against;
     /// `ApiKeySource` is delegated to it below. Unavailable until a test
@@ -134,6 +131,24 @@ impl MailStore for FakeServices {
         message_id: &str,
     ) -> Result<Option<MailMessage>, MailStoreError> {
         self.mail.get_message(inbox, message_id).await
+    }
+
+    async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
+        self.mail.list_messages(query).await
+    }
+
+    async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
+        self.mail.list_threads(query).await
+    }
+
+    async fn get_thread(
+        &self,
+        inbox: &InboxId,
+        thread_id: &str,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> Result<Option<ThreadView>, MailStoreError> {
+        self.mail.get_thread(inbox, thread_id, limit, start).await
     }
 }
 
@@ -424,9 +439,9 @@ pub fn function_url_event(path: &str, body: &Value) -> Value {
     })
 }
 
-/// A `Context` with a deadline 60 s in the future (rev5: "the harness default"),
-/// rather than `Context::default()`'s zero deadline — an already-elapsed
-/// deadline would make every D48 time-boxed action look instantly expired.
+/// A `Context` with a deadline 60 s in the future, rather than
+/// `Context::default()`'s zero deadline — an already-elapsed deadline would
+/// make every time-boxed action look instantly expired.
 pub fn test_context() -> Context {
     let now_ms = u64::try_from(
         SystemTime::now()

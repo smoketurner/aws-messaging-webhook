@@ -1,5 +1,5 @@
 //! Fake `ObjectStore` test double: an in-memory object map with per-key
-//! error injection, including a never-completing mode for the D48
+//! error injection, including a never-completing mode for the
 //! paused-time deadline tests.
 
 use std::collections::HashMap;
@@ -25,15 +25,15 @@ pub enum ObjectFailure {
     NotFound,
     Permanent,
     Transient,
-    /// The call's future never resolves — for D48's paused-time deadline
+    /// The call's future never resolves — for the paused-time deadline
     /// tests, where the surrounding `tokio::time::timeout` is what's under
     /// test, not this store.
     Hang,
 }
 
-/// The ordered sequence of calls made against each operation (N23): a
+/// The ordered sequence of calls made against each operation: a
 /// per-key call count is `iter().filter(|k| k == key).count()`, and the
-/// D48 "no put still pending after the deadline" test relies on a call
+/// "no put still pending after the deadline" test relies on a call
 /// being recorded synchronously at entry, before any injected failure
 /// (including [`ObjectFailure::Hang`]) is even consulted — so a hung call
 /// still shows up here exactly once, and never again once its future is
@@ -364,8 +364,8 @@ mod tests {
         store.inject("k", ObjectFailure::Hang);
 
         // The call is recorded synchronously at entry, before the future
-        // ever resolves (N23) — spawn it, let it start, then abort it
-        // without ever completing, mirroring what a D48 timeout does to a
+        // ever resolves — spawn it, let it start, then abort it
+        // without ever completing, mirroring what a timeout does to a
         // hung put.
         let task_store = std::sync::Arc::clone(&store);
         let hung = tokio::spawn(async move {

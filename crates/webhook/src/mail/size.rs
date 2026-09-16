@@ -1,4 +1,4 @@
-//! DynamoDB item sizing and the D5 item budget (`fit_item`).
+//! DynamoDB item sizing and the item budget (`fit_item`).
 //!
 //! [`dynamo_item_size`] follows AWS's documented item-size rules
 //! (<https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html>):
@@ -37,7 +37,7 @@ fn attribute_value_size(value: &AttributeValue) -> usize {
     }
 }
 
-/// The DynamoDB item size (§4/D5): the sum of every top-level attribute
+/// The DynamoDB item size: the sum of every top-level attribute
 /// name's byte length plus its value's size.
 #[must_use]
 pub fn dynamo_item_size(item: &Item) -> usize {
@@ -47,7 +47,7 @@ pub fn dynamo_item_size(item: &Item) -> usize {
 }
 
 /// The combined size of every item in one `TransactWriteItems` call, bounded
-/// at 4 MB (D26).
+/// at 4 MB.
 #[must_use]
 pub fn transaction_bytes(items: &[Item]) -> usize {
     items.iter().map(dynamo_item_size).sum()
@@ -61,7 +61,7 @@ fn item_of(msg: &MailMessage) -> Item {
 }
 
 /// Shrinks `msg` in place until its DynamoDB item size is at most
-/// [`ITEM_BUDGET_BYTES`] (D5), in this order:
+/// [`ITEM_BUDGET_BYTES`], in this order:
 ///
 /// 1. `html`, truncated at a `char` boundary (sets `body_truncated`).
 /// 2. `text`, truncated at a `char` boundary (sets `body_truncated`).
@@ -69,7 +69,7 @@ fn item_of(msg: &MailMessage) -> Item {
 /// 4. `attachments`, dropping from the tail one at a time (sets
 ///    `attachments_truncated`).
 /// 5. `thread_snapshot.recipients`, dropping from the tail one at a time.
-/// 6. `thread_snapshot.senders`, dropping from the tail one at a time (N19:
+/// 6. `thread_snapshot.senders`, dropping from the tail one at a time (
 ///    after `recipients`, both still last).
 ///
 /// Each step re-measures after every edit and stops as soon as the item
@@ -193,7 +193,7 @@ fn shrink_thread_snapshot_recipients(msg: &mut MailMessage) {
 }
 
 /// Drops `thread_snapshot.senders` from the tail, one at a time, until the
-/// item fits or none remain (N19: shrinks after `recipients`).
+/// item fits or none remain; shrinks after `recipients`.
 fn shrink_thread_snapshot_senders(msg: &mut MailMessage) {
     loop {
         let popped = match &mut msg.thread_snapshot {
@@ -391,9 +391,9 @@ mod tests {
     }
 
     proptest! {
-        /// At every maximum the plan bounds (large html/text, many headers,
-        /// many attachments, a large thread snapshot), `fit_item` always
-        /// reaches budget and never panics.
+        /// At every bounded maximum (large html/text, many headers, many
+        /// attachments, a large thread snapshot), `fit_item` always reaches
+        /// budget and never panics.
         #[test]
         fn fit_item_always_reaches_budget_at_maxima(
             html_len in 0usize..600_000,
