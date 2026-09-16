@@ -244,6 +244,61 @@ impl ObjectStore for FakeObjectStore {
         );
         Ok(PutOutcome::Created)
     }
+
+    /// A recognizable stand-in for a presigned URL, carrying the key and the
+    /// signed response overrides so a test can assert on all three. The real
+    /// implementation signs locally and never checks that the object exists,
+    /// so this does not either — only an injected failure makes it fail.
+    async fn presign_get(
+        &self,
+        key: &str,
+        disposition: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<String, ObjectError> {
+        match self.injected(key) {
+            Some(ObjectFailure::Hang) => future::pending().await,
+            Some(ObjectFailure::NotFound) => return Err(ObjectError::NotFound),
+            Some(ObjectFailure::Permanent) => {
+                return Err(ObjectError::Permanent(anyhow!(
+                    "injected permanent presign_get failure for {key}"
+                )));
+            }
+            Some(ObjectFailure::Transient) => {
+                return Err(ObjectError::Transient(anyhow!(
+                    "injected transient presign_get failure for {key}"
+                )));
+            }
+            None => {}
+        }
+        let mut url =
+            format!("https://example-bucket.s3.amazonaws.test/{key}?X-Amz-Signature=fake");
+        if let Some(disposition) = disposition {
+            url.push_str("&response-content-disposition=");
+            url.push_str(&urlencode(disposition));
+        }
+        if let Some(content_type) = content_type {
+            url.push_str("&response-content-type=");
+            url.push_str(&urlencode(content_type));
+        }
+        Ok(url)
+    }
+}
+
+/// Percent-encodes everything outside the unreserved set, so an assertion on
+/// the fake's URL sees the same escaping a real signer would apply.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(*byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

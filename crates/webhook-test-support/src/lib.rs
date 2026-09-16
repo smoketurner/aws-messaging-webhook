@@ -192,6 +192,17 @@ impl ObjectStore for FakeServices {
             .put_object_if_absent(key, body, content_type)
             .await
     }
+
+    async fn presign_get(
+        &self,
+        key: &str,
+        disposition: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<String, ObjectError> {
+        self.objects
+            .presign_get(key, disposition, content_type)
+            .await
+    }
 }
 
 impl FakeServices {

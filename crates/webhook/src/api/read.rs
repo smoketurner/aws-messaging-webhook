@@ -17,10 +17,11 @@ use axum::extract::{Path, RawQuery, State};
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
 use crate::mail::keys::{self, PageKey, decode_page_token, encode_page_token};
+use crate::mail::objects::{self, ObjectError};
 use crate::mail::store::{ListQuery, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
-use crate::mail::{InboxId, MailMessage};
+use crate::mail::{InboxId, MailMessage, time};
 use crate::state::{AppState, Services};
 
 /// How many store round-trips one list request may spend filling a page.
@@ -190,6 +191,115 @@ pub async fn get_message<T: Services>(
         .map_err(store_failure)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(wire::Message::from(&message)))
+}
+
+/// `GET /v0/inboxes/{inbox_id}/messages/{message_id}/raw`
+///
+/// Hands back a presigned URL for the stored raw MIME rather than streaming
+/// it through the function, so a large message costs nothing to serve.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when the inbox holds no such message, or the
+/// message predates retention and its raw object is gone; a store or object
+/// failure otherwise.
+pub async fn get_raw<T: Services>(
+    State(state): State<Arc<AppState<T>>>,
+    Path((inbox_id, message_id)): Path<(String, String)>,
+) -> Result<Json<wire::Download>, ApiError> {
+    let message = state
+        .services
+        .get_message(&InboxId(inbox_id), &message_id)
+        .await
+        .map_err(store_failure)?
+        .ok_or(ApiError::NotFound)?;
+    let key = message.raw_s3_key.as_deref().ok_or(ApiError::NotFound)?;
+
+    let disposition = objects::attachment_disposition(Some(&format!("{message_id}.eml")));
+    let url = state
+        .services
+        .presign_get(key, Some(&disposition), Some("message/rfc822"))
+        .await
+        .map_err(object_failure)?;
+
+    Ok(Json(wire::Download {
+        download_url: url,
+        expires_at: expires_at(),
+        size: message.size,
+        message_id: Some(message_id),
+        attachment_id: None,
+        filename: None,
+        content_type: Some("message/rfc822".to_owned()),
+        content_disposition: None,
+        content_id: None,
+    }))
+}
+
+/// `GET /v0/inboxes/{inbox_id}/messages/{message_id}/attachments/{attachment_id}`
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when the message, the attachment, or the stored
+/// object does not exist; a store or object failure otherwise.
+pub async fn get_attachment<T: Services>(
+    State(state): State<Arc<AppState<T>>>,
+    Path((inbox_id, message_id, attachment_id)): Path<(String, String, String)>,
+) -> Result<Json<wire::Download>, ApiError> {
+    let message = state
+        .services
+        .get_message(&InboxId(inbox_id), &message_id)
+        .await
+        .map_err(store_failure)?
+        .ok_or(ApiError::NotFound)?;
+
+    let attachment = message
+        .attachments
+        .iter()
+        .find(|candidate| candidate.attachment_id == attachment_id)
+        .ok_or(ApiError::NotFound)?;
+    // An attachment dropped for size is recorded without a key: its metadata
+    // is real, but there is nothing stored to hand back.
+    let key = attachment.object_key.as_deref().ok_or(ApiError::NotFound)?;
+
+    let disposition = objects::attachment_disposition(attachment.filename.as_deref());
+    let url = state
+        .services
+        .presign_get(key, Some(&disposition), Some(&attachment.content_type))
+        .await
+        .map_err(object_failure)?;
+
+    Ok(Json(wire::Download {
+        download_url: url,
+        expires_at: expires_at(),
+        size: attachment.size,
+        message_id: Some(message_id),
+        attachment_id: Some(attachment_id),
+        filename: attachment.filename.clone(),
+        content_type: Some(attachment.content_type.clone()),
+        content_disposition: Some(match attachment.content_disposition.as_str() {
+            "inline" => wire::ContentDisposition::Inline,
+            _ => wire::ContentDisposition::Attachment,
+        }),
+        content_id: attachment.content_id.clone(),
+    }))
+}
+
+/// When the URL just issued stops working.
+fn expires_at() -> String {
+    let ttl_ms = u64::try_from(objects::DOWNLOAD_URL_TTL.as_millis()).unwrap_or(0);
+    time::format(time::now_ms().saturating_add(ttl_ms))
+}
+
+/// Maps an object-store failure the same way [`store_failure`] maps a table
+/// failure: a missing object is a 404, a transient one is a retryable 502.
+fn object_failure(error: ObjectError) -> ApiError {
+    match error {
+        ObjectError::NotFound => ApiError::NotFound,
+        ObjectError::Transient(source) => ApiError::BadGateway(source),
+        ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
+            ApiError::Internal(anyhow::anyhow!("{error}"))
+        }
+    }
 }
 
 /// `GET /v0/inboxes/{inbox_id}/threads`

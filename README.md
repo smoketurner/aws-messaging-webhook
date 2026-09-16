@@ -283,7 +283,15 @@ answers `501` with a parseable body.
 | `GET /v0/inboxes/{inbox_id}/messages/{message_id}` | the full message, including `text`, `html`, `headers` and `references`, which the list view omits |
 | `GET /v0/inboxes/{inbox_id}/threads` | `{count, limit, threads[], next_page_token?}`, by last activity |
 | `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | one thread with its `messages[]` embedded oldest first, paginated independently |
+| `GET …/messages/{message_id}/raw` | `{message_id, size, download_url, expires_at}` for the stored raw MIME |
+| `GET …/messages/{message_id}/attachments/{attachment_id}` | the same, plus `filename`, `content_type`, `content_disposition` and `content_id` |
 | `PATCH /v0/inboxes/{inbox_id}/messages/{message_id}` | `{message_id, labels}` after applying `add_labels`/`remove_labels` |
+
+Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streamed through the
+function. The URL carries its own authorization — the API key is not needed to follow it, and
+anyone holding the URL can fetch the object until it expires. A message whose raw object or
+attachment has passed `MailRetentionDays`, and an attachment that was dropped for size, answer
+`404`: the metadata survives in the table, but there is nothing stored to hand back.
 
 `PATCH` takes `{"add_labels": …, "remove_labels": …}`, each either one label or a list. Labels
 are lowercased, trimmed and deduplicated. There is no "mark as read" endpoint: removing the
@@ -355,8 +363,6 @@ the same explicit `MailBucketName`, delete the retained bucket first.
 
 - Re-ingesting permanently failed ingests. Deliveries in `MailIngestDlq` aren't replayed
   automatically; their raw MIME stays under `inbound/` until `MailRetentionDays`.
-- Raw-message and attachment downloads (`GET …/messages/{id}/raw` and
-  `…/attachments/{id}`), which need presigned `GetObject` URLs.
 - Sending (`POST …/messages/send` and `…/reply`).
 
 ## EventBridge contract

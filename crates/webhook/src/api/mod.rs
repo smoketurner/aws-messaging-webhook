@@ -42,6 +42,14 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
             "/inboxes/{inbox_id}/messages/{message_id}",
             get(read::get_message::<T>).patch(labels::update_labels::<T>),
         )
+        .route(
+            "/inboxes/{inbox_id}/messages/{message_id}/raw",
+            get(read::get_raw::<T>),
+        )
+        .route(
+            "/inboxes/{inbox_id}/messages/{message_id}/attachments/{attachment_id}",
+            get(read::get_attachment::<T>),
+        )
         .route("/inboxes/{inbox_id}/threads", get(read::list_threads::<T>))
         .route(
             "/inboxes/{inbox_id}/threads/{thread_id}",

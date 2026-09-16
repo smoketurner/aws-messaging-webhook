@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use axum::body::Bytes;
@@ -15,7 +16,7 @@ use axum::body::Bytes;
 use crate::aws::{self, AwsServices};
 use crate::mail::ObjectMeta;
 use crate::mail::PutOutcome;
-use crate::mail::objects::{ObjectError, ObjectStore};
+use crate::mail::objects::{DOWNLOAD_URL_TTL, ObjectError, ObjectStore};
 
 /// The per-attempt and per-operation S3 timeouts, applied to every call
 /// via `.customize().config_override(...)` since the shared `s3` client
@@ -172,5 +173,30 @@ impl ObjectStore for AwsServices {
             Err(error) if is_precondition_failed(&error) => Ok(PutOutcome::AlreadyExists),
             Err(error) => Err(classify_object_error("PutObject", &error)),
         }
+    }
+
+    async fn presign_get(
+        &self,
+        key: &str,
+        disposition: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<String, ObjectError> {
+        let bucket = self.mail_bucket()?;
+        let config = PresigningConfig::expires_in(DOWNLOAD_URL_TTL)
+            .map_err(|e| ObjectError::Permanent(anyhow!("building the presigning config: {e}")))?;
+
+        let mut request = self.s3.get_object().bucket(bucket).key(key);
+        if let Some(disposition) = disposition {
+            request = request.response_content_disposition(disposition);
+        }
+        if let Some(content_type) = content_type {
+            request = request.response_content_type(content_type);
+        }
+
+        let presigned = request
+            .presigned(config)
+            .await
+            .map_err(|e| classify_object_error("GetObject(presign)", &e))?;
+        Ok(presigned.uri().to_owned())
     }
 }
