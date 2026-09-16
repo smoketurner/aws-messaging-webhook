@@ -606,6 +606,21 @@ impl MailStore for MailMemoryStore {
         std::future::ready(result)
     }
 
+    fn resolve_ses_message(
+        &self,
+        ses_message_id: &str,
+    ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        let resolved = self
+            .get_item(&keys::ses_ref_pk(ses_message_id), keys::ses_ref_sk())
+            .and_then(|item| {
+                let inbox = Self::string_attr(&item, "inbox_id")?;
+                let message_id = Self::string_attr(&item, "message_id")?;
+                Some((InboxId(inbox), message_id))
+            });
+        std::future::ready(Ok(resolved))
+    }
+
     fn get_send_state(
         &self,
         message_id: &str,

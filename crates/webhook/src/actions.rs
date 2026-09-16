@@ -184,6 +184,82 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
     }
 }
 
+/// The mailbox label an SES event records, if it records one.
+///
+/// `Send` is deliberately absent: the sender already marks the message sent,
+/// and a `Send` event arriving afterwards would say nothing new. `Click` has
+/// no mailbox label in the vocabulary this service uses.
+fn delivery_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Delivery" => Some("delivered"),
+        "Bounce" => Some("bounced"),
+        "Complaint" => Some("complained"),
+        "Reject" => Some("rejected"),
+        "Open" => Some("opened"),
+        _ => None,
+    }
+}
+
+/// Labels the mailbox message an SES event belongs to, when it belongs to
+/// one.
+///
+/// Most events on the configuration set are for mail this service did not
+/// send, so an unresolved id is the ordinary case and not a failure. The
+/// label is added, never removed: these events arrive out of order under
+/// at-least-once delivery, and a message that both bounced and was opened
+/// should say so.
+async fn apply_delivery_label<T: Services>(
+    state: &AppState<T>,
+    event: &crate::model::ses_notification::SesNotification,
+) -> Result<bool, ActionError> {
+    let Some(label) = delivery_label(&event.kind) else {
+        return Ok(false);
+    };
+    // Mail is only tracked when the mailbox is configured.
+    if state.config.mail.is_none() {
+        return Ok(false);
+    }
+
+    let resolved = state
+        .services
+        .resolve_ses_message(&event.mail.message_id)
+        .await
+        .map_err(mail_store_error)?;
+    let Some((inbox, message_id)) = resolved else {
+        return Ok(false);
+    };
+
+    let now = crate::mail::time::format(crate::mail::time::now_ms());
+    state
+        .services
+        .update_labels(&inbox, &message_id, &[label.to_owned()], &[], &now)
+        .await
+        .map_err(mail_store_error)?;
+
+    tracing::info!(
+        message_id,
+        inbox_id = %inbox.as_str(),
+        label,
+        event = "delivery_label_applied",
+        "labelled a sent message from its SES event"
+    );
+    Ok(true)
+}
+
+/// A mail-store failure during the delivery join, mapped onto the action
+/// retry contract: a throttled or unreachable table is worth a redelivery,
+/// anything else is logged and does not block the event from publishing.
+fn mail_store_error(error: crate::mail::store::MailStoreError) -> ActionError {
+    use crate::mail::store::MailStoreError;
+    match error {
+        MailStoreError::Transient(source) => ActionError::transient(source),
+        // A version conflict means someone else was writing the same message;
+        // a redelivery re-reads and applies the label onto their result.
+        MailStoreError::Conflict => ActionError::transient(anyhow::anyhow!("mail store conflict")),
+        other => ActionError::permanent(anyhow::anyhow!("{other}")),
+    }
+}
+
 /// Suppresses each recipient independently. `PutSuppressedDestination` is
 /// called once per recipient, so a failure for one address (e.g. SES
 /// `BadRequestException` for a malformed email in the bounce metadata) does
@@ -291,9 +367,13 @@ pub async fn run<T: Services>(
             Ok("feedback")
         }
         DomainEvent::Ses { event, .. } => {
+            // Runs before suppression so a mailbox message is labelled even
+            // if suppression then fails for one of its recipients.
+            let labelled = apply_delivery_label(state, event).await?;
+
             if let Some(bounce) = &event.bounce {
                 if !bounce.is_permanent() {
-                    return Ok("none");
+                    return Ok(if labelled { "delivery_label" } else { "none" });
                 }
                 suppress_recipients(state, &bounce.bounced_recipients, SuppressionReason::Bounce)
                     .await?;
@@ -308,7 +388,7 @@ pub async fn run<T: Services>(
                 .await?;
                 return Ok("suppression");
             }
-            Ok("none")
+            Ok(if labelled { "delivery_label" } else { "none" })
         }
         DomainEvent::SesInbound { event, .. } => {
             crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms).await

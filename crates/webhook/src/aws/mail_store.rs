@@ -819,6 +819,34 @@ impl MailStore for AwsServices {
         Err(MailStoreError::Conflict)
     }
 
+    async fn resolve_ses_message(
+        &self,
+        ses_message_id: &str,
+    ) -> Result<Option<(InboxId, String)>, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let output = self
+            .dynamo
+            .get_item()
+            .table_name(table_name)
+            .key("pk", DynamoAv::S(keys::ses_ref_pk(ses_message_id)))
+            .key("sk", DynamoAv::S(keys::ses_ref_sk().to_owned()))
+            .send()
+            .await
+            .map_err(|e| store_error_from_sdk("GetItem(ses ref)", &e))?;
+        let Some(item) = output.item else {
+            return Ok(None);
+        };
+        let inbox = match item.get("inbox_id") {
+            Some(DynamoAv::S(value)) => value.clone(),
+            _ => return Ok(None),
+        };
+        let message_id = match item.get("message_id") {
+            Some(DynamoAv::S(value)) => value.clone(),
+            _ => return Ok(None),
+        };
+        Ok(Some((InboxId(inbox), message_id)))
+    }
+
     async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let output = self

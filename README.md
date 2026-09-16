@@ -358,6 +358,12 @@ is refused rather than stored as-is, since nothing here decompresses.
 Fetched bytes are stored in the outbox under the attachment's id, so a retried send reuses them
 instead of re-fetching a URL whose content may have changed in the meantime.
 
+Once a message is sent, SES events on the configuration set label it: `delivered`, `bounced`,
+`complained`, `rejected` and `opened`. Labels are added and never removed, because these events
+arrive out of order under at-least-once delivery and a message that both bounced and was opened
+should say both. An event for mail this service did not send resolves to nothing and is ignored,
+which is the ordinary case on a shared configuration set.
+
 Because labels live on the items rather than in per-label index rows, a filtered list reads a
 page and filters it, re-reading up to five times to fill the page. A response can therefore come
 back with fewer than `limit` items *and* a `next_page_token`; that is a normal result, and the

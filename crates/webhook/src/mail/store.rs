@@ -137,6 +137,15 @@ pub trait MailStore: Send + Sync {
         now_epoch: u64,
     ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send;
 
+    /// Resolves an SES message id back to the mailbox message sent under it.
+    ///
+    /// `None` when this SES message did not come from the mailbox — most
+    /// events on the configuration set will not have.
+    fn resolve_ses_message(
+        &self,
+        ses_message_id: &str,
+    ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send;
+
     /// Reads one send's state, consistently.
     fn get_send_state(
         &self,

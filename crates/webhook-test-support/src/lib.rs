@@ -218,6 +218,13 @@ impl MailStore for FakeServices {
         self.mail.enqueue_send(msg, state, key, now_epoch).await
     }
 
+    async fn resolve_ses_message(
+        &self,
+        ses_message_id: &str,
+    ) -> Result<Option<(InboxId, String)>, MailStoreError> {
+        self.mail.resolve_ses_message(ses_message_id).await
+    }
+
     async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
         self.mail.get_send_state(message_id).await
     }

@@ -382,3 +382,70 @@ async fn an_unknown_message_is_skipped() {
     assert_eq!(handled, Handled::Skipped);
     assert!(h.state.services.sent.lock().unwrap().is_empty());
 }
+
+/// Feeds one SES event for `ses_message_id` through the real webhook path.
+async fn ses_event(h: &Harness, kind: &str, ses_message_id: &str) -> StatusCode {
+    let inner = json!({
+        "notificationType": kind,
+        "mail": { "messageId": ses_message_id },
+    });
+    let body = webhook_test_support::wrapped(h, &inner);
+    webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await
+}
+
+#[tokio::test]
+async fn an_ses_delivery_event_labels_the_message_it_belongs_to() {
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+    handle_send(&h.state, &message_id).await.unwrap();
+
+    let status = ses_event(&h, "Delivery", &format!("ses-{message_id}")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let message = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        message.labels.contains(&"delivered".to_owned()),
+        "{:?}",
+        message.labels
+    );
+    assert!(message.labels.contains(&"sent".to_owned()));
+}
+
+#[tokio::test]
+async fn events_for_mail_this_service_did_not_send_are_ignored() {
+    // Most events on a shared configuration set are for other senders.
+    let h = seeded().await;
+
+    let status = ses_event(&h, "Delivery", "ses-someone-else").await;
+
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn later_events_add_labels_rather_than_replacing_them() {
+    // These arrive out of order under at-least-once delivery, so a message
+    // that both bounced and was opened should say both.
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+    handle_send(&h.state, &message_id).await.unwrap();
+    let ses_id = format!("ses-{message_id}");
+
+    ses_event(&h, "Delivery", &ses_id).await;
+    ses_event(&h, "Open", &ses_id).await;
+
+    let message = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(message.labels.contains(&"delivered".to_owned()));
+    assert!(message.labels.contains(&"opened".to_owned()));
+}
