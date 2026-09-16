@@ -626,28 +626,24 @@ impl MailStore for MailMemoryStore {
         status: SendStatus,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<SendState>, MailStoreError>> + Send {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "test double: a poisoned lock is a test bug"
-        )]
-        let guard = self.inner.lock().unwrap();
-        let wanted = format!("SENDSTATUS#{}", status.as_str());
-        let mut out = Vec::new();
-        for item in guard.items.values() {
-            if Self::string_attr(item, "gsi3pk").as_deref() != Some(wanted.as_str()) {
-                continue;
-            }
-            match serde_dynamo::from_item(item.clone()) {
-                Ok(state) => out.push(state),
-                Err(e) => {
-                    return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
-                        "deserializing send state: {e}"
-                    ))));
-                }
-            }
-        }
-        out.truncate(limit);
-        std::future::ready(Ok(out))
+        // Goes through the same `query_page` the other listings use, keyed by
+        // the status index's own attributes, so this double cannot quietly
+        // disagree with the real store about which index serves a query.
+        let query = ListQuery {
+            inbox: InboxId(String::new()),
+            limit,
+            before: None,
+            after: None,
+            ascending: true,
+            start: None,
+        };
+        let page = self.query_page(
+            &format!("SENDSTATUS#{}", status.as_str()),
+            "gsi3pk",
+            "gsi3sk",
+            &query,
+        );
+        std::future::ready(page.map(|page| page.items))
     }
 
     fn get_send_state(

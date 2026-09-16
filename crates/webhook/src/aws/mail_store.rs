@@ -60,16 +60,8 @@ impl AwsServices {
     ) -> Result<Page<T>, MailStoreError> {
         let partition = query.partition;
         let table_name = self.mail_table_name()?.to_owned();
-        let index = if partition.starts_with("THREAD#") {
-            "ByThread"
-        } else {
-            "ByTime"
-        };
-        let (pk_attr, sk_attr) = if index == "ByThread" {
-            ("gsi2pk", "gsi2sk")
-        } else {
-            ("gsi1pk", "gsi1sk")
-        };
+        let index = query.index.name();
+        let (pk_attr, sk_attr) = query.index.key_attributes();
 
         let mut condition = "#pk = :pk".to_owned();
         let mut values = std::collections::HashMap::from([(
@@ -172,6 +164,10 @@ impl AwsServices {
 /// listed: inboxes are not inbox-scoped, so this carries the partition rather
 /// than deriving it from a [`ListQuery`]'s inbox.
 struct PageQuery<'a> {
+    /// Which index to read. Named rather than inferred from `partition`:
+    /// guessing it from a string prefix silently sent status queries to the
+    /// wrong index, which returns an empty page rather than an error.
+    index: MailIndex,
     partition: &'a str,
     limit: usize,
     before: Option<&'a str>,
@@ -180,10 +176,48 @@ struct PageQuery<'a> {
     start: Option<&'a PageKey>,
 }
 
+/// The mail table's secondary indexes, each with the attribute pair it is
+/// keyed by.
+///
+/// The names match the index names in `template.yaml`, which is why they
+/// share a prefix.
+#[expect(
+    clippy::enum_variant_names,
+    reason = "these are the index names the template declares"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailIndex {
+    /// Inboxes, messages and threads, ordered by time.
+    ByTime,
+    /// One thread's messages.
+    ByThread,
+    /// Send states, by status. Sparse: only send-state items carry its keys.
+    ByStatus,
+}
+
+impl MailIndex {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ByTime => "ByTime",
+            Self::ByThread => "ByThread",
+            Self::ByStatus => "ByStatus",
+        }
+    }
+
+    fn key_attributes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::ByTime => ("gsi1pk", "gsi1sk"),
+            Self::ByThread => ("gsi2pk", "gsi2sk"),
+            Self::ByStatus => ("gsi3pk", "gsi3sk"),
+        }
+    }
+}
+
 impl<'a> PageQuery<'a> {
     /// The inbox-scoped case: a [`ListQuery`] aimed at `partition`.
-    fn scoped(partition: &'a str, query: &'a ListQuery) -> Self {
+    fn scoped(index: MailIndex, partition: &'a str, query: &'a ListQuery) -> Self {
         Self {
+            index,
             partition,
             limit: query.limit,
             before: query.before.as_deref(),
@@ -855,6 +889,7 @@ impl MailStore for AwsServices {
         let page: Page<SendState> = self
             .query_page(
                 PageQuery {
+                    index: MailIndex::ByStatus,
                     partition: &format!("SENDSTATUS#{}", status.as_str()),
                     limit,
                     before: None,
@@ -1023,6 +1058,7 @@ impl MailStore for AwsServices {
     ) -> Result<Page<Inbox>, MailStoreError> {
         self.query_page(
             PageQuery {
+                index: MailIndex::ByTime,
                 partition: keys::inboxes_partition(),
                 limit,
                 before: None,
@@ -1037,14 +1073,20 @@ impl MailStore for AwsServices {
 
     async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
         let partition = format!("INBOX#{}#MSG", query.inbox.as_str());
-        self.query_page(PageQuery::scoped(&partition, query), "listing messages")
-            .await
+        self.query_page(
+            PageQuery::scoped(MailIndex::ByTime, &partition, query),
+            "listing messages",
+        )
+        .await
     }
 
     async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
         let partition = format!("INBOX#{}#THR", query.inbox.as_str());
-        self.query_page(PageQuery::scoped(&partition, query), "listing threads")
-            .await
+        self.query_page(
+            PageQuery::scoped(MailIndex::ByTime, &partition, query),
+            "listing threads",
+        )
+        .await
     }
 
     async fn get_thread(
@@ -1077,6 +1119,7 @@ impl MailStore for AwsServices {
         let messages = self
             .query_page(
                 PageQuery {
+                    index: MailIndex::ByThread,
                     partition: &partition,
                     limit,
                     before: None,

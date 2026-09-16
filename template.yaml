@@ -776,6 +776,17 @@ Resources:
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
 
+  # Separate from MailIngestDlq: a message here is mail that failed to go
+  # out, which is a different problem from mail that failed to come in, and
+  # an operator should not have to tell them apart by reading payloads.
+  MailSenderDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasMailDomain
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-mail-sender-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
   # The mail topics invoke the function directly. Lambda's async queue retries
   # a failed invocation twice; after that the event lands in MailIngestDlq.
   WebhookEventInvokeConfig:
@@ -958,7 +969,7 @@ Resources:
           - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"sk":{"S":["STATE"]},"send_status":{"S":["queued"]}}}}'
       DestinationConfig:
         OnFailure:
-          Destination: !GetAtt MailIngestDlq.Arn
+          Destination: !GetAtt MailSenderDlq.Arn
 
   # The mail relay: message items only (sk MSG#). Send-state, marker, key,
   # alias, thread and inbox items never invoke the relay.
@@ -1150,6 +1161,10 @@ Outputs:
     Condition: HasMailDomain
     Description: SQS DLQ for mail SNS deliveries that failed every async-invoke retry.
     Value: !Ref MailIngestDlq
+  MailSenderDlqUrl:
+    Condition: HasMailDomain
+    Description: SQS DLQ for sends that failed every retry. A message here is mail that did not go out.
+    Value: !Ref MailSenderDlq
   DnsRecords:
     Condition: NoHostedZone
     Description: Mail DNS records to publish (no HostedZoneId given).
