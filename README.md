@@ -287,6 +287,7 @@ answers `501` with a parseable body.
 | `GET …/messages/{message_id}/attachments/{attachment_id}` | the same, plus `filename`, `content_type`, `content_disposition` and `content_id` |
 | `PATCH /v0/inboxes/{inbox_id}/messages/{message_id}` | `{message_id, labels}` after applying `add_labels`/`remove_labels` |
 | `POST /v0/inboxes/{inbox_id}/messages/send` | `{message_id, thread_id}` once the send is durably queued |
+| `POST …/messages/{message_id}/reply` | the same, joining the original's thread |
 
 Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streamed through the
 function. The URL carries its own authorization — the API key is not needed to follow it, and
@@ -337,6 +338,13 @@ Headers the service controls — `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`
 `Content-*` — are rejected rather than ignored, so a caller cannot send as another inbox. Any CR
 or LF in an address, header name or header value is refused: all three end up in a MIME document
 where a newline would start a new header.
+
+`…/reply` takes the same body plus `reply_all`, and fills in what you leave out from the message
+being answered: the thread, `In-Reply-To`, the `References` chain, a `Re:` subject (not doubled
+if one is already there), and the recipient — the original's `Reply-To` if it set one, otherwise
+its sender. With `reply_all`, the original's other recipients are copied, minus this inbox, so a
+reply never arrives back where it came from. Naming `to`, `cc` or `bcc` yourself overrides the
+derived recipients but keeps the threading.
 
 An attachment `url` must be `https`, on the default port, with no embedded credentials, and must
 not resolve to a private or link-local address. That is checked here and again on every redirect

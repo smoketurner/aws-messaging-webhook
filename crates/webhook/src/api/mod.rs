@@ -80,10 +80,9 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
             delete(not_implemented),
         )
         .route("/inboxes/{inbox_id}/messages/send", post(send::send::<T>))
-        // Reply is not implemented yet.
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/reply",
-            post(not_implemented),
+            post(send::reply::<T>),
         )
         .fallback(unknown_route)
         .method_not_allowed_fallback(method_not_allowed)

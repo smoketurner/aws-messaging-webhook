@@ -36,7 +36,7 @@ use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, AttachmentMeta, Direction,
     HEADER_NAME_MAX, HEADER_VALUE_MAX, HEADERS_BUDGET, InboxId, LABEL_MAX_BYTES,
     MAX_OUTBOUND_DECODED_BYTES, MESSAGE_USER_LABEL_CAP, MailMessage, OUTBOUND_RECIPIENTS_MAX,
-    PREVIEW_CHARS, SUBJECT_MAX_BYTES, ids, keys, labels, time,
+    PREVIEW_CHARS, REFERENCES_MAX, SUBJECT_MAX_BYTES, ids, keys, labels, time,
 };
 use crate::state::{AppState, Services};
 
@@ -128,6 +128,19 @@ pub struct SendRequest {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub attachments: Option<Vec<AttachmentInput>>,
+}
+
+/// `POST …/messages/{message_id}/reply`.
+///
+/// The same body as a send, plus `reply_all`. Anything the caller leaves out
+/// is derived from the message being replied to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplyRequest {
+    #[serde(flatten)]
+    pub send: SendRequest,
+    /// Copy the original's other recipients as well as its sender.
+    #[serde(default)]
+    pub reply_all: bool,
 }
 
 /// One attachment that passed validation. Inline bytes are already decoded;
@@ -585,8 +598,22 @@ pub async fn send<T: Services>(
     headers: HeaderMap,
     Json(request): Json<SendRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    let inbox = InboxId(inbox_id);
-    let key_hash = idempotency_key_hash(&headers)?;
+    enqueue(&state, InboxId(inbox_id), request, &headers, None, "send").await
+}
+
+/// Validates, uploads and commits one outbound message.
+///
+/// `original`, when present, is the message being replied to; its ids give
+/// the new message its thread and its threading headers.
+async fn enqueue<T: Services>(
+    state: &AppState<T>,
+    inbox: InboxId,
+    request: SendRequest,
+    headers: &HeaderMap,
+    original: Option<&MailMessage>,
+    route: &str,
+) -> Result<Json<SendAccepted>, ApiError> {
+    let key_hash = idempotency_key_hash(headers)?;
 
     let Some(config) = state.config.mail.as_ref() else {
         return Err(ApiError::NotImplemented);
@@ -629,12 +656,15 @@ pub async fn send<T: Services>(
 
     let now_ms = time::now_ms();
     let now = time::format(now_ms);
-    let message_id = ids::outbound_message_id();
-    // A send with no reply context starts its own thread.
-    let thread_id = message_id.to_string();
-    let message_id = message_id.to_string();
+    let message_id = ids::outbound_message_id().to_string();
+    // A reply joins the original's thread; anything else starts its own.
+    let thread_id = original.map_or_else(|| message_id.clone(), |o| o.thread_id.clone());
 
-    let spec = build_spec(&inbox, config, &validated, &message_id, &thread_id, &now);
+    let mut spec = build_spec(&inbox, config, &validated, &message_id, &thread_id, &now);
+    if let Some(original) = original {
+        spec.in_reply_to = Some(original.rfc_message_id.clone());
+        spec.references = threading_references(original);
+    }
     upload_spec(&state.services, &spec, &validated).await?;
 
     let state_item = SendState::queued(
@@ -656,7 +686,7 @@ pub async fn send<T: Services>(
         message_id: message_id.clone(),
         thread_id: thread_id.clone(),
         request_hash,
-        route: "send".to_owned(),
+        route: route.to_owned(),
         created_at: now.clone(),
         expires_at: now_ms / 1_000 + KEY_TTL_SECONDS,
     });
@@ -676,6 +706,104 @@ pub async fn send<T: Services>(
             "this Idempotency-Key is already in use".to_owned(),
         )),
     }
+}
+
+/// The `References` chain for a reply: the original's own chain plus the
+/// message being replied to, capped so a long thread cannot grow the header
+/// without bound.
+fn threading_references(original: &MailMessage) -> Vec<String> {
+    let mut references = original.references.clone();
+    if !references.contains(&original.rfc_message_id) {
+        references.push(original.rfc_message_id.clone());
+    }
+    // Keep the oldest and the most recent, which is what threading actually
+    // relies on, and drop the middle when the chain runs long.
+    if references.len() > REFERENCES_MAX {
+        let keep_from = references.len() - (REFERENCES_MAX - 1);
+        let mut trimmed = vec![references[0].clone()];
+        trimmed.extend_from_slice(&references[keep_from..]);
+        references = trimmed;
+    }
+    references
+}
+
+/// `POST /v0/inboxes/{inbox_id}/messages/{message_id}/reply`
+///
+/// Derives the threading from the message being replied to, then queues the
+/// result exactly as [`send`] does.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when the inbox or the original message does not
+/// exist; otherwise as [`send`].
+pub async fn reply<T: Services>(
+    State(state): State<Arc<AppState<T>>>,
+    Path((inbox_id, message_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ReplyRequest>,
+) -> Result<Json<SendAccepted>, ApiError> {
+    let inbox = InboxId(inbox_id);
+    let original = state
+        .services
+        .get_message(&inbox, &message_id)
+        .await
+        .map_err(crate::api::read::store_failure)?
+        .ok_or(ApiError::NotFound)?;
+
+    let mut send = request.send;
+    // Recipients default to whoever should receive a reply to the original,
+    // unless the caller named its own.
+    if send.to.is_none() && send.cc.is_none() && send.bcc.is_none() {
+        send.to = Some(Addresses::Many(reply_recipients(&inbox, &original)));
+        if request.reply_all {
+            let others = reply_all_recipients(&inbox, &original);
+            if !others.is_empty() {
+                send.cc = Some(Addresses::Many(others));
+            }
+        }
+    }
+    if send.subject.is_none() {
+        send.subject = Some(reply_subject(&original.subject));
+    }
+
+    enqueue(&state, inbox, send, &headers, Some(&original), "reply").await
+}
+
+/// Who a reply goes to: the original's `Reply-To` if it set one, else its
+/// sender.
+fn reply_recipients(inbox: &InboxId, original: &crate::mail::MailMessage) -> Vec<String> {
+    if !original.reply_to.is_empty() {
+        return original.reply_to.clone();
+    }
+    // A message this inbox sent is replied to by writing to its recipients
+    // again, not to itself.
+    if original.from.split('@').next() == Some(inbox.as_str()) {
+        return original.to.clone();
+    }
+    vec![original.from.clone()]
+}
+
+/// The other participants, for `reply_all`. This inbox is excluded so a reply
+/// never arrives back in the inbox that sent it.
+fn reply_all_recipients(inbox: &InboxId, original: &crate::mail::MailMessage) -> Vec<String> {
+    let direct = reply_recipients(inbox, original);
+    let mut out = Vec::new();
+    for address in original.to.iter().chain(&original.cc) {
+        let is_self = address.split('@').next() == Some(inbox.as_str());
+        if !is_self && !direct.contains(address) && !out.contains(address) {
+            out.push(address.clone());
+        }
+    }
+    out
+}
+
+/// Prefixes `Re:` unless the subject already carries one.
+fn reply_subject(original: &str) -> String {
+    let trimmed = original.trim();
+    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("re:") {
+        return trimmed.to_owned();
+    }
+    format!("Re: {trimmed}")
 }
 
 /// Hashes the `Idempotency-Key` header, if one was sent.
