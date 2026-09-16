@@ -447,8 +447,8 @@ oversized detail is reduced the same way the SMS/SES pipeline's details are: `me
 back to `{payloadOmitted, ids}`; `meta` is never dropped.
 
 A payload matching no known family, and mail-table writes that aren't a message INSERT (send
-state, marker, key and RFC-alias items, and thread/pointer housekeeping writes), publish nothing
-from the mail table stream.
+state, marker, key and RFC-alias items, and thread housekeeping writes), publish nothing from
+the mail table stream.
 
 ## Data model
 
@@ -477,11 +477,14 @@ events table above, keyed by inbox and message rather than by SNS message id:
 | Inbox | `INBOX#<inbox>` | `META` | email, display name, metadata, timestamps |
 | Message | `INBOX#<inbox>` | `MSG#<messageId>` | the full message: addresses, subject, body, labels, attachments, headers |
 | Thread | `INBOX#<inbox>` | `THR#<threadId>` | rolled-up subject/preview/senders/recipients/labels, message count, size, newest attachments |
-| Message pointer | `INBOX#<inbox>#LABEL#<label>` | `MSGAT#<messageId>` | the per-label message list view |
-| Thread pointer | `INBOX#<inbox>#LABEL#<label>` | `THRAT#<timestamp>#<threadId>` | the per-label thread list view |
 | RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps an inbound or outbound `Message-ID` to the message/thread it belongs to, for reply threading |
 
-This release populates only the Inbox, Message, Thread and pointer items from inbound ingest.
+Labels live in the message and thread items themselves, not in per-label index rows: a list
+filtered by label is served by reading the time-ordered index and filtering the page. That keeps
+ingest to a fixed three writes per message, at the cost of reading past non-matching messages
+when a label is rare.
+
+This release populates only the Inbox, Message and Thread items from inbound ingest.
 The send-state, send-key and SES-reference items the send path adds live on the same table
 under their own `pk`s (`OUTBOX#<messageId>`, `SENDKEY#<sha256>`, `SESMSG#<sesMessageId>`,
 `SESCALL#<messageId>`) and are not written by this release. `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from

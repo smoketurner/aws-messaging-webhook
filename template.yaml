@@ -829,7 +829,7 @@ Resources:
       Endpoint: !GetAtt WebhookFunction.Arn
 
   # The mail relay: message items only (sk MSG#). Send-state, marker, key,
-  # alias, thread, pointer and inbox items never invoke the relay.
+  # alias, thread and inbox items never invoke the relay.
   MailStreamMapping:
     Type: AWS::Lambda::EventSourceMapping
     Condition: HasMailDomain

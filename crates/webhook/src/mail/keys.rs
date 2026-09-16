@@ -38,22 +38,6 @@ pub fn thread_sk(thread_id: &str) -> String {
     format!("THR#{thread_id}")
 }
 
-/// The message pointer's `pk` (per-inbox, per-label list view).
-#[must_use]
-pub fn label_pk(inbox_id: &str, label: &str) -> String {
-    format!("INBOX#{inbox_id}#LABEL#{label}")
-}
-
-#[must_use]
-pub fn message_pointer_sk(message_id: &str) -> String {
-    format!("MSGAT#{message_id}")
-}
-
-#[must_use]
-pub fn thread_pointer_sk(timestamp: &str, thread_id: &str) -> String {
-    format!("THRAT#{timestamp}#{thread_id}")
-}
-
 /// The RFC alias item's `pk`: `rfc_id` is the `Message-ID` value with the
 /// surrounding `<`/`>` stripped.
 #[must_use]
@@ -171,12 +155,6 @@ mod tests {
         assert_eq!(message_sk("mid-1"), "MSG#mid-1");
         assert_eq!(outbox_pk("mid-1"), "OUTBOX#mid-1");
         assert_eq!(thread_sk("tid-1"), "THR#tid-1");
-        assert_eq!(label_pk("support", "sent"), "INBOX#support#LABEL#sent");
-        assert_eq!(message_pointer_sk("mid-1"), "MSGAT#mid-1");
-        assert_eq!(
-            thread_pointer_sk("00000001-0002", "tid-1"),
-            "THRAT#00000001-0002#tid-1"
-        );
         assert_eq!(rfc_alias_pk("support", "abc@x"), "RFC#support#abc@x");
         assert_eq!(ses_ref_pk("ses-1"), "SESMSG#ses-1");
         assert_eq!(send_key_pk("deadbeef"), "SENDKEY#deadbeef");
@@ -186,8 +164,8 @@ mod tests {
     #[test]
     fn page_token_round_trips() {
         let key = PageKey {
-            partition: "INBOX#support#LABEL#unread".to_owned(),
-            sort: "MSGAT#mid-9".to_owned(),
+            partition: "INBOX#support#MSG".to_owned(),
+            sort: "mid-9".to_owned(),
         };
         let token = encode_page_token(&key);
         let decoded = decode_page_token(&token, &key.partition).unwrap();
@@ -197,11 +175,11 @@ mod tests {
     #[test]
     fn page_token_rejects_a_partition_mismatch() {
         let key = PageKey {
-            partition: "INBOX#support#LABEL#unread".to_owned(),
-            sort: "MSGAT#mid-9".to_owned(),
+            partition: "INBOX#support#MSG".to_owned(),
+            sort: "mid-9".to_owned(),
         };
         let token = encode_page_token(&key);
-        assert!(decode_page_token(&token, "INBOX#billing#LABEL#unread").is_err());
+        assert!(decode_page_token(&token, "INBOX#billing#MSG").is_err());
     }
 
     #[test]

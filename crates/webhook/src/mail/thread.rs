@@ -22,13 +22,13 @@ const THREAD_ADDRESS_SET_CAP: usize = 50;
 /// duplicated onto every message item rather than held once per thread.
 const THREAD_SNAPSHOT_ADDRESS_CAP: usize = 20;
 
-/// The thread's total label-union cap.
+/// The thread's total label-union cap, keeping the thread item's label set
+/// clear of DynamoDB's 400 KB item limit.
 pub const THREAD_LABEL_TOTAL_CAP: usize = 32;
 
 /// The in-memory thread state a read-modify-write cycle computes:
 /// read the thread consistently, apply this message's effect in Rust, then
-/// `Put` it version-conditioned in the same transaction as the label pointer
-/// deletes/puts.
+/// `Put` it version-conditioned in the same transaction as the message.
 ///
 /// Mirrors the Thread item's attributes one-to-one, plus `inbox_id` and
 /// `thread_id` (redundant with the item's key, same pattern `MailMessage`
@@ -39,8 +39,8 @@ pub struct ThreadState {
     pub inbox_id: InboxId,
     pub thread_id: String,
     /// Fixed-width (`mail::time::format`) last-activity timestamp: the sort
-    /// key component of the `ByTime`-equivalent thread index and of every
-    /// thread label pointer (`THRAT#<timestamp>#<thread_id>`).
+    /// key component of the thread index, which is what orders a thread list
+    /// by most recent activity.
     pub timestamp: String,
     pub subject: String,
     pub preview: String,
@@ -175,7 +175,7 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
 
 /// Applies `msg`'s effect to `existing`, returning the new thread state
 /// (computed in Rust from a consistent read, then `Put` version-checked
-/// in the same transaction as the label pointer updates).
+/// in the same transaction as the message itself).
 ///
 /// Received/sent timestamps: `received_timestamp` is set once, at the first
 /// inbound message, and never moves; `sent_timestamp` tracks the most recent

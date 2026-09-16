@@ -220,10 +220,7 @@ mod tests {
 
     #[test]
     fn retry_beats_a_later_duplicate_candidate() {
-        let ops = vec![
-            none_put(OpRole::ThreadPointer),
-            not_exists_put(OpRole::Message),
-        ];
+        let ops = vec![none_put(OpRole::SesRef), not_exists_put(OpRole::Message)];
         let reasons = vec![
             CancellationReason::TransactionConflict,
             CancellationReason::None,
@@ -238,10 +235,7 @@ mod tests {
     fn duplicate_beats_retry_when_both_present() {
         // Step 2 (Duplicate) is checked before step 3 (Retry): a definite
         // outcome always beats a mere retry signal elsewhere in the batch.
-        let ops = vec![
-            not_exists_put(OpRole::Message),
-            none_put(OpRole::ThreadPointer),
-        ];
+        let ops = vec![not_exists_put(OpRole::Message), none_put(OpRole::SesRef)];
         let reasons = vec![
             CancellationReason::ConditionalCheckFailed,
             CancellationReason::TransactionConflict,
@@ -264,7 +258,7 @@ mod tests {
 
     #[test]
     fn permanent_for_validation_error() {
-        let ops = vec![none_put(OpRole::ThreadPointer)];
+        let ops = vec![none_put(OpRole::SesRef)];
         let reasons = vec![CancellationReason::ValidationError];
         assert_eq!(
             decode_cancellation(TxnKind::Insert, &ops, &reasons),
@@ -274,7 +268,7 @@ mod tests {
 
     #[test]
     fn permanent_when_nothing_matches() {
-        let ops = vec![none_put(OpRole::ThreadPointer)];
+        let ops = vec![none_put(OpRole::SesRef)];
         let reasons = vec![CancellationReason::None];
         assert_eq!(
             decode_cancellation(TxnKind::Insert, &ops, &reasons),
@@ -291,7 +285,7 @@ mod tests {
         fn decode_cancellation_precedence_holds(
             kind_is_enqueue in any::<bool>(),
             has_send_key in any::<bool>(),
-            role_seed in proptest::collection::vec(0u8..7, 1..8),
+            role_seed in proptest::collection::vec(0u8..5, 1..8),
             reason_seed in proptest::collection::vec(0u8..9, 1..8),
         ) {
             let kind = if kind_is_enqueue { TxnKind::Enqueue } else { TxnKind::Insert };
@@ -299,8 +293,6 @@ mod tests {
                 OpRole::Message,
                 OpRole::SendState,
                 OpRole::Thread,
-                OpRole::MessagePointer,
-                OpRole::ThreadPointer,
                 OpRole::RfcAlias,
                 OpRole::SesRef,
             ];

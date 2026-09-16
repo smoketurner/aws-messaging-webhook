@@ -380,15 +380,6 @@ mod tests {
         assert_eq!(value["subject"], "Hello");
     }
 
-    /// `MessageItem` must serialize identically whether the source was
-    /// a `ByTime` query or a message pointer — since both convert from the
-    /// same `MailMessage`, the conversion is trivially deterministic.
-    #[test]
-    fn message_item_is_deterministic_from_the_same_source() {
-        let msg = sample_message();
-        assert_eq!(MessageItem::from(&msg), MessageItem::from(&msg));
-    }
-
     #[test]
     fn inline_and_other_dispositions_map_correctly() {
         let mut meta = AttachmentMeta {

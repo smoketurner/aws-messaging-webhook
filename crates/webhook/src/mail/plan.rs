@@ -3,21 +3,15 @@
 //! uniformly by `mail::txn::decode_cancellation`.
 //!
 //! `plan_insert` plans the ingest transaction: the message, its versioned
-//! thread, message and thread label pointers, and the `Message-ID` alias. It
-//! is pure — every input (the message and the thread state before and after)
-//! is computed by the caller from consistent reads; this module only turns
-//! that data into `WriteOp`s.
+//! thread, and the `Message-ID` alias. It is pure — every input (the message
+//! and the thread state before and after) is computed by the caller from
+//! consistent reads; this module only turns that data into `WriteOp`s.
 
 use serde_dynamo::AttributeValue;
 
 use crate::mail::store::MailStoreError;
 use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
 use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys, size};
-
-/// The ingest transaction's op-count ceiling, well inside DynamoDB's limit of
-/// 100: message + thread + 4 message pointers + 32 thread-pointer deletes +
-/// 32 puts + 1 alias.
-const INGEST_TXN_OP_CAP: usize = 71;
 
 /// Which role a planned op plays in its transaction — used by
 /// [`crate::mail::txn::decode_cancellation`] to interpret a cancellation
@@ -28,8 +22,6 @@ pub enum OpRole {
     Message,
     SendState,
     Thread,
-    MessagePointer,
-    ThreadPointer,
     RfcAlias,
     SesRef,
 }
@@ -122,47 +114,6 @@ fn item_with_keys<T: serde::Serialize>(
     Ok(item)
 }
 
-/// Builds the label pointer item for a thread (`INBOX#<inbox>#LABEL#<label>`
-/// / `THRAT#<timestamp>#<thread_id>`).
-fn thread_pointer_item(thread: &ThreadState, label: &str) -> serde_dynamo::Item {
-    let mut item = serde_dynamo::Item::default();
-    item.inner_mut().insert(
-        "pk".to_owned(),
-        AttributeValue::S(keys::label_pk(thread.inbox_id.as_str(), label)),
-    );
-    item.inner_mut().insert(
-        "sk".to_owned(),
-        AttributeValue::S(keys::thread_pointer_sk(
-            &thread.timestamp,
-            &thread.thread_id,
-        )),
-    );
-    item.inner_mut().insert(
-        "thread_id".to_owned(),
-        AttributeValue::S(thread.thread_id.clone()),
-    );
-    item
-}
-
-/// Builds the message pointer item for a label
-/// (`INBOX#<inbox>#LABEL#<label>` / `MSGAT#<message_id>`).
-fn message_pointer_item(msg: &MailMessage, label: &str) -> serde_dynamo::Item {
-    let mut item = serde_dynamo::Item::default();
-    item.inner_mut().insert(
-        "pk".to_owned(),
-        AttributeValue::S(keys::label_pk(msg.inbox_id.as_str(), label)),
-    );
-    item.inner_mut().insert(
-        "sk".to_owned(),
-        AttributeValue::S(keys::message_pointer_sk(&msg.message_id)),
-    );
-    item.inner_mut().insert(
-        "message_id".to_owned(),
-        AttributeValue::S(msg.message_id.clone()),
-    );
-    item
-}
-
 /// Strips a `Message-ID` header value's surrounding `<`/`>`, if present.
 fn strip_angle_brackets(rfc_id: &str) -> &str {
     rfc_id
@@ -175,8 +126,8 @@ fn strip_angle_brackets(rfc_id: &str) -> &str {
 /// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
 const ALIAS_ID_MAX_BYTES: usize = 900;
 
-/// Plans the ingest transaction: the message, its versioned thread, message
-/// and thread label pointers, and the `Message-ID` alias.
+/// Plans the ingest transaction: the message, its versioned thread, and the
+/// `Message-ID` alias.
 ///
 /// `thread_before` is the thread's state from a consistent read, or `None`
 /// for a brand-new thread; `thread_after` is the caller-computed result of
@@ -186,9 +137,9 @@ const ALIAS_ID_MAX_BYTES: usize = 900;
 /// # Errors
 ///
 /// Returns [`MailStoreError::LabelLimit`] when `thread_after`'s label union
-/// exceeds [`THREAD_LABEL_TOTAL_CAP`], and [`MailStoreError::Permanent`] if
-/// the planned transaction would exceed [`INGEST_TXN_OP_CAP`]. Both are
-/// permanent: a retry would plan the same oversized transaction.
+/// exceeds [`THREAD_LABEL_TOTAL_CAP`], which keeps the thread item's label
+/// set clear of DynamoDB's item-size limit. It is permanent: a retry would
+/// plan the same oversized item.
 pub fn plan_insert(
     msg: &MailMessage,
     thread_before: Option<&ThreadState>,
@@ -210,20 +161,11 @@ pub fn plan_insert(
         "thread labels must be sorted and deduplicated before planning"
     );
 
-    let mut ops = Vec::with_capacity(INGEST_TXN_OP_CAP);
+    // Message, thread, and at most one `Message-ID` alias.
+    let mut ops = Vec::with_capacity(3);
     ops.push(message_put(msg, thread_after)?);
     ops.push(thread_put(thread_before, thread_after)?);
-    push_thread_pointer_ops(&mut ops, thread_before, thread_after);
-    push_message_pointer_ops(&mut ops, msg);
     push_rfc_alias_op(&mut ops, msg);
-
-    if ops.len() > INGEST_TXN_OP_CAP {
-        return Err(MailStoreError::Permanent(anyhow::anyhow!(
-            "ingest transaction for message {} would need {} ops, over the cap of {INGEST_TXN_OP_CAP}",
-            msg.message_id,
-            ops.len(),
-        )));
-    }
 
     Ok(ops)
 }
@@ -312,49 +254,6 @@ fn thread_put(
     })
 }
 
-/// Deletes every label pointer at the thread's old timestamp, then puts one
-/// at its new timestamp for every label in the union (the pointer's sort
-/// key embeds the thread's last-activity timestamp, so it moves on every
-/// message even when the label set itself doesn't change).
-fn push_thread_pointer_ops(
-    ops: &mut Vec<PlannedOp>,
-    thread_before: Option<&ThreadState>,
-    thread_after: &ThreadState,
-) {
-    if let Some(before) = thread_before {
-        for label in &before.labels {
-            ops.push(PlannedOp {
-                role: OpRole::ThreadPointer,
-                op: WriteOp::Delete {
-                    pk: keys::label_pk(before.inbox_id.as_str(), label),
-                    sk: keys::thread_pointer_sk(&before.timestamp, &before.thread_id),
-                },
-            });
-        }
-    }
-    for label in &thread_after.labels {
-        ops.push(PlannedOp {
-            role: OpRole::ThreadPointer,
-            op: WriteOp::Put {
-                item: thread_pointer_item(thread_after, label),
-                cond: Cond::None,
-            },
-        });
-    }
-}
-
-fn push_message_pointer_ops(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
-    for label in &msg.labels {
-        ops.push(PlannedOp {
-            role: OpRole::MessagePointer,
-            op: WriteOp::Put {
-                item: message_pointer_item(msg, label),
-                cond: Cond::None,
-            },
-        });
-    }
-}
-
 /// Pushes the `Message-ID` alias op, skipping ids over
 /// [`ALIAS_ID_MAX_BYTES`].
 fn push_rfc_alias_op(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
@@ -425,38 +324,27 @@ mod tests {
     }
 
     #[test]
-    fn plan_insert_for_a_new_thread_has_no_pointer_deletes() {
+    fn plan_insert_for_a_new_thread_writes_the_message_thread_and_alias() {
         let msg = message("support", "tid-1", "mid-1", &["received", "unread"]);
         let thread = new_thread(&msg);
         let ops = plan_insert(&msg, None, &thread).unwrap();
 
-        assert!(ops.iter().any(|o| o.role == OpRole::Message));
-        assert!(ops.iter().any(|o| o.role == OpRole::Thread));
+        let roles: Vec<OpRole> = ops.iter().map(|o| o.role).collect();
         assert_eq!(
-            ops.iter()
-                .filter(
-                    |o| o.role == OpRole::ThreadPointer && matches!(o.op, WriteOp::Delete { .. })
-                )
-                .count(),
-            0
+            roles,
+            vec![OpRole::Message, OpRole::Thread, OpRole::RfcAlias]
         );
-        assert_eq!(
-            ops.iter()
-                .filter(|o| o.role == OpRole::ThreadPointer && matches!(o.op, WriteOp::Put { .. }))
-                .count(),
-            2
-        );
-        assert_eq!(
-            ops.iter()
-                .filter(|o| o.role == OpRole::MessagePointer)
-                .count(),
-            2
-        );
-        assert_eq!(ops.iter().filter(|o| o.role == OpRole::RfcAlias).count(), 1);
+
+        // A thread nobody has seen before is created, not updated.
+        let WriteOp::Put { cond, .. } = &ops.iter().find(|o| o.role == OpRole::Thread).unwrap().op
+        else {
+            panic!("expected a Put");
+        };
+        assert_eq!(*cond, Cond::NotExists);
     }
 
     #[test]
-    fn plan_insert_for_an_existing_thread_deletes_old_pointers_and_puts_new_ones() {
+    fn plan_insert_for_an_existing_thread_conditions_on_the_version_it_read() {
         let first = message("support", "tid-1", "mid-1", &["received", "unread"]);
         let before = new_thread(&first);
         let mut second = message("support", "tid-1", "mid-2", &["received", "unread"]);
@@ -464,17 +352,6 @@ mod tests {
         let after = apply_message(&before, &second);
 
         let ops = plan_insert(&second, Some(&before), &after).unwrap();
-        let deletes = ops
-            .iter()
-            .filter(|o| o.role == OpRole::ThreadPointer && matches!(o.op, WriteOp::Delete { .. }))
-            .count();
-        let puts = ops
-            .iter()
-            .filter(|o| o.role == OpRole::ThreadPointer && matches!(o.op, WriteOp::Put { .. }))
-            .count();
-        assert_eq!(deletes, 2);
-        assert_eq!(puts, 2);
-
         let WriteOp::Put { cond, .. } = &ops.iter().find(|o| o.role == OpRole::Thread).unwrap().op
         else {
             panic!("expected a Put");
@@ -544,10 +421,11 @@ mod tests {
     }
 
     proptest! {
-        /// At maxima (4 message labels, a 32-label thread before and after),
-        /// the ingest plan never exceeds the op cap of 71.
+        /// How many labels a message or its thread carries does not change
+        /// how many items the ingest transaction writes — the labels live in
+        /// the message and thread items themselves, not in per-label rows.
         #[test]
-        fn plan_insert_never_exceeds_the_op_cap_at_maxima(
+        fn plan_insert_writes_a_fixed_number_of_items_whatever_the_labels(
             message_label_count in 0usize..=4,
             thread_label_count in 0usize..=THREAD_LABEL_TOTAL_CAP,
         ) {
@@ -565,9 +443,8 @@ mod tests {
             after.timestamp = "00000002-0000".to_owned();
             after.version += 1;
 
-            let result = plan_insert(&msg, Some(&before), &after);
-            prop_assert!(result.is_ok());
-            prop_assert!(result.unwrap().len() <= INGEST_TXN_OP_CAP);
+            let ops = plan_insert(&msg, Some(&before), &after).unwrap();
+            prop_assert_eq!(ops.len(), 3);
         }
     }
 }
