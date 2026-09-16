@@ -645,6 +645,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     let cert_url = format!("{}/cert.pem", server.uri());
     let state = std::sync::Arc::new(aws_messaging_webhook::state::AppState {
         services: webhook_test_support::FakeServices::default(),
+        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
         verifier: sns_message_verifier::SnsVerifier::builder()
             .dangerous_allow_cert_url_prefix(server.uri())
             .build()

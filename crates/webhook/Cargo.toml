@@ -44,9 +44,14 @@ aws-sdk-sesv2 = { workspace = true, features = [
   "default-https-client",
   "rt-tokio",
 ] }
+aws-sdk-ssm = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
 aws-smithy-types.workspace = true
 aws_lambda_events = { workspace = true, features = ["dynamodb"] }
-axum.workspace = true
+axum = { workspace = true, features = ["json", "query"] }
 # rev5 addition, ahead of §9's phase-2 listing: mail::keys::PageToken (D11) is
 # an F1 (phase 1) deliverable and needs base64url now.
 base64 = { workspace = true, features = ["std"] }
@@ -60,9 +65,10 @@ serde_json = { workspace = true, features = ["std"] }
 serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
 sha2 = { workspace = true, features = ["std"] }
 sns-message-verifier.workspace = true
+subtle.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true, features = ["sensitive-headers", "trace"] }
 tracing = { workspace = true, features = ["std"] }
 url = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["std", "v7"] }

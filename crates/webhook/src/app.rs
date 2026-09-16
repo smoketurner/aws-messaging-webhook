@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
+use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::Response;
 use axum::routing::{get, post};
 use lambda_http::RequestExt as _;
+use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::entry::context_deadline;
@@ -59,9 +61,13 @@ pub fn app<T: Services>(state: Arc<AppState<T>>) -> Router {
         .route("/webhooks/sms/events", post(sms_events::<T>))
         .route("/webhooks/ses/events", post(ses_events::<T>))
         .route("/webhooks/ses/inbound", post(ses_inbound::<T>))
+        .with_state(Arc::clone(&state))
+        .merge(Router::new().nest("/v0", crate::api::router(state)))
         .layer(TraceLayer::new_for_http())
+        // Outside the trace layer, so a bearer key can never reach a log
+        // line: the header is redacted before tracing records the request.
+        .layer(SetSensitiveRequestHeadersLayer::new([AUTHORIZATION]))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
 }
 
 async fn healthz() -> &'static str {

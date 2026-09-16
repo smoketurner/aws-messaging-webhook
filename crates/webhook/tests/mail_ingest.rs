@@ -71,6 +71,7 @@ async fn mail_harness() -> Harness {
 
     let state = Arc::new(AppState {
         services: FakeServices::default(),
+        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
         verifier: SnsVerifier::builder()
             .dangerous_allow_cert_url_prefix(server.uri())
             .build()
@@ -563,6 +564,7 @@ async fn multi_recipient_inserts_into_every_target_inbox() {
 fn direct_state(bucket: &str) -> AppState<FakeServices> {
     AppState {
         services: FakeServices::default(),
+        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
         verifier: SnsVerifier::builder().build().unwrap(),
         allowlist: TopicAllowlist::parse(""),
         http: reqwest::Client::new(),

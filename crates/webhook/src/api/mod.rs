@@ -1,0 +1,67 @@
+//! The `AgentMail`-compatible `/v0` HTTP API (plan §8).
+//!
+//! Mounted on the same Function URL as the `/webhooks/...` paths. Every route
+//! is behind bearer auth, and every response body — success or failure —
+//! matches `AgentMail`'s documented shape, so an `AgentMail` SDK works
+//! against this service with only the base URL and key changed.
+//!
+//! Routes that `AgentMail` documents but this service does not implement
+//! answer `501` with a parseable body rather than a bare status line, and
+//! unknown `/v0` paths answer `AgentMail`'s `404`. Paths outside `/v0` keep
+//! axum's default `404`.
+
+pub mod auth;
+pub mod error;
+pub mod keys;
+pub mod unimplemented;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::routing::{any, delete, post};
+
+use crate::api::unimplemented::{method_not_allowed, not_implemented, unknown_route};
+use crate::state::{AppState, Services};
+
+/// The `/v0` router, ready to nest. Auth wraps every route including the
+/// fallbacks, so an unauthenticated caller learns nothing about which paths
+/// exist.
+pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
+    Router::new()
+        // Resource groups this service does not implement (D13).
+        .route("/inboxes/{inbox_id}/drafts", any(not_implemented))
+        .route("/inboxes/{inbox_id}/drafts/{*rest}", any(not_implemented))
+        .route("/inboxes/{inbox_id}/labels", any(not_implemented))
+        .route("/inboxes/{inbox_id}/labels/{*rest}", any(not_implemented))
+        .route("/pods", any(not_implemented))
+        .route("/pods/{*rest}", any(not_implemented))
+        .route("/domains", any(not_implemented))
+        .route("/domains/{*rest}", any(not_implemented))
+        .route("/webhooks", any(not_implemented))
+        .route("/webhooks/{*rest}", any(not_implemented))
+        // Phase-4 method/path pairs: the same paths serve real reads later,
+        // so only these methods answer 501.
+        .route("/inboxes", post(not_implemented))
+        .route("/inboxes/{inbox_id}", delete(not_implemented))
+        .route(
+            "/inboxes/{inbox_id}/threads/{thread_id}",
+            delete(not_implemented),
+        )
+        .route(
+            "/inboxes/{inbox_id}/messages/{message_id}",
+            delete(not_implemented),
+        )
+        // Sending arrives in phase 3.
+        .route("/inboxes/{inbox_id}/messages/send", post(not_implemented))
+        .route(
+            "/inboxes/{inbox_id}/messages/{message_id}/reply",
+            post(not_implemented),
+        )
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_bearer::<T>,
+        ))
+        .with_state(state)
+}

@@ -3,6 +3,7 @@
 
 pub mod actions;
 pub mod allowlist;
+pub mod api;
 pub mod app;
 pub mod aws;
 pub mod config;

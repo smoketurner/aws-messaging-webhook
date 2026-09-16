@@ -26,6 +26,7 @@
 //! code — the per-binary dead-code lint doesn't apply to a library's public
 //! API. Depended on by every integration test binary in `crates/webhook`.
 
+pub mod api_keys;
 pub mod mail_memory;
 pub mod objects;
 
@@ -35,10 +36,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
+use api_keys::FakeApiKeys;
 use aws_messaging_webhook::actions::{
     ActionError, ActionErrorKind, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason,
 };
 use aws_messaging_webhook::allowlist::TopicAllowlist;
+use aws_messaging_webhook::api::keys::{ApiKeyError, ApiKeySource, KeyCache};
 use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::{Config, FunctionMode};
 use aws_messaging_webhook::entry::dispatch;
@@ -84,6 +87,16 @@ pub struct FakeServices {
     /// Track B's fake object store (currently a stub); `ObjectStore` is
     /// delegated to it below.
     pub objects: FakeObjectStore,
+    /// The bearer keys the `/v0` surface authenticates against;
+    /// `ApiKeySource` is delegated to it below. Unavailable until a test
+    /// calls `set_keys`.
+    pub api_keys: FakeApiKeys,
+}
+
+impl ApiKeySource for FakeServices {
+    async fn fetch(&self) -> Result<String, ApiKeyError> {
+        self.api_keys.fetch().await
+    }
 }
 
 impl MailStore for FakeServices {
@@ -303,6 +316,7 @@ pub async fn harness_with(options: HarnessOptions) -> Harness {
 
     let state = Arc::new(AppState {
         services: FakeServices::default(),
+        api_keys: KeyCache::new(),
         verifier: SnsVerifier::builder()
             .dangerous_allow_cert_url_prefix(server.uri())
             .build()

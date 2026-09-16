@@ -157,6 +157,7 @@ dependencies = [
  "aws-sdk-pinpointsmsvoicev2",
  "aws-sdk-s3",
  "aws-sdk-sesv2",
+ "aws-sdk-ssm",
  "aws-smithy-types",
  "aws_lambda_events",
  "axum",
@@ -172,6 +173,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sns-message-verifier",
+ "subtle",
  "thiserror",
  "tokio",
  "tower",
@@ -332,6 +334,32 @@ name = "aws-sdk-sesv2"
 version = "1.128.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9bec8be9758c5541f77dc99371a8c32a501b9ea9859740a7cf2e0895c27ed09"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-ssm"
+version = "1.119.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3a2007c49b4a471fbf2560999b5e2a32a2a8dddf5a6780ee32ad79163cdba12"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -670,6 +698,7 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http 1.5.0",
  "http-body 1.1.0",
@@ -681,6 +710,9 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
  "tower",
  "tower-layer",
@@ -3313,6 +3345,7 @@ dependencies = [
  "reqwest",
  "serde_dynamo",
  "serde_json",
+ "sha2 0.10.9",
  "sns-message-verifier",
  "tokio",
  "tower",

@@ -2,6 +2,7 @@ use sns_message_verifier::SnsVerifier;
 
 use crate::actions::{SesApi, SmsVoiceApi};
 use crate::allowlist::TopicAllowlist;
+use crate::api::keys::{ApiKeySource, KeyCache};
 use crate::config::Config;
 use crate::mail::objects::ObjectStore;
 use crate::mail::store::MailStore;
@@ -12,7 +13,16 @@ use crate::store::EventStore;
 /// single type parameter. Production implements it on one struct wrapping the
 /// AWS SDK clients; tests implement it on one recording fake.
 pub trait Services:
-    EventStore + PublishEvents + SmsVoiceApi + SesApi + MailStore + ObjectStore + Send + Sync + 'static
+    EventStore
+    + PublishEvents
+    + SmsVoiceApi
+    + SesApi
+    + MailStore
+    + ObjectStore
+    + ApiKeySource
+    + Send
+    + Sync
+    + 'static
 {
 }
 
@@ -23,6 +33,7 @@ impl<T> Services for T where
         + SesApi
         + MailStore
         + ObjectStore
+        + ApiKeySource
         + Send
         + Sync
         + 'static
@@ -32,6 +43,9 @@ impl<T> Services for T where
 /// Shared application state; the router holds it behind one `Arc`.
 pub struct AppState<T: Services> {
     pub services: T,
+    /// Bearer API keys (D20), cached for the life of this execution
+    /// environment and shared by every `/v0` request.
+    pub api_keys: KeyCache,
     pub verifier: SnsVerifier,
     pub allowlist: TopicAllowlist,
     /// Client for `SubscribeURL` GETs (confirm and re-subscribe).

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_messaging_webhook::api::keys::KeyCache;
 use aws_messaging_webhook::aws::AwsServices;
 use aws_messaging_webhook::config::Config;
 use aws_messaging_webhook::entry;
@@ -37,6 +38,7 @@ async fn main() -> Result<(), lambda_http::Error> {
 
     let state = Arc::new(AppState {
         services,
+        api_keys: KeyCache::new(),
         verifier: verifier.build()?,
         allowlist,
         http: reqwest::Client::builder()

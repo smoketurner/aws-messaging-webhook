@@ -1,8 +1,8 @@
 //! Production [`Services`](crate::state::Services) implementation wrapping
 //! the AWS SDK clients.
 
-// Mail (AgentMail-compatible inbox) trait implementations: stubs for tracks
-// A (`MailStore`) and B (`ObjectStore`), filled in when those tracks land.
+// Mail (AgentMail-compatible inbox) trait implementations.
+pub mod api_keys;
 pub mod mail_store;
 pub mod objects;
 
@@ -33,6 +33,8 @@ pub struct AwsServices {
     /// unconditionally since it is cheap and `MailConfig` is per-invocation
     /// optional, not per-client.
     s3: aws_sdk_s3::Client,
+    /// Reads the `SecureString` holding the API key hashes (D20).
+    ssm: aws_sdk_ssm::Client,
     config: Config,
 }
 
@@ -45,6 +47,7 @@ impl AwsServices {
             sms: aws_sdk_pinpointsmsvoicev2::Client::new(sdk_config),
             ses: aws_sdk_sesv2::Client::new(sdk_config),
             s3: aws_sdk_s3::Client::new(sdk_config),
+            ssm: aws_sdk_ssm::Client::new(sdk_config),
             config,
         }
     }

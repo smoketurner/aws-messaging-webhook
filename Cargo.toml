@@ -38,6 +38,9 @@ aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
 # =1.6.2 (see below); =1.141.0 is the newest release that still resolves
 # against it (verified via `cargo tree`/`cargo deny`).
 aws-sdk-s3 = { version = "=1.141.0", default-features = false }
+# Same constraint as aws-sdk-s3: newer ssm releases want aws-smithy-types
+# ^1.7. =1.119.0 is the newest that resolves against the =1.6.2 pin.
+aws-sdk-ssm = { version = "=1.119.0", default-features = false }
 aws-smithy-types = { version = "=1.6.2", default-features = false }
 
 # Serialization
@@ -58,6 +61,8 @@ rsa = { version = "=0.9.10", default-features = false }
 sha1 = { version = "=0.10.7", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
 x509-cert = { version = "=0.2.5", default-features = false }
+# Constant-time comparison of presented API-key hashes (D20).
+subtle = { version = "=2.6.1", default-features = false }
 base64 = { version = "=0.23.1", default-features = false }
 url = { version = "=2.5.8", default-features = false }
 reqwest = { version = "=0.13.4", default-features = false }
