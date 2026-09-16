@@ -85,17 +85,6 @@ fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
     }
 }
 
-/// Whether `op` carries any condition at all (an unconditioned
-/// op's failed check is always `Permanent`, never reached in practice since
-/// DynamoDB only cancels a conditioned item, but checked defensively).
-fn is_conditioned(op: &WriteOp) -> bool {
-    match op {
-        WriteOp::Put { cond, .. } | WriteOp::Update { cond, .. } => !matches!(cond, Cond::None),
-        WriteOp::Delete { .. } => false,
-        WriteOp::AliasFirstWriter { .. } => true,
-    }
-}
-
 /// Decodes a transaction's cancellation into one [`TxnDecision`], per the
 /// precedence documented above. `ops` and `reasons` are parallel: one
 /// cancellation reason per planned transaction item.
@@ -148,8 +137,8 @@ pub fn decode_cancellation(
         }
     }
 
-    // Step 5: anything else, including a failed check on an unconditioned op.
-    let _ = ops.iter().any(|op| !is_conditioned(&op.op));
+    // Step 5: anything else, including a failed check on an unconditioned op
+    // — which DynamoDB never reports, since it only cancels a conditioned one.
     TxnDecision::Permanent
 }
 
