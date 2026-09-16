@@ -72,9 +72,9 @@ AWS SAM CLI.
 ```bash
 git clone https://github.com/smoketurner/aws-messaging-webhook
 cd aws-messaging-webhook
-sam build --config-env dev
-sam deploy --config-env dev --parameter-overrides \
-  "Stage=dev AllowedTopics=<your-account-id> OptOutListName=<your-opt-out-list>"
+sam build
+sam deploy --parameter-overrides \
+  "AllowedTopics=<your-account-id> OptOutListName=<your-opt-out-list>"
 ```
 
 > [!IMPORTANT]
@@ -177,7 +177,7 @@ CloudFormation reuses a stack's previous parameter values on update, so a stack 
 `LogLevel=TRACE` fails parameter validation on its next deploy. Pass a new level once:
 
 ```bash
-sam deploy --config-env dev --parameter-overrides "Stage=dev LogLevel=DEBUG"
+sam deploy --parameter-overrides "LogLevel=DEBUG"
 ```
 
 ## Mailbox
@@ -198,8 +198,8 @@ function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB mes
 > receipt rule set can't be created.
 
 ```bash
-sam deploy --config-env dev --parameter-overrides \
-  "Stage=dev AllowedTopics=<your-account-id> MailDomain=mail.example.com MailAddresses=hello,support \
+sam deploy --parameter-overrides \
+  "AllowedTopics=<your-account-id> MailDomain=mail.example.com MailAddresses=hello,support \
    ApiKeysParameterName=/aws-messaging-webhook/dev/api-keys HostedZoneId=<zone-id>"
 ```
 

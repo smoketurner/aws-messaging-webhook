@@ -77,10 +77,6 @@ cargo lambda invoke aws-messaging-webhook --data-file events/sms-inbound.json
 In debug builds, set `SNS_CERT_HOST_OVERRIDE` in `.env` to point at a local fake SNS
 (e.g., LocalStack). This env var is compiled out in release builds.
 
-> **Note:** `samconfig.toml` does not set a region. Export `AWS_DEFAULT_REGION` in your
-> shell (e.g., `export AWS_DEFAULT_REGION=us-east-1`) or pass `--region` explicitly to
-> SAM commands (`sam build --region us-east-1`, `sam deploy --region us-east-1`).
-
 ## Generating docs
 
 ```bash

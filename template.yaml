@@ -707,33 +707,7 @@ Resources:
             - AttributeName: gsi1sk
               KeyType: RANGE
           Projection:
-            ProjectionType: INCLUDE
-            NonKeyAttributes:
-              - inbox_id
-              - thread_id
-              - message_id
-              - labels
-              - timestamp
-              - from
-              - to
-              - cc
-              - bcc
-              - subject
-              - preview
-              - size
-              - attachments
-              - in_reply_to
-              - created_at
-              - updated_at
-              - senders
-              - recipients
-              - last_message_id
-              - message_count
-              - received_timestamp
-              - sent_timestamp
-              - email
-              - display_name
-              - metadata
+            ProjectionType: ALL
         - IndexName: ByThread
           KeySchema:
             - AttributeName: gsi2pk
@@ -741,7 +715,7 @@ Resources:
             - AttributeName: gsi2sk
               KeyType: RANGE
           Projection:
-            ProjectionType: KEYS_ONLY
+            ProjectionType: ALL
         # Sparse: only send-state items carry gsi3pk.
         - IndexName: ByStatus
           KeySchema:
@@ -750,14 +724,7 @@ Resources:
             - AttributeName: gsi3sk
               KeyType: RANGE
           Projection:
-            ProjectionType: INCLUDE
-            NonKeyAttributes:
-              - inbox_id
-              - send_status
-              - created_at
-              - requeued_at
-              - sending_at
-              - promote_at
+            ProjectionType: ALL
       StreamSpecification:
         StreamViewType: NEW_AND_OLD_IMAGES
       # Set only on idempotency-key and SES-call marker items.

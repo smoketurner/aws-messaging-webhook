@@ -17,7 +17,7 @@ prek run                                                # all pre-commit hooks: 
 Deploy (needs `cargo-lambda` and the AWS SAM CLI; toolchain pinned in `rust-toolchain.toml`):
 
 ```bash
-sam build --config-env dev && sam deploy --config-env dev
+sam build && sam deploy
 ```
 
 Topic wiring is plain AWS CLI (subscribe over https to a webhook path, or lambda protocol +

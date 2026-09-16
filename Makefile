@@ -1,7 +1,7 @@
 # aws-messaging-webhook -- developer commands
 # Run `make help` (or just `make`) to list available targets.
 
-.PHONY: help fmt fmt-check clippy test test-handlers test-verifier deny lint check watch build deploy-dev deploy-prod validate coverage clean install-tools doc prek
+.PHONY: help fmt fmt-check clippy test test-handlers test-verifier deny lint check watch build deploy validate coverage clean install-tools doc prek
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -35,15 +35,11 @@ watch: ## Start local Lambda runtime (cargo-lambda)
 	cargo lambda watch
 
 build: ## Build for deployment (SAM + cargo-lambda)
-	sam build --config-env dev
+	sam build
 
-deploy-dev: ## Build and deploy to dev
-	sam build --config-env dev
-	sam deploy --config-env dev
-
-deploy-prod: ## Build and deploy to prod
-	sam build --config-env prod
-	sam deploy --config-env prod
+deploy: ## Build and deploy
+	sam build
+	sam deploy
 
 validate: ## Lint the SAM template
 	sam validate --lint

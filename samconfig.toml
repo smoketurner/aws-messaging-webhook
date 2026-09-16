@@ -1,27 +1,20 @@
 version = 0.1
 
+[default.global.parameters]
+region = "us-east-1"
+profile = "plock-admin"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-nwao0jggejqu"
+
 [default.build.parameters]
 beta_features = true
+parallel = true
 
 [default.validate.parameters]
 lint = true
 
-[dev.build.parameters]
-beta_features = true
-
-[dev.deploy.parameters]
+[default.deploy.parameters]
 stack_name = "aws-messaging-webhook-dev"
-resolve_s3 = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
-parameter_overrides = "Stage=dev"
-
-[prod.build.parameters]
-beta_features = true
-
-[prod.deploy.parameters]
-stack_name = "aws-messaging-webhook"
-resolve_s3 = true
-capabilities = "CAPABILITY_IAM"
-confirm_changeset = true
-parameter_overrides = "Stage=prod"
+disable_rollback = true
+parameter_overrides = "Stage=dev HostedZoneId=Z04338642E432EB33SIGC MailDomain=mail.smoketurner.com MailAddresses=hello ApiKeysParameterName=/aws-messaging-webhook/dev/api-keys"
