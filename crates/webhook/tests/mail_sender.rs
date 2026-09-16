@@ -8,7 +8,7 @@
 
 use aws_messaging_webhook::actions::SendOutcome;
 use aws_messaging_webhook::mail::send::{SendState, SendStatus};
-use aws_messaging_webhook::mail::sender::{Handled, handle_send};
+use aws_messaging_webhook::mail::sender::{Handled, handle_send, sweep};
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, send};
 use axum::body::Body;
@@ -448,4 +448,64 @@ async fn later_events_add_labels_rather_than_replacing_them() {
         .unwrap();
     assert!(message.labels.contains(&"delivered".to_owned()));
     assert!(message.labels.contains(&"opened".to_owned()));
+}
+
+#[tokio::test]
+async fn the_sweep_releases_a_claim_whose_sender_died() {
+    // A sender killed mid-send leaves the state `sending` with no stream
+    // record to re-trigger it; nothing but the sweep would notice.
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+    h.state
+        .services
+        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sending);
+
+    let report = sweep(&h.state).await.unwrap();
+
+    assert_eq!(report.released, 1);
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Queued);
+    assert!(state.requeued_at.is_some());
+}
+
+#[tokio::test]
+async fn the_sweep_leaves_a_recent_claim_alone() {
+    // Taking a send away from a sender still working on it is how the same
+    // message gets sent twice.
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+    let now =
+        aws_messaging_webhook::mail::time::format(aws_messaging_webhook::mail::time::now_ms());
+    h.state
+        .services
+        .claim_send(&message_id, &now)
+        .await
+        .unwrap();
+
+    let report = sweep(&h.state).await.unwrap();
+
+    assert_eq!(report.released, 0);
+    assert_eq!(report.still_working, 1);
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sending);
+}
+
+#[tokio::test]
+async fn the_sweep_reports_unknown_sends_without_touching_them() {
+    // SES may hold these; releasing one could deliver it twice.
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+        reason: "connection reset".to_owned(),
+    });
+    handle_send(&h.state, &message_id).await.unwrap();
+
+    let report = sweep(&h.state).await.unwrap();
+
+    assert_eq!(report.unknown, 1);
+    assert_eq!(report.released, 0);
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
+    assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
 }

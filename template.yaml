@@ -881,6 +881,15 @@ Resources:
           SES_CONFIGURATION_SET: !Ref MailConfigurationSet
           MAIL_IDENTITY_ARN: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
           ATTACHMENT_URL_TTL_SECONDS: !Ref AttachmentUrlTtlSeconds
+      Events:
+        # A sender killed between claiming a send and recording its outcome
+        # leaves the state `sending` with nobody working on it and no stream
+        # record to re-trigger. Nothing else would notice, so this checks.
+        Sweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(10 minutes)
+            Description: Recover sends whose sender died mid-flight
       Policies:
         - Version: "2012-10-17"
           Statement:

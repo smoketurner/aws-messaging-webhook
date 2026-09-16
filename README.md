@@ -358,6 +358,13 @@ is refused rather than stored as-is, since nothing here decompresses.
 Fetched bytes are stored in the outbox under the attachment's id, so a retried send reuses them
 instead of re-fetching a URL whose content may have changed in the meantime.
 
+A scheduled sweep runs every ten minutes. A sender killed between claiming a send and recording
+its outcome leaves the send `sending` with nobody working on it and no stream record to
+re-trigger it; the sweep releases claims older than fifteen minutes so they are attempted again.
+That threshold is deliberately well beyond the sender's own timeout: taking a send away from a
+sender still working on it is how the same message gets delivered twice. Sends whose outcome is
+`unknown` are counted and left alone — SES may hold those, so only an operator can decide.
+
 Once a message is sent, SES events on the configuration set label it: `delivered`, `bounced`,
 `complained`, `rejected` and `opened`. Labels are added and never removed, because these events
 arrive out of order under at-least-once delivery and a message that both bounced and was opened
@@ -412,7 +419,10 @@ the same explicit `MailBucketName`, delete the retained bucket first.
 
 - Re-ingesting permanently failed ingests. Deliveries in `MailIngestDlq` aren't replayed
   automatically; their raw MIME stays under `inbound/` until `MailRetentionDays`.
-- Sending (`POST …/messages/send` and `…/reply`).
+- Resolving a send whose outcome is `unknown`. The sweep reports them; deciding whether to
+  resend or close one is an operator judgement and has no command yet.
+- Cleaning up `outbox/` objects once a send is finished. They expire with `MailRetentionDays`
+  rather than being removed promptly.
 
 ## EventBridge contract
 

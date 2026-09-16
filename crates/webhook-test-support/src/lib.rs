@@ -45,7 +45,7 @@ use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
-use aws_messaging_webhook::mail::send::{SendKey, SendState};
+use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
     EnqueueOutcome, ListQuery, MarkOutcome, Page, ThreadView,
 };
@@ -223,6 +223,14 @@ impl MailStore for FakeServices {
         ses_message_id: &str,
     ) -> Result<Option<(InboxId, String)>, MailStoreError> {
         self.mail.resolve_ses_message(ses_message_id).await
+    }
+
+    async fn list_by_status(
+        &self,
+        status: SendStatus,
+        limit: usize,
+    ) -> Result<Vec<SendState>, MailStoreError> {
+        self.mail.list_by_status(status, limit).await
     }
 
     async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {

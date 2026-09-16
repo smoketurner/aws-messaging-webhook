@@ -13,7 +13,7 @@
 use std::future::Future;
 
 use crate::mail::keys::PageKey;
-use crate::mail::send::{SendFailure, SendKey, SendState};
+use crate::mail::send::{SendFailure, SendKey, SendState, SendStatus};
 use crate::mail::thread::ThreadState;
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
@@ -145,6 +145,16 @@ pub trait MailStore: Send + Sync {
         &self,
         ses_message_id: &str,
     ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send;
+
+    /// Lists sends currently in `status`, from the sparse status index.
+    ///
+    /// Only the index's projection is needed here: the sweep decides what to
+    /// do from the status and timestamps alone.
+    fn list_by_status(
+        &self,
+        status: SendStatus,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<SendState>, MailStoreError>> + Send;
 
     /// Reads one send's state, consistently.
     fn get_send_state(

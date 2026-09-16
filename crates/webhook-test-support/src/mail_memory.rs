@@ -621,6 +621,35 @@ impl MailStore for MailMemoryStore {
         std::future::ready(Ok(resolved))
     }
 
+    fn list_by_status(
+        &self,
+        status: SendStatus,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<SendState>, MailStoreError>> + Send {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: a poisoned lock is a test bug"
+        )]
+        let guard = self.inner.lock().unwrap();
+        let wanted = format!("SENDSTATUS#{}", status.as_str());
+        let mut out = Vec::new();
+        for item in guard.items.values() {
+            if Self::string_attr(item, "gsi3pk").as_deref() != Some(wanted.as_str()) {
+                continue;
+            }
+            match serde_dynamo::from_item(item.clone()) {
+                Ok(state) => out.push(state),
+                Err(e) => {
+                    return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
+                        "deserializing send state: {e}"
+                    ))));
+                }
+            }
+        }
+        out.truncate(limit);
+        std::future::ready(Ok(out))
+    }
+
     fn get_send_state(
         &self,
         message_id: &str,

@@ -847,6 +847,27 @@ impl MailStore for AwsServices {
         Ok(Some((InboxId(inbox), message_id)))
     }
 
+    async fn list_by_status(
+        &self,
+        status: SendStatus,
+        limit: usize,
+    ) -> Result<Vec<SendState>, MailStoreError> {
+        let page: Page<SendState> = self
+            .query_page(
+                PageQuery {
+                    partition: &format!("SENDSTATUS#{}", status.as_str()),
+                    limit,
+                    before: None,
+                    after: None,
+                    ascending: true,
+                    start: None,
+                },
+                "listing sends by status",
+            )
+            .await?;
+        Ok(page.items)
+    }
+
     async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let output = self

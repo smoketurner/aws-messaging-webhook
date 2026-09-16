@@ -24,7 +24,7 @@ use crate::actions::{RawSend, SendOutcome};
 use crate::mail::build::{BuildError, BuiltPart, build_outbound};
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
 use crate::mail::objects::ObjectError;
-use crate::mail::send::{self, SendFailure, SendSpec, SendState};
+use crate::mail::send::{self, SendFailure, SendSpec, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, MarkOutcome};
 use crate::mail::url_policy;
 use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
@@ -127,6 +127,88 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<S
         }
         _ => None,
     }
+}
+
+/// How long a send may sit claimed before the sweep assumes its sender died.
+///
+/// Comfortably longer than the sender's own timeout, so a send that is merely
+/// slow is never taken away from a sender that is still working on it — doing
+/// that is how the same message gets sent twice.
+const CLAIM_STALE_AFTER_MS: u64 = 15 * 60 * 1_000;
+
+/// How many stuck sends one sweep looks at.
+const SWEEP_LIMIT: usize = 100;
+
+/// What one sweep did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Claims released because the sender holding them appears to be gone.
+    pub released: usize,
+    /// Claims left alone because they are still plausibly live.
+    pub still_working: usize,
+    /// Sends whose outcome is unknown. Reported, never touched.
+    pub unknown: usize,
+}
+
+/// Recovers sends whose sender died mid-flight.
+///
+/// A Lambda can be killed between claiming a send and recording its outcome,
+/// which leaves the state item `sending` with nobody working on it and no
+/// stream record to re-trigger. Nothing else would ever notice.
+///
+/// Sends in `unknown` are counted and left alone. SES may hold those
+/// messages, so releasing one could deliver it twice; only an operator can
+/// decide.
+///
+/// # Errors
+///
+/// [`SenderError`] when the store cannot be read or written.
+pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, SenderError> {
+    let now_ms = time::now_ms();
+    let now = time::format(now_ms);
+    let mut report = SweepReport::default();
+
+    for stuck in state
+        .services
+        .list_by_status(SendStatus::Sending, SWEEP_LIMIT)
+        .await
+        .map_err(|e| store_error(&e))?
+    {
+        let claimed_ms = stuck
+            .sending_at
+            .as_deref()
+            .and_then(time::parse)
+            .unwrap_or(now_ms);
+        if now_ms.saturating_sub(claimed_ms) < CLAIM_STALE_AFTER_MS {
+            report.still_working += 1;
+            continue;
+        }
+
+        tracing::warn!(
+            message_id = %stuck.message_id,
+            sending_at = stuck.sending_at.as_deref().unwrap_or("unknown"),
+            event = "send_claim_released",
+            "releasing a claim whose sender appears to be gone"
+        );
+        release(state, &stuck, &now).await?;
+        report.released += 1;
+    }
+
+    report.unknown = state
+        .services
+        .list_by_status(SendStatus::Unknown, SWEEP_LIMIT)
+        .await
+        .map_err(|e| store_error(&e))?
+        .len();
+    if report.unknown > 0 {
+        tracing::warn!(
+            count = report.unknown,
+            event = "sends_outcome_unknown",
+            "sends whose outcome SES never confirmed; an operator must resolve them"
+        );
+    }
+
+    Ok(report)
 }
 
 /// Claims `message_id`, sends it, and records the outcome.
