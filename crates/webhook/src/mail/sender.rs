@@ -22,10 +22,12 @@
 
 use crate::actions::{RawSend, SendOutcome};
 use crate::mail::build::{BuildError, BuiltPart, build_outbound};
+use crate::mail::fetch::{AttachmentFetcher, FetchError};
 use crate::mail::objects::ObjectError;
 use crate::mail::send::{self, SendFailure, SendSpec, SendState};
 use crate::mail::store::{MailStoreError, MarkOutcome};
-use crate::mail::{MAX_OUTBOUND_RAW_BYTES, time};
+use crate::mail::url_policy;
+use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
 use crate::metrics::names;
 use crate::state::{AppState, Services};
 
@@ -363,26 +365,114 @@ async fn load_parts<T: Services>(
     spec: &SendSpec,
 ) -> Result<Vec<LoadedPart>, LoadError> {
     let mut parts = Vec::with_capacity(spec.attachments.len());
+    let mut budget = MAX_OUTBOUND_DECODED_BYTES;
+
     for attachment in &spec.attachments {
-        let Some(key) = &attachment.object_key else {
+        // Bytes already in the outbox: either inlined at enqueue, or fetched
+        // by an earlier attempt at this send, which is what stops a retry
+        // re-fetching everything.
+        if let Some(key) = &attachment.object_key {
+            let bytes = state
+                .services
+                .get_object(key, MAX_OUTBOUND_RAW_BYTES)
+                .await?;
+            budget = budget.saturating_sub(bytes.len() as u64);
+            parts.push(LoadedPart {
+                spec: attachment.clone(),
+                bytes: bytes.to_vec(),
+            });
+            continue;
+        }
+
+        // An earlier attempt may already have fetched and stored it. The
+        // spec is written once at enqueue and never rewritten, so the stored
+        // object is the only record that the fetch happened.
+        let stored_key = send::part_key(&spec.message_id, &attachment.attachment_id);
+        match state
+            .services
+            .get_object(&stored_key, MAX_OUTBOUND_RAW_BYTES)
+            .await
+        {
+            Ok(bytes) => {
+                budget = budget.saturating_sub(bytes.len() as u64);
+                let mut spec_attachment = attachment.clone();
+                spec_attachment.object_key = Some(stored_key);
+                spec_attachment.size = bytes.len() as u64;
+                parts.push(LoadedPart {
+                    spec: spec_attachment,
+                    bytes: bytes.to_vec(),
+                });
+                continue;
+            }
+            Err(ObjectError::NotFound) => {}
+            Err(other) => return Err(other.into()),
+        }
+
+        let Some(raw_url) = &attachment.url else {
             tracing::error!(
                 message_id = %spec.message_id,
                 attachment_id = %attachment.attachment_id,
-                event = "send_part_not_fetched",
-                "URL-backed attachments are not fetched yet"
+                event = "send_part_has_no_source",
+                "attachment names neither stored bytes nor a URL"
             );
             return Err(LoadError::Missing);
         };
-        let bytes = state
+        // Re-checked here rather than trusted from the spec: the shape rules
+        // are cheap, and the spec has been sitting in S3 since enqueue.
+        let url = url_policy::parse_attachment_url(raw_url).map_err(|rejected| {
+            tracing::warn!(
+                message_id = %spec.message_id,
+                attachment_id = %attachment.attachment_id,
+                rejected = %rejected,
+                event = "send_part_url_blocked",
+                "attachment URL is not allowed"
+            );
+            LoadError::Missing
+        })?;
+
+        let fetched = AttachmentFetcher::fetch(&state.services, &url, budget)
+            .await
+            .map_err(|error| fetch_error(&spec.message_id, &attachment.attachment_id, &error))?;
+        budget = budget.saturating_sub(fetched.bytes.len() as u64);
+
+        // Stored under the attachment's own key so a retry reuses these
+        // bytes instead of fetching a URL whose content may have changed.
+        state
             .services
-            .get_object(key, MAX_OUTBOUND_RAW_BYTES)
+            .put_object_if_absent(
+                &stored_key,
+                axum::body::Bytes::from(fetched.bytes.clone()),
+                &attachment.content_type,
+            )
             .await?;
+
+        let mut spec_attachment = attachment.clone();
+        spec_attachment.object_key = Some(stored_key);
+        spec_attachment.size = fetched.bytes.len() as u64;
         parts.push(LoadedPart {
-            spec: attachment.clone(),
-            bytes: bytes.to_vec(),
+            spec: spec_attachment,
+            bytes: fetched.bytes,
         });
     }
     Ok(parts)
+}
+
+/// Maps a fetch failure onto the two outcomes the caller distinguishes: worth
+/// another attempt, or not.
+fn fetch_error(message_id: &str, attachment_id: &str, error: &FetchError) -> LoadError {
+    if error.is_transient() {
+        return LoadError::Unavailable(anyhow::anyhow!("fetching {attachment_id}: {error}"));
+    }
+    // The URL is never logged: it came from a caller and may carry a
+    // credential in its path or query.
+    tracing::warn!(
+        message_id,
+        attachment_id,
+        error = %error,
+        event = "send_part_fetch_failed",
+        "attachment could not be fetched"
+    );
+    LoadError::Missing
 }
 
 async fn fail<T: Services>(

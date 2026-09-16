@@ -89,7 +89,12 @@ Two workspace crates:
   a misconfigured opt-out list must not become a retry storm.
 - **No verification bypass in release builds.** `SNS_CERT_HOST_OVERRIDE` (for
   `cargo lambda watch` against a fake SNS) is compiled in under `#[cfg(debug_assertions)]`
-  only. The HTTP clients never follow redirects — that's part of the trust model, not a nicety.
+  only; `mail/fetch.rs`'s plain-http mode is `#[cfg(test)]` for the same reason. The SNS HTTP
+  clients never follow redirects — that's part of the trust model, not a nicety. The one
+  exception is `mail/fetch.rs`, which fetches caller-supplied attachment URLs and therefore
+  *must* handle redirects; it follows them by hand, at most five hops, re-running the full
+  `mail/url_policy.rs` shape and address checks on every `Location`, because the first check
+  says nothing about where a redirect leads.
 - **Handler tests are the integration suite.** `crates/webhook/tests/handlers.rs` drives the
   real router with properly signed envelopes against one `FakeServices` implementing the
   `Services` trait (`state.rs` — the single bound aggregating `EventStore + PublishEvents +

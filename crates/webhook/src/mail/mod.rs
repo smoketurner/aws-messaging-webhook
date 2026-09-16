@@ -24,6 +24,7 @@ pub mod wire;
 
 pub mod build;
 pub mod events;
+pub mod fetch;
 pub mod ingest;
 pub mod labels;
 pub mod mime;

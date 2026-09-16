@@ -306,12 +306,65 @@ async fn bcc_is_given_to_ses_but_stays_out_of_the_message() {
 }
 
 #[tokio::test]
-async fn a_url_attachment_is_not_sent_with_a_missing_part() {
-    // Fetching is not implemented yet. Until it is, the send must stop
-    // rather than go out without its attachment.
+async fn a_url_attachment_is_fetched_and_reaches_ses() {
     let h = seeded().await;
+    h.state
+        .services
+        .serve_url("https://example.com/report.pdf", b"report bytes");
+    let mut request = body();
+    request["attachments"] = json!([{
+        "url": "https://example.com/report.pdf",
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+    }]);
+    let message_id = queued(&h, &request).await;
+
+    let handled = handle_send(&h.state, &message_id).await.unwrap();
+
+    assert_eq!(handled, Handled::Sent);
+    let sent = h.state.services.sent.lock().unwrap();
+    assert!(
+        sent[0].raw_text().contains("report.pdf"),
+        "{}",
+        sent[0].raw_text()
+    );
+    assert_eq!(
+        h.state.services.fetched.lock().unwrap().as_slice(),
+        ["https://example.com/report.pdf"]
+    );
+}
+
+#[tokio::test]
+async fn a_fetched_attachment_is_stored_so_a_retry_does_not_fetch_again() {
+    // The URL's content could change between attempts; the message that was
+    // built once must stay the message that is sent.
+    let h = seeded().await;
+    h.state
+        .services
+        .serve_url("https://example.com/report.pdf", b"report bytes");
     let mut request = body();
     request["attachments"] = json!([{ "url": "https://example.com/report.pdf" }]);
+    let message_id = queued(&h, &request).await;
+
+    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+        reason: "Throttled".to_owned(),
+    });
+    handle_send(&h.state, &message_id).await.unwrap();
+    handle_send(&h.state, &message_id).await.unwrap();
+
+    assert_eq!(
+        h.state.services.fetched.lock().unwrap().len(),
+        1,
+        "the second attempt should reuse the stored bytes"
+    );
+}
+
+#[tokio::test]
+async fn an_unfetchable_url_fails_the_send_rather_than_sending_without_it() {
+    // Going out without the attachment would be worse than not going out.
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "url": "https://example.com/missing.pdf" }]);
     let message_id = queued(&h, &request).await;
 
     let handled = handle_send(&h.state, &message_id).await.unwrap();

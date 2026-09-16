@@ -80,12 +80,30 @@ pub enum UrlRejected {
 /// userinfo, names a port other than 443, has no host, or is an IP literal
 /// that is not a public address.
 pub fn parse_attachment_url(raw: &str) -> Result<AttachmentUrl, UrlRejected> {
+    parse_with(raw, false)
+}
+
+/// [`parse_attachment_url`] with the transport rules relaxed, for tests whose
+/// mock server speaks plain http on an arbitrary port. Every other rule,
+/// including the address rules, still applies — those are what the SSRF tests
+/// actually exercise.
+///
+/// # Errors
+///
+/// As [`parse_attachment_url`], except that `http` and any port are accepted.
+#[cfg(test)]
+pub fn parse_attachment_url_allowing_http(raw: &str) -> Result<AttachmentUrl, UrlRejected> {
+    parse_with(raw, true)
+}
+
+fn parse_with(raw: &str, relaxed_transport: bool) -> Result<AttachmentUrl, UrlRejected> {
     if raw.len() > URL_MAX_BYTES {
         return Err(UrlRejected::TooLong);
     }
     let url = Url::parse(raw).map_err(|_| UrlRejected::Malformed)?;
 
-    if url.scheme() != "https" {
+    let scheme_ok = url.scheme() == "https" || (relaxed_transport && url.scheme() == "http");
+    if !scheme_ok {
         return Err(UrlRejected::NotHttps);
     }
     // Credentials in a URL are a redirect-laundering trick as often as a real
@@ -95,9 +113,11 @@ pub fn parse_attachment_url(raw: &str) -> Result<AttachmentUrl, UrlRejected> {
     }
     // `port()` is None when the port is the scheme default, so this allows
     // 443 written either way and nothing else.
-    match url.port() {
-        None | Some(443) => {}
-        Some(_) => return Err(UrlRejected::PortNotAllowed),
+    if !relaxed_transport {
+        match url.port() {
+            None | Some(443) => {}
+            Some(_) => return Err(UrlRejected::PortNotAllowed),
+        }
     }
 
     let host = url.host().ok_or(UrlRejected::NoHost)?;

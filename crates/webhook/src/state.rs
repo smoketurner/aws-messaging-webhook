@@ -4,6 +4,7 @@ use crate::actions::{SesApi, SmsVoiceApi};
 use crate::allowlist::TopicAllowlist;
 use crate::api::keys::{ApiKeySource, KeyCache};
 use crate::config::Config;
+use crate::mail::fetch::AttachmentFetcher;
 use crate::mail::objects::ObjectStore;
 use crate::mail::store::MailStore;
 use crate::publish::PublishEvents;
@@ -19,6 +20,7 @@ pub trait Services:
     + SesApi
     + MailStore
     + ObjectStore
+    + AttachmentFetcher
     + ApiKeySource
     + Send
     + Sync
@@ -33,6 +35,7 @@ impl<T> Services for T where
         + SesApi
         + MailStore
         + ObjectStore
+        + AttachmentFetcher
         + ApiKeySource
         + Send
         + Sync

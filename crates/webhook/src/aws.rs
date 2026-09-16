@@ -25,6 +25,7 @@ use crate::actions::{
     ActionError, FeedbackStatus, RawSend, SendOutcome, SesApi, SmsVoiceApi, SuppressionReason,
 };
 use crate::config::{Config, MailConfig};
+use crate::mail::fetch::{AttachmentFetcher, FetchError, Fetched, HttpAttachmentFetcher};
 use crate::model::DomainEvent;
 use crate::model::ses_notification::{SesBounce, SesEngagement};
 use crate::publish::{OutboundEvent, PublishError, PublishEvents};
@@ -42,7 +43,19 @@ pub struct AwsServices {
     s3: aws_sdk_s3::Client,
     /// Reads the `SecureString` holding the API key hashes.
     ssm: aws_sdk_ssm::Client,
+    /// Fetches URL-backed attachments, behind the SSRF guards.
+    fetcher: HttpAttachmentFetcher,
     config: Config,
+}
+
+impl AttachmentFetcher for AwsServices {
+    async fn fetch(
+        &self,
+        url: &crate::mail::url_policy::AttachmentUrl,
+        max_bytes: u64,
+    ) -> Result<Fetched, FetchError> {
+        self.fetcher.fetch(url, max_bytes).await
+    }
 }
 
 impl AwsServices {
@@ -55,6 +68,7 @@ impl AwsServices {
             ses: aws_sdk_sesv2::Client::new(sdk_config),
             s3: aws_sdk_s3::Client::new(sdk_config),
             ssm: aws_sdk_ssm::Client::new(sdk_config),
+            fetcher: HttpAttachmentFetcher::new(),
             config,
         }
     }

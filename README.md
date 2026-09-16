@@ -347,9 +347,16 @@ reply never arrives back where it came from. Naming `to`, `cc` or `bcc` yourself
 derived recipients but keeps the threading.
 
 An attachment `url` must be `https`, on the default port, with no embedded credentials, and must
-not resolve to a private or link-local address. That is checked here and again on every redirect
-hop when the sender fetches it; the sender is the only HTTP client in this service that follows
-redirects at all.
+not resolve to a private or link-local address. That is checked when the request is accepted and
+again when the sender fetches it — on the URL itself and on every redirect `Location`, at most
+five hops. The sender is the only HTTP client in this service that follows redirects at all, and
+it does so by hand for exactly that reason: the first check says nothing about where a redirect
+leads. The host is resolved once and the connection pinned to the addresses that passed, so the
+name cannot resolve to something else between the check and the connect. A compressed response
+is refused rather than stored as-is, since nothing here decompresses.
+
+Fetched bytes are stored in the outbox under the attachment's id, so a retried send reuses them
+instead of re-fetching a URL whose content may have changed in the meantime.
 
 Because labels live on the items rather than in per-label index rows, a filtered list reads a
 page and filters it, re-reading up to five times to fill the page. A response can therefore come

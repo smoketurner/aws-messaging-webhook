@@ -42,6 +42,7 @@ use aws_messaging_webhook::api::keys::{ApiKeyError, ApiKeySource, KeyCache};
 use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::entry::dispatch;
+use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
 use aws_messaging_webhook::mail::send::{SendKey, SendState};
@@ -97,6 +98,40 @@ pub struct FakeServices {
     /// The outcome the next `send_raw` returns, consumed once. Defaults to a
     /// successful send.
     pub send_outcome: Mutex<Option<SendOutcome>>,
+    /// URLs the fake fetcher serves, by URL string. A URL that is not here
+    /// fails the way an unreachable host would.
+    pub fetchable: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// Every URL `fetch` was asked for, in order.
+    pub fetched: Mutex<Vec<String>>,
+}
+
+impl AttachmentFetcher for FakeServices {
+    fn fetch(
+        &self,
+        url: &aws_messaging_webhook::mail::url_policy::AttachmentUrl,
+        max_bytes: u64,
+    ) -> impl Future<Output = Result<Fetched, FetchError>> + Send {
+        self.fetched.lock().unwrap().push(url.as_str().to_owned());
+        let result = match self.fetchable.lock().unwrap().get(url.as_str()).cloned() {
+            None => Err(FetchError::Rejected { status: 404 }),
+            Some(body) if body.len() as u64 > max_bytes => Err(FetchError::TooLarge),
+            Some(body) => Ok(Fetched {
+                bytes: body,
+                content_type: None,
+            }),
+        };
+        std::future::ready(result)
+    }
+}
+
+impl FakeServices {
+    /// Makes `url` fetchable with `body`.
+    pub fn serve_url(&self, url: &str, body: &[u8]) {
+        self.fetchable
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), body.to_vec());
+    }
 }
 
 /// One call to [`SesApi::send_raw`], captured for assertions.
