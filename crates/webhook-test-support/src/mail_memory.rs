@@ -12,7 +12,10 @@ use std::sync::Mutex;
 
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, TxnKind, WriteOp};
-use aws_messaging_webhook::mail::store::{ListQuery, MailStore, MailStoreError, Page, ThreadView};
+use aws_messaging_webhook::mail::send::{SendKey, SendState};
+use aws_messaging_webhook::mail::store::{
+    EnqueueOutcome, ListQuery, MailStore, MailStoreError, Page, ThreadView,
+};
 use aws_messaging_webhook::mail::thread::{ThreadState, apply_message, new_thread};
 use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use aws_messaging_webhook::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
@@ -512,6 +515,80 @@ impl MailStore for MailMemoryStore {
                     Commit::Cancelled(TxnDecision::Permanent | TxnDecision::KeyExists) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "ingest transaction for message {} was cancelled",
+                            msg.message_id
+                        )));
+                    }
+                }
+            }
+            Err(MailStoreError::Conflict)
+        })();
+        std::future::ready(result)
+    }
+
+    fn get_send_key(
+        &self,
+        key_hash: &str,
+    ) -> impl Future<Output = Result<Option<SendKey>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        let result = self
+            .get_item(&keys::send_key_pk(key_hash), keys::send_key_sk())
+            .map(|item| {
+                serde_dynamo::from_item(item).map_err(|e| {
+                    MailStoreError::Permanent(anyhow::anyhow!("deserializing send key: {e}"))
+                })
+            })
+            .transpose();
+        std::future::ready(result)
+    }
+
+    fn enqueue_send(
+        &self,
+        msg: &MailMessage,
+        state: &SendState,
+        key: Option<&SendKey>,
+        now_epoch: u64,
+    ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        use aws_messaging_webhook::mail::plan::plan_enqueue;
+
+        let result = (|| {
+            for _attempt in 0..=MAX_RETRIES {
+                let thread_before: Option<ThreadState> = self
+                    .get_item(
+                        &keys::inbox_pk(msg.inbox_id.as_str()),
+                        &keys::thread_sk(&msg.thread_id),
+                    )
+                    .map(|item| {
+                        serde_dynamo::from_item(item).map_err(|e| {
+                            MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
+                        })
+                    })
+                    .transpose()?;
+                let thread_after = match &thread_before {
+                    Some(before) => apply_message(before, msg),
+                    None => new_thread(msg),
+                };
+
+                let ops = plan_enqueue(
+                    msg,
+                    state,
+                    key,
+                    thread_before.as_ref(),
+                    &thread_after,
+                    now_epoch,
+                )?;
+                match self.attempt(&ops)? {
+                    Commit::Applied => return Ok(EnqueueOutcome::Committed),
+                    Commit::Cancelled(TxnDecision::KeyExists) => {
+                        return Ok(EnqueueOutcome::KeyExists);
+                    }
+                    Commit::Cancelled(TxnDecision::Duplicate) => {
+                        return Ok(EnqueueOutcome::AlreadyQueued);
+                    }
+                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                    Commit::Cancelled(TxnDecision::Permanent) => {
+                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                            "enqueue transaction for message {} was cancelled",
                             msg.message_id
                         )));
                     }

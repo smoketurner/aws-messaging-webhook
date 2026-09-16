@@ -217,9 +217,16 @@ impl SendState {
 /// timestamp in epoch seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendKey {
+    /// SHA-256 of the `Idempotency-Key` header value, which is what the item
+    /// is keyed by. The header itself is never stored: it is a client secret
+    /// in the sense that it must not be guessable by another caller.
+    pub key_hash: String,
     pub inbox_id: InboxId,
     pub message_id: String,
     pub thread_id: String,
+    /// A fingerprint of the request body, so the same key presented with a
+    /// *different* request is refused instead of silently sending something
+    /// the caller did not ask for.
     pub request_hash: String,
     pub route: String,
     pub created_at: String,

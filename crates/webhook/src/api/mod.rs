@@ -16,6 +16,7 @@ pub mod keys;
 pub mod labels;
 pub mod pagination;
 pub mod read;
+pub mod send;
 pub mod unimplemented;
 
 use std::sync::Arc;

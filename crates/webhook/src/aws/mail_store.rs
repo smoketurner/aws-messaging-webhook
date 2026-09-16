@@ -25,7 +25,8 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use crate::aws::{self, AwsServices};
 use crate::mail::keys::{self, PageKey};
 use crate::mail::plan::{Check, Cond, PlannedOp, TxnKind, WriteOp};
-use crate::mail::store::{ListQuery, MailStore, MailStoreError, Page, ThreadView};
+use crate::mail::send::{SendKey, SendState};
+use crate::mail::store::{EnqueueOutcome, ListQuery, MailStore, MailStoreError, Page, ThreadView};
 use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
 use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
@@ -751,6 +752,69 @@ impl MailStore for AwsServices {
                 .map(Some)
                 .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing message: {e}"))),
         }
+    }
+
+    async fn get_send_key(&self, key_hash: &str) -> Result<Option<SendKey>, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let output = self
+            .dynamo
+            .get_item()
+            .table_name(table_name)
+            .key("pk", DynamoAv::S(keys::send_key_pk(key_hash)))
+            .key("sk", DynamoAv::S(keys::send_key_sk().to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| store_error_from_sdk("GetItem(send key)", &e))?;
+        match output.item {
+            None => Ok(None),
+            Some(item) => serde_dynamo::from_item(item)
+                .map(Some)
+                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing send key: {e}"))),
+        }
+    }
+
+    async fn enqueue_send(
+        &self,
+        msg: &MailMessage,
+        state: &SendState,
+        key: Option<&SendKey>,
+        now_epoch: u64,
+    ) -> Result<EnqueueOutcome, MailStoreError> {
+        for _attempt in 0..=MAX_TXN_RETRIES {
+            // The thread is re-read on every attempt: a concurrent send into
+            // the same thread moves its version.
+            let thread_before = self.get_thread_state(&msg.inbox_id, &msg.thread_id).await?;
+            let thread_after = match &thread_before {
+                Some(before) => apply_message(before, msg),
+                None => new_thread(msg),
+            };
+
+            let ops = crate::mail::plan::plan_enqueue(
+                msg,
+                state,
+                key,
+                thread_before.as_ref(),
+                &thread_after,
+                now_epoch,
+            )?;
+
+            match self.attempt_transaction(TxnKind::Enqueue, &ops).await? {
+                Attempt::Committed => return Ok(EnqueueOutcome::Committed),
+                Attempt::Decision(TxnDecision::KeyExists) => return Ok(EnqueueOutcome::KeyExists),
+                Attempt::Decision(TxnDecision::Duplicate) => {
+                    return Ok(EnqueueOutcome::AlreadyQueued);
+                }
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(TxnDecision::Permanent) => {
+                    return Err(MailStoreError::Permanent(anyhow!(
+                        "enqueue transaction for message {} was cancelled",
+                        msg.message_id
+                    )));
+                }
+            }
+        }
+        Err(MailStoreError::Conflict)
     }
 
     async fn update_labels(

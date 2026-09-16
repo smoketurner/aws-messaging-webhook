@@ -204,10 +204,7 @@ pub fn plan_enqueue(
     // First, so a cancellation names the key conflict before anything else.
     if let Some(key) = key {
         let key_keys = [
-            (
-                "pk",
-                AttributeValue::S(keys::send_key_pk(&key.request_hash)),
-            ),
+            ("pk", AttributeValue::S(keys::send_key_pk(&key.key_hash))),
             ("sk", AttributeValue::S(keys::send_key_sk().to_owned())),
         ];
         ops.push(PlannedOp {
@@ -547,6 +544,7 @@ mod tests {
         let thread = new_thread(&msg);
         let state = queued_state(&msg, Some("SENDKEY#abc"));
         let key = crate::mail::send::SendKey {
+            key_hash: "keyhash".to_owned(),
             inbox_id: msg.inbox_id.clone(),
             message_id: msg.message_id.clone(),
             thread_id: msg.thread_id.clone(),
@@ -559,9 +557,15 @@ mod tests {
         let ops = plan_enqueue(&msg, &state, Some(&key), None, &thread, 1_700_000_000).unwrap();
 
         assert_eq!(ops[0].role, OpRole::IdempotencyKey);
-        let WriteOp::Put { cond, .. } = &ops[0].op else {
+        let WriteOp::Put { item, cond } = &ops[0].op else {
             panic!("expected a Put");
         };
+        // Keyed by the hash of the header, not of the request body: two
+        // different keys must never land on the same item.
+        assert_eq!(
+            item.inner().get("pk"),
+            Some(&AttributeValue::S("SENDKEY#keyhash".to_owned()))
+        );
         assert_eq!(
             *cond,
             Cond::NotExistsOrExpired {

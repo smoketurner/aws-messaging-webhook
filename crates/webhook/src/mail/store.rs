@@ -13,6 +13,7 @@
 use std::future::Future;
 
 use crate::mail::keys::PageKey;
+use crate::mail::send::{SendKey, SendState};
 use crate::mail::thread::ThreadState;
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
@@ -46,6 +47,19 @@ pub struct ListQuery {
     pub ascending: bool,
     /// Where to resume, from a page token the caller presented.
     pub start: Option<PageKey>,
+}
+
+/// What an enqueue attempt resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// The send is queued.
+    Committed,
+    /// This request's own earlier commit: the message already exists, so the
+    /// caller answers with the ids it already derived.
+    AlreadyQueued,
+    /// A live idempotency key claimed this request hash. The caller reads it
+    /// back to decide between replaying its answer and refusing a reused key.
+    KeyExists,
 }
 
 /// A thread plus one page of its messages, ascending.
@@ -91,6 +105,23 @@ pub trait MailStore: Send + Sync {
         inbox: &InboxId,
         message_id: &str,
     ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send;
+
+    /// Reads the record an `Idempotency-Key` resolves to, consistently, so a
+    /// replay is never answered from a stale read.
+    fn get_send_key(
+        &self,
+        key_hash: &str,
+    ) -> impl Future<Output = Result<Option<SendKey>, MailStoreError>> + Send;
+
+    /// Commits a queued send: the message, its send state, its thread, the
+    /// alias, and the idempotency key when one was given.
+    fn enqueue_send(
+        &self,
+        msg: &MailMessage,
+        state: &SendState,
+        key: Option<&SendKey>,
+        now_epoch: u64,
+    ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send;
 
     /// Adds and removes labels on one message, updating its thread's union in
     /// the same transaction. Returns the message's resulting labels, or

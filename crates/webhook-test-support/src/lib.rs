@@ -43,7 +43,8 @@ use aws_messaging_webhook::config::{Config, FunctionMode};
 use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
-use aws_messaging_webhook::mail::store::{ListQuery, Page, ThreadView};
+use aws_messaging_webhook::mail::send::{SendKey, SendState};
+use aws_messaging_webhook::mail::store::{EnqueueOutcome, ListQuery, Page, ThreadView};
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
 use aws_messaging_webhook::mail::thread::ThreadState;
 use aws_messaging_webhook::mail::{
@@ -139,6 +140,20 @@ impl MailStore for FakeServices {
         start: Option<PageKey>,
     ) -> Result<Page<Inbox>, MailStoreError> {
         self.mail.list_inboxes(limit, start).await
+    }
+
+    async fn get_send_key(&self, request_hash: &str) -> Result<Option<SendKey>, MailStoreError> {
+        self.mail.get_send_key(request_hash).await
+    }
+
+    async fn enqueue_send(
+        &self,
+        msg: &MailMessage,
+        state: &SendState,
+        key: Option<&SendKey>,
+        now_epoch: u64,
+    ) -> Result<EnqueueOutcome, MailStoreError> {
+        self.mail.enqueue_send(msg, state, key, now_epoch).await
     }
 
     async fn update_labels(
