@@ -56,6 +56,48 @@ pub struct MailMemoryStore {
     inner: Mutex<Inner>,
 }
 
+/// A minimal inbound message, for tests that need one in the store without
+/// driving a whole SES receipt through ingest. Callers adjust the fields the
+/// test is actually about.
+#[must_use]
+pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMessage {
+    MailMessage {
+        inbox_id: InboxId(inbox.to_owned()),
+        thread_id: thread_id.to_owned(),
+        message_id: message_id.to_owned(),
+        ses_message_id: None,
+        direction: aws_messaging_webhook::mail::Direction::Inbound,
+        rfc_message_id: format!("<{message_id}@example.com>"),
+        in_reply_to: None,
+        references: Vec::new(),
+        labels: vec!["received".to_owned(), "unread".to_owned()],
+        timestamp: "00000001-0000".to_owned(),
+        from: "sender@example.com".to_owned(),
+        reply_to: Vec::new(),
+        to: vec![format!("{inbox}@example.com")],
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: "Hello".to_owned(),
+        preview: "Hello there".to_owned(),
+        size: 1_000,
+        text: Some("hello there".to_owned()),
+        html: None,
+        body_truncated: false,
+        headers: std::collections::BTreeMap::new(),
+        attachments: Vec::new(),
+        attachments_truncated: false,
+        raw_s3_key: Some("inbound/x".to_owned()),
+        verdicts: None,
+        thread_snapshot: None,
+        delivery: std::collections::BTreeMap::new(),
+        send_status: None,
+        sent_at: None,
+        version: 0,
+        created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+    }
+}
+
 impl MailMemoryStore {
     /// Queues a scripted failure for the next transaction attempt only.
     pub fn inject(&self, failure: Injected) {
@@ -290,10 +332,17 @@ impl MailMemoryStore {
         let more = rows.len() > query.limit;
         rows.truncate(query.limit);
 
+        // Mirror DynamoDB's LastEvaluatedKey: the index key plus the table
+        // key for the same item, so a token from the fake exercises the same
+        // continuation path as a real one.
         let next = more.then(|| {
-            rows.last().map(|(sort, _)| PageKey {
-                partition: partition.to_owned(),
-                sort: sort.clone(),
+            rows.last().and_then(|(sort, item)| {
+                Some(PageKey {
+                    partition: partition.to_owned(),
+                    sort: sort.clone(),
+                    table_pk: Self::string_attr(item, "pk")?,
+                    table_sk: Self::string_attr(item, "sk")?,
+                })
             })
         });
         let mut items = Vec::with_capacity(rows.len());
@@ -379,6 +428,14 @@ impl MailStore for MailMemoryStore {
         item.inner_mut().insert(
             "sk".to_owned(),
             AttributeValue::S(keys::inbox_sk().to_owned()),
+        );
+        item.inner_mut().insert(
+            "gsi1pk".to_owned(),
+            AttributeValue::S(keys::inboxes_partition().to_owned()),
+        );
+        item.inner_mut().insert(
+            "gsi1sk".to_owned(),
+            AttributeValue::S(inbox.as_str().to_owned()),
         );
         guard.items.insert(key, item);
         std::future::ready(Ok(inbox_record))
@@ -483,6 +540,23 @@ impl MailStore for MailMemoryStore {
         })
     }
 
+    fn list_inboxes(
+        &self,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> impl Future<Output = Result<Page<Inbox>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        let query = ListQuery {
+            inbox: InboxId(String::new()),
+            limit,
+            before: None,
+            after: None,
+            ascending: true,
+            start,
+        };
+        std::future::ready(self.query_page(keys::inboxes_partition(), "gsi1pk", "gsi1sk", &query))
+    }
+
     fn list_messages(
         &self,
         query: &ListQuery,
@@ -538,48 +612,10 @@ impl MailStore for MailMemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use aws_messaging_webhook::mail::Direction;
-
     use super::*;
 
     fn message(message_id: &str, thread_id: &str) -> MailMessage {
-        MailMessage {
-            inbox_id: InboxId("support".to_owned()),
-            thread_id: thread_id.to_owned(),
-            message_id: message_id.to_owned(),
-            ses_message_id: None,
-            direction: Direction::Inbound,
-            rfc_message_id: format!("<{message_id}@example.com>"),
-            in_reply_to: None,
-            references: Vec::new(),
-            labels: vec!["received".to_owned(), "unread".to_owned()],
-            timestamp: "00000001-0000".to_owned(),
-            from: "sender@example.com".to_owned(),
-            reply_to: Vec::new(),
-            to: vec!["support@example.com".to_owned()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Hello".to_owned(),
-            preview: "Hello there".to_owned(),
-            size: 1_000,
-            text: Some("hello there".to_owned()),
-            html: None,
-            body_truncated: false,
-            headers: BTreeMap::new(),
-            attachments: Vec::new(),
-            attachments_truncated: false,
-            raw_s3_key: Some("inbound/x".to_owned()),
-            verdicts: None,
-            thread_snapshot: None,
-            delivery: BTreeMap::new(),
-            send_status: None,
-            sent_at: None,
-            version: 0,
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
-        }
+        sample_message("support", message_id, thread_id)
     }
 
     #[tokio::test]

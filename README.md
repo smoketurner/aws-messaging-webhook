@@ -270,6 +270,40 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
 
 The API is served under the `ApiBaseUrl` output; `InboxIds` lists the configured inboxes.
 
+### Mailbox API
+
+Every `/v0` route needs `Authorization: Bearer <key>`. Reads are implemented; everything else
+answers `501` with a parseable body.
+
+| Route | Returns |
+|---|---|
+| `GET /v0/inboxes` | `{count, limit, inboxes[], next_page_token?}` |
+| `GET /v0/inboxes/{inbox_id}` | one inbox |
+| `GET /v0/inboxes/{inbox_id}/messages` | `{count, limit, messages[], next_page_token?}`, newest first |
+| `GET /v0/inboxes/{inbox_id}/messages/{message_id}` | the full message, including `text`, `html`, `headers` and `references`, which the list view omits |
+| `GET /v0/inboxes/{inbox_id}/threads` | `{count, limit, threads[], next_page_token?}`, by last activity |
+| `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | one thread with its `messages[]` embedded oldest first, paginated independently |
+
+List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (default false),
+`before`, `after`, `labels`, `from`, `to`, `subject`, and the four `include_*` flags
+(`include_spam`, `include_blocked`, `include_unauthenticated`, `include_trash`).
+
+- `before` and `after` are UTC timestamps, accepted either as `2026-01-15T09:30:00.000Z` or
+  `2026-01-15T09:30:00Z`. The window is half-open: `after` includes its own instant, `before`
+  excludes it. Any other offset is rejected rather than read as UTC.
+- `labels`, `from`, `to` and `subject` may repeat. An item must carry *every* requested label;
+  for `from`/`to`/`subject` it must match *any* value of each field given, case-insensitively,
+  as a substring.
+- The `include_*` flags default to false and drop items carrying that label. Naming a label
+  explicitly overrides the flag that would hide it, so `?labels=trash` returns trashed mail.
+- `page_token` is opaque and bound to the partition it was issued for: presenting one to a
+  different inbox is a `400`, not another inbox's data.
+
+Because labels live on the items rather than in per-label index rows, a filtered list reads a
+page and filters it, re-reading up to five times to fill the page. A response can therefore come
+back with fewer than `limit` items *and* a `next_page_token`; that is a normal result, and the
+client follows the token.
+
 ### How the mailbox is wired
 
 - **Topology.** The stack owns two SNS topics, `MailInboundTopicArn` (receipt notifications)
@@ -313,6 +347,10 @@ the same explicit `MailBucketName`, delete the retained bucket first.
 
 - Re-ingesting permanently failed ingests. Deliveries in `MailIngestDlq` aren't replayed
   automatically; their raw MIME stays under `inbound/` until `MailRetentionDays`.
+- Raw-message and attachment downloads (`GET …/messages/{id}/raw` and
+  `…/attachments/{id}`), which need presigned `GetObject` URLs.
+- `PATCH …/messages/{id}` for changing labels, which is how a client marks mail read.
+- Sending (`POST …/messages/send` and `…/reply`).
 
 ## EventBridge contract
 
@@ -483,6 +521,13 @@ Labels live in the message and thread items themselves, not in per-label index r
 filtered by label is served by reading the time-ordered index and filtering the page. That keeps
 ingest to a fixed three writes per message, at the cost of reading past non-matching messages
 when a label is rare.
+
+Two indexes serve the reads. `ByTime` (`gsi1pk`/`gsi1sk`) holds three partition shapes:
+`INBOX#<inbox>#MSG` sorted by message id, `INBOX#<inbox>#THR` sorted by
+`<timestamp>#<threadId>`, and `INBOXES` sorted by inbox id. `ByThread`
+(`gsi2pk`/`gsi2sk`) holds `THREAD#<inbox>#<threadId>` sorted by message id, for a thread's own
+messages. Message ids are UUIDv7s, so sorting by id *is* sorting by time, which is what lets a
+`before`/`after` window become a plain key range.
 
 This release populates only the Inbox, Message and Thread items from inbound ingest.
 The send-state, send-key and SES-reference items the send path adds live on the same table

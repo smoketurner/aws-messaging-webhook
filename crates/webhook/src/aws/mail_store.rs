@@ -52,10 +52,10 @@ impl AwsServices {
     /// post-filtering can stop mid-page.
     async fn query_page<T: serde::de::DeserializeOwned>(
         &self,
-        partition: &str,
-        query: &ListQuery,
+        query: PageQuery<'_>,
         context: &'static str,
     ) -> Result<Page<T>, MailStoreError> {
+        let partition = query.partition;
         let table_name = self.mail_table_name()?.to_owned();
         let index = if partition.starts_with("THREAD#") {
             "ByThread"
@@ -73,19 +73,19 @@ impl AwsServices {
             ":pk".to_owned(),
             DynamoAv::S(partition.to_owned()),
         )]);
-        match (&query.after, &query.before) {
+        match (query.after, query.before) {
             (Some(after), Some(before)) => {
                 condition.push_str(" AND #sk BETWEEN :after AND :before");
-                values.insert(":after".to_owned(), DynamoAv::S(after.clone()));
-                values.insert(":before".to_owned(), DynamoAv::S(before.clone()));
+                values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
+                values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
             }
             (Some(after), None) => {
                 condition.push_str(" AND #sk > :after");
-                values.insert(":after".to_owned(), DynamoAv::S(after.clone()));
+                values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
             }
             (None, Some(before)) => {
                 condition.push_str(" AND #sk < :before");
-                values.insert(":before".to_owned(), DynamoAv::S(before.clone()));
+                values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
             }
             (None, None) => {}
         }
@@ -101,10 +101,10 @@ impl AwsServices {
             .set_expression_attribute_values(Some(values))
             .scan_index_forward(query.ascending)
             .limit(i32::try_from(query.limit).unwrap_or(i32::MAX));
-        if let Some(start) = &query.start {
+        if let Some(start) = query.start {
             request = request
-                .exclusive_start_key("pk", DynamoAv::S(keys::inbox_pk(query.inbox.as_str())))
-                .exclusive_start_key("sk", DynamoAv::S(start.sort.clone()))
+                .exclusive_start_key("pk", DynamoAv::S(start.table_pk.clone()))
+                .exclusive_start_key("sk", DynamoAv::S(start.table_sk.clone()))
                 .exclusive_start_key(pk_attr, DynamoAv::S(start.partition.clone()))
                 .exclusive_start_key(sk_attr, DynamoAv::S(start.sort.clone()));
         }
@@ -114,24 +114,21 @@ impl AwsServices {
             .await
             .map_err(|e| store_error_from_sdk(context, &e))?;
 
+        // The continuation comes from DynamoDB's own LastEvaluatedKey, which
+        // already holds both the index and table keys in the exact form the
+        // next ExclusiveStartKey needs.
+        let next = output
+            .last_evaluated_key
+            .as_ref()
+            .and_then(|key| page_key_from_last_evaluated(key, pk_attr, sk_attr));
+
         let mut items = Vec::new();
-        let mut last_sort = None;
         for item in output.items.unwrap_or_default() {
-            if let Some(DynamoAv::S(sort)) = item.get(sk_attr) {
-                last_sort = Some(sort.clone());
-            }
             items.push(
                 serde_dynamo::from_item(item)
                     .map_err(|e| MailStoreError::Permanent(anyhow!("{context}: {e}")))?,
             );
         }
-        // Only hand back a continuation when DynamoDB says there is more.
-        let next = output.last_evaluated_key.and_then(|_| {
-            last_sort.map(|sort| PageKey {
-                partition: partition.to_owned(),
-                sort,
-            })
-        });
         Ok(Page { items, next })
     }
 
@@ -166,6 +163,55 @@ impl AwsServices {
                 .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}"))),
         }
     }
+}
+
+/// One page of one index partition, independent of which collection is being
+/// listed: inboxes are not inbox-scoped, so this carries the partition rather
+/// than deriving it from a [`ListQuery`]'s inbox.
+struct PageQuery<'a> {
+    partition: &'a str,
+    limit: usize,
+    before: Option<&'a str>,
+    after: Option<&'a str>,
+    ascending: bool,
+    start: Option<&'a PageKey>,
+}
+
+impl<'a> PageQuery<'a> {
+    /// The inbox-scoped case: a [`ListQuery`] aimed at `partition`.
+    fn scoped(partition: &'a str, query: &'a ListQuery) -> Self {
+        Self {
+            partition,
+            limit: query.limit,
+            before: query.before.as_deref(),
+            after: query.after.as_deref(),
+            ascending: query.ascending,
+            start: query.start.as_ref(),
+        }
+    }
+}
+
+/// Turns a `LastEvaluatedKey` into a [`PageKey`].
+///
+/// Returns `None` when any of the four attributes is missing or is not a
+/// string, which would make the continuation unusable; the caller then
+/// reports the page as the last one rather than handing back a token that
+/// would fail on presentation.
+fn page_key_from_last_evaluated(
+    key: &HashMap<String, DynamoAv>,
+    pk_attr: &str,
+    sk_attr: &str,
+) -> Option<PageKey> {
+    let string = |name: &str| match key.get(name) {
+        Some(DynamoAv::S(value)) => Some(value.clone()),
+        _ => None,
+    };
+    Some(PageKey {
+        partition: string(pk_attr)?,
+        sort: string(sk_attr)?,
+        table_pk: string("pk")?,
+        table_sk: string("sk")?,
+    })
 }
 
 /// Maps an SDK failure to the mail-store retry policy: network faults,
@@ -511,6 +557,16 @@ impl MailStore for AwsServices {
             "sk".to_owned(),
             DynamoAv::S(keys::inbox_sk().to_owned()).into(),
         );
+        // Every inbox shares one index partition so `GET /v0/inboxes` is a
+        // single query; there are few enough inboxes for that to stay cheap.
+        item.inner_mut().insert(
+            "gsi1pk".to_owned(),
+            DynamoAv::S(keys::inboxes_partition().to_owned()).into(),
+        );
+        item.inner_mut().insert(
+            "gsi1sk".to_owned(),
+            DynamoAv::S(inbox.as_str().to_owned()).into(),
+        );
 
         let mut builder = self.dynamo.put_item().table_name(table_name.clone());
         for (name, value) in item.inner() {
@@ -697,14 +753,35 @@ impl MailStore for AwsServices {
         }
     }
 
+    async fn list_inboxes(
+        &self,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> Result<Page<Inbox>, MailStoreError> {
+        self.query_page(
+            PageQuery {
+                partition: keys::inboxes_partition(),
+                limit,
+                before: None,
+                after: None,
+                ascending: true,
+                start: start.as_ref(),
+            },
+            "listing inboxes",
+        )
+        .await
+    }
+
     async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
         let partition = format!("INBOX#{}#MSG", query.inbox.as_str());
-        self.query_page(&partition, query, "listing messages").await
+        self.query_page(PageQuery::scoped(&partition, query), "listing messages")
+            .await
     }
 
     async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
         let partition = format!("INBOX#{}#THR", query.inbox.as_str());
-        self.query_page(&partition, query, "listing threads").await
+        self.query_page(PageQuery::scoped(&partition, query), "listing threads")
+            .await
     }
 
     async fn get_thread(
@@ -733,16 +810,16 @@ impl MailStore for AwsServices {
 
         // Messages of one thread, oldest first: ByThread is keyed by the
         // message id, which orders by time.
+        let partition = format!("THREAD#{}#{}", inbox.as_str(), thread_id);
         let messages = self
             .query_page(
-                &format!("THREAD#{}#{}", inbox.as_str(), thread_id),
-                &ListQuery {
-                    inbox: inbox.clone(),
+                PageQuery {
+                    partition: &partition,
                     limit,
                     before: None,
                     after: None,
                     ascending: true,
-                    start,
+                    start: start.as_ref(),
                 },
                 "listing thread messages",
             )

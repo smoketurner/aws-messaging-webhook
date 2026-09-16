@@ -13,12 +13,14 @@
 pub mod auth;
 pub mod error;
 pub mod keys;
+pub mod pagination;
+pub mod read;
 pub mod unimplemented;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{any, delete, post};
+use axum::routing::{any, delete, get, post};
 
 use crate::api::unimplemented::{method_not_allowed, not_implemented, unknown_route};
 use crate::state::{AppState, Services};
@@ -28,6 +30,22 @@ use crate::state::{AppState, Services};
 /// exist.
 pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
     Router::new()
+        // Reads.
+        .route("/inboxes", get(read::list_inboxes::<T>))
+        .route("/inboxes/{inbox_id}", get(read::get_inbox::<T>))
+        .route(
+            "/inboxes/{inbox_id}/messages",
+            get(read::list_messages::<T>),
+        )
+        .route(
+            "/inboxes/{inbox_id}/messages/{message_id}",
+            get(read::get_message::<T>),
+        )
+        .route("/inboxes/{inbox_id}/threads", get(read::list_threads::<T>))
+        .route(
+            "/inboxes/{inbox_id}/threads/{thread_id}",
+            get(read::get_thread::<T>),
+        )
         // Resource groups this service does not implement.
         .route("/inboxes/{inbox_id}/drafts", any(not_implemented))
         .route("/inboxes/{inbox_id}/drafts/{*rest}", any(not_implemented))

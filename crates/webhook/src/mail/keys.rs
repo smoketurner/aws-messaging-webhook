@@ -16,6 +16,13 @@ pub fn inbox_sk() -> &'static str {
     "META"
 }
 
+/// The index partition holding every inbox, so listing them is one query
+/// rather than a table scan.
+#[must_use]
+pub fn inboxes_partition() -> &'static str {
+    "INBOXES"
+}
+
 #[must_use]
 pub fn message_sk(message_id: &str) -> String {
     format!("MSG#{message_id}")
@@ -83,12 +90,22 @@ pub fn ses_call_sk() -> &'static str {
     "CALL"
 }
 
-/// A decoded `before`/`after`/page-token key: the partition it was issued for
-/// plus the sort key of the boundary item.
+/// A decoded page-token key: where in an index to resume.
+///
+/// Both halves are needed. A `Query` against a secondary index takes an
+/// `ExclusiveStartKey` holding the index's own key *and* the table's key for
+/// the same item, because the index's key is not unique on its own. Carrying
+/// the table key here keeps it exact rather than re-derived from the sort
+/// value, whose shape differs per index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageKey {
+    /// The index partition the token was issued for, re-validated against the
+    /// request that presents it.
     pub partition: String,
+    /// The index sort key of the last returned item.
     pub sort: String,
+    pub table_pk: String,
+    pub table_sk: String,
 }
 
 /// The opaque page token: base64url JSON of the last *returned* item's
@@ -98,6 +115,8 @@ pub struct PageKey {
 struct PageTokenPayload {
     partition: String,
     sort: String,
+    table_pk: String,
+    table_sk: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -116,6 +135,8 @@ pub fn encode_page_token(key: &PageKey) -> String {
     let payload = PageTokenPayload {
         partition: key.partition.clone(),
         sort: key.sort.clone(),
+        table_pk: key.table_pk.clone(),
+        table_sk: key.table_sk.clone(),
     };
     // Infallible: `PageTokenPayload` is plain owned strings.
     #[expect(
@@ -141,6 +162,8 @@ pub fn decode_page_token(token: &str, expected_partition: &str) -> Result<PageKe
     Ok(PageKey {
         partition: payload.partition,
         sort: payload.sort,
+        table_pk: payload.table_pk,
+        table_sk: payload.table_sk,
     })
 }
 
@@ -166,6 +189,8 @@ mod tests {
         let key = PageKey {
             partition: "INBOX#support#MSG".to_owned(),
             sort: "mid-9".to_owned(),
+            table_pk: "INBOX#support".to_owned(),
+            table_sk: "MSG#mid-9".to_owned(),
         };
         let token = encode_page_token(&key);
         let decoded = decode_page_token(&token, &key.partition).unwrap();
@@ -177,6 +202,8 @@ mod tests {
         let key = PageKey {
             partition: "INBOX#support#MSG".to_owned(),
             sort: "mid-9".to_owned(),
+            table_pk: "INBOX#support".to_owned(),
+            table_sk: "MSG#mid-9".to_owned(),
         };
         let token = encode_page_token(&key);
         assert!(decode_page_token(&token, "INBOX#billing#MSG").is_err());
@@ -194,8 +221,10 @@ mod tests {
         fn page_token_round_trip_holds_for_any_strings(
             partition in "[A-Za-z0-9#_-]{1,80}",
             sort in "[A-Za-z0-9#_-]{1,80}",
+            table_pk in "[A-Za-z0-9#_-]{1,80}",
+            table_sk in "[A-Za-z0-9#_-]{1,80}",
         ) {
-            let key = PageKey { partition: partition.clone(), sort };
+            let key = PageKey { partition: partition.clone(), sort, table_pk, table_sk };
             let token = encode_page_token(&key);
             prop_assert_eq!(decode_page_token(&token, &partition).unwrap(), key);
         }

@@ -189,6 +189,12 @@ pub struct Thread {
     pub updated_at: String,
     pub created_at: String,
     pub messages: Vec<Message>,
+    /// The embedded `messages` are paginated independently of the thread
+    /// list, so a long thread stays within one response.
+    pub count: usize,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received_timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,6 +205,41 @@ pub struct Thread {
     pub preview: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+}
+
+impl Thread {
+    /// Builds the full thread view: its rolled-up state plus one page of its
+    /// messages, oldest first.
+    #[must_use]
+    pub fn new(
+        thread: &crate::mail::thread::ThreadState,
+        messages: Vec<Message>,
+        limit: usize,
+        next_page_token: Option<String>,
+    ) -> Self {
+        Self {
+            inbox_id: thread.inbox_id.as_str().to_owned(),
+            thread_id: thread.thread_id.clone(),
+            labels: thread.labels.clone(),
+            timestamp: thread.timestamp.clone(),
+            senders: thread.senders.clone(),
+            recipients: thread.recipients.clone(),
+            last_message_id: thread.last_message_id.clone(),
+            message_count: thread.message_count,
+            size: thread.size,
+            updated_at: thread.updated_at.clone(),
+            created_at: thread.created_at.clone(),
+            count: messages.len(),
+            messages,
+            limit,
+            next_page_token,
+            received_timestamp: thread.received_timestamp.clone(),
+            sent_timestamp: thread.sent_timestamp.clone(),
+            subject: (!thread.subject.is_empty()).then(|| thread.subject.clone()),
+            preview: (!thread.preview.is_empty()).then(|| thread.preview.clone()),
+            attachments: thread.attachments.iter().map(Attachment::from).collect(),
+        }
+    }
 }
 
 /// The list view: the same fields as [`Thread`] minus the embedded
@@ -274,6 +315,67 @@ impl From<&crate::mail::Inbox> for Inbox {
             metadata: inbox.metadata.clone(),
         }
     }
+}
+
+/// The list envelope. `count` is the number of items in *this* page, not a
+/// total: counting every match would mean reading the whole partition.
+/// `next_page_token` is absent on the last page.
+///
+/// Each collection gets its own type because the contract names the array
+/// after the collection (`inboxes`, `messages`, `threads`) rather than using
+/// a shared key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboxList {
+    pub count: usize,
+    pub limit: usize,
+    pub inboxes: Vec<Inbox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageList {
+    pub count: usize,
+    pub limit: usize,
+    pub messages: Vec<MessageItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreadList {
+    pub count: usize,
+    pub limit: usize,
+    pub threads: Vec<ThreadItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+/// A presigned download: the raw MIME of a message, or one attachment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Download {
+    pub download_url: String,
+    pub expires_at: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_disposition: Option<ContentDisposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+}
+
+/// The `PATCH …/messages/{id}` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageLabels {
+    pub message_id: String,
+    pub labels: Vec<String>,
 }
 
 #[cfg(test)]

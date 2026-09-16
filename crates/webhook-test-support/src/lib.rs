@@ -133,6 +133,14 @@ impl MailStore for FakeServices {
         self.mail.get_message(inbox, message_id).await
     }
 
+    async fn list_inboxes(
+        &self,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> Result<Page<Inbox>, MailStoreError> {
+        self.mail.list_inboxes(limit, start).await
+    }
+
     async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
         self.mail.list_messages(query).await
     }

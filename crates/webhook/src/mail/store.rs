@@ -92,6 +92,14 @@ pub trait MailStore: Send + Sync {
         message_id: &str,
     ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send;
 
+    /// Lists every inbox, ordered by id. Inboxes are few and not
+    /// inbox-scoped, so this takes only a page size and a continuation.
+    fn list_inboxes(
+        &self,
+        limit: usize,
+        start: Option<PageKey>,
+    ) -> impl Future<Output = Result<Page<Inbox>, MailStoreError>> + Send;
+
     /// Lists an inbox's messages newest-first by default, from the time-ordered
     /// index. Label and substring filters are applied by the caller on the
     /// returned page, so this returns whatever the bounds select.
