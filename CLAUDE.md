@@ -94,8 +94,10 @@ Two workspace crates:
   real router with properly signed envelopes against one `FakeServices` implementing the
   `Services` trait (`state.rs` — the single bound aggregating `EventStore + PublishEvents +
   SmsVoiceApi + SesApi`). New downstream calls go through that trait so tests stay AWS-free.
-- SNS topics and subscriptions deliberately live outside the SAM stack; `template.yaml` maps
-  CloudFormation parameters to the env vars `config.rs` reads.
+- SNS topics and subscriptions deliberately live outside the SAM stack, except the two
+  stack-owned mail topics (SES receipts and SES configuration-set events, created only when
+  `MailDomain` is set); `template.yaml` maps CloudFormation parameters to the env vars
+  `config.rs` reads.
 
 ## Dependencies
 
