@@ -1,9 +1,10 @@
-//! The mail table store trait.
+//! The mail table store trait: every read and write the mailbox performs.
 //!
-//! Holds the methods ingest needs (`get_inbox`, `ensure_inbox`,
-//! `message_exists`, `resolve_rfc_ids`, `insert_message`, `get_message`) and
-//! the read-API queries (`list_messages`, `list_threads`, `get_thread`). The
-//! send/outbox methods arrive with the sending phase.
+//! Three groups. Ingest (`get_inbox`, `ensure_inbox`, `message_exists`,
+//! `resolve_rfc_ids`, `insert_message`, `get_message`), the read API
+//! (`list_inboxes`, `list_messages`, `list_threads`, `get_thread`,
+//! `update_labels`), and sending (`enqueue_send`, `claim_send`, `mark_send`
+//! and the queries the sweep uses).
 //!
 //! The list queries read the time-ordered index rather than per-label
 //! partitions: one inbox's volume doesn't justify the write amplification of

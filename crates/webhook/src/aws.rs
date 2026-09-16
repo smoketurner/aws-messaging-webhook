@@ -36,10 +36,9 @@ pub struct AwsServices {
     events: aws_sdk_eventbridge::Client,
     sms: aws_sdk_pinpointsmsvoicev2::Client,
     ses: aws_sdk_sesv2::Client,
-    /// Mail bodies and attachments (`MailConfig.bucket`). Unused until
-    /// tracks A/B implement `MailStore`/`ObjectStore` for real; constructed
-    /// unconditionally since it is cheap and `MailConfig` is per-invocation
-    /// optional, not per-client.
+    /// Mail bodies and attachments (`MailConfig.bucket`). Constructed
+    /// unconditionally: it is cheap, and whether mail is configured is a
+    /// per-invocation question rather than a per-client one.
     s3: aws_sdk_s3::Client,
     /// Reads the `SecureString` holding the API key hashes.
     ssm: aws_sdk_ssm::Client,

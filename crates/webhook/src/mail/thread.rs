@@ -1,7 +1,8 @@
 //! Thread resolution and the versioned read-modify-write state.
 //!
-//! Reply derivation (`Re:` subjects, `reply_all` exclusion, `ses_rfc_ids`
-//! composition) is P3 and added when track K lands.
+//! A thread is computed in Rust from a consistent read and written back
+//! version-conditioned, in the same transaction as whatever changed it, so
+//! two messages arriving at once cannot each overwrite the other's effect.
 
 use std::collections::BTreeMap;
 

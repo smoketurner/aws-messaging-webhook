@@ -2,7 +2,8 @@
 //! send specs. The bucket is always `MailConfig.bucket` — never a parameter,
 //! so no caller can address another bucket.
 //!
-//! `copy_object` and `delete_object` arrive with the sending phase.
+//! Objects are written once and never modified, so there is no update or
+//! delete here: retention removes them on the bucket's own schedule.
 
 use std::future::Future;
 use std::time::Duration;

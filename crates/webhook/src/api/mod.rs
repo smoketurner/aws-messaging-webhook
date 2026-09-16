@@ -67,8 +67,8 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
         .route("/domains/{*rest}", any(not_implemented))
         .route("/webhooks", any(not_implemented))
         .route("/webhooks/{*rest}", any(not_implemented))
-        // Phase-4 method/path pairs: the same paths serve real reads later,
-        // so only these methods answer 501.
+        // These paths already serve real reads, so only the methods this
+        // service does not implement answer 501.
         .route("/inboxes", post(not_implemented))
         .route("/inboxes/{inbox_id}", delete(not_implemented))
         .route(

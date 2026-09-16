@@ -1,4 +1,8 @@
-//! Validating a send request.
+//! Queuing outbound mail: `POST …/messages/send` and `…/{id}/reply`.
+//!
+//! Both validate, upload the message's parts and spec to the outbox, and
+//! commit a queued message — they never call SES. The sender does that from
+//! the table's stream.
 //!
 //! Everything a caller supplies is checked here, before anything is uploaded
 //! or queued, and every problem is reported at once rather than one per
