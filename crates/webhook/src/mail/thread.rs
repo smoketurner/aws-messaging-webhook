@@ -217,6 +217,44 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     next
 }
 
+/// Applies one message's label change to its thread.
+///
+/// `label_counts` is how many of the thread's messages carry each label, so a
+/// label leaves the thread's union only when its last carrier gives it up.
+///
+/// The thread's `timestamp` deliberately does not move: relabelling a message
+/// is not new activity, and the timestamp is the thread list's sort key, so
+/// touching it would jump the thread to the top of every list.
+#[must_use]
+pub fn apply_label_patch(
+    existing: &ThreadState,
+    added: &[String],
+    removed: &[String],
+    now: &str,
+) -> ThreadState {
+    let mut next = existing.clone();
+
+    for label in added {
+        add_label(&mut next.labels, label);
+        *next.label_counts.entry(label.clone()).or_insert(0) += 1;
+    }
+
+    for label in removed {
+        let Some(count) = next.label_counts.get_mut(label) else {
+            continue;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            next.label_counts.remove(label);
+            next.labels.retain(|existing| existing != label);
+        }
+    }
+
+    next.version += 1;
+    now.clone_into(&mut next.updated_at);
+    next
+}
+
 /// Builds the message-embedded snapshot from the thread's full state,
 /// capping `senders`/`recipients` at [`THREAD_SNAPSHOT_ADDRESS_CAP`] (lower
 /// than the thread's own [`THREAD_ADDRESS_SET_CAP`]).

@@ -522,6 +522,82 @@ impl MailStore for MailMemoryStore {
         std::future::ready(result)
     }
 
+    fn update_labels(
+        &self,
+        inbox: &InboxId,
+        message_id: &str,
+        add: &[String],
+        remove: &[String],
+        now: &str,
+    ) -> impl Future<Output = Result<Option<Vec<String>>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        use aws_messaging_webhook::mail::plan::plan_patch;
+        use aws_messaging_webhook::mail::thread::apply_label_patch;
+
+        let result = (|| {
+            for _attempt in 0..=MAX_RETRIES {
+                let Some(item) = self.get_item(
+                    &keys::inbox_pk(inbox.as_str()),
+                    &keys::message_sk(message_id),
+                ) else {
+                    return Ok(None);
+                };
+                let msg: MailMessage = serde_dynamo::from_item(item).map_err(|e| {
+                    MailStoreError::Permanent(anyhow::anyhow!("deserializing message: {e}"))
+                })?;
+                let Some(thread_item) = self.get_item(
+                    &keys::inbox_pk(inbox.as_str()),
+                    &keys::thread_sk(&msg.thread_id),
+                ) else {
+                    return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                        "message {message_id} refers to a thread that does not exist"
+                    )));
+                };
+                let thread_before: ThreadState =
+                    serde_dynamo::from_item(thread_item).map_err(|e| {
+                        MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
+                    })?;
+
+                let mut new_labels = msg.labels.clone();
+                let mut added = Vec::new();
+                for label in add {
+                    if !new_labels.iter().any(|existing| existing == label) {
+                        new_labels.push(label.clone());
+                        added.push(label.clone());
+                    }
+                }
+                let mut removed = Vec::new();
+                for label in remove {
+                    if new_labels.iter().any(|existing| existing == label) {
+                        new_labels.retain(|existing| existing != label);
+                        removed.push(label.clone());
+                    }
+                }
+                new_labels.sort();
+
+                if added.is_empty() && removed.is_empty() {
+                    return Ok(Some(new_labels));
+                }
+
+                let thread_after = apply_label_patch(&thread_before, &added, &removed, now);
+                let ops = plan_patch(&msg, &new_labels, &thread_before, &thread_after, now)?;
+                match self.attempt(&ops)? {
+                    Commit::Applied => return Ok(Some(new_labels)),
+                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                    Commit::Cancelled(
+                        TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::Duplicate,
+                    ) => {
+                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                            "label patch for message {message_id} was cancelled"
+                        )));
+                    }
+                }
+            }
+            Err(MailStoreError::Conflict)
+        })();
+        std::future::ready(result)
+    }
+
     fn get_message(
         &self,
         inbox: &InboxId,

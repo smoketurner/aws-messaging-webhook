@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod error;
 pub mod keys;
+pub mod labels;
 pub mod pagination;
 pub mod read;
 pub mod unimplemented;
@@ -39,7 +40,7 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
         )
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}",
-            get(read::get_message::<T>),
+            get(read::get_message::<T>).patch(labels::update_labels::<T>),
         )
         .route("/inboxes/{inbox_id}/threads", get(read::list_threads::<T>))
         .route(

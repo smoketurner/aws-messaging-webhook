@@ -280,7 +280,7 @@ pub async fn get_thread<T: Services>(
 /// Maps a store failure onto the API's retry contract: a throttled or
 /// unreachable table is a 502 the client may retry, and anything else is a
 /// 500. Neither leaks the underlying error to the caller.
-fn store_failure(error: MailStoreError) -> ApiError {
+pub(crate) fn store_failure(error: MailStoreError) -> ApiError {
     match error {
         MailStoreError::NotFound => ApiError::NotFound,
         MailStoreError::InvalidPageToken => {

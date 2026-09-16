@@ -92,6 +92,21 @@ pub trait MailStore: Send + Sync {
         message_id: &str,
     ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send;
 
+    /// Adds and removes labels on one message, updating its thread's union in
+    /// the same transaction. Returns the message's resulting labels, or
+    /// `None` when the inbox holds no such message.
+    ///
+    /// `add` and `remove` are already validated and sorted; a label in both
+    /// is the caller's problem to reject, not this method's to arbitrate.
+    fn update_labels(
+        &self,
+        inbox: &InboxId,
+        message_id: &str,
+        add: &[String],
+        remove: &[String],
+        now: &str,
+    ) -> impl Future<Output = Result<Option<Vec<String>>, MailStoreError>> + Send;
+
     /// Lists every inbox, ordered by id. Inboxes are few and not
     /// inbox-scoped, so this takes only a page size and a continuation.
     fn list_inboxes(

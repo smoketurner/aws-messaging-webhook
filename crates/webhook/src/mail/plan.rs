@@ -170,6 +170,66 @@ pub fn plan_insert(
     Ok(ops)
 }
 
+/// Plans a label change: the message's new label set and its thread's
+/// recomputed union, both version-conditioned on what the caller read.
+///
+/// The message is an `Update` rather than a `Put` so a concurrent write to
+/// any other attribute survives; only `labels`, `version` and `updated_at`
+/// are touched. An empty label set removes the attribute, because DynamoDB
+/// has no empty string set.
+///
+/// # Errors
+///
+/// [`MailStoreError::LabelLimit`] when the thread's union would exceed
+/// [`THREAD_LABEL_TOTAL_CAP`].
+pub fn plan_patch(
+    msg: &MailMessage,
+    new_labels: &[String],
+    thread_before: &ThreadState,
+    thread_after: &ThreadState,
+    now: &str,
+) -> Result<Vec<PlannedOp>, MailStoreError> {
+    if thread_after.labels.len() > THREAD_LABEL_TOTAL_CAP {
+        return Err(MailStoreError::LabelLimit(format!(
+            "thread {} would carry {} labels, over the cap of {THREAD_LABEL_TOTAL_CAP}",
+            thread_after.thread_id,
+            thread_after.labels.len(),
+        )));
+    }
+    debug_assert!(
+        is_sorted_and_deduped(new_labels),
+        "message labels must be sorted and deduplicated before planning"
+    );
+
+    let mut set = vec![
+        (
+            "version".to_owned(),
+            AttributeValue::N((msg.version + 1).to_string()),
+        ),
+        ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
+    ];
+    let mut remove = Vec::new();
+    if new_labels.is_empty() {
+        remove.push("labels".to_owned());
+    } else {
+        set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
+    }
+
+    Ok(vec![
+        PlannedOp {
+            role: OpRole::Message,
+            op: WriteOp::Update {
+                pk: keys::inbox_pk(msg.inbox_id.as_str()),
+                sk: keys::message_sk(&msg.message_id),
+                set,
+                remove,
+                cond: Cond::VersionEquals(msg.version),
+            },
+        },
+        thread_put(Some(thread_before), thread_after)?,
+    ])
+}
+
 /// Builds the message item's `Put`. For an inbound message the
 /// `thread_snapshot` is populated here from `thread_after` — the
 /// caller-computed thread state that already includes this message — on a

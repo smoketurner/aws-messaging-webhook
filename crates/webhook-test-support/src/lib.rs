@@ -141,6 +141,19 @@ impl MailStore for FakeServices {
         self.mail.list_inboxes(limit, start).await
     }
 
+    async fn update_labels(
+        &self,
+        inbox: &InboxId,
+        message_id: &str,
+        add: &[String],
+        remove: &[String],
+        now: &str,
+    ) -> Result<Option<Vec<String>>, MailStoreError> {
+        self.mail
+            .update_labels(inbox, message_id, add, remove, now)
+            .await
+    }
+
     async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
         self.mail.list_messages(query).await
     }

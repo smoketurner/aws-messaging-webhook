@@ -283,6 +283,14 @@ answers `501` with a parseable body.
 | `GET /v0/inboxes/{inbox_id}/messages/{message_id}` | the full message, including `text`, `html`, `headers` and `references`, which the list view omits |
 | `GET /v0/inboxes/{inbox_id}/threads` | `{count, limit, threads[], next_page_token?}`, by last activity |
 | `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | one thread with its `messages[]` embedded oldest first, paginated independently |
+| `PATCH /v0/inboxes/{inbox_id}/messages/{message_id}` | `{message_id, labels}` after applying `add_labels`/`remove_labels` |
+
+`PATCH` takes `{"add_labels": …, "remove_labels": …}`, each either one label or a list. Labels
+are lowercased, trimmed and deduplicated. There is no "mark as read" endpoint: removing the
+`unread` label is how a client marks mail read. The labels the service sets itself — everything
+except `unread`, `spam`, `trash` and your own — are rejected with a `400`, as is a label given in
+both fields. A message's thread keeps a label until the last message carrying it gives it up, and
+relabelling does not count as thread activity, so it doesn't reorder a thread list.
 
 List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (default false),
 `before`, `after`, `labels`, `from`, `to`, `subject`, and the four `include_*` flags
@@ -349,7 +357,6 @@ the same explicit `MailBucketName`, delete the retained bucket first.
   automatically; their raw MIME stays under `inbound/` until `MailRetentionDays`.
 - Raw-message and attachment downloads (`GET …/messages/{id}/raw` and
   `…/attachments/{id}`), which need presigned `GetObject` URLs.
-- `PATCH …/messages/{id}` for changing labels, which is how a client marks mail read.
 - Sending (`POST …/messages/send` and `…/reply`).
 
 ## EventBridge contract

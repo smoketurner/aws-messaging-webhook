@@ -26,7 +26,7 @@ use crate::aws::{self, AwsServices};
 use crate::mail::keys::{self, PageKey};
 use crate::mail::plan::{Check, Cond, PlannedOp, TxnKind, WriteOp};
 use crate::mail::store::{ListQuery, MailStore, MailStoreError, Page, ThreadView};
-use crate::mail::thread::{ThreadState, apply_message, new_thread};
+use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
 use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
@@ -751,6 +751,75 @@ impl MailStore for AwsServices {
                 .map(Some)
                 .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing message: {e}"))),
         }
+    }
+
+    async fn update_labels(
+        &self,
+        inbox: &InboxId,
+        message_id: &str,
+        add: &[String],
+        remove: &[String],
+        now: &str,
+    ) -> Result<Option<Vec<String>>, MailStoreError> {
+        for _attempt in 0..=MAX_TXN_RETRIES {
+            // Re-read both items on every attempt: a retry means someone
+            // else moved a version, so the previous computation is stale.
+            let Some(msg) = self.get_message(inbox, message_id).await? else {
+                return Ok(None);
+            };
+            let Some(thread_before) = self.get_thread_state(inbox, &msg.thread_id).await? else {
+                return Err(MailStoreError::Permanent(anyhow!(
+                    "message {message_id} refers to thread {}, which does not exist",
+                    msg.thread_id
+                )));
+            };
+
+            let mut new_labels = msg.labels.clone();
+            let mut actually_added = Vec::new();
+            for label in add {
+                if !new_labels.iter().any(|existing| existing == label) {
+                    new_labels.push(label.clone());
+                    actually_added.push(label.clone());
+                }
+            }
+            let mut actually_removed = Vec::new();
+            for label in remove {
+                if new_labels.iter().any(|existing| existing == label) {
+                    new_labels.retain(|existing| existing != label);
+                    actually_removed.push(label.clone());
+                }
+            }
+            new_labels.sort();
+
+            // Nothing to do: report the current labels rather than spending a
+            // transaction and a version bump on a no-op.
+            if actually_added.is_empty() && actually_removed.is_empty() {
+                return Ok(Some(new_labels));
+            }
+
+            let thread_after =
+                apply_label_patch(&thread_before, &actually_added, &actually_removed, now);
+            let ops = crate::mail::plan::plan_patch(
+                &msg,
+                &new_labels,
+                &thread_before,
+                &thread_after,
+                now,
+            )?;
+
+            match self.attempt_transaction(TxnKind::Patch, &ops).await? {
+                Attempt::Committed => return Ok(Some(new_labels)),
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(
+                    TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::Duplicate,
+                ) => {
+                    return Err(MailStoreError::Permanent(anyhow!(
+                        "label patch for message {message_id} was cancelled"
+                    )));
+                }
+            }
+        }
+        Err(MailStoreError::Conflict)
     }
 
     async fn list_inboxes(
