@@ -1,0 +1,20 @@
+From: Alice Sender <alice@example.com>
+To: Bob Recipient <bob@example.com>
+Subject: Inline image with Content-ID
+Date: Mon, 1 Sep 2025 10:10:00 +0000
+Message-ID: <cid-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="rel-boundary"
+
+--rel-boundary
+Content-Type: text/html; charset=utf-8
+
+<p>See attached: <img src="cid:logo123"></p>
+--rel-boundary
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <logo123>
+Content-Disposition: inline; filename="logo.png"
+
+aGVsbG8gd29ybGQ=
+--rel-boundary--

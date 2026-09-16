@@ -18,6 +18,15 @@
 //! The stream event is deserialized with `aws_lambda_events::dynamodb` and its
 //! images with `serde_dynamo`, so the typed `AttributeValue`s (including the
 //! base64 binary `raw_body`) are decoded by the library rather than by hand.
+//!
+//! The same consumer also relays the mail table's stream: its
+//! items are told apart from the events-table's by `sk` prefix (`MSG#` for a
+//! message item; every other mail-table `sk` — `STATE`, `META`, `THR#…`,
+//! `MSGAT#…`, `THRAT#…`, `RFC`, `SESMSG#…`, `SENDKEY#…`, `SESCALL#…` — never
+//! publishes in P1). A `MSG#` image deserializes straight into
+//! [`crate::mail::MailMessage`] via `serde_dynamo::from_item`, never by
+//! hand-parsing the attribute JSON, so [`crate::mail::events::build_mail_events`]
+//! works from the same struct the store reads and writes.
 
 use aws_lambda_events::dynamodb::Event;
 use axum::body::Bytes;
@@ -25,6 +34,8 @@ use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
+use crate::mail::MailMessage;
+use crate::mail::events::build_mail_events;
 use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
 use crate::publish::{OutboundEvent, SCHEMA_VERSION, build_outbound};
@@ -32,7 +43,7 @@ use crate::state::{AppState, Services};
 use crate::store::EventRecord;
 
 /// Reads a DynamoDB `String` attribute from a stream image.
-fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
+pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
     match image.get(key) {
         Some(AttributeValue::S(value)) => Some(value.as_str()),
         _ => None,
@@ -103,7 +114,19 @@ pub async fn handle_stream<T: Services>(
             // current_status transitions (INSERT of the first status, or a
             // MODIFY that changes it) — not on count-only bumps.
             publish_status_changed(state, new_image, &record.change.old_image).await
+        } else if sk.starts_with("MSG#") {
+            // Mail-table message item. Only an INSERT with a `received`
+            // label publishes in P1; a MODIFY (labels-only, promotion
+            // repoints, metadata writes) never diffs `labels`, so it settles
+            // without publishing.
+            if record.event_name != "INSERT" {
+                continue;
+            }
+            publish_mail_record(state, new_image).await
         } else {
+            // Every other mail-table item (STATE, META, THR#…, MSGAT#…,
+            // THRAT#…, RFC, SESMSG#…, SENDKEY#…, SESCALL#…) never matches the
+            // relay filter in production and never publishes here.
             continue;
         };
         // Reconstruction / no-op cases settle without a retry; only a
@@ -183,6 +206,58 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
             RelayOutcome::Retry
         }
     }
+}
+
+/// Publishes the `message.received*` event(s) for one `MSG#` mail-table
+/// INSERT image. Returns [`RelayOutcome::Retry`] on a transient publish
+/// failure; a deserialization failure is a deterministic bug (not a
+/// transient fault), so it is logged and returns [`RelayOutcome::Settled`]
+/// (an INSERT's absent or empty `OldImage` is never read here, so it can't
+/// cause this).
+async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
+    let msg: MailMessage = match serde_dynamo::from_item(image.clone()) {
+        Ok(msg) => msg,
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                event = "stream_bad_mail_image",
+                "mail-table MSG# image did not deserialize into MailMessage"
+            );
+            return RelayOutcome::Settled;
+        }
+    };
+
+    let events = build_mail_events(&msg, &state.config.event_source);
+    let mut outcome = RelayOutcome::Settled;
+    for event in events {
+        let outbound = OutboundEvent {
+            detail_type: event.detail_type.to_owned(),
+            detail: event.detail,
+        };
+        match state.services.publish(&outbound).await {
+            Ok(()) => {
+                metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
+                tracing::info!(
+                    inbox_id = msg.inbox_id.as_str(),
+                    message_id = msg.message_id,
+                    detail_type = outbound.detail_type,
+                    outcome = "published",
+                    "mail event published to EventBridge"
+                );
+            }
+            Err(error) => {
+                metrics::counter!(names::PUBLISH_FAILURES).increment(1);
+                tracing::error!(
+                    ?error,
+                    message_id = msg.message_id,
+                    event = "publish_failure",
+                    "failed to publish mail event to EventBridge; will retry"
+                );
+                outcome = RelayOutcome::Retry;
+            }
+        }
+    }
+    outcome
 }
 
 /// Publishes a `message.status.changed` event when the per-message aggregate's

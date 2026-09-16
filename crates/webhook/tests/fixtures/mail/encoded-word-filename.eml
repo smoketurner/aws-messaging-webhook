@@ -1,0 +1,19 @@
+From: Alice Sender <alice@example.com>
+To: Bob Recipient <bob@example.com>
+Subject: Encoded filename attachment
+Date: Mon, 1 Sep 2025 10:25:00 +0000
+Message-ID: <encoded-name-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="enc-boundary"
+
+--enc-boundary
+Content-Type: text/plain; charset=utf-8
+
+See the attached file.
+--enc-boundary
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename*=UTF-8''%C3%A9t%C3%A9.pdf
+
+aGVsbG8gd29ybGQ=
+--enc-boundary--

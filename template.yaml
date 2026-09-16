@@ -4,6 +4,7 @@ Description: >-
   Webhook receiver for AWS End User Messaging and SES events delivered over
   SNS: verifies signatures, persists an event-sourced record to DynamoDB,
   performs lifecycle actions, and re-publishes to an EventBridge bus.
+  Optionally hosts a mailbox on SES (MailDomain).
 
 Parameters:
   Stage:
@@ -16,7 +17,9 @@ Parameters:
   LogLevel:
     Type: String
     Default: INFO
-    AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR]
+    # No TRACE: at TRACE the Lambda runtime logs raw invoke payloads and the
+    # AWS SDK logs full requests and responses, which leaks secrets.
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
   AllowedTopics:
     Type: String
     Default: ""
@@ -56,12 +59,133 @@ Parameters:
       query the events table directly (e.g. to fetch a record whose EventBridge
       payload was omitted for size). Empty (the default) creates no role and
       grants no cross-account access.
+  MailDomain:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^([a-z0-9-]+\.)+[a-z]{2,}$
+    Description: >-
+      Receiving domain and sending identity of the mailbox, e.g.
+      mail.example.com. Empty (the default) creates no mail resource.
+  MailAddresses:
+    Type: String
+    Default: ""
+    # A String, not a CommaDelimitedList, capped at 10 entries: the receipt-rule
+    # recipients and InboxIds are built from ten fixed slots (see Conditions).
+    AllowedPattern: ^$|^[a-z0-9._+-]{1,64}(,[a-z0-9._+-]{1,64}){0,9}$
+    Description: >-
+      Comma-separated local parts (at most 10), each an inbox at MailDomain,
+      e.g. hello,support. Required unless MailCatchAll is true.
+  MailCatchAll:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: true makes the receipt rule accept every address at MailDomain.
+  MailAutoCreateInboxes:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: With MailCatchAll, whether mail to an unknown local part creates an inbox.
+  MailSenderMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: >-
+      How many sends may run at once. Each concurrent execution can make one
+      SES call at a time, so this is the ceiling on the send rate this stack
+      asks SES for; raise it only alongside the account's sending quota.
+  MailBucketName:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$
+    Description: Mail bucket name. Empty lets CloudFormation generate one.
+  MailRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    Description: >-
+      S3 expiration for inbound raw MIME, attachments and sent raw MIME. Never
+      applies to outbox/.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^Z[A-Z0-9]+$
+    Description: >-
+      Route 53 hosted zone for MailDomain. When set the stack publishes every
+      mail DNS record; when empty the DnsRecords output lists them.
+  DmarcPolicy:
+    Type: String
+    Default: quarantine
+    AllowedValues: [none, quarantine, reject]
+  ReceiptTlsPolicy:
+    Type: String
+    Default: Optional
+    AllowedValues: [Optional, Require]
+  ExistingReceiptRuleSetName:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$
+    Description: >-
+      Empty creates a receipt rule set (activate it after deploy). Set it to
+      add the rule to a rule set that already exists and is active in this
+      region.
+  ApiKeysParameterName:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^/[A-Za-z0-9_./-]{1,1010}$
+    Description: >-
+      Name, starting with "/", of the SecureString SSM parameter holding the
+      /v0 API key hashes. Create the parameter after deploy.
+  ApiKeysKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$
+    Description: Customer-managed KMS key of the API key parameter. Empty means aws/ssm.
+  AttachmentUrlTtlSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 3600
+    Description: Lifetime of presigned attachment and raw-message download URLs.
+
+Rules:
+  MailAddressesRequired:
+    RuleCondition: !And
+      - !Not [!Equals [!Ref MailDomain, ""]]
+      - !Equals [!Ref MailCatchAll, "false"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref MailAddresses, ""]]
+        AssertDescription: MailAddresses must list at least one local part unless MailCatchAll is true.
 
 Conditions:
   IsProd: !Equals [!Ref Stage, prod]
   HasOptOutList: !Not [!Equals [!Ref OptOutListName, ""]]
   # A CommaDelimitedList defaulting to "" yields a single empty-string element.
   HasConsumers: !Not [!Equals [!Select [0, !Ref ConsumerAccountIds], ""]]
+  HasMailDomain: !Not [!Equals [!Ref MailDomain, ""]]
+  HasHostedZone: !And [!Condition HasMailDomain, !Not [!Equals [!Ref HostedZoneId, ""]]]
+  NoHostedZone: !And [!Condition HasMailDomain, !Equals [!Ref HostedZoneId, ""]]
+  CreateReceiptRuleSet: !And [!Condition HasMailDomain, !Equals [!Ref ExistingReceiptRuleSetName, ""]]
+  IsCatchAll: !Equals [!Ref MailCatchAll, "true"]
+  HasMailBucketName: !Not [!Equals [!Ref MailBucketName, ""]]
+  HasApiKeys: !And [!Condition HasMailDomain, !Not [!Equals [!Ref ApiKeysParameterName, ""]]]
+  HasApiKeysKmsKey: !And [!Condition HasApiKeys, !Not [!Equals [!Ref ApiKeysKmsKeyArn, ""]]]
+  HasAllowedTopics: !Not [!Equals [!Ref AllowedTopics, ""]]
+  AllowlistMailTopics: !And [!Condition HasMailDomain, !Condition HasAllowedTopics]
+  # Address slots, which cap MailAddresses at 10 local parts. CloudFormation
+  # cannot map over a list and a Fn::Join delimiter must be a literal, so
+  # "local@MailDomain" is built per slot. The list is padded with ten empty
+  # entries so every Select index exists.
+  HasMailAddress0: !Not [!Equals [!Ref MailAddresses, ""]]
+  HasMailAddress1: !Not [!Equals [!Select [1, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress2: !Not [!Equals [!Select [2, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress3: !Not [!Equals [!Select [3, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress4: !Not [!Equals [!Select [4, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress5: !Not [!Equals [!Select [5, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress6: !Not [!Equals [!Select [6, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress7: !Not [!Equals [!Select [7, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress8: !Not [!Equals [!Select [8, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
+  HasMailAddress9: !Not [!Equals [!Select [9, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]], ""]]
 
 Resources:
   WebhookFunction:
@@ -77,8 +201,9 @@ Resources:
       Handler: bootstrap
       Runtime: provided.al2023
       Architectures: [arm64]
-      MemorySize: 256
-      Timeout: 10
+      # Mail ingest parses up to 40 MB of MIME inside one invocation.
+      MemorySize: !If [HasMailDomain, 512, 256]
+      Timeout: !If [HasMailDomain, 90, 10]
       FunctionUrlConfig:
         AuthType: NONE
       LoggingConfig:
@@ -91,12 +216,30 @@ Resources:
           TABLE_NAME: !Ref EventsTable
           EVENT_BUS_NAME: !Ref EventBus
           EVENT_SOURCE: !Ref EventSource
-          ALLOWED_TOPICS: !Ref AllowedTopics
+          # The stack-owned mail topics join a non-empty allowlist; an empty
+          # allowlist already allows them.
+          ALLOWED_TOPICS: !If
+            - AllowlistMailTopics
+            - !Join [",", [!Ref AllowedTopics, !Ref MailInboundTopic, !Ref MailEventsTopic]]
+            - !Ref AllowedTopics
           AUTO_RESUBSCRIBE: !Ref AutoResubscribe
           OPT_OUT_LIST_NAME: !Ref OptOutListName
           RAW_EVENT_RETENTION_DAYS: !Ref RawEventRetentionDays
           AGGREGATE_RETENTION_DAYS: !Ref AggregateRetentionDays
           STACK_NAME: !Ref AWS::StackName
+          MAIL_DOMAIN: !If [HasMailDomain, !Ref MailDomain, !Ref AWS::NoValue]
+          MAIL_TABLE_NAME: !If [HasMailDomain, !Ref MailTable, !Ref AWS::NoValue]
+          MAIL_BUCKET: !If [HasMailDomain, !Ref MailBucket, !Ref AWS::NoValue]
+          MAIL_INBOXES: !If [HasMailDomain, !Ref MailAddresses, !Ref AWS::NoValue]
+          MAIL_CATCH_ALL: !If [HasMailDomain, !Ref MailCatchAll, !Ref AWS::NoValue]
+          MAIL_AUTO_CREATE_INBOXES: !If [HasMailDomain, !Ref MailAutoCreateInboxes, !Ref AWS::NoValue]
+          SES_CONFIGURATION_SET: !If [HasMailDomain, !Ref MailConfigurationSet, !Ref AWS::NoValue]
+          MAIL_IDENTITY_ARN: !If
+            - HasMailDomain
+            - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
+            - !Ref AWS::NoValue
+          API_KEYS_PARAMETER: !If [HasApiKeys, !Ref ApiKeysParameterName, !Ref AWS::NoValue]
+          ATTACHMENT_URL_TTL_SECONDS: !If [HasMailDomain, !Ref AttachmentUrlTtlSeconds, !Ref AWS::NoValue]
       Events:
         # The stream relay: the sole publisher of event details to EventBridge.
         # Retries a failed publish, bisects a poison batch, reports per-record
@@ -152,7 +295,7 @@ Resources:
               Resource: "*"
             - Sid: SuppressionList
               Effect: Allow
-              Action: sesv2:PutSuppressedDestination
+              Action: ses:PutSuppressedDestination
               Resource: "*"
             # The stream event-source mapping routes records that exhaust their
             # retries to this queue; the function role needs to write to it.
@@ -160,6 +303,92 @@ Resources:
               Effect: Allow
               Action: sqs:SendMessage
               Resource: !GetAtt PublishDlq.Arn
+            # Mail statements. Transactions are authorized through the item
+            # actions. No ses:SendEmail (only the sender sends) and no S3 delete.
+            - !If
+              - HasMailDomain
+              - Sid: MailTableReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !GetAtt MailTable.Arn
+                  - !Sub "${MailTable.Arn}/index/*"
+              - !Ref AWS::NoValue
+            - !If
+              - HasMailDomain
+              - Sid: MailStreamRead
+                Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                Resource: !GetAtt MailTable.StreamArn
+              - !Ref AWS::NoValue
+            - !If
+              - HasMailDomain
+              - Sid: MailObjectsRead
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${MailBucket.Arn}/inbound/*"
+                  - !Sub "${MailBucket.Arn}/attachments/*"
+                  - !Sub "${MailBucket.Arn}/sent/*"
+                  - !Sub "${MailBucket.Arn}/outbox/*"
+              - !Ref AWS::NoValue
+            - !If
+              - HasMailDomain
+              - Sid: MailObjectsWrite
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "${MailBucket.Arn}/attachments/*"
+                  - !Sub "${MailBucket.Arn}/outbox/*"
+              - !Ref AWS::NoValue
+            # Without ListBucket, S3 answers GetObject/HeadObject on a missing
+            # key with 403 instead of 404, and a missing object would look
+            # like a transient failure. The code never lists the bucket.
+            - !If
+              - HasMailDomain
+              - Sid: MailObjectsNotFound
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt MailBucket.Arn
+              - !Ref AWS::NoValue
+            - !If
+              - HasMailDomain
+              - Sid: MailIdentityStatus
+                Effect: Allow
+                Action: ses:GetEmailIdentity
+                Resource: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
+              - !Ref AWS::NoValue
+            - !If
+              - HasApiKeys
+              - Sid: ApiKeysRead
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeysParameterName}"
+              - !Ref AWS::NoValue
+            - !If
+              - HasApiKeysKmsKey
+              - Sid: ApiKeysDecrypt
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref ApiKeysKmsKeyArn
+              - !Ref AWS::NoValue
+            - !If
+              - HasMailDomain
+              - Sid: MailIngestOnFailureDlq
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt MailIngestDlq.Arn
+              - !Ref AWS::NoValue
 
   FunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -232,6 +461,627 @@ Resources:
                   - dynamodb:Query
                 Resource: !GetAtt EventsTable.Arn
 
+  # ---------------------------------------------------------------------------
+  # Mailbox (MailDomain). Everything below is conditional, so a stack without a
+  # mail domain is unchanged. The two mail SNS topics are the only topics the
+  # stack owns: a receipt rule and an event destination must name their topic.
+  # ---------------------------------------------------------------------------
+
+  MailConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Condition: HasMailDomain
+
+  MailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Condition: HasMailDomain
+    Properties:
+      EmailIdentity: !Ref MailDomain
+      DkimAttributes:
+        SigningEnabled: true
+      MailFromAttributes:
+        MailFromDomain: !Sub "bounce.${MailDomain}"
+        BehaviorOnMxFailure: USE_DEFAULT_VALUE
+      # Every send from the identity is stamped with the set, so delivery
+      # events flow even if a caller omits it.
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref MailConfigurationSet
+
+  MailEventsTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasMailDomain
+    Properties:
+      SignatureVersion: "2"
+
+  MailEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasMailDomain
+    Properties:
+      Topics:
+        - !Ref MailEventsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SesEventPublishing
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref MailEventsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${MailConfigurationSet}"
+
+  MailEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Condition: HasMailDomain
+    DependsOn: MailEventsTopicPolicy
+    Properties:
+      ConfigurationSetName: !Ref MailConfigurationSet
+      EventDestination:
+        Name: mail-events
+        Enabled: true
+        MatchingEventTypes: [send, delivery, bounce, complaint, reject, open]
+        SnsDestination:
+          TopicARN: !Ref MailEventsTopic
+
+  # Mail outlives the stack. outbox/ has no lifecycle rule: nothing a queued,
+  # sending or unknown message needs may expire.
+  MailBucket:
+    Type: AWS::S3::Bucket
+    Condition: HasMailDomain
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If [HasMailBucketName, !Ref MailBucketName, !Ref AWS::NoValue]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-inbound
+            Status: Enabled
+            Prefix: inbound/
+            ExpirationInDays: !Ref MailRetentionDays
+          - Id: expire-attachments
+            Status: Enabled
+            Prefix: attachments/
+            ExpirationInDays: !Ref MailRetentionDays
+          - Id: expire-sent
+            Status: Enabled
+            Prefix: sent/
+            ExpirationInDays: !Ref MailRetentionDays
+
+  MailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: HasMailDomain
+    Properties:
+      Bucket: !Ref MailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The rule ARN is built from names: a !Ref to MailReceiptRule would be
+          # circular, since the rule depends on this policy.
+          - Sid: SesReceiptWrites
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${MailBucket.Arn}/inbound/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub
+                  - "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${RuleSet}:receipt-rule/${AWS::StackName}-inbound"
+                  - RuleSet: !If [CreateReceiptRuleSet, !Ref MailReceiptRuleSet, !Ref ExistingReceiptRuleSetName]
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt MailBucket.Arn
+              - !Sub "${MailBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  MailInboundTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasMailDomain
+    Properties:
+      SignatureVersion: "2"
+
+  MailInboundTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasMailDomain
+    Properties:
+      Topics:
+        - !Ref MailInboundTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SesReceiptPublishing
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref MailInboundTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub
+                  - "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${RuleSet}:receipt-rule/${AWS::StackName}-inbound"
+                  - RuleSet: !If [CreateReceiptRuleSet, !Ref MailReceiptRuleSet, !Ref ExistingReceiptRuleSetName]
+
+  # CloudFormation cannot activate a rule set; see the README post-deploy steps.
+  MailReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Condition: CreateReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub "${AWS::StackName}-mail"
+
+  MailReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    Condition: HasMailDomain
+    # SES checks it can write to the bucket and publish to the topic when the
+    # rule is created.
+    DependsOn:
+      - MailBucketPolicy
+      - MailInboundTopicPolicy
+    Properties:
+      RuleSetName: !If [CreateReceiptRuleSet, !Ref MailReceiptRuleSet, !Ref ExistingReceiptRuleSetName]
+      Rule:
+        Name: !Sub "${AWS::StackName}-inbound"
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: !Ref ReceiptTlsPolicy
+        Recipients: !If
+          - IsCatchAll
+          - [!Ref MailDomain]
+          - !Split
+            - ","
+            - !Join
+              - ""
+              - - !Sub ["${L}@${MailDomain}", {L: !Select [0, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}]
+                - !If [HasMailAddress1, !Sub [",${L}@${MailDomain}", {L: !Select [1, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress2, !Sub [",${L}@${MailDomain}", {L: !Select [2, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress3, !Sub [",${L}@${MailDomain}", {L: !Select [3, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress4, !Sub [",${L}@${MailDomain}", {L: !Select [4, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress5, !Sub [",${L}@${MailDomain}", {L: !Select [5, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress6, !Sub [",${L}@${MailDomain}", {L: !Select [6, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress7, !Sub [",${L}@${MailDomain}", {L: !Select [7, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress8, !Sub [",${L}@${MailDomain}", {L: !Select [8, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+                - !If [HasMailAddress9, !Sub [",${L}@${MailDomain}", {L: !Select [9, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+        Actions:
+          - S3Action:
+              BucketName: !Ref MailBucket
+              ObjectKeyPrefix: inbound/
+              TopicArn: !Ref MailInboundTopic
+
+  # The mailbox table. Its stream has exactly two readers — the relay
+  # (MailStreamMapping) and the sender — which is DynamoDB's recommended
+  # ceiling; a third consumer needs Kinesis Data Streams for DynamoDB.
+  MailTable:
+    Type: AWS::DynamoDB::Table
+    Condition: HasMailDomain
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
+        - AttributeName: gsi3pk
+          AttributeType: S
+        - AttributeName: gsi3sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ByTime
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - inbox_id
+              - thread_id
+              - message_id
+              - labels
+              - timestamp
+              - from
+              - to
+              - cc
+              - bcc
+              - subject
+              - preview
+              - size
+              - attachments
+              - in_reply_to
+              - created_at
+              - updated_at
+              - senders
+              - recipients
+              - last_message_id
+              - message_count
+              - received_timestamp
+              - sent_timestamp
+              - email
+              - display_name
+              - metadata
+        - IndexName: ByThread
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+        # Sparse: only send-state items carry gsi3pk.
+        - IndexName: ByStatus
+          KeySchema:
+            - AttributeName: gsi3pk
+              KeyType: HASH
+            - AttributeName: gsi3sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - inbox_id
+              - send_status
+              - created_at
+              - requeued_at
+              - sending_at
+              - promote_at
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      # Set only on idempotency-key and SES-call marker items.
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+
+  MailIngestDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasMailDomain
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-mail-ingest-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
+  # Separate from MailIngestDlq: a message here is mail that failed to go
+  # out, which is a different problem from mail that failed to come in, and
+  # an operator should not have to tell them apart by reading payloads.
+  MailSenderDlq:
+    Type: AWS::SQS::Queue
+    Condition: HasMailDomain
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-mail-sender-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
+  # The mail topics invoke the function directly. Lambda's async queue retries
+  # a failed invocation twice; after that the event lands in MailIngestDlq.
+  WebhookEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Condition: HasMailDomain
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt MailIngestDlq.Arn
+
+  MailInboundPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasMailDomain
+    Properties:
+      FunctionName: !GetAtt WebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref MailInboundTopic
+
+  MailInboundSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasMailDomain
+    DependsOn: MailInboundPermission
+    Metadata:
+      cfn-lint:
+        config:
+          # W3694 misreads the SAM function's Arn attribute; a lambda-protocol
+          # subscription endpoint is exactly the function ARN.
+          ignore_checks: [W3694]
+    Properties:
+      TopicArn: !Ref MailInboundTopic
+      Protocol: lambda
+      Endpoint: !GetAtt WebhookFunction.Arn
+
+  MailEventsPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasMailDomain
+    Properties:
+      FunctionName: !GetAtt WebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref MailEventsTopic
+
+  MailEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasMailDomain
+    DependsOn: MailEventsPermission
+    Metadata:
+      cfn-lint:
+        config:
+          # W3694 misreads the SAM function's Arn attribute; a lambda-protocol
+          # subscription endpoint is exactly the function ARN.
+          ignore_checks: [W3694]
+    Properties:
+      TopicArn: !Ref MailEventsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt WebhookFunction.Arn
+
+  # The sender: the same binary in its other mode, reached only through the
+  # mail table's stream. It is a separate function so its concurrency, memory
+  # and IAM are scoped to sending, and so a slow send cannot occupy the
+  # function serving the API.
+  MailSenderFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasMailDomain
+    Metadata:
+      BuildMethod: rust-cargolambda
+      BuildProperties:
+        Binary: aws-messaging-webhook
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-mail-sender"
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      # Holds the assembled message and its base64 form in memory at once.
+      MemorySize: 1024
+      Timeout: 120
+      # One SES call at a time per environment keeps a burst of queued mail
+      # from running into the account's sending rate.
+      ReservedConcurrentExecutions: !Ref MailSenderMaxConcurrency
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: !Ref LogLevel
+        SystemLogLevel: INFO
+        LogGroup: !Ref MailSenderLogGroup
+      Environment:
+        Variables:
+          FUNCTION_MODE: sender
+          TABLE_NAME: !Ref EventsTable
+          EVENT_BUS_NAME: !Ref EventBus
+          EVENT_SOURCE: !Ref EventSource
+          STACK_NAME: !Ref AWS::StackName
+          MAIL_DOMAIN: !Ref MailDomain
+          MAIL_TABLE_NAME: !Ref MailTable
+          MAIL_BUCKET: !Ref MailBucket
+          MAIL_INBOXES: !Ref MailAddresses
+          MAIL_CATCH_ALL: !Ref MailCatchAll
+          MAIL_AUTO_CREATE_INBOXES: !Ref MailAutoCreateInboxes
+          SES_CONFIGURATION_SET: !Ref MailConfigurationSet
+          MAIL_IDENTITY_ARN: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
+          ATTACHMENT_URL_TTL_SECONDS: !Ref AttachmentUrlTtlSeconds
+      Events:
+        # A sender killed between claiming a send and recording its outcome
+        # leaves the state `sending` with nobody working on it and no stream
+        # record to re-trigger. Nothing else would notice, so this checks.
+        Sweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(10 minutes)
+            Description: Recover sends whose sender died mid-flight
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: MailTableAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt MailTable.Arn
+                - !Sub "${MailTable.Arn}/index/*"
+            - Sid: OutboxObjects
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MailBucket.Arn}/outbox/*"
+            - Sid: SentObjects
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MailBucket.Arn}/sent/*"
+            # A 404 rather than a 403 for a missing key needs ListBucket.
+            - Sid: OutboxList
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt MailBucket.Arn
+            # Scoped to this domain's identity and this stack's configuration
+            # set: the sender cannot send as another domain.
+            - Sid: SendMail
+              Effect: Allow
+              Action: ses:SendEmail
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${MailConfigurationSet}"
+
+  MailSenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasMailDomain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-mail-sender"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Send-state items only, and only while they are queued. The filter keeps
+  # the sender from being invoked for its own claim and mark writes, which
+  # move the status away from `queued`.
+  MailSenderStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasMailDomain
+    DependsOn: MailSenderFunctionRole
+    Properties:
+      EventSourceArn: !GetAtt MailTable.StreamArn
+      FunctionName: !Ref MailSenderFunction
+      StartingPosition: TRIM_HORIZON
+      # One record at a time: a batch that fails partway would otherwise
+      # re-deliver sends that already reached SES.
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      MaximumRetryAttempts: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"sk":{"S":["STATE"]},"send_status":{"S":["queued"]}}}}'
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt MailSenderDlq.Arn
+
+  # The mail relay: message items only (sk MSG#). Send-state, marker, key,
+  # alias, thread and inbox items never invoke the relay.
+  MailStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasMailDomain
+    DependsOn: WebhookFunctionRole
+    Properties:
+      EventSourceArn: !GetAtt MailTable.StreamArn
+      FunctionName: !Ref WebhookFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"sk":{"S":[{"prefix":"MSG#"}]}}}}'
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt PublishDlq.Arn
+
+  MailMxRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref MailDomain
+      Type: MX
+      TTL: "300"
+      ResourceRecords:
+        - !Sub "10 inbound-smtp.${AWS::Region}.amazonaws.com"
+
+  MailDkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt MailIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: "300"
+      ResourceRecords:
+        - !GetAtt MailIdentity.DkimDNSTokenValue1
+
+  MailDkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt MailIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: "300"
+      ResourceRecords:
+        - !GetAtt MailIdentity.DkimDNSTokenValue2
+
+  MailDkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt MailIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: "300"
+      ResourceRecords:
+        - !GetAtt MailIdentity.DkimDNSTokenValue3
+
+  MailFromMxRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "bounce.${MailDomain}"
+      Type: MX
+      TTL: "300"
+      ResourceRecords:
+        - !Sub "10 feedback-smtp.${AWS::Region}.amazonses.com"
+
+  MailFromSpfRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "bounce.${MailDomain}"
+      Type: TXT
+      TTL: "300"
+      ResourceRecords:
+        - '"v=spf1 include:amazonses.com ~all"'
+
+  MailSpfRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref MailDomain
+      Type: TXT
+      TTL: "300"
+      ResourceRecords:
+        - '"v=spf1 include:amazonses.com -all"'
+
+  MailDmarcRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "_dmarc.${MailDomain}"
+      Type: TXT
+      TTL: "300"
+      ResourceRecords:
+        - !Sub '"v=DMARC1; p=${DmarcPolicy}"'
+
 Outputs:
   WebhookUrl:
     Description: Base Function URL (trailing slash included).
@@ -264,3 +1114,67 @@ Outputs:
     Condition: HasConsumers
     Description: Role ARN for downstream consumers to assume for read-only table access.
     Value: !GetAtt ConsumerReadRole.Arn
+  MailTableName:
+    Condition: HasMailDomain
+    Value: !Ref MailTable
+  MailBucketName:
+    Condition: HasMailDomain
+    Value: !Ref MailBucket
+  MailInboundTopicArn:
+    Condition: HasMailDomain
+    Description: Stack-owned topic for SES receipt notifications (already subscribed).
+    Value: !Ref MailInboundTopic
+  MailEventsTopicArn:
+    Condition: HasMailDomain
+    Description: Stack-owned topic for SES configuration-set events (already subscribed).
+    Value: !Ref MailEventsTopic
+  MailConfigurationSetName:
+    Condition: HasMailDomain
+    Value: !Ref MailConfigurationSet
+  InboxIds:
+    Condition: HasMailDomain
+    Description: Configured inbox ids (addresses). Catch-all inboxes appear on first mail.
+    Value: !If
+      - HasMailAddress0
+      - !Join
+        - ""
+        - - !Sub ["${L}@${MailDomain}", {L: !Select [0, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}]
+          - !If [HasMailAddress1, !Sub [",${L}@${MailDomain}", {L: !Select [1, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress2, !Sub [",${L}@${MailDomain}", {L: !Select [2, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress3, !Sub [",${L}@${MailDomain}", {L: !Select [3, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress4, !Sub [",${L}@${MailDomain}", {L: !Select [4, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress5, !Sub [",${L}@${MailDomain}", {L: !Select [5, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress6, !Sub [",${L}@${MailDomain}", {L: !Select [6, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress7, !Sub [",${L}@${MailDomain}", {L: !Select [7, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress8, !Sub [",${L}@${MailDomain}", {L: !Select [8, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+          - !If [HasMailAddress9, !Sub [",${L}@${MailDomain}", {L: !Select [9, !Split [",", !Join [",", [!Ref MailAddresses, ",,,,,,,,,"]]]]}], ""]
+      - !Sub "none configured (catch-all on ${MailDomain})"
+  ApiBaseUrl:
+    Condition: HasMailDomain
+    Description: Base URL of the mailbox API.
+    Value: !Sub "${WebhookFunctionUrl.FunctionUrl}v0"
+  ReceiptRuleSetName:
+    Condition: HasMailDomain
+    Description: Receipt rule set holding the mail rule. Activate it once after the first deploy.
+    Value: !If [CreateReceiptRuleSet, !Ref MailReceiptRuleSet, !Ref ExistingReceiptRuleSetName]
+  MailIngestDlqUrl:
+    Condition: HasMailDomain
+    Description: SQS DLQ for mail SNS deliveries that failed every async-invoke retry.
+    Value: !Ref MailIngestDlq
+  MailSenderDlqUrl:
+    Condition: HasMailDomain
+    Description: SQS DLQ for sends that failed every retry. A message here is mail that did not go out.
+    Value: !Ref MailSenderDlq
+  DnsRecords:
+    Condition: NoHostedZone
+    Description: Mail DNS records to publish (no HostedZoneId given).
+    Value: !Join
+      - "\n"
+      - - !Sub "${MailDomain} MX 10 inbound-smtp.${AWS::Region}.amazonaws.com"
+        - !Sub "${MailIdentity.DkimDNSTokenName1} CNAME ${MailIdentity.DkimDNSTokenValue1}"
+        - !Sub "${MailIdentity.DkimDNSTokenName2} CNAME ${MailIdentity.DkimDNSTokenValue2}"
+        - !Sub "${MailIdentity.DkimDNSTokenName3} CNAME ${MailIdentity.DkimDNSTokenValue3}"
+        - !Sub "bounce.${MailDomain} MX 10 feedback-smtp.${AWS::Region}.amazonses.com"
+        - !Sub 'bounce.${MailDomain} TXT "v=spf1 include:amazonses.com ~all"'
+        - !Sub '${MailDomain} TXT "v=spf1 include:amazonses.com -all"'
+        - !Sub '_dmarc.${MailDomain} TXT "v=DMARC1; p=${DmarcPolicy}"'

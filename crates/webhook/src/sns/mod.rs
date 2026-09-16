@@ -49,6 +49,7 @@ pub async fn handle_sns<T: Services>(
     state: &AppState<T>,
     ingress: Ingress,
     verified: VerifiedSns,
+    deadline: tokio::time::Instant,
 ) -> Result<Response, AppError> {
     match verified.envelope.message_type {
         MessageType::SubscriptionConfirmation => {
@@ -57,7 +58,9 @@ pub async fn handle_sns<T: Services>(
         MessageType::UnsubscribeConfirmation => {
             handle_unsubscribe(state, ingress, &verified.envelope).await
         }
-        MessageType::Notification => process_notification(state, ingress, &verified).await,
+        MessageType::Notification => {
+            process_notification(state, ingress, &verified, deadline).await
+        }
     }
 }
 
@@ -150,6 +153,7 @@ async fn process_notification<T: Services>(
     state: &AppState<T>,
     ingress: Ingress,
     verified: &VerifiedSns,
+    deadline: tokio::time::Instant,
 ) -> Result<Response, AppError> {
     let envelope = &verified.envelope;
     let event = DomainEvent::classify(&envelope.message);
@@ -194,7 +198,12 @@ async fn process_notification<T: Services>(
     // if a prior attempt persisted but died before acting. Publishing the event
     // to EventBridge is the stream relay's job (see `crate::stream`), not the
     // request path's: the persisted item is the outbox entry.
-    let action = match actions::run(state, &event).await {
+    // The verified envelope's own `Timestamp` is `received_ms`'s third
+    // fallback (after `mail.timestamp`/`receipt.timestamp`), so a redelivery
+    // never has to fall back to wall-clock time to compute the same
+    // deterministic inbound message id.
+    let envelope_ts_ms = crate::mail::time::parse(&envelope.timestamp);
+    let action = match actions::run(state, &event, deadline, envelope_ts_ms).await {
         Ok(action) => action,
         Err(error) => match error.kind {
             ActionErrorKind::Transient => {

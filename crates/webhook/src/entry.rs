@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -40,6 +40,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::app;
+use crate::config::FunctionMode;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
@@ -122,16 +123,43 @@ pub async fn dispatch<T: Services>(
     // Function URL payload never does — an attacker-controlled HTTP body only
     // ever appears as a JSON *string field* inside the API Gateway envelope,
     // so it cannot fake this shape.
+    // Neither the sweep nor an operator command carries records: a scheduled
+    // rule sends a bare event and an operator invokes with a command object,
+    // and no other pathway produces either shape.
+    if state.config.mode == FunctionMode::Sender && payload.get("Records").is_none() {
+        if payload.get("command").is_some() {
+            let command: crate::mail::sender::Command = serde_json::from_value(payload)
+                .map_err(|e| format!("not a sender command: {e}"))?;
+            crate::mail::sender::handle_command(&state, &command).await?;
+            return Ok(serde_json::json!({ "ok": true }));
+        }
+        let report = crate::mail::sender::sweep(&state).await?;
+        return Ok(serde_json::json!({
+            "released": report.released,
+            "stillWorking": report.still_working,
+            "unknown": report.unknown,
+        }));
+    }
+
     if payload.get("Records").is_some() {
         // Both DynamoDB streams and direct SNS deliver a `Records` array; the
         // stream records carry `eventSource: aws:dynamodb` (and a `dynamodb`
         // object), while SNS records carry `Sns`.
         if is_dynamodb_stream(&payload) {
-            return crate::stream::handle_stream(&state, payload).await;
+            // The same stream feeds both halves of the binary, and each
+            // ignores the records the other owns: the relay publishes message
+            // inserts, the sender acts on send-state items.
+            return match state.config.mode {
+                FunctionMode::Webhook => crate::stream::handle_stream(&state, payload).await,
+                FunctionMode::Sender => {
+                    crate::mail::sender::handle_sender_stream(&state, payload).await
+                }
+            };
         }
         let event = SnsEvent::deserialize(payload)
             .map_err(|e| format!("payload has Records but is not an SNS event: {e}"))?;
-        handle_direct(&state, event).await?;
+        let deadline = context_deadline(&context);
+        handle_direct(&state, event, deadline).await?;
         Ok(Value::Null)
     } else {
         serve_http(router, payload, context).await
@@ -169,10 +197,11 @@ async fn serve_http(
 async fn handle_direct<T: Services>(
     state: &AppState<T>,
     event: SnsEvent,
+    deadline: tokio::time::Instant,
 ) -> Result<(), lambda_http::Error> {
     for record in event.records {
         let raw_body = Bytes::from(serde_json::to_vec(&record.sns)?);
-        let status = process_record(state, raw_body).await.status();
+        let status = process_record(state, raw_body, deadline).await.status();
         if status.is_server_error() {
             // Fail the whole invocation: any unprocessed records redeliver
             // with it, and the idempotent persist makes re-runs safe.
@@ -186,13 +215,30 @@ async fn handle_direct<T: Services>(
     Ok(())
 }
 
-async fn process_record<T: Services>(state: &AppState<T>, raw_body: Bytes) -> Response {
+async fn process_record<T: Services>(
+    state: &AppState<T>,
+    raw_body: Bytes,
+    deadline: tokio::time::Instant,
+) -> Response {
     let verified = match VerifiedSns::verify(state, raw_body).await {
         Ok(verified) => verified,
         Err(error) => return error.into_response(),
     };
-    match handle_sns(state, Ingress::Direct, verified).await {
+    match handle_sns(state, Ingress::Direct, verified, deadline).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
+}
+
+/// Converts a Lambda invocation's execution deadline (`Context::deadline()`,
+/// a [`SystemTime`]) into a [`tokio::time::Instant`] so time-boxing can
+/// use `tokio::time::timeout_at` directly. Saturates to zero (an
+/// already-elapsed deadline) rather than panicking when the deadline has
+/// already passed by the time this runs.
+pub(crate) fn context_deadline(ctx: &Context) -> tokio::time::Instant {
+    let remaining = ctx
+        .deadline()
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    tokio::time::Instant::now() + remaining
 }

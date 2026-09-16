@@ -34,32 +34,51 @@ aws-sdk-pinpointsmsvoicev2 = { workspace = true, features = [
   "default-https-client",
   "rt-tokio",
 ] }
+aws-sdk-s3 = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
 aws-sdk-sesv2 = { workspace = true, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-ssm = { workspace = true, features = [
   "behavior-version-latest",
   "default-https-client",
   "rt-tokio",
 ] }
 aws-smithy-types.workspace = true
 aws_lambda_events = { workspace = true, features = ["dynamodb"] }
-axum.workspace = true
+axum = { workspace = true, features = ["json", "query"] }
+# Page tokens (mail::keys) are base64url-encoded.
+base64 = { workspace = true, features = ["std"] }
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
+mail-builder.workspace = true
+mail-parser.workspace = true
 metrics.workspace = true
 metrics_cloudwatch_embedded = { workspace = true, features = ["lambda"] }
 reqwest = { workspace = true, features = ["rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
-serde_dynamo = { workspace = true }
+serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
+sha2 = { workspace = true, features = ["std"] }
 sns-message-verifier.workspace = true
+subtle.workspace = true
 thiserror = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tower-http = { workspace = true, features = ["trace"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tower-http = { workspace = true, features = ["sensitive-headers", "trace"] }
 tracing = { workspace = true, features = ["std"] }
 url = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["std", "v7"] }
 
 [dev-dependencies]
 proptest = { workspace = true, features = ["std"] }
 sns-message-verifier = { workspace = true, features = ["test-fixtures"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
 tower = { workspace = true, features = ["util"] }
+webhook-test-support.workspace = true
 wiremock.workspace = true
 
 [lints]

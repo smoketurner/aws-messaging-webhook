@@ -23,6 +23,7 @@ SNS → Lambda invocation. Then it:
 
 - [Architecture](#architecture)
 - [Deploy](#deploy)
+- [Mailbox](#mailbox)
 - [EventBridge contract](#eventbridge-contract)
 - [Data model](#data-model)
 - [Operations](#operations)
@@ -89,7 +90,9 @@ sam deploy --config-env dev --parameter-overrides \
 
 ### Wire up topics
 
-Topics and subscriptions live outside the stack, next to your EUM/SES configuration. To wire
+Topics and subscriptions live outside the stack, next to your EUM/SES configuration. (The one
+exception is the two mail topics the stack creates and subscribes itself when `MailDomain` is
+set; see [Mailbox](#mailbox).) To wire
 a topic to the Function URL (the HTTPS pathway), subscribe it to the matching webhook
 endpoint. The stack outputs each endpoint as a ready-to-use URL:
 
@@ -148,7 +151,7 @@ destination (SQS) on the function.
 | `EventSource` | `aws-messaging-webhook` | `source` field on published EventBridge events |
 | `RawEventRetentionDays` | `30` | DynamoDB TTL for raw event items |
 | `AggregateRetentionDays` | `365` | DynamoDB TTL for the per-message aggregate item; kept longer than raw events so current state outlives them |
-| `LogLevel` | `INFO` | `TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR` |
+| `LogLevel` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` (no `TRACE`; see [Upgrading from `LogLevel=TRACE`](#upgrading-from-logleveltrace)) |
 | `LogRetentionDays` | `30` | CloudWatch log retention |
 | `ConsumerAccountIds` | *(empty)* | Comma-separated 12-digit account ids allowed to assume the read-only consumer role (see [Consumer read access](#consumer-read-access)); empty grants none |
 
@@ -163,7 +166,308 @@ destination (SQS) on the function.
 - **SMS opt-out handling** fires only with self-managed opt-outs enabled on your numbers
   (AWS-managed opt-outs intercept STOP before SNS ever sees it) and requires `OptOutListName`.
 - SNS topics and subscriptions deliberately live *outside* this stack, next to your EUM/SES
-  configuration; the wiring commands above bridge the two after deploy.
+  configuration; the wiring commands above bridge the two after deploy. The exception is the
+  two mail topics a mailbox stack owns (see [Mailbox](#mailbox)).
+
+### Upgrading from `LogLevel=TRACE`
+
+`TRACE` is no longer an allowed `LogLevel`: at that level the Lambda runtime logs raw
+invocation payloads and the AWS SDK logs full requests and responses, which leaks secrets.
+CloudFormation reuses a stack's previous parameter values on update, so a stack deployed with
+`LogLevel=TRACE` fails parameter validation on its next deploy. Pass a new level once:
+
+```bash
+sam deploy --config-env dev --parameter-overrides "Stage=dev LogLevel=DEBUG"
+```
+
+## Mailbox
+
+Setting `MailDomain` also makes the stack a mailbox on SES. The stack
+creates the SES identity and configuration set, a receipt rule that stores inbound mail in S3,
+the mail bucket and mail table, two SNS topics subscribed to the function, and (with
+`HostedZoneId`) the DNS records.
+
+With `MailDomain` empty (the default), none of those resources exist, and the function keeps
+its 10 s timeout, 256 MB of memory and its current environment. A mailbox stack runs the
+function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB message.
+
+> [!IMPORTANT]
+> **Region.** SES email receiving is offered only in some regions. Deploy a mailbox stack in a
+> region that has an email receiving endpoint in the
+> [SES endpoints list](https://docs.aws.amazon.com/general/latest/gr/ses.html); elsewhere the
+> receipt rule set can't be created.
+
+```bash
+sam deploy --config-env dev --parameter-overrides \
+  "Stage=dev AllowedTopics=<your-account-id> MailDomain=mail.example.com MailAddresses=hello,support \
+   ApiKeysParameterName=/aws-messaging-webhook/dev/api-keys HostedZoneId=<zone-id>"
+```
+
+### Mailbox parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `MailDomain` | *(empty)* | Receiving domain and sending identity, e.g. `mail.example.com`. Empty disables every mail resource |
+| `MailAddresses` | *(empty)* | Comma-separated local parts, **at most 10** (e.g. `hello,support`). Each becomes the inbox `<local>@<MailDomain>`. Required unless `MailCatchAll=true`. The cap exists because CloudFormation can't map over a list, so the template builds the recipient addresses from ten fixed slots |
+| `MailCatchAll` | `false` | `true` makes the receipt rule accept every address at the domain |
+| `MailAutoCreateInboxes` | `false` | With catch-all, whether mail to an unknown local part creates an inbox |
+| `MailBucketName` | *(empty)* | Empty lets CloudFormation generate the bucket name |
+| `MailRetentionDays` | `365` | S3 expiration for inbound raw MIME, attachments and sent raw MIME |
+| `HostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
+| `DmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
+| `ReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
+| `ExistingReceiptRuleSetName` | *(empty)* | Empty creates a rule set. Set it to add the rule to a rule set that is already active in the region |
+| `ApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Must start with `/` |
+| `ApiKeysKmsKeyArn` | *(empty)* | Customer-managed KMS key that encrypts that parameter; empty means `aws/ssm` |
+| `AttachmentUrlTtlSeconds` | `900` | Lifetime of presigned download URLs, 60–3600 |
+
+### After the first deploy
+
+CloudFormation can't do the steps below, so run them once. They use this helper:
+
+```bash
+stack=aws-messaging-webhook-dev
+output() { aws cloudformation describe-stacks --stack-name "$stack" \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+```
+
+1. **Publish DNS** (skip if you set `HostedZoneId`). `output DnsRecords` lists the records:
+   - the domain's MX to `inbound-smtp.<region>.amazonaws.com`;
+   - three DKIM CNAMEs;
+   - the MAIL FROM domain `bounce.<domain>`, with an MX to `feedback-smtp.<region>.amazonses.com`
+     and `v=spf1 include:amazonses.com ~all`;
+   - the domain's SPF record `v=spf1 include:amazonses.com -all`;
+   - `_dmarc.<domain>`.
+2. **Wait for DKIM `SUCCESS`** before sending mail from the identity:
+
+   ```bash
+   aws sesv2 get-email-identity --email-identity mail.example.com \
+     --query '{dkim: DkimAttributes.Status, mailFrom: MailFromAttributes.MailFromDomainStatus}'
+   ```
+
+3. **Activate the receipt rule set.** A region has exactly one active rule set, so activating
+   this one deactivates any other. If a rule set is already active, redeploy with
+   `ExistingReceiptRuleSetName` set to its name instead; the stack then only adds its rule.
+
+   ```bash
+   aws ses set-active-receipt-rule-set --rule-set-name "$(output ReceiptRuleSetName)"
+   ```
+
+4. **Create the API key parameter.** CloudFormation can't create a SecureString parameter. Its
+   name must start with `/` and equal `ApiKeysParameterName`. The value holds SHA-256 hashes,
+   never the keys:
+
+   ```bash
+   key="am_$(openssl rand -hex 24)"
+   hash=$(printf '%s' "$key" | openssl dgst -sha256 -r | cut -d' ' -f1)
+   aws ssm put-parameter --name /aws-messaging-webhook/dev/api-keys --type SecureString \
+     --value "{\"keys\":[{\"id\":\"key_1\",\"sha256\":\"$hash\"}]}"
+   echo "$key"   # hand this to the client; it isn't stored anywhere
+   ```
+
+   Add `--key-id <ApiKeysKmsKeyArn>` when you use a customer-managed key. To rotate, overwrite
+   the parameter with both entries, move clients to the new key, then remove the old entry.
+
+The API is served under the `ApiBaseUrl` output; `InboxIds` lists the configured inboxes.
+
+### Mailbox API
+
+Every `/v0` route needs `Authorization: Bearer <key>`. Reads are implemented; everything else
+answers `501` with a parseable body.
+
+| Route | Returns |
+|---|---|
+| `GET /v0/inboxes` | `{count, limit, inboxes[], next_page_token?}` |
+| `GET /v0/inboxes/{inbox_id}` | one inbox |
+| `GET /v0/inboxes/{inbox_id}/messages` | `{count, limit, messages[], next_page_token?}`, newest first |
+| `GET /v0/inboxes/{inbox_id}/messages/{message_id}` | the full message, including `text`, `html`, `headers` and `references`, which the list view omits |
+| `GET /v0/inboxes/{inbox_id}/threads` | `{count, limit, threads[], next_page_token?}`, by last activity |
+| `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | one thread with its `messages[]` embedded oldest first, paginated independently |
+| `GET …/messages/{message_id}/raw` | `{message_id, size, download_url, expires_at}` for the stored raw MIME |
+| `GET …/messages/{message_id}/attachments/{attachment_id}` | the same, plus `filename`, `content_type`, `content_disposition` and `content_id` |
+| `PATCH /v0/inboxes/{inbox_id}/messages/{message_id}` | `{message_id, labels}` after applying `add_labels`/`remove_labels` |
+| `POST /v0/inboxes/{inbox_id}/messages/send` | `{message_id, thread_id}` once the send is durably queued |
+| `POST …/messages/{message_id}/reply` | the same, joining the original's thread |
+
+Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streamed through the
+function. The URL carries its own authorization — the API key is not needed to follow it, and
+anyone holding the URL can fetch the object until it expires. A message whose raw object or
+attachment has passed `MailRetentionDays`, and an attachment that was dropped for size, answer
+`404`: the metadata survives in the table, but there is nothing stored to hand back.
+
+`PATCH` takes `{"add_labels": …, "remove_labels": …}`, each either one label or a list. Labels
+are lowercased, trimmed and deduplicated. There is no "mark as read" endpoint: removing the
+`unread` label is how a client marks mail read. The labels the service sets itself — everything
+except `unread`, `spam`, `trash` and your own — are rejected with a `400`, as is a label given in
+both fields. A message's thread keeps a label until the last message carrying it gives it up, and
+relabelling does not count as thread activity, so it doesn't reorder a thread list.
+
+List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (default false),
+`before`, `after`, `labels`, `from`, `to`, `subject`, and the four `include_*` flags
+(`include_spam`, `include_blocked`, `include_unauthenticated`, `include_trash`).
+
+- `before` and `after` are UTC timestamps, accepted either as `2026-01-15T09:30:00.000Z` or
+  `2026-01-15T09:30:00Z`. The window is half-open: `after` includes its own instant, `before`
+  excludes it. Any other offset is rejected rather than read as UTC.
+- `labels`, `from`, `to` and `subject` may repeat. An item must carry *every* requested label;
+  for `from`/`to`/`subject` it must match *any* value of each field given, case-insensitively,
+  as a substring.
+- The `include_*` flags default to false and drop items carrying that label. Naming a label
+  explicitly overrides the flag that would hide it, so `?labels=trash` returns trashed mail.
+- `page_token` is opaque and bound to the partition it was issued for: presenting one to a
+  different inbox is a `400`, not another inbox's data.
+
+### Sending
+
+`POST …/messages/send` takes `to`/`cc`/`bcc` (one address or a list), `subject`, `text` and/or
+`html`, and optionally `reply_to`, `labels`, `headers` and `attachments`. Each attachment gives
+exactly one of `content` (base64) or `url`.
+
+**It queues; it does not send.** The response means the message is durably recorded, not that
+SES has accepted it. A separate sender function consumes the mail table's stream and makes the
+SES call. This exists because SESv2 `SendEmail` has no idempotency token and the AWS SDKs retry
+5xx on their own, so a synchronous send could deliver the same mail more than once.
+
+Send `Idempotency-Key` to make a retry safe. The same key with the same request returns the
+original ids; the same key with a *different* request is a `409`, since silently sending
+something the caller didn't ask for is worse than refusing. Keys are remembered for 24 hours.
+Without a key, a retry after a lost response can queue the message twice.
+
+Headers the service controls — `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`,
+`Date`, `Message-ID`, `In-Reply-To`, `References`, `Return-Path`, `MIME-Version` and every
+`Content-*` — are rejected rather than ignored, so a caller cannot send as another inbox. Any CR
+or LF in an address, header name or header value is refused: all three end up in a MIME document
+where a newline would start a new header.
+
+`…/reply` takes the same body plus `reply_all`, and fills in what you leave out from the message
+being answered: the thread, `In-Reply-To`, the `References` chain, a `Re:` subject (not doubled
+if one is already there), and the recipient — the original's `Reply-To` if it set one, otherwise
+its sender. With `reply_all`, the original's other recipients are copied, minus this inbox, so a
+reply never arrives back where it came from. Naming `to`, `cc` or `bcc` yourself overrides the
+derived recipients but keeps the threading.
+
+An attachment `url` must be `https`, on the default port, with no embedded credentials, and must
+not resolve to a private or link-local address. That is checked when the request is accepted and
+again when the sender fetches it — on the URL itself and on every redirect `Location`, at most
+five hops. The sender is the only HTTP client in this service that follows redirects at all, and
+it does so by hand for exactly that reason: the first check says nothing about where a redirect
+leads. The host is resolved once and the connection pinned to the addresses that passed, so the
+name cannot resolve to something else between the check and the connect. A compressed response
+is refused rather than stored as-is, since nothing here decompresses.
+
+Fetched bytes are stored in the outbox under the attachment's id, so a retried send reuses them
+instead of re-fetching a URL whose content may have changed in the meantime.
+
+A scheduled sweep runs every ten minutes. A sender killed between claiming a send and recording
+its outcome leaves the send `sending` with nobody working on it and no stream record to
+re-trigger it; the sweep releases claims older than fifteen minutes so they are attempted again.
+That threshold is deliberately well beyond the sender's own timeout: taking a send away from a
+sender still working on it is how the same message gets delivered twice. Sends whose outcome is
+`unknown` are counted and left alone — SES may hold those, so only an operator can decide.
+
+Once a message is sent, SES events on the configuration set label it: `delivered`, `bounced`,
+`complained`, `rejected` and `opened`. Labels are added and never removed, because these events
+arrive out of order under at-least-once delivery and a message that both bounced and was opened
+should say both. An event for mail this service did not send resolves to nothing and is ignored,
+which is the ordinary case on a shared configuration set.
+
+Because labels live on the items rather than in per-label index rows, a filtered list reads a
+page and filters it, re-reading up to five times to fill the page. A response can therefore come
+back with fewer than `limit` items *and* a `next_page_token`; that is a normal result, and the
+client follows the token.
+
+### How the mailbox is wired
+
+- **Topology.** The stack owns two SNS topics, `MailInboundTopicArn` (receipt notifications)
+  and `MailEventsTopicArn` (configuration-set events for sent mail). Both are subscribed to the
+  function over the direct (lambda) pathway with per-topic invoke permissions, so there's no
+  wiring step. Every other topic stays outside the stack. When `AllowedTopics` is non-empty,
+  the two mail topic ARNs are appended to the function's allowlist automatically.
+- **Retries.** Lambda's async queue retries a failed mail delivery twice, then sends it to
+  `MailIngestDlq` (`MailIngestDlqUrl` output). That on-failure destination applies to every
+  asynchronous invocation of the function, including direct SNS subscriptions you wired by hand.
+- **Mail table stream.** The mail table's stream has at most two readers, the stream relay and
+  the mail sender, which is DynamoDB's recommended ceiling. A third consumer needs Kinesis Data
+  Streams for DynamoDB.
+- **Retention.** Objects under `inbound/`, `attachments/` and `sent/` expire after
+  `MailRetentionDays`, but mail table items stay. After that, raw-message and attachment
+  downloads for older messages return 404. Nothing under `outbox/` expires.
+- The mail bucket and mail table are retained when the stack or the mailbox is deleted.
+
+### Mail metrics
+
+Mail ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as
+CloudWatch Embedded Metrics Format (EMF) in the stack-name namespace, each carrying a `function`
+dimension. The stack defines no alarms; build your own alarms or dashboards on these metrics and
+on the `MailIngestDlq` and `PublishDlq` queue depths.
+
+### Disabling the mailbox
+
+SES refuses to delete the active rule set, so clearing `MailDomain` on a stack whose created
+rule set is active fails the update. Deactivate it first:
+
+```bash
+aws ses set-active-receipt-rule-set   # no name: deactivates the active rule set
+```
+
+With `ExistingReceiptRuleSetName`, only the stack's rule is removed and no deactivation is
+needed, but mail to the mailbox addresses then matches no rule. The mail bucket and mail table
+are retained, so delete them by hand if you don't need them. If you re-enable the mailbox with
+the same explicit `MailBucketName`, delete the retained bucket first.
+
+### Operator runbook
+
+Two situations need a person. Both are driven by invoking the sender function directly rather
+than through the API: they are rare, destructive and account-scoped, so `lambda:InvokeFunction`
+is a better gate than a bearer key.
+
+**A send whose outcome is `unknown`.** SES was called and no usable answer came back, so it may
+or may not hold the message. Nothing automatic will touch it — resending risks delivering twice.
+Find them in the sweep's log line (`sends_outcome_unknown`) or by querying `ByStatus`, then
+decide:
+
+```bash
+sender=aws-messaging-webhook-dev-mail-sender
+
+# Send it again, accepting that the recipient may get two copies.
+aws lambda invoke --function-name "$sender" --payload \
+  '{"command":"resend","message_id":"<id>"}' /dev/stdout
+
+# Or record the outcome without sending anything.
+aws lambda invoke --function-name "$sender" --payload \
+  '{"command":"close_sent","message_id":"<id>"}' /dev/stdout
+aws lambda invoke --function-name "$sender" --payload \
+  '{"command":"close_failed","message_id":"<id>"}' /dev/stdout
+```
+
+Only a send in `unknown` can be resolved; anything else is refused, because resolving a send
+still in flight would race the sender holding it and resolving a finished one would rewrite a
+settled outcome. Closing as sent labels the message `sent` without an SES id; closing as failed
+labels it `rejected` with reason `closed_by_operator`.
+
+**Mail that failed to ingest.** Deliveries that exhausted their retries land in `MailIngestDlq`
+carrying the original event, so replaying one is re-invoking the webhook function with it:
+
+```bash
+queue=$(output MailIngestDlqUrl)
+msg=$(aws sqs receive-message --queue-url "$queue" --max-number-of-messages 1)
+echo "$msg" | jq -r '.Messages[0].Body' | jq '.requestPayload' > /tmp/replay.json
+
+aws lambda invoke --function-name aws-messaging-webhook-dev-webhook \
+  --payload file:///tmp/replay.json /dev/stdout
+
+# Once it succeeds, drop the DLQ message.
+aws sqs delete-message --queue-url "$queue" \
+  --receipt-handle "$(echo "$msg" | jq -r '.Messages[0].ReceiptHandle')"
+```
+
+Ingest is idempotent — the message id is derived from the SES message id and receipt timestamp,
+so a replay that partly succeeded before resolves to the same ids rather than duplicating. The
+signature is re-verified on replay, which works as long as the signing certificate is still
+valid; that holds comfortably within the queue's 14-day retention.
+
+`MailSenderDlq` holds sends that exhausted their retries. Replay one the same way, against the
+sender function.
 
 ## EventBridge contract
 
@@ -254,6 +558,53 @@ the human `openCount` / `clickCount`. Consumers wanting the raw signal per event
 read `detail.event.open.isBotEvent` (or `.click.isBotEvent`) off the `ses.open` /
 `ses.click` detail, which is forwarded verbatim.
 
+### Mailbox events
+
+A mailbox stack's mail table stream additionally publishes mailbox detail-types on the same
+bus, `source` and `schemaVersion` contract as above. Only the inbound side is implemented;
+`message.sent`, `message.delivered`, `message.bounced`, `message.complained`,
+`message.rejected` and `message.opened` arrive with the sender and SES-event pipeline.
+
+`message.received`, `message.received.spam` (spam/virus verdict `FAIL`) or
+`message.received.unauthenticated` (SPF/DKIM/DMARC `FAIL`, spam/virus clean) fires once per
+inbox a newly-ingested message lands in — a message to two inboxes publishes two events, one per
+inbox. Precedence is spam over unauthenticated over plain; nothing is ever dropped, only
+classified. Shape:
+
+```json
+{
+  "schemaVersion": 1,
+  "meta": {
+    "messageId": "…", "inboxId": "…", "threadId": "…", "sesMessageId": "…"
+  },
+  "type": "message.received",
+  "event_type": "message.received",
+  "event_id": "evt_…",
+  "message": {
+    "inbox_id": "…", "thread_id": "…", "message_id": "…",
+    "labels": ["received", "unread"],
+    "timestamp": "…", "from": "…", "to": ["…"], "size": 1234,
+    "updated_at": "…", "created_at": "…",
+    "subject": "…", "preview": "…", "text": "…", "html": "…",
+    "attachments": [{ "attachment_id": "…", "size": 1234, "filename": "…", "content_type": "…", "content_disposition": "attachment" }],
+    "in_reply_to": "…", "references": ["…"], "headers": { "X-…": "…" }
+  },
+  "thread": { "thread_id": "…", "subject": "…", "message_count": 1, "recipients": ["…"] }
+}
+```
+
+`message` is the same `Message` object the `/v0` read API returns.
+`thread` is the compact snapshot taken as of this message's arrival (`thread_id`, `subject`,
+`message_count`, `recipients`), not a full thread fetch — a consumer wanting the thread's current
+state re-reads it, since the snapshot is only ever as fresh as the message that carries it. An
+oversized detail is reduced the same way the SMS/SES pipeline's details are: `message.html`,
+`.text` and `.headers` drop first, then `thread` shrinks to `{thread_id}`, then `message` falls
+back to `{payloadOmitted, ids}`; `meta` is never dropped.
+
+A payload matching no known family, and mail-table writes that aren't a message INSERT (send
+state, marker, key and RFC-alias items, and thread housekeeping writes), publish nothing from
+the mail table stream.
+
 ## Data model
 
 One DynamoDB table (`TableName` output):
@@ -269,6 +620,40 @@ One DynamoDB table (`TableName` output):
 
 A message's full timeline is one `Query` on `pk`; its current state is one `GetItem` on
 `pk` + `AGG`.
+
+### Mail table
+
+A mailbox stack additionally creates a second, separate DynamoDB table (`MailTableName`
+output) holding the mailbox — a distinct partition space from the messaging
+events table above, keyed by inbox and message rather than by SNS message id:
+
+| Item | `pk` | `sk` | Holds |
+|---|---|---|---|
+| Inbox | `INBOX#<inbox>` | `META` | email, display name, metadata, timestamps |
+| Message | `INBOX#<inbox>` | `MSG#<messageId>` | the full message: addresses, subject, body, labels, attachments, headers |
+| Thread | `INBOX#<inbox>` | `THR#<threadId>` | rolled-up subject/preview/senders/recipients/labels, message count, size, newest attachments |
+| RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps an inbound or outbound `Message-ID` to the message/thread it belongs to, for reply threading |
+
+Labels live in the message and thread items themselves, not in per-label index rows: a list
+filtered by label is served by reading the time-ordered index and filtering the page. That keeps
+ingest to a fixed three writes per message, at the cost of reading past non-matching messages
+when a label is rare.
+
+Two indexes serve the reads. `ByTime` (`gsi1pk`/`gsi1sk`) holds three partition shapes:
+`INBOX#<inbox>#MSG` sorted by message id, `INBOX#<inbox>#THR` sorted by
+`<timestamp>#<threadId>`, and `INBOXES` sorted by inbox id. `ByThread`
+(`gsi2pk`/`gsi2sk`) holds `THREAD#<inbox>#<threadId>` sorted by message id, for a thread's own
+messages. Message ids are UUIDv7s, so sorting by id *is* sorting by time, which is what lets a
+`before`/`after` window become a plain key range.
+
+This release populates only the Inbox, Message and Thread items from inbound ingest.
+The send-state, send-key and SES-reference items the send path adds live on the same table
+under their own `pk`s (`OUTBOX#<messageId>`, `SENDKEY#<sha256>`, `SESMSG#<sesMessageId>`,
+`SESCALL#<messageId>`) and are not written by this release. `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from
+the SES message id and receipt timestamp), so a redelivered SES notification always resolves to
+the same message rather than creating a duplicate. A message's raw MIME and attachments live in
+the mail bucket, not the table; the message item's `raw_s3_key`/attachment `object_key`s point at
+them.
 
 ### Consumer read access
 

@@ -32,6 +32,18 @@ pub mod names {
     pub const SUBSCRIPTIONS_LOST: &str = "SubscriptionsLost";
     pub const COLD_START: &str = "ColdStart";
     pub const LATENCY: &str = "Latency";
+
+    // Mail inbox.
+    pub const MESSAGES_INGESTED: &str = "MessagesIngested";
+    pub const INGEST_FAILURES: &str = "IngestFailures";
+    pub const INGEST_SKIPPED: &str = "IngestSkipped";
+    pub const INGEST_TIMEOUTS: &str = "IngestTimeouts";
+    pub const API_REQUESTS: &str = "ApiRequests";
+    pub const API_AUTH_FAILURES: &str = "ApiAuthFailures";
+    pub const MESSAGES_QUEUED: &str = "MessagesQueued";
+    pub const MESSAGES_SENT: &str = "MessagesSent";
+    pub const SEND_FAILURES: &str = "SendFailures";
+    pub const SEND_OUTCOME_UNKNOWN: &str = "SendOutcomeUnknown";
 }
 
 /// Initialize the EMF collector. Returns a `&'static Collector` handle which

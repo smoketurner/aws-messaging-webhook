@@ -91,6 +91,53 @@ pub trait SesApi: Send + Sync {
         email_address: &str,
         reason: SuppressionReason,
     ) -> impl Future<Output = Result<(), ActionError>> + Send;
+
+    /// Hands one already-assembled message to SES.
+    ///
+    /// `envelope` carries the real recipients, including `bcc`, which is why
+    /// they are passed alongside the document rather than read out of it.
+    ///
+    /// The implementation must disable the SDK's own retries. `SendEmail` has
+    /// no idempotency token, so a retried call that the first attempt had
+    /// actually delivered sends the message twice; deciding what a failure
+    /// means is [`SendOutcome`]'s job, not the SDK's.
+    fn send_raw(&self, request: &RawSend<'_>) -> impl Future<Output = SendOutcome> + Send;
+}
+
+/// One call to SES.
+#[derive(Debug, Clone, Copy)]
+pub struct RawSend<'a> {
+    pub raw: &'a [u8],
+    pub from: &'a str,
+    pub to: &'a [String],
+    pub cc: &'a [String],
+    pub bcc: &'a [String],
+    pub configuration_set: &'a str,
+    /// The verified domain identity this inbox sends under.
+    pub identity_arn: &'a str,
+    /// Tagged onto the send so a delivery event that arrives before the
+    /// message is marked sent can still be traced back to it.
+    pub message_id: &'a str,
+}
+
+/// What one SES call resolved to.
+///
+/// The distinction that matters is between [`Self::Failed`] — SES definitely
+/// did not accept the message — and [`Self::Unknown`], where it may have. The
+/// two are never collapsed: resending an `Unknown` risks delivering twice,
+/// and abandoning a `Failed` loses mail that could have been sent.
+#[derive(Debug)]
+pub enum SendOutcome {
+    /// SES accepted it and returned its own message id.
+    Sent { ses_message_id: String },
+    /// SES refused it, and will refuse it again: a rejected address, an
+    /// unverified identity, a paused account.
+    Failed { reason: String },
+    /// Throttled or briefly unavailable. Worth another attempt.
+    Retryable { reason: String },
+    /// No usable answer: a timeout, a dropped connection, an unreadable
+    /// response. SES may or may not have the message.
+    Unknown { reason: String },
 }
 
 /// Carrier-standard keyword families. Constants, not configuration.
@@ -134,6 +181,82 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
         KeywordIntent::OptIn
     } else {
         KeywordIntent::None
+    }
+}
+
+/// The mailbox label an SES event records, if it records one.
+///
+/// `Send` is deliberately absent: the sender already marks the message sent,
+/// and a `Send` event arriving afterwards would say nothing new. `Click` has
+/// no mailbox label in the vocabulary this service uses.
+fn delivery_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Delivery" => Some("delivered"),
+        "Bounce" => Some("bounced"),
+        "Complaint" => Some("complained"),
+        "Reject" => Some("rejected"),
+        "Open" => Some("opened"),
+        _ => None,
+    }
+}
+
+/// Labels the mailbox message an SES event belongs to, when it belongs to
+/// one.
+///
+/// Most events on the configuration set are for mail this service did not
+/// send, so an unresolved id is the ordinary case and not a failure. The
+/// label is added, never removed: these events arrive out of order under
+/// at-least-once delivery, and a message that both bounced and was opened
+/// should say so.
+async fn apply_delivery_label<T: Services>(
+    state: &AppState<T>,
+    event: &crate::model::ses_notification::SesNotification,
+) -> Result<bool, ActionError> {
+    let Some(label) = delivery_label(&event.kind) else {
+        return Ok(false);
+    };
+    // Mail is only tracked when the mailbox is configured.
+    if state.config.mail.is_none() {
+        return Ok(false);
+    }
+
+    let resolved = state
+        .services
+        .resolve_ses_message(&event.mail.message_id)
+        .await
+        .map_err(mail_store_error)?;
+    let Some((inbox, message_id)) = resolved else {
+        return Ok(false);
+    };
+
+    let now = crate::mail::time::format(crate::mail::time::now_ms());
+    state
+        .services
+        .update_labels(&inbox, &message_id, &[label.to_owned()], &[], &now)
+        .await
+        .map_err(mail_store_error)?;
+
+    tracing::info!(
+        message_id,
+        inbox_id = %inbox.as_str(),
+        label,
+        event = "delivery_label_applied",
+        "labelled a sent message from its SES event"
+    );
+    Ok(true)
+}
+
+/// A mail-store failure during the delivery join, mapped onto the action
+/// retry contract: a throttled or unreachable table is worth a redelivery,
+/// anything else is logged and does not block the event from publishing.
+fn mail_store_error(error: crate::mail::store::MailStoreError) -> ActionError {
+    use crate::mail::store::MailStoreError;
+    match error {
+        MailStoreError::Transient(source) => ActionError::transient(source),
+        // A version conflict means someone else was writing the same message;
+        // a redelivery re-reads and applies the label onto their result.
+        MailStoreError::Conflict => ActionError::transient(anyhow::anyhow!("mail store conflict")),
+        other => ActionError::permanent(anyhow::anyhow!("{other}")),
     }
 }
 
@@ -185,6 +308,13 @@ async fn suppress_recipients<T: Services>(
 pub async fn run<T: Services>(
     state: &AppState<T>,
     event: &DomainEvent,
+    // Threaded through for inbound-ingest time-boxing; only the
+    // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
+    deadline: tokio::time::Instant,
+    // The verified SNS envelope `Timestamp`, parsed to epoch ms by the
+    // caller; the third `received_ms` fallback, threaded to the
+    // `SesInbound` arm only.
+    envelope_ts_ms: Option<u64>,
 ) -> Result<&'static str, ActionError> {
     match event {
         DomainEvent::SmsInbound { event, .. } => {
@@ -237,9 +367,13 @@ pub async fn run<T: Services>(
             Ok("feedback")
         }
         DomainEvent::Ses { event, .. } => {
+            // Runs before suppression so a mailbox message is labelled even
+            // if suppression then fails for one of its recipients.
+            let labelled = apply_delivery_label(state, event).await?;
+
             if let Some(bounce) = &event.bounce {
                 if !bounce.is_permanent() {
-                    return Ok("none");
+                    return Ok(if labelled { "delivery_label" } else { "none" });
                 }
                 suppress_recipients(state, &bounce.bounced_recipients, SuppressionReason::Bounce)
                     .await?;
@@ -254,9 +388,12 @@ pub async fn run<T: Services>(
                 .await?;
                 return Ok("suppression");
             }
-            Ok("none")
+            Ok(if labelled { "delivery_label" } else { "none" })
         }
-        DomainEvent::SesInbound { .. } | DomainEvent::Unknown { .. } => Ok("none"),
+        DomainEvent::SesInbound { event, .. } => {
+            crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms).await
+        }
+        DomainEvent::Unknown { .. } => Ok("none"),
     }
 }
 

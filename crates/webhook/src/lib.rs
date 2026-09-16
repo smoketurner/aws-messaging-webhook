@@ -3,11 +3,14 @@
 
 pub mod actions;
 pub mod allowlist;
+pub mod api;
 pub mod app;
 pub mod aws;
 pub mod config;
 pub mod entry;
 pub mod error;
+pub mod logging;
+pub mod mail;
 pub mod metrics;
 pub mod model;
 pub mod publish;

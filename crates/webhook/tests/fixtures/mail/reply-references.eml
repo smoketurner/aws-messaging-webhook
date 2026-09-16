@@ -1,0 +1,11 @@
+From: Bob Recipient <bob@example.com>
+To: Alice Sender <alice@example.com>
+Subject: Re: Plain text hello
+Date: Mon, 1 Sep 2025 11:00:00 +0000
+Message-ID: <reply-1@example.com>
+In-Reply-To: <plain-1@example.com>
+References: <root-0@example.com> <plain-1@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Thanks Alice, got it.
