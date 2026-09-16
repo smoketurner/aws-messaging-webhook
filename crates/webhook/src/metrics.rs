@@ -44,15 +44,6 @@ pub mod names {
     pub const MESSAGES_SENT: &str = "MessagesSent";
     pub const SEND_FAILURES: &str = "SendFailures";
     pub const SEND_OUTCOME_UNKNOWN: &str = "SendOutcomeUnknown";
-    pub const SEND_UNKNOWN_OUTSTANDING: &str = "SendUnknownOutstanding";
-    pub const SEND_QUEUE_STALE: &str = "SendQueueStale";
-    pub const SEND_MARK_DEFERRED: &str = "SendMarkDeferred";
-    pub const OUTBOX_CLEANUP_FAILED: &str = "OutboxCleanupFailed";
-    pub const UNKNOWN_OUTBOX_EXPIRED: &str = "UnknownOutboxExpired";
-    /// Sends whose outbox has expired but which no operator has closed.
-    pub const SEND_EXPIRED_OUTSTANDING: &str = "SendExpiredOutstanding";
-    /// An expiry sweep whose delete or finish step failed.
-    pub const OUTBOX_EXPIRE_FAILED: &str = "OutboxExpireFailed";
 }
 
 /// Initialize the EMF collector. Returns a `&'static Collector` handle which
