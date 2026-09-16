@@ -21,7 +21,7 @@ use crate::mail::send::{SendSpec, SpecAttachment};
 /// One attachment's bytes, paired with the spec entry describing it.
 pub struct BuiltPart<'a> {
     pub spec: &'a SpecAttachment,
-    pub bytes: Vec<u8>,
+    pub bytes: &'a [u8],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,7 +158,7 @@ fn alternative(spec: &SendSpec) -> MimePart<'_> {
 }
 
 fn attachment_part<'a>(part: &'a BuiltPart<'a>) -> MimePart<'a> {
-    MimePart::new(part.spec.content_type.as_str(), part.bytes.as_slice())
+    MimePart::new(part.spec.content_type.as_str(), part.bytes)
 }
 
 fn address<'a>(email: &'a str, display_name: Option<&'a str>) -> Address<'a> {
@@ -282,7 +282,7 @@ mod tests {
         spec.attachments = vec![attachment.clone()];
         let parts = vec![BuiltPart {
             spec: &attachment,
-            bytes: b"pdf".to_vec(),
+            bytes: b"pdf",
         }];
 
         let raw = build(&spec, &parts);
@@ -303,7 +303,7 @@ mod tests {
         spec.attachments = vec![attachment.clone()];
         let parts = vec![BuiltPart {
             spec: &attachment,
-            bytes: b"png".to_vec(),
+            bytes: b"png",
         }];
 
         let raw = build(&spec, &parts);
@@ -323,11 +323,11 @@ mod tests {
         let parts = vec![
             BuiltPart {
                 spec: &inline,
-                bytes: b"png".to_vec(),
+                bytes: b"png",
             },
             BuiltPart {
                 spec: &attached,
-                bytes: b"pdf".to_vec(),
+                bytes: b"pdf",
             },
         ];
 

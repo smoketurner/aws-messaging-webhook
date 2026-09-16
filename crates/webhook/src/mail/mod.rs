@@ -14,6 +14,7 @@ pub mod keys;
 pub mod objects;
 pub mod plan;
 pub mod send;
+pub mod sender;
 pub mod size;
 pub mod store;
 pub mod time;

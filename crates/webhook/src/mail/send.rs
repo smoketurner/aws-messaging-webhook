@@ -290,6 +290,132 @@ pub struct SendSpec {
     pub created_at: String,
 }
 
+impl SendState {
+    /// The state after a sender takes this record.
+    ///
+    /// Claiming is what makes a send happen at most once: the write is
+    /// conditioned on the status still being `queued`, so of two senders
+    /// looking at the same stream record, exactly one proceeds.
+    #[must_use]
+    pub fn claimed(&self, now: &str) -> Self {
+        Self {
+            send_status: SendStatus::Sending,
+            version: self.version + 1,
+            sending_at: Some(now.to_owned()),
+            // Cleared so a later release can set it again and re-trigger the
+            // sender through its absent-to-present transition.
+            requeued_at: None,
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// The state after SES accepted the message.
+    #[must_use]
+    pub fn sent(&self, now: &str) -> Self {
+        Self {
+            send_status: SendStatus::Sent,
+            version: self.version + 1,
+            sending_at: None,
+            // The outbox objects can be cleaned up once nothing needs to
+            // rebuild the message.
+            promote_at: Some(now.to_owned()),
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// The state after SES refused the message for good.
+    #[must_use]
+    pub fn failed(&self, failure: SendFailure, now: &str) -> Self {
+        Self {
+            send_status: SendStatus::Failed,
+            version: self.version + 1,
+            sending_at: None,
+            failure: Some(failure),
+            promote_at: Some(now.to_owned()),
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// The state after a send whose outcome never came back.
+    ///
+    /// Nothing is cleaned up: the outbox objects stay, because an operator
+    /// may later decide to resend, and that has to rebuild the same message.
+    #[must_use]
+    pub fn unknown(&self, now: &str) -> Self {
+        Self {
+            send_status: SendStatus::Unknown,
+            version: self.version + 1,
+            sending_at: None,
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// The state after handing the record back for another attempt.
+    #[must_use]
+    pub fn released(&self, now: &str) -> Self {
+        Self {
+            send_status: SendStatus::Queued,
+            version: self.version + 1,
+            sending_at: None,
+            requeued_at: Some(now.to_owned()),
+            transient_failures: self.transient_failures + 1,
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+}
+
+/// Works out the new send state, the message's new labels, and the SES id to
+/// record, for one outcome.
+///
+/// Shared by every [`crate::mail::store::MailStore`] implementation so the
+/// in-memory double cannot drift from the real one on the question of what a
+/// given outcome means.
+#[must_use]
+pub fn mark_transition<'a>(
+    state: &SendState,
+    msg: &crate::mail::MailMessage,
+    outcome: crate::mail::store::MarkOutcome<'a>,
+    now: &str,
+) -> (SendState, Vec<String>, Option<&'a str>) {
+    use crate::mail::store::MarkOutcome;
+
+    let relabel = |remove: &str, add: &str| {
+        let mut labels: Vec<String> = msg
+            .labels
+            .iter()
+            .filter(|label| label.as_str() != remove)
+            .cloned()
+            .collect();
+        if !labels.iter().any(|label| label == add) {
+            labels.push(add.to_owned());
+        }
+        labels.sort();
+        labels
+    };
+
+    match outcome {
+        MarkOutcome::Sent { ses_message_id } => (
+            state.sent(now),
+            relabel("queued", "sent"),
+            Some(ses_message_id),
+        ),
+        MarkOutcome::Failed(failure) => (
+            state.failed(failure, now),
+            relabel("queued", "rejected"),
+            None,
+        ),
+        // Neither sent nor known to have failed, so the labels do not move:
+        // claiming either would be a statement this service cannot support.
+        MarkOutcome::Unknown => (state.unknown(now), msg.labels.clone(), None),
+        MarkOutcome::Released => (state.released(now), msg.labels.clone(), None),
+    }
+}
+
 /// The outbox key prefix for one message.
 #[must_use]
 pub fn outbox_prefix(message_id: &str) -> String {

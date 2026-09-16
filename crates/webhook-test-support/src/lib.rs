@@ -45,7 +45,9 @@ use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
 use aws_messaging_webhook::mail::send::{SendKey, SendState};
-use aws_messaging_webhook::mail::store::{EnqueueOutcome, ListQuery, Page, ThreadView};
+use aws_messaging_webhook::mail::store::{
+    EnqueueOutcome, ListQuery, MarkOutcome, Page, ThreadView,
+};
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
 use aws_messaging_webhook::mail::thread::ThreadState;
 use aws_messaging_webhook::mail::{
@@ -179,6 +181,27 @@ impl MailStore for FakeServices {
         now_epoch: u64,
     ) -> Result<EnqueueOutcome, MailStoreError> {
         self.mail.enqueue_send(msg, state, key, now_epoch).await
+    }
+
+    async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
+        self.mail.get_send_state(message_id).await
+    }
+
+    async fn claim_send(
+        &self,
+        message_id: &str,
+        now: &str,
+    ) -> Result<Option<SendState>, MailStoreError> {
+        self.mail.claim_send(message_id, now).await
+    }
+
+    async fn mark_send(
+        &self,
+        state: &SendState,
+        outcome: MarkOutcome<'_>,
+        now: &str,
+    ) -> Result<(), MailStoreError> {
+        self.mail.mark_send(state, outcome, now).await
     }
 
     async fn update_labels(

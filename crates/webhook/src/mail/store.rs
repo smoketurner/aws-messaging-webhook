@@ -13,7 +13,7 @@
 use std::future::Future;
 
 use crate::mail::keys::PageKey;
-use crate::mail::send::{SendKey, SendState};
+use crate::mail::send::{SendFailure, SendKey, SendState};
 use crate::mail::thread::ThreadState;
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
@@ -60,6 +60,20 @@ pub enum EnqueueOutcome {
     /// A live idempotency key claimed this request hash. The caller reads it
     /// back to decide between replaying its answer and refusing a reused key.
     KeyExists,
+}
+
+/// How a send finished, as [`MailStore::mark_send`] is told it.
+#[derive(Debug, Clone, Copy)]
+pub enum MarkOutcome<'a> {
+    /// SES accepted it, and gave back its own id.
+    Sent { ses_message_id: &'a str },
+    /// It will not be sent.
+    Failed(SendFailure),
+    /// SES may or may not have it. The message keeps its `queued` label,
+    /// because it is neither sent nor known to have failed.
+    Unknown,
+    /// Hand it back for another attempt.
+    Released,
 }
 
 /// A thread plus one page of its messages, ascending.
@@ -122,6 +136,32 @@ pub trait MailStore: Send + Sync {
         key: Option<&SendKey>,
         now_epoch: u64,
     ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send;
+
+    /// Reads one send's state, consistently.
+    fn get_send_state(
+        &self,
+        message_id: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
+
+    /// Takes a queued send for this sender.
+    ///
+    /// `None` means someone else already has it, or it is no longer queued.
+    /// That is the ordinary outcome of two senders seeing the same stream
+    /// record, not an error.
+    fn claim_send(
+        &self,
+        message_id: &str,
+        now: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
+
+    /// Records how a send ended, moving the state item and the message's
+    /// mirrored status and labels together.
+    fn mark_send(
+        &self,
+        state: &SendState,
+        outcome: MarkOutcome<'_>,
+        now: &str,
+    ) -> impl Future<Output = Result<(), MailStoreError>> + Send;
 
     /// Adds and removes labels on one message, updating its thread's union in
     /// the same transaction. Returns the message's resulting labels, or

@@ -12,9 +12,9 @@ use std::sync::Mutex;
 
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, TxnKind, WriteOp};
-use aws_messaging_webhook::mail::send::{SendKey, SendState};
+use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
-    EnqueueOutcome, ListQuery, MailStore, MailStoreError, Page, ThreadView,
+    EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
 use aws_messaging_webhook::mail::thread::{ThreadState, apply_message, new_thread};
 use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
@@ -597,6 +597,99 @@ impl MailStore for MailMemoryStore {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "enqueue transaction for message {} was cancelled",
                             msg.message_id
+                        )));
+                    }
+                }
+            }
+            Err(MailStoreError::Conflict)
+        })();
+        std::future::ready(result)
+    }
+
+    fn get_send_state(
+        &self,
+        message_id: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        let result = self
+            .get_item(&keys::outbox_pk(message_id), keys::outbox_sk())
+            .map(|item| {
+                serde_dynamo::from_item(item).map_err(|e| {
+                    MailStoreError::Permanent(anyhow::anyhow!("deserializing send state: {e}"))
+                })
+            })
+            .transpose();
+        std::future::ready(result)
+    }
+
+    fn claim_send(
+        &self,
+        message_id: &str,
+        now: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        use aws_messaging_webhook::mail::plan::plan_claim;
+
+        let result = (|| {
+            for _attempt in 0..=MAX_RETRIES {
+                let Some(item) = self.get_item(&keys::outbox_pk(message_id), keys::outbox_sk())
+                else {
+                    return Ok(None);
+                };
+                let before: SendState = serde_dynamo::from_item(item).map_err(|e| {
+                    MailStoreError::Permanent(anyhow::anyhow!("deserializing send state: {e}"))
+                })?;
+                if before.send_status != SendStatus::Queued {
+                    return Ok(None);
+                }
+
+                let after = before.claimed(now);
+                let ops = plan_claim(&before, &after)?;
+                match self.attempt(&ops)? {
+                    Commit::Applied => return Ok(Some(after)),
+                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                    Commit::Cancelled(_) => return Ok(None),
+                }
+            }
+            Err(MailStoreError::Conflict)
+        })();
+        std::future::ready(result)
+    }
+
+    fn mark_send(
+        &self,
+        state: &SendState,
+        outcome: MarkOutcome<'_>,
+        now: &str,
+    ) -> impl Future<Output = Result<(), MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        use aws_messaging_webhook::mail::plan::plan_mark;
+        use aws_messaging_webhook::mail::send::mark_transition;
+
+        let result = (|| {
+            for _attempt in 0..=MAX_RETRIES {
+                let Some(item) = self.get_item(
+                    &keys::inbox_pk(state.inbox_id.as_str()),
+                    &keys::message_sk(&state.message_id),
+                ) else {
+                    return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                        "send state {} has no message",
+                        state.message_id
+                    )));
+                };
+                let msg: MailMessage = serde_dynamo::from_item(item).map_err(|e| {
+                    MailStoreError::Permanent(anyhow::anyhow!("deserializing message: {e}"))
+                })?;
+
+                let (after, labels, ses_message_id) = mark_transition(state, &msg, outcome, now);
+                let ops = plan_mark(state, &after, &msg, &labels, ses_message_id, now)?;
+                match self.attempt(&ops)? {
+                    Commit::Applied => return Ok(()),
+                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                    Commit::Cancelled(_) => {
+                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                            "marking send {} was cancelled",
+                            state.message_id
                         )));
                     }
                 }

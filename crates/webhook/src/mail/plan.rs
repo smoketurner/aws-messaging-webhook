@@ -9,7 +9,7 @@
 
 use serde_dynamo::AttributeValue;
 
-use crate::mail::send::{SendKey, SendState};
+use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::MailStoreError;
 use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
 use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys, size};
@@ -220,6 +220,31 @@ pub fn plan_enqueue(
 
     ops.push(message_put(msg, thread_after)?);
 
+    ops.push(send_state_put(None, state)?);
+    ops.push(thread_put(thread_before, thread_after)?);
+    push_rfc_alias_op(&mut ops, msg);
+
+    Ok(ops)
+}
+
+/// The `Put` for a send-state item, version-conditioned on what was read.
+///
+/// The index keys move with the status, which is what keeps the sweep's view
+/// of "queued" and "sending" accurate without a second write.
+fn send_state_put(
+    before: Option<&SendState>,
+    after: &SendState,
+) -> Result<PlannedOp, MailStoreError> {
+    send_state_op(
+        after,
+        before.map_or(Cond::NotExists, |before| {
+            Cond::VersionEquals(before.version)
+        }),
+    )
+}
+
+/// The send-state item with its keys, under an arbitrary condition.
+fn send_state_op(state: &SendState, cond: Cond) -> Result<PlannedOp, MailStoreError> {
     let state_keys = [
         ("pk", AttributeValue::S(keys::outbox_pk(&state.message_id))),
         ("sk", AttributeValue::S(keys::outbox_sk().to_owned())),
@@ -229,16 +254,129 @@ pub fn plan_enqueue(
         ),
         ("gsi3sk", AttributeValue::S(state.message_id.clone())),
     ];
-    ops.push(PlannedOp {
+    Ok(PlannedOp {
         role: OpRole::SendState,
         op: WriteOp::Put {
             item: item_with_keys(state, state_keys)?,
-            cond: Cond::NotExists,
+            cond,
+        },
+    })
+}
+
+/// Plans the claim that hands one queued send to one sender.
+///
+/// The condition is on the status, not just the version: a record that is
+/// already `sending` must not be claimed again, however old its version
+/// looks, because that is exactly how the same message gets sent twice.
+///
+/// # Errors
+///
+/// Propagates a serialization failure as [`MailStoreError::Permanent`].
+pub fn plan_claim(before: &SendState, after: &SendState) -> Result<Vec<PlannedOp>, MailStoreError> {
+    Ok(vec![send_state_op(
+        after,
+        Cond::All(vec![
+            Check::Eq(
+                "send_status",
+                AttributeValue::S(SendStatus::Queued.as_str().to_owned()),
+            ),
+            Check::Eq("version", AttributeValue::N(before.version.to_string())),
+        ]),
+    )?])
+}
+
+/// Plans the end of a send: the new send state, the message's mirrored
+/// status and labels, and — when SES gave us one — the alias that maps its
+/// message id back to ours.
+///
+/// Both items move together so a reader can never see a message still
+/// labelled `queued` whose send is finished, and the message is written once
+/// per outcome rather than once per attempt, which is what keeps the relay
+/// from publishing an event for every retry.
+///
+/// # Errors
+///
+/// Propagates a serialization failure as [`MailStoreError::Permanent`].
+pub fn plan_mark(
+    state_before: &SendState,
+    state_after: &SendState,
+    msg: &MailMessage,
+    new_labels: &[String],
+    ses_message_id: Option<&str>,
+    now: &str,
+) -> Result<Vec<PlannedOp>, MailStoreError> {
+    debug_assert!(
+        is_sorted_and_deduped(new_labels),
+        "message labels must be sorted and deduplicated before planning"
+    );
+
+    let mut ops = Vec::with_capacity(3);
+    ops.push(send_state_put(Some(state_before), state_after)?);
+
+    let mut set = vec![
+        (
+            "version".to_owned(),
+            AttributeValue::N((msg.version + 1).to_string()),
+        ),
+        ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
+        (
+            "send_status".to_owned(),
+            AttributeValue::S(state_after.send_status.as_str().to_owned()),
+        ),
+    ];
+    let mut remove = Vec::new();
+    if new_labels.is_empty() {
+        remove.push("labels".to_owned());
+    } else {
+        set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
+    }
+    if let Some(ses_message_id) = ses_message_id {
+        set.push((
+            "ses_message_id".to_owned(),
+            AttributeValue::S(ses_message_id.to_owned()),
+        ));
+        set.push(("sent_at".to_owned(), AttributeValue::S(now.to_owned())));
+    }
+
+    ops.push(PlannedOp {
+        role: OpRole::Message,
+        op: WriteOp::Update {
+            pk: keys::inbox_pk(msg.inbox_id.as_str()),
+            sk: keys::message_sk(&msg.message_id),
+            set,
+            remove,
+            cond: Cond::VersionEquals(msg.version),
         },
     });
 
-    ops.push(thread_put(thread_before, thread_after)?);
-    push_rfc_alias_op(&mut ops, msg);
+    if let Some(ses_message_id) = ses_message_id {
+        // Unconditioned: a redrive that marks the same send again should
+        // rewrite this rather than cancel the whole transaction.
+        let mut item = serde_dynamo::Item::default();
+        item.inner_mut().insert(
+            "pk".to_owned(),
+            AttributeValue::S(keys::ses_ref_pk(ses_message_id)),
+        );
+        item.inner_mut().insert(
+            "sk".to_owned(),
+            AttributeValue::S(keys::ses_ref_sk().to_owned()),
+        );
+        item.inner_mut().insert(
+            "inbox_id".to_owned(),
+            AttributeValue::S(msg.inbox_id.as_str().to_owned()),
+        );
+        item.inner_mut().insert(
+            "message_id".to_owned(),
+            AttributeValue::S(msg.message_id.clone()),
+        );
+        ops.push(PlannedOp {
+            role: OpRole::SesRef,
+            op: WriteOp::Put {
+                item,
+                cond: Cond::None,
+            },
+        });
+    }
 
     Ok(ops)
 }

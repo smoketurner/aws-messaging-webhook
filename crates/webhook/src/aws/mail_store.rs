@@ -25,8 +25,10 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use crate::aws::{self, AwsServices};
 use crate::mail::keys::{self, PageKey};
 use crate::mail::plan::{Check, Cond, PlannedOp, TxnKind, WriteOp};
-use crate::mail::send::{SendKey, SendState};
-use crate::mail::store::{EnqueueOutcome, ListQuery, MailStore, MailStoreError, Page, ThreadView};
+use crate::mail::send::{SendKey, SendState, SendStatus, mark_transition};
+use crate::mail::store::{
+    EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
+};
 use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
 use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
@@ -810,6 +812,85 @@ impl MailStore for AwsServices {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "enqueue transaction for message {} was cancelled",
                         msg.message_id
+                    )));
+                }
+            }
+        }
+        Err(MailStoreError::Conflict)
+    }
+
+    async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let output = self
+            .dynamo
+            .get_item()
+            .table_name(table_name)
+            .key("pk", DynamoAv::S(keys::outbox_pk(message_id)))
+            .key("sk", DynamoAv::S(keys::outbox_sk().to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| store_error_from_sdk("GetItem(send state)", &e))?;
+        match output.item {
+            None => Ok(None),
+            Some(item) => serde_dynamo::from_item(item)
+                .map(Some)
+                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing send state: {e}"))),
+        }
+    }
+
+    async fn claim_send(
+        &self,
+        message_id: &str,
+        now: &str,
+    ) -> Result<Option<SendState>, MailStoreError> {
+        for _attempt in 0..=MAX_TXN_RETRIES {
+            let Some(before) = self.get_send_state(message_id).await? else {
+                return Ok(None);
+            };
+            // Anything but `queued` means this record is not ours to take:
+            // another sender holds it, or it has already finished.
+            if before.send_status != SendStatus::Queued {
+                return Ok(None);
+            }
+
+            let after = before.claimed(now);
+            let ops = crate::mail::plan::plan_claim(&before, &after)?;
+            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+                Attempt::Committed => return Ok(Some(after)),
+                // Lost the race: re-read, and the status check above settles
+                // it.
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(_) => return Ok(None),
+            }
+        }
+        Err(MailStoreError::Conflict)
+    }
+
+    async fn mark_send(
+        &self,
+        state: &SendState,
+        outcome: MarkOutcome<'_>,
+        now: &str,
+    ) -> Result<(), MailStoreError> {
+        for _attempt in 0..=MAX_TXN_RETRIES {
+            let Some(msg) = self.get_message(&state.inbox_id, &state.message_id).await? else {
+                return Err(MailStoreError::Permanent(anyhow!(
+                    "send state {} has no message",
+                    state.message_id
+                )));
+            };
+            let (after, labels, ses_message_id) = mark_transition(state, &msg, outcome, now);
+            let ops =
+                crate::mail::plan::plan_mark(state, &after, &msg, &labels, ses_message_id, now)?;
+
+            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+                Attempt::Committed => return Ok(()),
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(_) => {
+                    return Err(MailStoreError::Permanent(anyhow!(
+                        "marking send {} was cancelled",
+                        state.message_id
                     )));
                 }
             }
