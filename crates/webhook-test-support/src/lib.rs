@@ -34,7 +34,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::anyhow;
 use api_keys::FakeApiKeys;
 use aws_messaging_webhook::actions::{
-    ActionError, ActionErrorKind, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason,
+    ActionError, ActionErrorKind, FeedbackStatus, RawSend, SendOutcome, SesApi, SmsVoiceApi,
+    SuppressionReason,
 };
 use aws_messaging_webhook::allowlist::TopicAllowlist;
 use aws_messaging_webhook::api::keys::{ApiKeyError, ApiKeySource, KeyCache};
@@ -89,6 +90,30 @@ pub struct FakeServices {
     /// `ApiKeySource` is delegated to it below. Unavailable until a test
     /// calls `set_keys`.
     pub api_keys: FakeApiKeys,
+    /// Every message handed to `send_raw`, in order.
+    pub sent: Mutex<Vec<SentMessage>>,
+    /// The outcome the next `send_raw` returns, consumed once. Defaults to a
+    /// successful send.
+    pub send_outcome: Mutex<Option<SendOutcome>>,
+}
+
+/// One call to [`SesApi::send_raw`], captured for assertions.
+#[derive(Debug, Clone)]
+pub struct SentMessage {
+    pub message_id: String,
+    pub raw: Vec<u8>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub from: String,
+}
+
+impl SentMessage {
+    /// The assembled message as text, for asserting on headers and bodies.
+    #[must_use]
+    pub fn raw_text(&self) -> String {
+        String::from_utf8_lossy(&self.raw).into_owned()
+    }
 }
 
 impl ApiKeySource for FakeServices {
@@ -308,6 +333,27 @@ impl SmsVoiceApi for FakeServices {
 }
 
 impl SesApi for FakeServices {
+    fn send_raw(&self, request: &RawSend<'_>) -> impl Future<Output = SendOutcome> + Send {
+        self.record(format!("send_raw:{}", request.message_id));
+        self.sent.lock().unwrap().push(SentMessage {
+            message_id: request.message_id.to_owned(),
+            raw: request.raw.to_vec(),
+            to: request.to.to_vec(),
+            cc: request.cc.to_vec(),
+            bcc: request.bcc.to_vec(),
+            from: request.from.to_owned(),
+        });
+        let outcome =
+            self.send_outcome
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| SendOutcome::Sent {
+                    ses_message_id: format!("ses-{}", request.message_id),
+                });
+        std::future::ready(outcome)
+    }
+
     fn put_suppressed_destination(
         &self,
         email_address: &str,

@@ -91,6 +91,53 @@ pub trait SesApi: Send + Sync {
         email_address: &str,
         reason: SuppressionReason,
     ) -> impl Future<Output = Result<(), ActionError>> + Send;
+
+    /// Hands one already-assembled message to SES.
+    ///
+    /// `envelope` carries the real recipients, including `bcc`, which is why
+    /// they are passed alongside the document rather than read out of it.
+    ///
+    /// The implementation must disable the SDK's own retries. `SendEmail` has
+    /// no idempotency token, so a retried call that the first attempt had
+    /// actually delivered sends the message twice; deciding what a failure
+    /// means is [`SendOutcome`]'s job, not the SDK's.
+    fn send_raw(&self, request: &RawSend<'_>) -> impl Future<Output = SendOutcome> + Send;
+}
+
+/// One call to SES.
+#[derive(Debug, Clone, Copy)]
+pub struct RawSend<'a> {
+    pub raw: &'a [u8],
+    pub from: &'a str,
+    pub to: &'a [String],
+    pub cc: &'a [String],
+    pub bcc: &'a [String],
+    pub configuration_set: &'a str,
+    /// The verified domain identity this inbox sends under.
+    pub identity_arn: &'a str,
+    /// Tagged onto the send so a delivery event that arrives before the
+    /// message is marked sent can still be traced back to it.
+    pub message_id: &'a str,
+}
+
+/// What one SES call resolved to.
+///
+/// The distinction that matters is between [`Self::Failed`] — SES definitely
+/// did not accept the message — and [`Self::Unknown`], where it may have. The
+/// two are never collapsed: resending an `Unknown` risks delivering twice,
+/// and abandoning a `Failed` loses mail that could have been sent.
+#[derive(Debug)]
+pub enum SendOutcome {
+    /// SES accepted it and returned its own message id.
+    Sent { ses_message_id: String },
+    /// SES refused it, and will refuse it again: a rejected address, an
+    /// unverified identity, a paused account.
+    Failed { reason: String },
+    /// Throttled or briefly unavailable. Worth another attempt.
+    Retryable { reason: String },
+    /// No usable answer: a timeout, a dropped connection, an unreadable
+    /// response. SES may or may not have the message.
+    Unknown { reason: String },
 }
 
 /// Carrier-standard keyword families. Constants, not configuration.

@@ -12,11 +12,18 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem, Update};
 use aws_sdk_eventbridge::types::PutEventsRequestEntry;
 use aws_sdk_pinpointsmsvoicev2::types::MessageFeedbackStatus;
-use aws_sdk_sesv2::types::SuppressionListReason;
+use aws_sdk_sesv2::config::Builder as SesConfigBuilder;
+use aws_sdk_sesv2::config::retry::RetryConfig;
+use aws_sdk_sesv2::operation::send_email::SendEmailOutput;
+use aws_sdk_sesv2::types::{
+    Destination as SesDestination, EmailContent, MessageTag, RawMessage, SuppressionListReason,
+};
 use aws_smithy_types::Blob;
 use aws_smithy_types::error::display::DisplayErrorContext;
 
-use crate::actions::{ActionError, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason};
+use crate::actions::{
+    ActionError, FeedbackStatus, RawSend, SendOutcome, SesApi, SmsVoiceApi, SuppressionReason,
+};
 use crate::config::{Config, MailConfig};
 use crate::model::DomainEvent;
 use crate::model::ses_notification::{SesBounce, SesEngagement};
@@ -439,14 +446,140 @@ impl SesApi for AwsServices {
             .map_err(|e| classify_action_error("PutSuppressedDestination", &e))?;
         Ok(())
     }
+
+    async fn send_raw(&self, request: &RawSend<'_>) -> SendOutcome {
+        let mut destination = SesDestination::builder();
+        for address in request.to {
+            destination = destination.to_addresses(address);
+        }
+        for address in request.cc {
+            destination = destination.cc_addresses(address);
+        }
+        for address in request.bcc {
+            destination = destination.bcc_addresses(address);
+        }
+
+        // A builder that will not build means the request was never sent, so
+        // this is a definite failure rather than an ambiguous one.
+        let raw = match RawMessage::builder()
+            .data(Blob::new(request.raw.to_vec()))
+            .build()
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                return SendOutcome::Failed {
+                    reason: format!("building the raw message: {error}"),
+                };
+            }
+        };
+        let tag = match MessageTag::builder()
+            .name("mailbox_message")
+            .value(request.message_id)
+            .build()
+        {
+            Ok(tag) => tag,
+            Err(error) => {
+                return SendOutcome::Failed {
+                    reason: format!("building the message tag: {error}"),
+                };
+            }
+        };
+
+        let result = self
+            .ses
+            .send_email()
+            .from_email_address(request.from)
+            .from_email_address_identity_arn(request.identity_arn)
+            .configuration_set_name(request.configuration_set)
+            .destination(destination.build())
+            .content(EmailContent::builder().raw(raw).build())
+            .email_tags(tag)
+            .customize()
+            // One attempt, always. A retry of a call that already succeeded
+            // would send the message a second time, and SendEmail has no
+            // idempotency token to prevent that.
+            .config_override(SesConfigBuilder::new().retry_config(RetryConfig::disabled()))
+            .send()
+            .await;
+
+        classify_send_result(result)
+    }
+}
+
+/// Turns one `SendEmail` result into a [`SendOutcome`].
+///
+/// The split that matters is between a definite refusal and an answer that
+/// never arrived. A service error carries an HTTP status, so SES has replied
+/// and its answer is authoritative: 4xx other than 429 is a permanent
+/// refusal, 429 and 5xx are worth retrying. Everything else — a timeout, a
+/// dropped connection, a response that could not be parsed — means the
+/// request may have been received and acted on, so it is `Unknown` and the
+/// message is never resent without an operator saying so.
+fn classify_send_result<E>(result: Result<SendEmailOutput, SdkError<E>>) -> SendOutcome
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let error = match result {
+        Ok(output) => {
+            return SendOutcome::Sent {
+                ses_message_id: output.message_id().unwrap_or_default().to_owned(),
+            };
+        }
+        Err(error) => error,
+    };
+
+    let reason = DisplayErrorContext(&error).to_string();
+    match &error {
+        SdkError::ServiceError(context) => {
+            let status = context.raw().status().as_u16();
+            if status == 429 || status >= 500 {
+                SendOutcome::Retryable { reason }
+            } else {
+                SendOutcome::Failed { reason }
+            }
+        }
+        // Rejected before anything was sent: nothing reached SES.
+        SdkError::ConstructionFailure(_) => SendOutcome::Failed { reason },
+        // The request may be in flight or already handled.
+        _ => SendOutcome::Unknown { reason },
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_sesv2::operation::send_email::SendEmailError;
     use axum::body::Bytes;
 
     use super::*;
     use crate::model::Source;
+
+    /// A send whose answer never arrived must never be reported as a
+    /// failure. Doing so would let the sender give up on — or worse, resend —
+    /// a message SES may already have accepted.
+    #[test]
+    fn an_unanswered_send_is_unknown_rather_than_failed() {
+        let timeout: SdkError<SendEmailError> =
+            SdkError::timeout_error(Box::new(std::io::Error::other("timed out")));
+        assert!(
+            matches!(
+                classify_send_result(Err(timeout)),
+                SendOutcome::Unknown { .. }
+            ),
+            "a timeout leaves the outcome genuinely unknown"
+        );
+    }
+
+    /// A request that was never built cannot have reached SES, so it is a
+    /// definite failure and safe to stop on.
+    #[test]
+    fn a_request_that_was_never_sent_is_a_definite_failure() {
+        let construction: SdkError<SendEmailError> =
+            SdkError::construction_failure(Box::new(std::io::Error::other("bad field")));
+        assert!(matches!(
+            classify_send_result(Err(construction)),
+            SendOutcome::Failed { .. }
+        ));
+    }
 
     fn record(source: Option<Source>, aggregate_id: &str) -> EventRecord {
         EventRecord {
