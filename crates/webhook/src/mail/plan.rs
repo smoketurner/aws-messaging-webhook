@@ -9,6 +9,7 @@
 
 use serde_dynamo::AttributeValue;
 
+use crate::mail::send::{SendKey, SendState};
 use crate::mail::store::MailStoreError;
 use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
 use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys, size};
@@ -164,6 +165,81 @@ pub fn plan_insert(
     // Message, thread, and at most one `Message-ID` alias.
     let mut ops = Vec::with_capacity(3);
     ops.push(message_put(msg, thread_after)?);
+    ops.push(thread_put(thread_before, thread_after)?);
+    push_rfc_alias_op(&mut ops, msg);
+
+    Ok(ops)
+}
+
+/// Plans the enqueue transaction: the idempotency key (when one was given),
+/// the queued message, its send state, its thread, and the `Message-ID`
+/// alias.
+///
+/// Everything lands in one transaction so a queued message can never exist
+/// without the state item the sender claims, and an idempotency key can never
+/// be recorded for a send that was not committed.
+///
+/// # Errors
+///
+/// [`MailStoreError::LabelLimit`] when the thread's union would exceed
+/// [`THREAD_LABEL_TOTAL_CAP`].
+pub fn plan_enqueue(
+    msg: &MailMessage,
+    state: &SendState,
+    key: Option<&SendKey>,
+    thread_before: Option<&ThreadState>,
+    thread_after: &ThreadState,
+    now_epoch: u64,
+) -> Result<Vec<PlannedOp>, MailStoreError> {
+    if thread_after.labels.len() > THREAD_LABEL_TOTAL_CAP {
+        return Err(MailStoreError::LabelLimit(format!(
+            "thread {} would carry {} labels, over the cap of {THREAD_LABEL_TOTAL_CAP}",
+            thread_after.thread_id,
+            thread_after.labels.len(),
+        )));
+    }
+
+    let mut ops = Vec::with_capacity(5);
+
+    // First, so a cancellation names the key conflict before anything else.
+    if let Some(key) = key {
+        let key_keys = [
+            (
+                "pk",
+                AttributeValue::S(keys::send_key_pk(&key.request_hash)),
+            ),
+            ("sk", AttributeValue::S(keys::send_key_sk().to_owned())),
+        ];
+        ops.push(PlannedOp {
+            role: OpRole::IdempotencyKey,
+            op: WriteOp::Put {
+                item: item_with_keys(key, key_keys)?,
+                // An expired key is reusable; a live one is a replay, which
+                // the caller resolves by reading it back.
+                cond: Cond::NotExistsOrExpired { now_epoch },
+            },
+        });
+    }
+
+    ops.push(message_put(msg, thread_after)?);
+
+    let state_keys = [
+        ("pk", AttributeValue::S(keys::outbox_pk(&state.message_id))),
+        ("sk", AttributeValue::S(keys::outbox_sk().to_owned())),
+        (
+            "gsi3pk",
+            AttributeValue::S(format!("SENDSTATUS#{}", state.send_status.as_str())),
+        ),
+        ("gsi3sk", AttributeValue::S(state.message_id.clone())),
+    ];
+    ops.push(PlannedOp {
+        role: OpRole::SendState,
+        op: WriteOp::Put {
+            item: item_with_keys(state, state_keys)?,
+            cond: Cond::NotExists,
+        },
+    });
+
     ops.push(thread_put(thread_before, thread_after)?);
     push_rfc_alias_op(&mut ops, msg);
 
@@ -417,6 +493,110 @@ mod tests {
             panic!("expected a Put");
         };
         assert_eq!(*cond, Cond::VersionEquals(0));
+    }
+
+    fn queued_state(msg: &MailMessage, key_pk: Option<&str>) -> SendState {
+        SendState::queued(
+            msg.inbox_id.clone(),
+            msg.message_id.clone(),
+            msg.thread_id.clone(),
+            crate::mail::send::Envelope {
+                to: vec!["recipient@example.com".to_owned()],
+                ..crate::mail::send::Envelope::default()
+            },
+            key_pk.map(ToOwned::to_owned),
+            "2026-01-01T00:00:00.000Z",
+        )
+    }
+
+    #[test]
+    fn plan_enqueue_commits_the_message_and_its_send_state_together() {
+        // A queued message without its state item would never be claimed, so
+        // both must be in the same transaction, and both must be new.
+        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        msg.direction = Direction::Outbound;
+        let thread = new_thread(&msg);
+        let state = queued_state(&msg, None);
+
+        let ops = plan_enqueue(&msg, &state, None, None, &thread, 1_800_000_000).unwrap();
+
+        let roles: Vec<OpRole> = ops.iter().map(|o| o.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                OpRole::Message,
+                OpRole::SendState,
+                OpRole::Thread,
+                OpRole::RfcAlias
+            ]
+        );
+        for role in [OpRole::Message, OpRole::SendState] {
+            let WriteOp::Put { cond, .. } = &ops.iter().find(|o| o.role == role).unwrap().op else {
+                panic!("expected a Put for {role:?}");
+            };
+            assert_eq!(*cond, Cond::NotExists, "{role:?} must be new");
+        }
+    }
+
+    #[test]
+    fn plan_enqueue_puts_the_idempotency_key_first_and_lets_an_expired_one_go() {
+        // The key op leads so a cancellation names the replay before any
+        // other conflict, and an expired key must be reusable.
+        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        msg.direction = Direction::Outbound;
+        let thread = new_thread(&msg);
+        let state = queued_state(&msg, Some("SENDKEY#abc"));
+        let key = crate::mail::send::SendKey {
+            inbox_id: msg.inbox_id.clone(),
+            message_id: msg.message_id.clone(),
+            thread_id: msg.thread_id.clone(),
+            request_hash: "abc".to_owned(),
+            route: "send".to_owned(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+
+        let ops = plan_enqueue(&msg, &state, Some(&key), None, &thread, 1_700_000_000).unwrap();
+
+        assert_eq!(ops[0].role, OpRole::IdempotencyKey);
+        let WriteOp::Put { cond, .. } = &ops[0].op else {
+            panic!("expected a Put");
+        };
+        assert_eq!(
+            *cond,
+            Cond::NotExistsOrExpired {
+                now_epoch: 1_700_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn plan_enqueue_indexes_the_send_state_by_its_status() {
+        // The sweep finds work through the status index, so a queued send has
+        // to be in the queued partition.
+        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        msg.direction = Direction::Outbound;
+        let thread = new_thread(&msg);
+        let state = queued_state(&msg, None);
+
+        let ops = plan_enqueue(&msg, &state, None, None, &thread, 1_800_000_000).unwrap();
+        let WriteOp::Put { item, .. } =
+            &ops.iter().find(|o| o.role == OpRole::SendState).unwrap().op
+        else {
+            panic!("expected a Put");
+        };
+
+        assert_eq!(
+            item.inner().get("gsi3pk"),
+            Some(&AttributeValue::S("SENDSTATUS#queued".to_owned()))
+        );
+        assert_eq!(
+            item.inner().get("pk"),
+            Some(&AttributeValue::S("OUTBOX#mid-1".to_owned()))
+        );
+        // The envelope rides on the state item, not the message.
+        let stored: SendState = serde_dynamo::from_item(item.clone()).unwrap();
+        assert_eq!(stored.envelope.to, vec!["recipient@example.com"]);
     }
 
     #[test]
