@@ -43,7 +43,7 @@ use crate::state::{AppState, Services};
 use crate::store::EventRecord;
 
 /// Reads a DynamoDB `String` attribute from a stream image.
-fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
+pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
     match image.get(key) {
         Some(AttributeValue::S(value)) => Some(value.as_str()),
         _ => None,

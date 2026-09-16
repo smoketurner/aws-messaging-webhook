@@ -57,6 +57,76 @@ pub enum SenderError {
     NotConfigured,
 }
 
+/// Drives one batch of mail-table stream records.
+///
+/// Only send-state items matter here, and only two transitions on them: a new
+/// queued send, and a release, which is visible as `requeued_at` appearing.
+/// Everything else on this stream — messages, threads, aliases — belongs to
+/// the relay running in the other mode.
+///
+/// Failures are reported per record through `batchItemFailures`, so one
+/// unavailable dependency does not force the whole batch to be redelivered
+/// and re-attempted.
+///
+/// # Errors
+///
+/// Only when the payload is not a stream event at all.
+pub async fn handle_sender_stream<T: Services>(
+    state: &AppState<T>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, lambda_http::Error> {
+    let event: aws_lambda_events::dynamodb::Event = serde_json::from_value(payload)
+        .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
+
+    let mut failures = Vec::new();
+    for record in event.records {
+        let Some(message_id) = queued_send_id(&record) else {
+            continue;
+        };
+        if let Err(error) = handle_send(state, &message_id).await {
+            tracing::error!(
+                message_id,
+                error = ?error,
+                event = "send_record_failed",
+                "returning this record for redelivery"
+            );
+            if let Some(sequence_number) = record.change.sequence_number.clone() {
+                failures.push(serde_json::json!({ "itemIdentifier": sequence_number }));
+            }
+        }
+    }
+    Ok(serde_json::json!({ "batchItemFailures": failures }))
+}
+
+/// The message id a record is asking to be sent, if it is asking at all.
+fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<String> {
+    let new_image = &record.change.new_image;
+    if crate::stream::image_str(new_image, "sk")? != "STATE" {
+        return None;
+    }
+    if crate::stream::image_str(new_image, "send_status")? != "queued" {
+        return None;
+    }
+
+    let message_id = crate::stream::image_str(new_image, "pk")?
+        .strip_prefix("OUTBOX#")?
+        .to_owned();
+
+    match record.event_name.as_str() {
+        "INSERT" => Some(message_id),
+        // A release is the only MODIFY worth acting on, and it is visible as
+        // `requeued_at` appearing. Acting on every MODIFY would re-enter the
+        // sender on its own claim and mark writes.
+        "MODIFY" => {
+            let was_absent =
+                crate::stream::image_str(&record.change.old_image, "requeued_at").is_none();
+            let is_present = crate::stream::image_str(new_image, "requeued_at").is_some();
+            (was_absent && is_present).then_some(message_id)
+        }
+        _ => None,
+    }
+}
+
 /// Claims `message_id`, sends it, and records the outcome.
 ///
 /// # Errors

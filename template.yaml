@@ -85,6 +85,15 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: With MailCatchAll, whether mail to an unknown local part creates an inbox.
+  MailSenderMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: >-
+      How many sends may run at once. Each concurrent execution can make one
+      SES call at a time, so this is the ceiling on the send rate this stack
+      asks SES for; raise it only alongside the account's sending quota.
   MailBucketName:
     Type: String
     Default: ""
@@ -827,6 +836,120 @@ Resources:
       TopicArn: !Ref MailEventsTopic
       Protocol: lambda
       Endpoint: !GetAtt WebhookFunction.Arn
+
+  # The sender: the same binary in its other mode, reached only through the
+  # mail table's stream. It is a separate function so its concurrency, memory
+  # and IAM are scoped to sending, and so a slow send cannot occupy the
+  # function serving the API.
+  MailSenderFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasMailDomain
+    Metadata:
+      BuildMethod: rust-cargolambda
+      BuildProperties:
+        Binary: aws-messaging-webhook
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-mail-sender"
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      # Holds the assembled message and its base64 form in memory at once.
+      MemorySize: 1024
+      Timeout: 120
+      # One SES call at a time per environment keeps a burst of queued mail
+      # from running into the account's sending rate.
+      ReservedConcurrentExecutions: !Ref MailSenderMaxConcurrency
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: !Ref LogLevel
+        SystemLogLevel: INFO
+        LogGroup: !Ref MailSenderLogGroup
+      Environment:
+        Variables:
+          FUNCTION_MODE: sender
+          TABLE_NAME: !Ref EventsTable
+          EVENT_BUS_NAME: !Ref EventBus
+          EVENT_SOURCE: !Ref EventSource
+          STACK_NAME: !Ref AWS::StackName
+          MAIL_DOMAIN: !Ref MailDomain
+          MAIL_TABLE_NAME: !Ref MailTable
+          MAIL_BUCKET: !Ref MailBucket
+          MAIL_INBOXES: !Ref MailAddresses
+          MAIL_CATCH_ALL: !Ref MailCatchAll
+          MAIL_AUTO_CREATE_INBOXES: !Ref MailAutoCreateInboxes
+          SES_CONFIGURATION_SET: !Ref MailConfigurationSet
+          MAIL_IDENTITY_ARN: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
+          ATTACHMENT_URL_TTL_SECONDS: !Ref AttachmentUrlTtlSeconds
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: MailTableAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt MailTable.Arn
+                - !Sub "${MailTable.Arn}/index/*"
+            - Sid: OutboxObjects
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MailBucket.Arn}/outbox/*"
+            - Sid: SentObjects
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MailBucket.Arn}/sent/*"
+            # A 404 rather than a 403 for a missing key needs ListBucket.
+            - Sid: OutboxList
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt MailBucket.Arn
+            # Scoped to this domain's identity and this stack's configuration
+            # set: the sender cannot send as another domain.
+            - Sid: SendMail
+              Effect: Allow
+              Action: ses:SendEmail
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${MailConfigurationSet}"
+
+  MailSenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasMailDomain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-mail-sender"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Send-state items only, and only while they are queued. The filter keeps
+  # the sender from being invoked for its own claim and mark writes, which
+  # move the status away from `queued`.
+  MailSenderStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasMailDomain
+    DependsOn: MailSenderFunctionRole
+    Properties:
+      EventSourceArn: !GetAtt MailTable.StreamArn
+      FunctionName: !Ref MailSenderFunction
+      StartingPosition: TRIM_HORIZON
+      # One record at a time: a batch that fails partway would otherwise
+      # re-deliver sends that already reached SES.
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      MaximumRetryAttempts: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["INSERT","MODIFY"],"dynamodb":{"NewImage":{"sk":{"S":["STATE"]},"send_status":{"S":["queued"]}}}}'
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt MailIngestDlq.Arn
 
   # The mail relay: message items only (sk MSG#). Send-state, marker, key,
   # alias, thread and inbox items never invoke the relay.

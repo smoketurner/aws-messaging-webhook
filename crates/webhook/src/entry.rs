@@ -40,6 +40,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::app;
+use crate::config::FunctionMode;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
@@ -127,7 +128,15 @@ pub async fn dispatch<T: Services>(
         // stream records carry `eventSource: aws:dynamodb` (and a `dynamodb`
         // object), while SNS records carry `Sns`.
         if is_dynamodb_stream(&payload) {
-            return crate::stream::handle_stream(&state, payload).await;
+            // The same stream feeds both halves of the binary, and each
+            // ignores the records the other owns: the relay publishes message
+            // inserts, the sender acts on send-state items.
+            return match state.config.mode {
+                FunctionMode::Webhook => crate::stream::handle_stream(&state, payload).await,
+                FunctionMode::Sender => {
+                    crate::mail::sender::handle_sender_stream(&state, payload).await
+                }
+            };
         }
         let event = SnsEvent::deserialize(payload)
             .map_err(|e| format!("payload has Records but is not an SNS event: {e}"))?;
