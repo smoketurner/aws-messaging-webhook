@@ -18,6 +18,13 @@ pub struct SesInboundNotification {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SesReceipt {
+    /// The envelope recipients SES matched this receipt rule against.
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    /// SES's receipt timestamp — one of the `received_ms` fallbacks (D38):
+    /// `mail.timestamp`, else this, else the SNS envelope `Timestamp`.
+    #[serde(default)]
+    pub timestamp: Option<String>,
     #[serde(default)]
     pub spam_verdict: Option<Verdict>,
     #[serde(default)]
@@ -179,6 +186,26 @@ mod tests {
         assert_eq!(event.notification_type, "Received");
         assert_eq!(event.mail.message_id, "d6iitobk75ur44p8kdnnp7g2n800");
         assert!(!event.receipt.is_quarantined());
+    }
+
+    #[test]
+    fn recipients_and_timestamp_are_parsed() {
+        let event: SesInboundNotification = serde_json::from_str(CLEAN).unwrap();
+        assert_eq!(event.receipt.recipients, vec!["recipient@example.com"]);
+        assert_eq!(
+            event.receipt.timestamp.as_deref(),
+            Some("2015-09-11T20:32:33.936Z")
+        );
+    }
+
+    #[test]
+    fn recipients_and_timestamp_default_to_empty() {
+        let event: SesInboundNotification = serde_json::from_str(
+            r#"{"notificationType":"Received","receipt":{},"mail":{"messageId":"m1"}}"#,
+        )
+        .unwrap();
+        assert!(event.receipt.recipients.is_empty());
+        assert_eq!(event.receipt.timestamp, None);
     }
 
     #[test]

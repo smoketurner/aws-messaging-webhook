@@ -28,8 +28,11 @@ const MAX_DETAIL_BYTES: usize = 250_000;
 /// `commonHeaders.subject` duplicated into `meta.inbound.headers` exceeds it on
 /// its own).
 ///
+/// `pub(crate)`: [`crate::mail::events::cap_mail_detail`] reserves the same
+/// envelope headroom for the mail-table relay's `message.received*` events.
+///
 /// [1]: https://docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutEventsRequestEntry.html
-const PUT_EVENTS_ENTRY_CAP_BYTES: usize = 262_144;
+pub(crate) const PUT_EVENTS_ENTRY_CAP_BYTES: usize = 262_144;
 
 /// One event ready for `PutEvents`.
 #[derive(Debug, Clone)]
@@ -49,7 +52,10 @@ pub trait PublishEvents: Send + Sync {
     ) -> impl Future<Output = Result<(), PublishError>> + Send;
 }
 
-fn detail_bytes(detail: &Value) -> usize {
+/// The would-be `Detail` byte length of `detail` if `PutEvents` serialized it.
+/// `pub(crate)` so [`crate::mail::events::cap_mail_detail`] can reuse the same
+/// measurement for the mail-table relay's size-reduction ladder.
+pub(crate) fn detail_bytes(detail: &Value) -> usize {
     serde_json::to_vec(detail).map_or(usize::MAX, |bytes| bytes.len())
 }
 

@@ -1,241 +1,24 @@
-#![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+// Every `.unwrap()` here lives inside a `#[tokio::test]` function, which
+// clippy.toml's `allow-unwrap-in-tests` already exempts; the non-test helper
+// functions that needed an explicit `unwrap_used` expectation live in the
+// `webhook-test-support` dev-dependency crate.
 
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 
-use anyhow::anyhow;
-use aws_messaging_webhook::actions::{
-    ActionError, ActionErrorKind, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason,
-};
-use aws_messaging_webhook::allowlist::TopicAllowlist;
+use aws_messaging_webhook::actions::ActionErrorKind;
 use aws_messaging_webhook::app::app;
-use aws_messaging_webhook::config::Config;
-use aws_messaging_webhook::entry::dispatch;
-use aws_messaging_webhook::model::DomainEvent;
-use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
-use aws_messaging_webhook::state::AppState;
-use aws_messaging_webhook::store::{EventRecord, EventStore, PersistOutcome, StoreError};
+use aws_messaging_webhook::store::PersistOutcome;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use lambda_http::{Context, LambdaEvent};
 use serde_json::{Value, json};
-use sns_message_verifier::SnsVerifier;
-use sns_message_verifier::fixtures::{SnsFixture, notification, subscription_confirmation};
+use sns_message_verifier::fixtures::{notification, subscription_confirmation};
 use tower::ServiceExt as _;
+use webhook_test_support::{
+    HarnessOptions, direct_sns_event, direct_sns_record, function_url_event, harness, harness_with,
+    invoke, post, wrapped,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-const ALLOWED_ACCOUNT: &str = "123456789012";
-
-#[derive(Default)]
-struct FakeServices {
-    calls: Mutex<Vec<String>>,
-    published: Mutex<Vec<OutboundEvent>>,
-    persist_outcome: Mutex<Option<PersistOutcome>>,
-    fail_persist: AtomicBool,
-    fail_publish: AtomicBool,
-    action_error: Mutex<Option<ActionErrorKind>>,
-    /// Email addresses whose suppression call fails with a permanent error,
-    /// simulating SES `BadRequestException` for a malformed recipient. Other
-    /// recipients still succeed — the action must continue past these.
-    permanent_suppression_failures: Mutex<Vec<String>>,
-}
-
-impl FakeServices {
-    fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    fn record(&self, call: impl Into<String>) {
-        self.calls.lock().unwrap().push(call.into());
-    }
-
-    fn action_result(&self) -> Result<(), ActionError> {
-        match *self.action_error.lock().unwrap() {
-            Some(ActionErrorKind::Transient) => Err(ActionError::transient(anyhow!(
-                "simulated transient action failure"
-            ))),
-            Some(ActionErrorKind::Permanent) => Err(ActionError::permanent(anyhow!(
-                "simulated permanent action failure"
-            ))),
-            None => Ok(()),
-        }
-    }
-}
-
-impl EventStore for FakeServices {
-    fn persist_new(
-        &self,
-        record: &EventRecord,
-        _event: &DomainEvent,
-    ) -> impl Future<Output = Result<PersistOutcome, StoreError>> + Send {
-        self.record(format!("persist:{}", record.aggregate_id));
-        let result = if self.fail_persist.load(Ordering::SeqCst) {
-            Err(StoreError(anyhow!("simulated persist failure")))
-        } else {
-            Ok(self
-                .persist_outcome
-                .lock()
-                .unwrap()
-                .unwrap_or(PersistOutcome::Fresh))
-        };
-        std::future::ready(result)
-    }
-}
-
-impl PublishEvents for FakeServices {
-    fn publish(
-        &self,
-        event: &OutboundEvent,
-    ) -> impl Future<Output = Result<(), PublishError>> + Send {
-        self.record(format!("publish:{}", event.detail_type));
-        let result = if self.fail_publish.load(Ordering::SeqCst) {
-            Err(PublishError(anyhow!("simulated publish failure")))
-        } else {
-            self.published.lock().unwrap().push(event.clone());
-            Ok(())
-        };
-        std::future::ready(result)
-    }
-}
-
-impl SmsVoiceApi for FakeServices {
-    fn put_message_feedback(
-        &self,
-        message_id: &str,
-        status: FeedbackStatus,
-    ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("feedback:{message_id}:{status:?}"));
-        std::future::ready(self.action_result())
-    }
-
-    fn put_opted_out_number(
-        &self,
-        _opt_out_list_name: &str,
-        phone_number: &str,
-    ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("opt_out:{phone_number}"));
-        std::future::ready(self.action_result())
-    }
-
-    fn delete_opted_out_number(
-        &self,
-        _opt_out_list_name: &str,
-        phone_number: &str,
-    ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("opt_in:{phone_number}"));
-        std::future::ready(self.action_result())
-    }
-}
-
-impl SesApi for FakeServices {
-    fn put_suppressed_destination(
-        &self,
-        email_address: &str,
-        reason: SuppressionReason,
-    ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("suppress:{email_address}:{reason:?}"));
-        let result = if self
-            .permanent_suppression_failures
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| e == email_address)
-        {
-            Err(ActionError::permanent(anyhow!(
-                "simulated permanent suppression failure for {email_address}"
-            )))
-        } else {
-            self.action_result()
-        };
-        std::future::ready(result)
-    }
-}
-
-struct Harness {
-    state: Arc<AppState<FakeServices>>,
-    fixture: SnsFixture,
-    cert_url: String,
-    server: MockServer,
-}
-
-impl Harness {
-    fn fake(&self) -> &FakeServices {
-        &self.state.services
-    }
-}
-
-struct HarnessOptions {
-    allowed_topics: &'static str,
-    /// `Some(n)`: assert exactly n certificate fetches at teardown.
-    cert_fetches: Option<u64>,
-    auto_resubscribe: bool,
-    opt_out_list: bool,
-}
-
-impl Default for HarnessOptions {
-    fn default() -> Self {
-        Self {
-            allowed_topics: ALLOWED_ACCOUNT,
-            cert_fetches: None,
-            auto_resubscribe: true,
-            opt_out_list: true,
-        }
-    }
-}
-
-async fn harness_with(options: HarnessOptions) -> Harness {
-    let fixture = SnsFixture::new();
-    let server = MockServer::start().await;
-    let cert_mock = Mock::given(method("GET"))
-        .and(path("/cert.pem"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(&fixture.cert_pem));
-    let cert_mock = match options.cert_fetches {
-        Some(count) => cert_mock.expect(count),
-        None => cert_mock,
-    };
-    cert_mock.mount(&server).await;
-    let cert_url = format!("{}/cert.pem", server.uri());
-
-    let state = Arc::new(AppState {
-        services: FakeServices::default(),
-        verifier: SnsVerifier::builder()
-            .dangerous_allow_cert_url_prefix(server.uri())
-            .build()
-            .unwrap(),
-        allowlist: TopicAllowlist::parse(options.allowed_topics),
-        http: reqwest::Client::new(),
-        config: Config {
-            table_name: "events".to_owned(),
-            event_bus_name: "bus".to_owned(),
-            event_source: "aws-messaging-webhook".to_owned(),
-            auto_resubscribe: options.auto_resubscribe,
-            opt_out_list_name: options.opt_out_list.then(|| "opt-out-list".to_owned()),
-            raw_event_retention_days: 30,
-            aggregate_retention_days: 365,
-        },
-        dangerous_subscribe_url_prefix: Some(server.uri()),
-    });
-    Harness {
-        state,
-        fixture,
-        cert_url,
-        server,
-    }
-}
-
-async fn harness() -> Harness {
-    harness_with(HarnessOptions::default()).await
-}
-
-async fn post(state: Arc<AppState<FakeServices>>, route: &str, body: &Value) -> StatusCode {
-    let request = Request::post(route)
-        .header("x-amz-sns-message-type", "Notification")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    app(state).oneshot(request).await.unwrap().status()
-}
 
 #[tokio::test]
 async fn valid_notification_persists() {
@@ -460,14 +243,6 @@ async fn healthz_responds_ok() {
     let request = Request::get("/healthz").body(Body::empty()).unwrap();
     let response = app(h.state.clone()).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-/// Wraps an inner AWS payload as the SNS `Message` of a signed notification.
-fn wrapped(h: &Harness, inner: &Value) -> Value {
-    let mut body = notification(&h.cert_url);
-    body["Message"] = json!(inner.to_string());
-    h.fixture.sign(&mut body, "2");
-    body
 }
 
 fn inbound_sms(keyword: &str) -> Value {
@@ -860,7 +635,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     // A cold-start cert fetch that fails transiently must not be a permanent
     // 4xx — that would make SNS drop a correctly-signed message. The verifier
     // has no cached cert and the cert server 500s, so verify() -> CertFetch.
-    let fixture = SnsFixture::new();
+    let fixture = sns_message_verifier::fixtures::SnsFixture::new();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/cert.pem"))
@@ -868,15 +643,17 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
         .mount(&server)
         .await;
     let cert_url = format!("{}/cert.pem", server.uri());
-    let state = Arc::new(AppState {
-        services: FakeServices::default(),
-        verifier: SnsVerifier::builder()
+    let state = std::sync::Arc::new(aws_messaging_webhook::state::AppState {
+        services: webhook_test_support::FakeServices::default(),
+        verifier: sns_message_verifier::SnsVerifier::builder()
             .dangerous_allow_cert_url_prefix(server.uri())
             .build()
             .unwrap(),
-        allowlist: TopicAllowlist::parse(ALLOWED_ACCOUNT),
+        allowlist: aws_messaging_webhook::allowlist::TopicAllowlist::parse(
+            webhook_test_support::ALLOWED_ACCOUNT,
+        ),
         http: reqwest::Client::new(),
-        config: Config {
+        config: aws_messaging_webhook::config::Config {
             table_name: "events".to_owned(),
             event_bus_name: "bus".to_owned(),
             event_source: "aws-messaging-webhook".to_owned(),
@@ -884,6 +661,8 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
             opt_out_list_name: Some("opt-out-list".to_owned()),
             raw_event_retention_days: 30,
             aggregate_retention_days: 365,
+            mode: aws_messaging_webhook::config::FunctionMode::Webhook,
+            mail: None,
         },
         dangerous_subscribe_url_prefix: Some(server.uri()),
     });
@@ -893,75 +672,6 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     let status = post(state, "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-/// Re-keys a signed envelope to the casing a direct SNS → Lambda record uses.
-fn lambda_record_casing(mut envelope: Value) -> Value {
-    let record = envelope.as_object_mut().unwrap();
-    if let Some(url) = record.remove("SigningCertURL") {
-        record.insert("SigningCertUrl".to_owned(), url);
-    }
-    if let Some(url) = record.remove("UnsubscribeURL") {
-        record.insert("UnsubscribeUrl".to_owned(), url);
-    }
-    envelope
-}
-
-fn direct_sns_record(envelope: &Value) -> Value {
-    json!({
-        "EventSource": "aws:sns",
-        "EventVersion": "1.0",
-        "EventSubscriptionArn":
-            "arn:aws:sns:us-east-1:123456789012:test-topic:11111111-2222-3333-4444-555555555555",
-        "Sns": lambda_record_casing(envelope.clone()),
-    })
-}
-
-fn direct_sns_event(envelope: &Value) -> Value {
-    json!({ "Records": [direct_sns_record(envelope)] })
-}
-
-/// A Function URL invocation payload (API Gateway v2 shape) that POSTs `body`.
-fn function_url_event(path: &str, body: &Value) -> Value {
-    json!({
-        "version": "2.0",
-        "routeKey": "$default",
-        "rawPath": path,
-        "rawQueryString": "",
-        "headers": {
-            "content-type": "text/plain; charset=UTF-8",
-            "x-amz-sns-message-type": "Notification",
-        },
-        "requestContext": {
-            "accountId": "anonymous",
-            "apiId": "url-id",
-            "domainName": "url-id.lambda-url.us-east-1.on.aws",
-            "domainPrefix": "url-id",
-            "http": {
-                "method": "POST",
-                "path": path,
-                "protocol": "HTTP/1.1",
-                "sourceIp": "10.0.0.1",
-                "userAgent": "Amazon Simple Notification Service Agent",
-            },
-            "requestId": "request-id",
-            "routeKey": "$default",
-            "stage": "$default",
-            "time": "04/Aug/2026:00:00:00 +0000",
-            "timeEpoch": 1_754_265_600_000_i64,
-        },
-        "body": body.to_string(),
-        "isBase64Encoded": false,
-    })
-}
-
-/// Drives the single-binary entry point exactly as the Lambda runtime would.
-async fn invoke(
-    state: Arc<AppState<FakeServices>>,
-    payload: Value,
-) -> Result<Value, lambda_http::Error> {
-    let router = app(state.clone());
-    dispatch(state, router, LambdaEvent::new(payload, Context::default())).await
 }
 
 #[tokio::test]
@@ -1088,38 +798,17 @@ async fn unrecognized_invoke_payload_is_an_error() {
     assert!(h.fake().calls().is_empty());
 }
 
-/// A DynamoDB Streams INSERT event carrying one event item whose `raw_body`
-/// is the given (base64-encoded) SNS envelope bytes.
-fn dynamodb_insert_event(raw_body: &[u8], sk: &str, sequence: &str) -> Value {
-    json!({
-        "Records": [{
-            "awsRegion": "us-east-1",
-            "eventID": "evt-1",
-            "eventName": "INSERT",
-            "eventSource": "aws:dynamodb",
-            "dynamodb": {
-                "ApproximateCreationDateTime": 1_754_265_600.0,
-                "SequenceNumber": sequence,
-                "SizeBytes": 42,
-                "StreamViewType": "NEW_IMAGE",
-                "NewImage": {
-                    "pk": {"S": "MSG#agg-1"},
-                    "sk": {"S": sk},
-                    "received_at": {"S": "2026-08-04T00:00:00.000Z"},
-                    "raw_body": {"B": aws_smithy_types::base64::encode(raw_body)},
-                }
-            }
-        }]
-    })
-}
-
 #[tokio::test]
 async fn stream_publishes_persisted_event() {
     let h = harness().await;
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
     let raw = serde_json::to_vec(&body).unwrap();
-    let event = dynamodb_insert_event(&raw, "EVT#2026-08-04T00:00:00.000Z#sns-1", "seq-1");
+    let event = webhook_test_support::dynamodb_insert_event(
+        &raw,
+        "EVT#2026-08-04T00:00:00.000Z#sns-1",
+        "seq-1",
+    );
 
     let result = invoke(h.state.clone(), event).await.unwrap();
 
@@ -1135,7 +824,7 @@ async fn stream_skips_aggregate_and_non_event_records() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
     let raw = serde_json::to_vec(&body).unwrap();
-    let event = dynamodb_insert_event(&raw, "AGG", "seq-agg");
+    let event = webhook_test_support::dynamodb_insert_event(&raw, "AGG", "seq-agg");
 
     let result = invoke(h.state.clone(), event).await.unwrap();
 
@@ -1150,7 +839,7 @@ async fn stream_reports_publish_failure_for_retry() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
     let raw = serde_json::to_vec(&body).unwrap();
-    let event = dynamodb_insert_event(&raw, "EVT#t#sns-1", "seq-9");
+    let event = webhook_test_support::dynamodb_insert_event(&raw, "EVT#t#sns-1", "seq-9");
 
     let result = invoke(h.state.clone(), event).await.unwrap();
 
@@ -1162,48 +851,10 @@ async fn stream_reports_publish_failure_for_retry() {
     );
 }
 
-/// A DynamoDB Streams event for one aggregate (`sk = AGG`) record with the given
-/// new/old `current_status` values (None = attribute absent).
-fn dynamodb_agg_event(
-    event_name: &str,
-    new_status: Option<&str>,
-    old_status: Option<&str>,
-) -> Value {
-    let mut new_image = json!({
-        "pk": {"S": "MSG#agg-1"},
-        "sk": {"S": "AGG"},
-        "source": {"S": "ses-events"},
-        "open_count": {"N": "2"},
-    });
-    if let Some(status) = new_status {
-        new_image["current_status"] = json!({"S": status});
-    }
-    let mut old_image = json!({ "pk": {"S": "MSG#agg-1"}, "sk": {"S": "AGG"} });
-    if let Some(status) = old_status {
-        old_image["current_status"] = json!({"S": status});
-    }
-    json!({
-        "Records": [{
-            "awsRegion": "us-east-1",
-            "eventID": "evt-agg",
-            "eventName": event_name,
-            "eventSource": "aws:dynamodb",
-            "dynamodb": {
-                "ApproximateCreationDateTime": 1_754_265_600.0,
-                "SequenceNumber": "seq-agg",
-                "SizeBytes": 20,
-                "StreamViewType": "NEW_AND_OLD_IMAGES",
-                "NewImage": new_image,
-                "OldImage": old_image,
-            }
-        }]
-    })
-}
-
 #[tokio::test]
 async fn stream_publishes_status_change_on_transition() {
     let h = harness().await;
-    let event = dynamodb_agg_event("MODIFY", Some("delivered"), Some("sent"));
+    let event = webhook_test_support::dynamodb_agg_event("MODIFY", Some("delivered"), Some("sent"));
 
     let result = invoke(h.state.clone(), event).await.unwrap();
 
@@ -1219,7 +870,7 @@ async fn stream_publishes_status_change_on_transition() {
 #[tokio::test]
 async fn stream_publishes_initial_status_on_aggregate_insert() {
     let h = harness().await;
-    let event = dynamodb_agg_event("INSERT", Some("sent"), None);
+    let event = webhook_test_support::dynamodb_agg_event("INSERT", Some("sent"), None);
 
     invoke(h.state.clone(), event).await.unwrap();
 
@@ -1233,7 +884,8 @@ async fn stream_publishes_initial_status_on_aggregate_insert() {
 async fn stream_skips_status_event_when_status_unchanged() {
     let h = harness().await;
     // An open/click bumped counts but left current_status at "delivered".
-    let event = dynamodb_agg_event("MODIFY", Some("delivered"), Some("delivered"));
+    let event =
+        webhook_test_support::dynamodb_agg_event("MODIFY", Some("delivered"), Some("delivered"));
 
     let result = invoke(h.state.clone(), event).await.unwrap();
 

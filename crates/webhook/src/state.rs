@@ -3,6 +3,8 @@ use sns_message_verifier::SnsVerifier;
 use crate::actions::{SesApi, SmsVoiceApi};
 use crate::allowlist::TopicAllowlist;
 use crate::config::Config;
+use crate::mail::objects::ObjectStore;
+use crate::mail::store::MailStore;
 use crate::publish::PublishEvents;
 use crate::store::EventStore;
 
@@ -10,12 +12,20 @@ use crate::store::EventStore;
 /// single type parameter. Production implements it on one struct wrapping the
 /// AWS SDK clients; tests implement it on one recording fake.
 pub trait Services:
-    EventStore + PublishEvents + SmsVoiceApi + SesApi + Send + Sync + 'static
+    EventStore + PublishEvents + SmsVoiceApi + SesApi + MailStore + ObjectStore + Send + Sync + 'static
 {
 }
 
 impl<T> Services for T where
-    T: EventStore + PublishEvents + SmsVoiceApi + SesApi + Send + Sync + 'static
+    T: EventStore
+        + PublishEvents
+        + SmsVoiceApi
+        + SesApi
+        + MailStore
+        + ObjectStore
+        + Send
+        + Sync
+        + 'static
 {
 }
 

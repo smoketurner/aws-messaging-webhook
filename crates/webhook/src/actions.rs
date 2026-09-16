@@ -185,6 +185,13 @@ async fn suppress_recipients<T: Services>(
 pub async fn run<T: Services>(
     state: &AppState<T>,
     event: &DomainEvent,
+    // Threaded through for `D48` inbound-ingest time-boxing; only the
+    // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
+    deadline: tokio::time::Instant,
+    // The verified SNS envelope `Timestamp`, parsed to epoch ms by the
+    // caller; N24's third `received_ms` fallback, threaded to the
+    // `SesInbound` arm only.
+    envelope_ts_ms: Option<u64>,
 ) -> Result<&'static str, ActionError> {
     match event {
         DomainEvent::SmsInbound { event, .. } => {
@@ -256,7 +263,10 @@ pub async fn run<T: Services>(
             }
             Ok("none")
         }
-        DomainEvent::SesInbound { .. } | DomainEvent::Unknown { .. } => Ok("none"),
+        DomainEvent::SesInbound { event, .. } => {
+            crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms).await
+        }
+        DomainEvent::Unknown { .. } => Ok("none"),
     }
 }
 

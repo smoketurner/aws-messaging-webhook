@@ -1,6 +1,11 @@
 //! Production [`Services`](crate::state::Services) implementation wrapping
 //! the AWS SDK clients.
 
+// Mail (AgentMail-compatible inbox) trait implementations: stubs for tracks
+// A (`MailStore`) and B (`ObjectStore`), filled in when those tracks land.
+pub mod mail_store;
+pub mod objects;
+
 use anyhow::{Context as _, anyhow};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
@@ -12,7 +17,7 @@ use aws_smithy_types::Blob;
 use aws_smithy_types::error::display::DisplayErrorContext;
 
 use crate::actions::{ActionError, FeedbackStatus, SesApi, SmsVoiceApi, SuppressionReason};
-use crate::config::Config;
+use crate::config::{Config, MailConfig};
 use crate::model::DomainEvent;
 use crate::model::ses_notification::{SesBounce, SesEngagement};
 use crate::publish::{OutboundEvent, PublishError, PublishEvents};
@@ -23,6 +28,11 @@ pub struct AwsServices {
     events: aws_sdk_eventbridge::Client,
     sms: aws_sdk_pinpointsmsvoicev2::Client,
     ses: aws_sdk_sesv2::Client,
+    /// Mail bodies and attachments (`MailConfig.bucket`). Unused until
+    /// tracks A/B implement `MailStore`/`ObjectStore` for real; constructed
+    /// unconditionally since it is cheap and `MailConfig` is per-invocation
+    /// optional, not per-client.
+    s3: aws_sdk_s3::Client,
     config: Config,
 }
 
@@ -34,8 +44,17 @@ impl AwsServices {
             events: aws_sdk_eventbridge::Client::new(sdk_config),
             sms: aws_sdk_pinpointsmsvoicev2::Client::new(sdk_config),
             ses: aws_sdk_sesv2::Client::new(sdk_config),
+            s3: aws_sdk_s3::Client::new(sdk_config),
             config,
         }
+    }
+
+    /// The mail bucket/table configuration (`Config.mail`), when mail
+    /// ingestion is enabled. `None` when it isn't — every mail store/object
+    /// store method is only ever reached when the caller has already gated
+    /// on mail being configured; each maps `None` into its own error type.
+    pub(crate) fn mail_config(&self) -> Option<&MailConfig> {
+        self.config.mail.as_ref()
     }
 }
 
@@ -279,20 +298,25 @@ impl PublishEvents for AwsServices {
     }
 }
 
-/// Maps an SDK failure onto the action retry policy: network faults,
-/// timeouts, throttling, and 5xx are transient (worth an SNS redelivery);
-/// everything else — validation, access denied, bad configuration — is
-/// permanent (log and move on).
-fn classify_action_error<E>(context: &'static str, error: &SdkError<E>) -> ActionError
+/// Throttling error codes for DynamoDB/Pinpoint/SES actions and the mail
+/// store. S3 (`aws::objects`) uses a different vocabulary and keeps its own
+/// list.
+pub(crate) const THROTTLING_CODES: [&str; 3] = [
+    "ThrottlingException",
+    "TooManyRequestsException",
+    "RequestThrottled",
+];
+
+/// Maps an SDK failure onto the transient/permanent retry policy shared by
+/// actions, the mail store, and the object store: network faults, timeouts,
+/// and 5xx/429/throttling responses are transient (worth a retry);
+/// everything else is permanent. `throttling_codes` is the calling API's own
+/// vocabulary for its throttling error code, since it differs per service.
+pub(crate) fn sdk_error_is_transient<E>(error: &SdkError<E>, throttling_codes: &[&str]) -> bool
 where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    E: ProvideErrorMetadata,
 {
-    const THROTTLING_CODES: [&str; 3] = [
-        "ThrottlingException",
-        "TooManyRequestsException",
-        "RequestThrottled",
-    ];
-    let transient = match error {
+    match error {
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
             true
         }
@@ -303,12 +327,22 @@ where
                 || ctx
                     .err()
                     .code()
-                    .is_some_and(|code| THROTTLING_CODES.contains(&code))
+                    .is_some_and(|code| throttling_codes.contains(&code))
         }
         _ => false,
-    };
+    }
+}
+
+/// Maps an SDK failure onto the action retry policy: network faults,
+/// timeouts, throttling, and 5xx are transient (worth an SNS redelivery);
+/// everything else — validation, access denied, bad configuration — is
+/// permanent (log and move on).
+fn classify_action_error<E>(context: &'static str, error: &SdkError<E>) -> ActionError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
     let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if transient {
+    if sdk_error_is_transient(error, &THROTTLING_CODES) {
         ActionError::transient(source)
     } else {
         ActionError::permanent(source)

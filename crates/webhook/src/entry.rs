@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -131,7 +131,8 @@ pub async fn dispatch<T: Services>(
         }
         let event = SnsEvent::deserialize(payload)
             .map_err(|e| format!("payload has Records but is not an SNS event: {e}"))?;
-        handle_direct(&state, event).await?;
+        let deadline = context_deadline(&context);
+        handle_direct(&state, event, deadline).await?;
         Ok(Value::Null)
     } else {
         serve_http(router, payload, context).await
@@ -169,10 +170,11 @@ async fn serve_http(
 async fn handle_direct<T: Services>(
     state: &AppState<T>,
     event: SnsEvent,
+    deadline: tokio::time::Instant,
 ) -> Result<(), lambda_http::Error> {
     for record in event.records {
         let raw_body = Bytes::from(serde_json::to_vec(&record.sns)?);
-        let status = process_record(state, raw_body).await.status();
+        let status = process_record(state, raw_body, deadline).await.status();
         if status.is_server_error() {
             // Fail the whole invocation: any unprocessed records redeliver
             // with it, and the idempotent persist makes re-runs safe.
@@ -186,13 +188,30 @@ async fn handle_direct<T: Services>(
     Ok(())
 }
 
-async fn process_record<T: Services>(state: &AppState<T>, raw_body: Bytes) -> Response {
+async fn process_record<T: Services>(
+    state: &AppState<T>,
+    raw_body: Bytes,
+    deadline: tokio::time::Instant,
+) -> Response {
     let verified = match VerifiedSns::verify(state, raw_body).await {
         Ok(verified) => verified,
         Err(error) => return error.into_response(),
     };
-    match handle_sns(state, Ingress::Direct, verified).await {
+    match handle_sns(state, Ingress::Direct, verified, deadline).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
+}
+
+/// Converts a Lambda invocation's execution deadline (`Context::deadline()`,
+/// a [`SystemTime`]) into a [`tokio::time::Instant`] so `D48` time-boxing can
+/// use `tokio::time::timeout_at` directly. Saturates to zero (an
+/// already-elapsed deadline) rather than panicking when the deadline has
+/// already passed by the time this runs.
+pub(crate) fn context_deadline(ctx: &Context) -> tokio::time::Instant {
+    let remaining = ctx
+        .deadline()
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    tokio::time::Instant::now() + remaining
 }

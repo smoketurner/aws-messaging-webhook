@@ -32,6 +32,27 @@ pub mod names {
     pub const SUBSCRIPTIONS_LOST: &str = "SubscriptionsLost";
     pub const COLD_START: &str = "ColdStart";
     pub const LATENCY: &str = "Latency";
+
+    // Mail (AgentMail-compatible inbox).
+    pub const MESSAGES_INGESTED: &str = "MessagesIngested";
+    pub const INGEST_FAILURES: &str = "IngestFailures";
+    pub const INGEST_SKIPPED: &str = "IngestSkipped";
+    pub const INGEST_TIMEOUTS: &str = "IngestTimeouts";
+    pub const API_REQUESTS: &str = "ApiRequests";
+    pub const API_AUTH_FAILURES: &str = "ApiAuthFailures";
+    pub const MESSAGES_QUEUED: &str = "MessagesQueued";
+    pub const MESSAGES_SENT: &str = "MessagesSent";
+    pub const SEND_FAILURES: &str = "SendFailures";
+    pub const SEND_OUTCOME_UNKNOWN: &str = "SendOutcomeUnknown";
+    pub const SEND_UNKNOWN_OUTSTANDING: &str = "SendUnknownOutstanding";
+    pub const SEND_QUEUE_STALE: &str = "SendQueueStale";
+    pub const SEND_MARK_DEFERRED: &str = "SendMarkDeferred";
+    pub const OUTBOX_CLEANUP_FAILED: &str = "OutboxCleanupFailed";
+    pub const UNKNOWN_OUTBOX_EXPIRED: &str = "UnknownOutboxExpired";
+    /// rev5 N2: the expired-but-not-yet-closed `unknown` outbox count.
+    pub const SEND_EXPIRED_OUTSTANDING: &str = "SendExpiredOutstanding";
+    /// rev5 N11: an expiry sweep run whose delete/finish step failed.
+    pub const OUTBOX_EXPIRE_FAILED: &str = "OutboxExpireFailed";
 }
 
 /// Initialize the EMF collector. Returns a `&'static Collector` handle which

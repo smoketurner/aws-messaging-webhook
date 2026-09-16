@@ -1,0 +1,19 @@
+From: Alice Sender <alice@example.com>
+To: Bob Recipient <bob@example.com>
+Subject: Hostile content type attachment
+Date: Mon, 1 Sep 2025 10:35:00 +0000
+Message-ID: <hostile-ct-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="hostile-boundary"
+
+--hostile-boundary
+Content-Type: text/plain; charset=utf-8
+
+See the attached file with a hostile content type.
+--hostile-boundary
+Content-Type: application/x-this-type-is-way-too-long-to-fit-inside-the-normalized-content-type-cap-of-one-hundred-and-twenty-seven-bytes-so-it-must-fall-back-to-the-default-octet-stream-type
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="evil.bin"
+
+aGVsbG8gd29ybGQ=
+--hostile-boundary--

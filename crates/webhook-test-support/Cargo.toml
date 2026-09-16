@@ -1,0 +1,35 @@
+[package]
+name = "webhook-test-support"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared FakeServices harness for aws-messaging-webhook's integration test binaries"
+publish = false
+
+[lib]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+aws-messaging-webhook.workspace = true
+aws-smithy-types.workspace = true
+axum.workspace = true
+lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
+reqwest = { workspace = true, features = ["rustls"] }
+serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
+serde_json = { workspace = true, features = ["std"] }
+sns-message-verifier = { workspace = true, features = ["test-fixtures"] }
+tower = { workspace = true, features = ["util"] }
+wiremock.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+  "time",
+] }
+
+[lints]
+workspace = true

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/sns-message-verifier", "crates/webhook"]
+members = [
+  "crates/sns-message-verifier",
+  "crates/webhook",
+  "crates/webhook-test-support",
+]
 
 [workspace.package]
 edition = "2024"
@@ -9,7 +13,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/smoketurner/aws-messaging-webhook"
 
 [workspace.dependencies]
+aws-messaging-webhook = { path = "crates/webhook" }
 sns-message-verifier = { path = "crates/sns-message-verifier" }
+webhook-test-support = { path = "crates/webhook-test-support" }
 
 # Exact version pins only, with default features disabled on everything;
 # each member crate opts into exactly the features it uses.
@@ -28,6 +34,10 @@ aws-sdk-dynamodb = { version = "=1.120.0", default-features = false }
 aws-sdk-eventbridge = { version = "=1.112.0", default-features = false }
 aws-sdk-pinpointsmsvoicev2 = { version = "=1.116.0", default-features = false }
 aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
+# aws-sdk-s3 =1.147.0 needs aws-smithy-types ^1.7, but the workspace pins
+# =1.6.2 (see below); =1.141.0 is the newest release that still resolves
+# against it (verified via `cargo tree`/`cargo deny`).
+aws-sdk-s3 = { version = "=1.141.0", default-features = false }
 aws-smithy-types = { version = "=1.6.2", default-features = false }
 
 # Serialization
@@ -51,6 +61,11 @@ x509-cert = { version = "=0.2.5", default-features = false }
 base64 = { version = "=0.23.1", default-features = false }
 url = { version = "=2.5.8", default-features = false }
 reqwest = { version = "=0.13.4", default-features = false }
+
+# Mail (AgentMail-compatible inbox). uuid =1.26.1 unifies with the transitive
+# uuid pulled in by other dependencies (verified via `cargo tree`).
+mail-parser = { version = "=0.11.9", default-features = false }
+uuid = { version = "=1.26.1", default-features = false }
 
 # Observability
 metrics = { version = "=0.24.6", default-features = false }
