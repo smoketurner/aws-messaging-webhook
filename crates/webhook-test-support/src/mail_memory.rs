@@ -709,6 +709,28 @@ impl MailStore for MailMemoryStore {
         std::future::ready(result)
     }
 
+    fn note_ses_call(
+        &self,
+        claimed: &SendState,
+        now: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::plan::plan_ses_call;
+
+        let result = (|| {
+            let after = claimed.calling_ses(now);
+            let ops = plan_ses_call(claimed, &after)?;
+            for _attempt in 0..=MAX_RETRIES {
+                match self.attempt(&ops)? {
+                    Commit::Applied => return Ok(Some(after)),
+                    Commit::Cancelled(TxnDecision::Retry) => {}
+                    Commit::Cancelled(_) | Commit::AliasTaken(_) => return Ok(None),
+                }
+            }
+            Err(MailStoreError::Conflict)
+        })();
+        std::future::ready(result)
+    }
+
     fn mark_send(
         &self,
         state: &SendState,
@@ -771,7 +793,23 @@ impl MailStore for MailMemoryStore {
                 drop_taken_aliases(&mut ops, &taken);
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(()),
-                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                    Commit::Cancelled(TxnDecision::Retry) => {}
+                    Commit::Cancelled(TxnDecision::VersionConflict) => {
+                        // Mirrors the real store: a send state another writer
+                        // moved on is a lost claim, not something to retry.
+                        let current: Option<SendState> = self
+                            .get_item(&keys::outbox_pk(&state.message_id), keys::outbox_sk())
+                            .map(serde_dynamo::from_item)
+                            .transpose()
+                            .map_err(|e| {
+                                MailStoreError::Permanent(anyhow::anyhow!(
+                                    "deserializing send state: {e}"
+                                ))
+                            })?;
+                        if current.is_none_or(|current| current.version != state.version) {
+                            return Err(MailStoreError::Conflict);
+                        }
+                    }
                     Commit::AliasTaken(keys) => taken.extend(keys),
                     Commit::Cancelled(_) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(

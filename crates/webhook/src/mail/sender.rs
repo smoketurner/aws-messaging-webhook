@@ -20,6 +20,10 @@
 //! already hold the message, and sending it again is worse than leaving it
 //! for an operator to resolve.
 
+use std::time::Duration;
+
+use tokio::time::Instant;
+
 use crate::actions::{RawSend, SendOutcome};
 use crate::mail::build::{BuildError, BuiltPart, build_outbound};
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
@@ -53,8 +57,6 @@ pub enum Handled {
 pub enum SenderError {
     #[error("the mail store was unavailable")]
     Store(#[source] anyhow::Error),
-    #[error("the object store was unavailable")]
-    Objects(#[source] anyhow::Error),
     #[error("mail is not configured")]
     NotConfigured,
 }
@@ -76,6 +78,7 @@ pub enum SenderError {
 pub async fn handle_sender_stream<T: Services>(
     state: &AppState<T>,
     payload: serde_json::Value,
+    deadline: Instant,
 ) -> Result<serde_json::Value, lambda_http::Error> {
     let event: aws_lambda_events::dynamodb::Event = serde_json::from_value(payload)
         .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
@@ -85,7 +88,7 @@ pub async fn handle_sender_stream<T: Services>(
         let Some(message_id) = queued_send_id(&record) else {
             continue;
         };
-        if let Err(error) = handle_send(state, &message_id).await {
+        if let Err(error) = handle_send(state, &message_id, deadline).await {
             tracing::error!(
                 message_id,
                 error = ?error,
@@ -251,13 +254,35 @@ const CLAIM_STALE_AFTER_MS: u64 = 15 * 60 * 1_000;
 /// How many stuck sends one sweep looks at.
 const SWEEP_LIMIT: usize = 100;
 
+/// Time kept back from the invocation deadline for calling SES and recording
+/// its answer: loading a send stops early enough to leave it. Covers
+/// [`crate::aws::SES_CALL_TIMEOUT`] plus a few store writes.
+const SEND_RESERVE: Duration = Duration::from_secs(35);
+
+/// Time kept back from the deadline when waiting before a hand-back, so the
+/// release itself still has room to run.
+const RELEASE_RESERVE: Duration = Duration::from_secs(5);
+
+/// How many times a send may be handed back before it is abandoned.
+const MAX_TRANSIENT_FAILURES: u32 = 5;
+
+/// How many times recording a send SES accepted is attempted before giving
+/// up and leaving it to the sweep.
+const MARK_SENT_ATTEMPTS: u32 = 3;
+
 /// What one sweep did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Claims released because the sender holding them appears to be gone.
+    /// Claims released because the sender holding them appears to be gone
+    /// before it called SES.
     pub released: usize,
+    /// Claims whose sender appears to be gone after it was about to call
+    /// SES, moved to `unknown` because the message may have gone out.
+    pub marked_unknown: usize,
     /// Claims left alone because they are still plausibly live.
     pub still_working: usize,
+    /// Stuck sends the sweep could not update; the next sweep tries again.
+    pub errors: usize,
     /// Sends whose outcome is unknown. Reported, never touched.
     pub unknown: usize,
 }
@@ -268,13 +293,19 @@ pub struct SweepReport {
 /// which leaves the state item `sending` with nobody working on it and no
 /// stream record to re-trigger. Nothing else would ever notice.
 ///
-/// Sends in `unknown` are counted and left alone. SES may hold those
-/// messages, so releasing one could deliver it twice; only an operator can
-/// decide.
+/// A stale claim is released only when its sender never got as far as
+/// calling SES. One whose sender recorded that it was about to call SES may
+/// already have been delivered, so it becomes `unknown` for an operator:
+/// releasing it could send the message twice.
+///
+/// Sends in `unknown` are counted and left alone. A stuck send that cannot be
+/// updated — its state moved on since the index was read, or the store is
+/// briefly unavailable — is logged and skipped, so one does not stop the
+/// rest from being recovered.
 ///
 /// # Errors
 ///
-/// [`SenderError`] when the store cannot be read or written.
+/// [`SenderError`] when the store cannot be listed.
 pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, SenderError> {
     let now_ms = time::now_ms();
     let now = time::format(now_ms);
@@ -296,14 +327,40 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
             continue;
         }
 
-        tracing::warn!(
-            message_id = %stuck.message_id,
-            sending_at = stuck.sending_at.as_deref().unwrap_or("unknown"),
-            event = "send_claim_released",
-            "releasing a claim whose sender appears to be gone"
-        );
-        release(state, &stuck, &now).await?;
-        report.released += 1;
+        let result = if stuck.ses_call_at.is_some() {
+            tracing::error!(
+                message_id = %stuck.message_id,
+                ses_call_at = stuck.ses_call_at.as_deref().unwrap_or_default(),
+                event = "send_claim_stale_after_ses_call",
+                "a sender died after it was about to call SES; the message may have gone out"
+            );
+            state
+                .services
+                .mark_send(&stuck, MarkOutcome::Unknown, &now)
+                .await
+                .map(|()| report.marked_unknown += 1)
+        } else {
+            tracing::warn!(
+                message_id = %stuck.message_id,
+                sending_at = stuck.sending_at.as_deref().unwrap_or("unknown"),
+                event = "send_claim_released",
+                "releasing a claim whose sender appears to be gone"
+            );
+            state
+                .services
+                .mark_send(&stuck, MarkOutcome::Released, &now)
+                .await
+                .map(|()| report.released += 1)
+        };
+        if let Err(error) = result {
+            report.errors += 1;
+            tracing::warn!(
+                message_id = %stuck.message_id,
+                error = ?error,
+                event = "sweep_update_failed",
+                "could not recover a stuck send; the next sweep will try again"
+            );
+        }
     }
 
     report.unknown = state
@@ -325,13 +382,19 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
 
 /// Claims `message_id`, sends it, and records the outcome.
 ///
+/// `deadline` is when the invocation ends. Loading the send must finish
+/// [`SEND_RESERVE`] before it, which is what keeps a slow attachment from
+/// getting the invocation killed while it holds the claim.
+///
 /// # Errors
 ///
-/// [`SenderError`] only for failures worth another delivery of the same
-/// record; every permanent outcome is recorded and returns `Ok`.
+/// [`SenderError`] only when the store could not record where the send got
+/// to; every other outcome, including a hand-back for another attempt, is
+/// recorded and returns `Ok`.
 pub async fn handle_send<T: Services>(
     state: &AppState<T>,
     message_id: &str,
+    deadline: Instant,
 ) -> Result<Handled, SenderError> {
     let config = state
         .config
@@ -355,55 +418,59 @@ pub async fn handle_send<T: Services>(
     };
 
     // From here the claim is held, so every path must record an outcome.
-    let spec = match load_spec(state, message_id).await {
-        Ok(spec) => spec,
-        Err(LoadError::Missing) => {
-            return fail(state, &claimed, SendFailure::SendSpecMissing, &now).await;
+    let load_by = deadline
+        .checked_sub(SEND_RESERVE)
+        .unwrap_or_else(Instant::now);
+    let (spec, parts) = match tokio::time::timeout_at(load_by, load(state, message_id)).await {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(LoadError::Permanent(failure))) => {
+            return fail(state, &claimed, failure, &now).await;
         }
-        Err(LoadError::Unavailable(error)) => {
-            // Hand the record back rather than holding a claim nobody will
-            // release, then let the event source redeliver it.
-            release(state, &claimed, &now).await?;
-            return Err(SenderError::Objects(error));
-        }
-    };
-
-    let parts = match load_parts(state, &spec).await {
-        Ok(parts) => parts,
-        Err(LoadError::Missing) => {
-            return fail(state, &claimed, SendFailure::AttachmentFetchFailed, &now).await;
-        }
-        Err(LoadError::Unavailable(error)) => {
-            release(state, &claimed, &now).await?;
-            return Err(SenderError::Objects(error));
-        }
-    };
-
-    let built = match build_outbound(
-        &spec,
-        &parts.iter().map(part_ref).collect::<Vec<_>>(),
-        MAX_OUTBOUND_RAW_BYTES,
-    ) {
-        Ok(built) => built,
-        Err(BuildError::TooLarge { size, limit }) => {
+        Ok(Err(LoadError::Transient { failure, error })) => {
             tracing::warn!(
                 message_id,
-                size,
-                limit,
-                event = "send_too_large",
-                "assembled message exceeds what SES accepts"
-            );
-            return fail(state, &claimed, SendFailure::MessageTooLarge, &now).await;
-        }
-        Err(BuildError::Failed(error)) => {
-            tracing::error!(
-                message_id,
                 error = ?error,
-                event = "send_build_failed",
-                "could not assemble the message"
+                event = "send_load_unavailable",
+                "could not load the send; handing it back"
             );
-            return fail(state, &claimed, SendFailure::MessageTooLarge, &now).await;
+            return hand_back(state, &claimed, failure, &now, deadline).await;
         }
+        Err(_elapsed) => {
+            tracing::warn!(
+                message_id,
+                event = "send_load_timed_out",
+                "loading the send did not finish in the time available; handing it back"
+            );
+            return hand_back(
+                state,
+                &claimed,
+                SendFailure::AttachmentFetchUnavailable,
+                &now,
+                deadline,
+            )
+            .await;
+        }
+    };
+
+    let built = match build(&spec, &parts) {
+        Ok(built) => built,
+        Err(failure) => return fail(state, &claimed, failure, &now).await,
+    };
+
+    // Recorded before the call, so a sender that dies from here on leaves a
+    // claim the sweep will not release: it may already have been sent.
+    let Some(calling) = state
+        .services
+        .note_ses_call(&claimed, &now)
+        .await
+        .map_err(store_error)?
+    else {
+        tracing::warn!(
+            message_id,
+            event = "send_claim_lost",
+            "the claim moved on before SES was called; not sending"
+        );
+        return Ok(Handled::Skipped);
     };
 
     let outcome = state
@@ -420,45 +487,62 @@ pub async fn handle_send<T: Services>(
         })
         .await;
 
-    record_outcome(state, &claimed, outcome, &now).await
+    record_outcome(state, &calling, outcome, &now, deadline).await
+}
+
+/// Assembles the raw message, or the failure a send that cannot be built
+/// comes to.
+fn build(spec: &SendSpec, parts: &[LoadedPart]) -> Result<Vec<u8>, SendFailure> {
+    let message_id = spec.message_id.as_str();
+    build_outbound(
+        spec,
+        &parts.iter().map(part_ref).collect::<Vec<_>>(),
+        MAX_OUTBOUND_RAW_BYTES,
+    )
+    .map_err(|error| match error {
+        BuildError::TooLarge { size, limit } => {
+            tracing::warn!(
+                message_id,
+                size,
+                limit,
+                event = "send_too_large",
+                "assembled message exceeds what SES accepts"
+            );
+            SendFailure::MessageTooLarge
+        }
+        BuildError::Failed(error) => {
+            tracing::error!(
+                message_id,
+                error = ?error,
+                event = "send_build_failed",
+                "could not assemble the message"
+            );
+            SendFailure::BuildFailed
+        }
+    })
 }
 
 /// Records what SES said, which is the only write that touches the message.
 async fn record_outcome<T: Services>(
     state: &AppState<T>,
-    claimed: &SendState,
+    calling: &SendState,
     outcome: SendOutcome,
     now: &str,
+    deadline: Instant,
 ) -> Result<Handled, SenderError> {
-    let config = state
-        .config
-        .mail
-        .as_ref()
-        .ok_or(SenderError::NotConfigured)?;
-    let message_id = claimed.message_id.as_str();
+    let message_id = calling.message_id.as_str();
     match outcome {
         SendOutcome::Sent { ses_message_id } => {
-            state
-                .services
-                .mark_send(
-                    claimed,
-                    MarkOutcome::Sent(SesSent {
-                        message_id: &ses_message_id,
-                        region: &config.region,
-                    }),
-                    now,
-                )
-                .await
-                .map_err(store_error)?;
+            mark_sent(state, calling, &ses_message_id, now, deadline).await?;
             metrics::counter!(names::MESSAGES_SENT).increment(1);
             tracing::info!(
                 message_id,
                 ses_message_id,
-                inbox_id = %claimed.inbox_id.as_str(),
+                inbox_id = %calling.inbox_id.as_str(),
                 event = "message_sent",
                 "sent"
             );
-            clear_outbox(state, claimed).await;
+            clear_outbox(state, calling).await;
             Ok(Handled::Sent)
         }
         SendOutcome::Failed { reason } => {
@@ -468,22 +552,16 @@ async fn record_outcome<T: Services>(
                 event = "send_rejected",
                 "SES refused the message"
             );
-            fail(state, claimed, SendFailure::Rejected, now).await
+            fail(state, calling, SendFailure::Rejected, now).await
         }
         SendOutcome::Retryable { reason } => {
             tracing::warn!(
                 message_id,
                 reason,
                 event = "send_retryable",
-                "SES was unavailable; releasing for another attempt"
+                "SES did not take the request; handing it back for another attempt"
             );
-            // Give up for good once a send has been handed back too often,
-            // rather than looping on it forever.
-            if claimed.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
-                return fail(state, claimed, SendFailure::SesUnavailable, now).await;
-            }
-            release(state, claimed, now).await?;
-            Ok(Handled::Skipped)
+            hand_back(state, calling, SendFailure::SesUnavailable, now, deadline).await
         }
         SendOutcome::Unknown { reason } => {
             // Deliberately terminal. SES may hold the message; sending it
@@ -496,7 +574,7 @@ async fn record_outcome<T: Services>(
             );
             state
                 .services
-                .mark_send(claimed, MarkOutcome::Unknown, now)
+                .mark_send(calling, MarkOutcome::Unknown, now)
                 .await
                 .map_err(store_error)?;
             metrics::counter!(names::SEND_OUTCOME_UNKNOWN).increment(1);
@@ -505,8 +583,100 @@ async fn record_outcome<T: Services>(
     }
 }
 
-/// How many times a send may be handed back before it is abandoned.
-const MAX_TRANSIENT_FAILURES: u32 = 5;
+/// Records that SES accepted the message, retrying briefly.
+///
+/// SES already has the message, so this is worth trying hard: if it cannot
+/// be recorded, the claim is left carrying its SES-call mark, and the sweep
+/// moves it to `unknown` rather than sending it again.
+async fn mark_sent<T: Services>(
+    state: &AppState<T>,
+    calling: &SendState,
+    ses_message_id: &str,
+    now: &str,
+    deadline: Instant,
+) -> Result<(), SenderError> {
+    let config = state
+        .config
+        .mail
+        .as_ref()
+        .ok_or(SenderError::NotConfigured)?;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let result = state
+            .services
+            .mark_send(
+                calling,
+                MarkOutcome::Sent(SesSent {
+                    message_id: ses_message_id,
+                    region: &config.region,
+                }),
+                now,
+            )
+            .await;
+        let error = match result {
+            Ok(()) => return Ok(()),
+            // Another writer moved this send on; retrying cannot help.
+            Err(error @ MailStoreError::Conflict) => error,
+            Err(error) if attempt >= MARK_SENT_ATTEMPTS => error,
+            Err(error) => {
+                tracing::warn!(
+                    message_id = %calling.message_id,
+                    attempt,
+                    error = ?error,
+                    event = "send_mark_retrying",
+                    "SES accepted the message but recording it failed; retrying"
+                );
+                wait_before_retry(Duration::from_secs(u64::from(attempt)), deadline).await;
+                continue;
+            }
+        };
+        tracing::error!(
+            message_id = %calling.message_id,
+            ses_message_id,
+            error = ?error,
+            event = "send_mark_failed",
+            "SES accepted the message but it could not be recorded; the sweep will mark it unknown"
+        );
+        return Err(store_error(error));
+    }
+}
+
+/// Hands a send back for another attempt after a transient failure, waiting
+/// first so the next attempt is not immediate, or records `failure` once it
+/// has been handed back too often.
+///
+/// Returns `Ok`: the release sets `requeued_at`, which is itself the stream
+/// record that re-triggers the sender. Also failing the invocation would
+/// redeliver the original record on top, multiplying attempts.
+async fn hand_back<T: Services>(
+    state: &AppState<T>,
+    claimed: &SendState,
+    failure: SendFailure,
+    now: &str,
+    deadline: Instant,
+) -> Result<Handled, SenderError> {
+    if claimed.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
+        return fail(state, claimed, failure, now).await;
+    }
+    let delay = Duration::from_secs(1 << claimed.transient_failures.min(4));
+    wait_before_retry(delay, deadline).await;
+    state
+        .services
+        .mark_send(claimed, MarkOutcome::Released, now)
+        .await
+        .map_err(store_error)?;
+    Ok(Handled::Skipped)
+}
+
+/// Sleeps for `delay`, cut short so [`RELEASE_RESERVE`] of the invocation
+/// remains.
+async fn wait_before_retry(delay: Duration, deadline: Instant) {
+    let latest = deadline
+        .checked_sub(RELEASE_RESERVE)
+        .unwrap_or_else(Instant::now);
+    tokio::time::sleep_until((Instant::now() + delay).min(latest)).await;
+}
 
 /// Removes the outbox objects for a finished send.
 ///
@@ -546,37 +716,73 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     }
 }
 
-/// Why a spec or part could not be loaded.
+/// Why a send could not be loaded.
 enum LoadError {
-    /// It is not there, and will not appear: retention removed it, or it was
-    /// never written.
-    Missing,
-    /// The object store could not answer.
-    Unavailable(anyhow::Error),
+    /// A retry would fail the same way: record this failure.
+    Permanent(SendFailure),
+    /// A retry may succeed: hand the send back, and record `failure` once it
+    /// has been handed back too often.
+    Transient {
+        failure: SendFailure,
+        error: anyhow::Error,
+    },
 }
 
-impl From<ObjectError> for LoadError {
-    fn from(error: ObjectError) -> Self {
-        match error {
-            ObjectError::NotFound => Self::Missing,
-            ObjectError::Transient(source) => Self::Unavailable(source),
-            other => Self::Unavailable(anyhow::anyhow!("{other}")),
+/// Classifies an object-store failure while loading `key`. `missing` is the
+/// failure a key that is not there comes to.
+fn object_load_error(
+    message_id: &str,
+    key: &str,
+    error: ObjectError,
+    missing: SendFailure,
+) -> LoadError {
+    match error {
+        ObjectError::NotFound => LoadError::Permanent(missing),
+        ObjectError::Transient(source) => LoadError::Transient {
+            failure: SendFailure::OutboxUnavailable,
+            error: source,
+        },
+        // Access denied or an object over the limit: the same answer every
+        // time, so retrying would only loop.
+        error @ (ObjectError::Permanent(_) | ObjectError::TooLarge { .. }) => {
+            tracing::error!(
+                message_id,
+                key,
+                error = ?error,
+                event = "send_outbox_refused",
+                "the object store refused an outbox object"
+            );
+            LoadError::Permanent(SendFailure::OutboxUnavailable)
         }
     }
+}
+
+/// Reads the spec and every part it names.
+async fn load<T: Services>(
+    state: &AppState<T>,
+    message_id: &str,
+) -> Result<(SendSpec, Vec<LoadedPart>), LoadError> {
+    let spec = load_spec(state, message_id).await?;
+    let parts = load_parts(state, &spec).await?;
+    Ok((spec, parts))
 }
 
 async fn load_spec<T: Services>(
     state: &AppState<T>,
     message_id: &str,
 ) -> Result<SendSpec, LoadError> {
+    let key = send::spec_key(message_id);
     let bytes = state
         .services
-        .get_object(&send::spec_key(message_id), MAX_OUTBOUND_RAW_BYTES)
-        .await?;
+        .get_object(&key, MAX_OUTBOUND_RAW_BYTES)
+        .await
+        .map_err(|error| {
+            object_load_error(message_id, &key, error, SendFailure::SendSpecMissing)
+        })?;
     serde_json::from_slice(&bytes).map_err(|e| {
         // A spec that will not parse will not parse on a retry either.
         tracing::error!(message_id, error = ?e, event = "send_spec_unreadable", "unreadable spec");
-        LoadError::Missing
+        LoadError::Permanent(SendFailure::SendSpecMissing)
     })
 }
 
@@ -594,15 +800,13 @@ fn part_ref(part: &LoadedPart) -> BuiltPart<'_> {
     }
 }
 
-/// Reads every attachment named by the spec.
-///
-/// A URL-backed part that has not been fetched yet has no object key; those
-/// are not supported by this sender yet and stop the send rather than
-/// silently producing a message missing its attachment.
+/// Reads every attachment named by the spec: bytes already in the outbox, or
+/// a URL fetched once and stored so a retry reuses it.
 async fn load_parts<T: Services>(
     state: &AppState<T>,
     spec: &SendSpec,
 ) -> Result<Vec<LoadedPart>, LoadError> {
+    let message_id = spec.message_id.as_str();
     let mut parts = Vec::with_capacity(spec.attachments.len());
     let mut budget = MAX_OUTBOUND_DECODED_BYTES;
 
@@ -614,7 +818,10 @@ async fn load_parts<T: Services>(
             let bytes = state
                 .services
                 .get_object(key, MAX_OUTBOUND_RAW_BYTES)
-                .await?;
+                .await
+                .map_err(|error| {
+                    object_load_error(message_id, key, error, SendFailure::AttachmentFetchFailed)
+                })?;
             budget = budget.saturating_sub(bytes.len() as u64);
             parts.push(LoadedPart {
                 spec: attachment.clone(),
@@ -626,7 +833,7 @@ async fn load_parts<T: Services>(
         // An earlier attempt may already have fetched and stored it. The
         // spec is written once at enqueue and never rewritten, so the stored
         // object is the only record that the fetch happened.
-        let stored_key = send::part_key(&spec.message_id, &attachment.attachment_id);
+        let stored_key = send::part_key(message_id, &attachment.attachment_id);
         match state
             .services
             .get_object(&stored_key, MAX_OUTBOUND_RAW_BYTES)
@@ -644,34 +851,41 @@ async fn load_parts<T: Services>(
                 continue;
             }
             Err(ObjectError::NotFound) => {}
-            Err(other) => return Err(other.into()),
+            Err(error) => {
+                return Err(object_load_error(
+                    message_id,
+                    &stored_key,
+                    error,
+                    SendFailure::AttachmentFetchFailed,
+                ));
+            }
         }
 
         let Some(raw_url) = &attachment.url else {
             tracing::error!(
-                message_id = %spec.message_id,
+                message_id,
                 attachment_id = %attachment.attachment_id,
                 event = "send_part_has_no_source",
                 "attachment names neither stored bytes nor a URL"
             );
-            return Err(LoadError::Missing);
+            return Err(LoadError::Permanent(SendFailure::AttachmentFetchFailed));
         };
         // Re-checked here rather than trusted from the spec: the shape rules
         // are cheap, and the spec has been sitting in S3 since enqueue.
         let url = url_policy::parse_attachment_url(raw_url).map_err(|rejected| {
             tracing::warn!(
-                message_id = %spec.message_id,
+                message_id,
                 attachment_id = %attachment.attachment_id,
                 rejected = %rejected,
                 event = "send_part_url_blocked",
                 "attachment URL is not allowed"
             );
-            LoadError::Missing
+            LoadError::Permanent(SendFailure::AttachmentFetchFailed)
         })?;
 
         let fetched = AttachmentFetcher::fetch(&state.services, &url, budget)
             .await
-            .map_err(|error| fetch_error(&spec.message_id, &attachment.attachment_id, &error))?;
+            .map_err(|error| fetch_error(message_id, &attachment.attachment_id, error))?;
         budget = budget.saturating_sub(fetched.bytes.len() as u64);
 
         // Stored under the attachment's own key so a retry reuses these
@@ -683,7 +897,15 @@ async fn load_parts<T: Services>(
                 axum::body::Bytes::from(fetched.bytes.clone()),
                 &attachment.content_type,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                object_load_error(
+                    message_id,
+                    &stored_key,
+                    error,
+                    SendFailure::AttachmentFetchFailed,
+                )
+            })?;
 
         let mut spec_attachment = attachment.clone();
         spec_attachment.object_key = Some(stored_key);
@@ -696,11 +918,13 @@ async fn load_parts<T: Services>(
     Ok(parts)
 }
 
-/// Maps a fetch failure onto the two outcomes the caller distinguishes: worth
-/// another attempt, or not.
-fn fetch_error(message_id: &str, attachment_id: &str, error: &FetchError) -> LoadError {
+/// Maps a fetch failure onto whether another attempt could succeed.
+fn fetch_error(message_id: &str, attachment_id: &str, error: FetchError) -> LoadError {
     if error.is_transient() {
-        return LoadError::Unavailable(anyhow::anyhow!("fetching {attachment_id}: {error}"));
+        return LoadError::Transient {
+            failure: SendFailure::AttachmentFetchUnavailable,
+            error: anyhow::Error::new(error).context(format!("fetching {attachment_id}")),
+        };
     }
     // The URL is never logged: it came from a caller and may carry a
     // credential in its path or query.
@@ -711,7 +935,7 @@ fn fetch_error(message_id: &str, attachment_id: &str, error: &FetchError) -> Loa
         event = "send_part_fetch_failed",
         "attachment could not be fetched"
     );
-    LoadError::Missing
+    LoadError::Permanent(SendFailure::AttachmentFetchFailed)
 }
 
 async fn fail<T: Services>(
@@ -733,18 +957,6 @@ async fn fail<T: Services>(
         "send will not be retried"
     );
     Ok(Handled::Failed)
-}
-
-async fn release<T: Services>(
-    state: &AppState<T>,
-    claimed: &SendState,
-    now: &str,
-) -> Result<(), SenderError> {
-    state
-        .services
-        .mark_send(claimed, MarkOutcome::Released, now)
-        .await
-        .map_err(store_error)
 }
 
 fn store_error(error: MailStoreError) -> SenderError {

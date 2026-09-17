@@ -219,15 +219,20 @@ This is the design's central decision, and it exists because a synchronous send 
 the same mail more than once. SESv2 `SendEmail` has no idempotency token, and the AWS SDKs retry
 5xx on their own, so one API request could become three deliveries.
 
-At most once is enforced in three places:
+At most once is enforced in four places:
 
 1. **The claim.** A conditional write moves `queued` to `sending`. The stream delivers at least
    once, so two senders will be handed the same record; exactly one wins and the other stops,
    which is an ordinary outcome and not an error.
-2. **SDK retries are disabled** on the send call. What a failure means is this service's
-   decision, not the SDK's.
-3. **An ambiguous outcome is terminal.** A timeout or dropped connection means SES *may* hold
-   the message. The send stops as `unknown` and keeps its `queued` label, because it is neither
+2. **The SES-call mark.** Just before calling SES the sender records `ses_call_at` on the
+   state, conditioned on still holding the claim. A claim that goes stale without it was never
+   sent and can be released; one with it may have been, so it is never sent again
+   automatically.
+3. **SDK retries are disabled** on the send call. What a failure means is this service's
+   decision, not the SDK's. Only 429 and 503 are retried, since those mean SES did not take the
+   request; 500, 502 and 504 can follow an accepted message and count as unknown.
+4. **An ambiguous outcome is terminal.** A timeout, a dropped connection or an ambiguous 5xx
+   means SES *may* hold the message. The send stops as `unknown` and keeps its `queued` label, because it is neither
    sent nor known to have failed and claiming either would be a statement this service cannot
    support. Only an operator resolves it. Collapsing `unknown` into `failed` is the bug that
    would eventually double-send.
@@ -236,9 +241,19 @@ Marking the outcome is the only write that touches the message item, so the rela
 event per send rather than one per attempt; `sending` is never mirrored onto the message for the
 same reason.
 
-A transient failure hands the record back with `requeued_at` set, whose appearance re-triggers
-the sender, and gives up after five attempts so a lastingly unavailable SES cannot keep one
-message circulating forever.
+A transient failure — SES refusing the request, the object store or an attachment host
+briefly unavailable — hands the record back with `requeued_at` set, whose appearance
+re-triggers the sender. The sender waits first (one second, doubling to sixteen), and the
+invocation succeeds rather than also asking the stream to redeliver, which would multiply
+attempts. After five hand-backs the send fails, so nothing unavailable keeps a message
+circulating forever. An answer that will not change — the object store refusing access, an
+object over the limit, an attachment host rejecting the request — fails the send at once.
+
+Loading the spec and its attachments must finish thirty-five seconds before the invocation
+deadline, which leaves room for the SES call (bounded at twenty seconds) and recording its
+answer; a load that runs long is handed back rather than getting the sender killed while it
+holds the claim. When SES accepts a message but recording that fails, the sender retries the
+write briefly and otherwise leaves the claim carrying its SES-call mark.
 
 `Idempotency-Key` is hashed, never stored, and the stored record carries a fingerprint of the
 request body. The same key with the same request replays the original ids; the same key with a
@@ -282,7 +297,10 @@ message that was already built rather than a URL whose content may have changed.
 
 A sender killed between claiming a send and recording its outcome leaves the state `sending`
 with nobody working on it and no stream record to re-trigger it. Nothing else would notice, so a
-scheduled sweep releases claims older than fifteen minutes.
+scheduled sweep looks at claims older than fifteen minutes. One without an SES-call mark is
+released to be attempted again; one with the mark may already have been delivered, so it moves
+to `unknown` for an operator. A stuck send the sweep cannot update is logged and left for the
+next sweep, without stopping the rest.
 
 That threshold is well beyond the sender's own timeout on purpose: taking a send away from a
 sender still working on it is how the same message gets delivered twice. Sends in `unknown` are

@@ -39,6 +39,19 @@ use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 /// up with `MailStoreError::Conflict`.
 const MAX_TXN_RETRIES: u32 = 3;
 
+/// Waits before retrying a cancelled transaction: exponential from 25 ms,
+/// with jitter so writers that collided do not collide again in step.
+async fn backoff(attempt: u32) {
+    let base_ms = 25_u64 << attempt.min(4);
+    let jitter_ms = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    ) % base_ms;
+    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+}
+
 /// `BatchGetItem` loops on `UnprocessedKeys` at most this many times before
 /// surfacing a transient error.
 const MAX_BATCH_GET_ATTEMPTS: u32 = 5;
@@ -780,7 +793,7 @@ impl MailStore for AwsServices {
 
     async fn insert_message(&self, msg: &MailMessage) -> Result<InsertOutcome, MailStoreError> {
         let mut taken = Vec::new();
-        for _attempt in 0..=MAX_TXN_RETRIES {
+        for attempt in 0..=MAX_TXN_RETRIES {
             // Read the thread consistently, compute its new state in
             // Rust, then plan the whole transaction fresh — re-read on every
             // retry, since a concurrent writer may have moved the thread's
@@ -799,7 +812,9 @@ impl MailStore for AwsServices {
             match self.attempt_transaction(TxnKind::Insert, &ops).await? {
                 Attempt::Committed => return Ok(InsertOutcome::Fresh),
                 Attempt::Decision(TxnDecision::Duplicate) => return Ok(InsertOutcome::Duplicate),
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
+                    backoff(attempt).await;
+                }
                 Attempt::AliasTaken(keys) => taken.extend(keys),
                 Attempt::Decision(
                     TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::AliasTaken,
@@ -826,6 +841,8 @@ impl MailStore for AwsServices {
             .table_name(table_name)
             .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
             .key("sk", DynamoAv::S(keys::message_sk(message_id)))
+            // Consistent: the version read here conditions the next write.
+            .consistent_read(true)
             .send()
             .await
             .map_err(|e| store_error_from_sdk("GetItem(message)", &e))?;
@@ -865,7 +882,7 @@ impl MailStore for AwsServices {
         now_epoch: u64,
     ) -> Result<EnqueueOutcome, MailStoreError> {
         let mut taken = Vec::new();
-        for _attempt in 0..=MAX_TXN_RETRIES {
+        for attempt in 0..=MAX_TXN_RETRIES {
             // The thread is re-read on every attempt: a concurrent send into
             // the same thread moves its version.
             let thread_before = self.get_thread_state(&msg.inbox_id, &msg.thread_id).await?;
@@ -890,7 +907,9 @@ impl MailStore for AwsServices {
                 Attempt::Decision(TxnDecision::Duplicate) => {
                     return Ok(EnqueueOutcome::AlreadyQueued);
                 }
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
+                    backoff(attempt).await;
+                }
                 Attempt::AliasTaken(keys) => taken.extend(keys),
                 Attempt::Decision(TxnDecision::Permanent | TxnDecision::AliasTaken) => {
                     return Err(MailStoreError::Permanent(anyhow!(
@@ -978,7 +997,7 @@ impl MailStore for AwsServices {
         message_id: &str,
         now: &str,
     ) -> Result<Option<SendState>, MailStoreError> {
-        for _attempt in 0..=MAX_TXN_RETRIES {
+        for attempt in 0..=MAX_TXN_RETRIES {
             let Some(before) = self.get_send_state(message_id).await? else {
                 return Ok(None);
             };
@@ -994,7 +1013,29 @@ impl MailStore for AwsServices {
                 Attempt::Committed => return Ok(Some(after)),
                 // Lost the race: re-read, and the status check above settles
                 // it.
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
+                    backoff(attempt).await;
+                }
+                Attempt::Decision(_) | Attempt::AliasTaken(_) => return Ok(None),
+            }
+        }
+        Err(MailStoreError::Conflict)
+    }
+
+    async fn note_ses_call(
+        &self,
+        claimed: &SendState,
+        now: &str,
+    ) -> Result<Option<SendState>, MailStoreError> {
+        let after = claimed.calling_ses(now);
+        let ops = crate::mail::plan::plan_ses_call(claimed, &after)?;
+        for attempt in 0..=MAX_TXN_RETRIES {
+            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+                Attempt::Committed => return Ok(Some(after)),
+                // Throttled or conflicting with another transaction: the same
+                // write is still the right one.
+                Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
+                // The state moved on under this sender: the claim is gone.
                 Attempt::Decision(_) | Attempt::AliasTaken(_) => return Ok(None),
             }
         }
@@ -1008,7 +1049,7 @@ impl MailStore for AwsServices {
         now: &str,
     ) -> Result<(), MailStoreError> {
         let mut taken = Vec::new();
-        for _attempt in 0..=MAX_TXN_RETRIES {
+        for attempt in 0..=MAX_TXN_RETRIES {
             let Some(msg) = self.get_message(&state.inbox_id, &state.message_id).await? else {
                 return Err(MailStoreError::Permanent(anyhow!(
                     "send state {} has no message",
@@ -1044,7 +1085,18 @@ impl MailStore for AwsServices {
 
             match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
                 Attempt::Committed => return Ok(()),
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
+                Attempt::Decision(TxnDecision::VersionConflict) => {
+                    // A conflict on the send state itself means another writer
+                    // moved this send on — retrying with the state the caller
+                    // holds can never succeed, so the claim is reported lost.
+                    // A conflict on the message or thread is retried.
+                    let current = self.get_send_state(&state.message_id).await?;
+                    if current.is_none_or(|current| current.version != state.version) {
+                        return Err(MailStoreError::Conflict);
+                    }
+                    backoff(attempt).await;
+                }
                 Attempt::AliasTaken(keys) => taken.extend(keys),
                 Attempt::Decision(_) => {
                     return Err(MailStoreError::Permanent(anyhow!(
@@ -1065,7 +1117,7 @@ impl MailStore for AwsServices {
         remove: &[String],
         now: &str,
     ) -> Result<Option<Vec<String>>, MailStoreError> {
-        for _attempt in 0..=MAX_TXN_RETRIES {
+        for attempt in 0..=MAX_TXN_RETRIES {
             // Re-read both items on every attempt: a retry means someone
             // else moved a version, so the previous computation is stale.
             let Some(msg) = self.get_message(inbox, message_id).await? else {
@@ -1113,7 +1165,9 @@ impl MailStore for AwsServices {
 
             match self.attempt_transaction(TxnKind::Patch, &ops).await? {
                 Attempt::Committed => return Ok(Some(new_labels)),
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
+                    backoff(attempt).await;
+                }
                 Attempt::Decision(
                     TxnDecision::Permanent
                     | TxnDecision::KeyExists

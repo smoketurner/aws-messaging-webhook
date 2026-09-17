@@ -288,6 +288,29 @@ pub fn plan_claim(before: &SendState, after: &SendState) -> Result<Vec<PlannedOp
     )?])
 }
 
+/// Plans recording that the claimed send is about to call SES: the state
+/// alone, conditioned on still being `sending` at the version this sender
+/// holds, so a claim that was lost is never marked.
+///
+/// # Errors
+///
+/// Propagates a serialization failure as [`MailStoreError::Permanent`].
+pub fn plan_ses_call(
+    before: &SendState,
+    after: &SendState,
+) -> Result<Vec<PlannedOp>, MailStoreError> {
+    Ok(vec![send_state_op(
+        after,
+        Cond::All(vec![
+            Check::Eq(
+                "send_status",
+                AttributeValue::S(SendStatus::Sending.as_str().to_owned()),
+            ),
+            Check::Eq("version", AttributeValue::N(before.version.to_string())),
+        ]),
+    )?])
+}
+
 /// Plans the end of a send: the new send state, the message's mirrored
 /// status and labels, and — when SES gave us one — the alias that maps its
 /// message id back to ours.
