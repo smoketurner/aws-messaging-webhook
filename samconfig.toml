@@ -17,4 +17,4 @@ stack_name = "aws-messaging-webhook-dev"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 disable_rollback = true
-parameter_overrides = "pStage=dev pHostedZoneId=Z04338642E432EB33SIGC pMailDomain=mail.smoketurner.com pMailAddresses=hello pApiKeysParameterName=/aws-messaging-webhook/dev/api-keys"
+parameter_overrides = "pStage=dev pHostedZoneId=Z16D1PNQBSPVGS pMailDomain=mail.bigkong.com pMailInbox=hello pApiKeysParameterName=/messaging-webhook/dev/api-keys"
