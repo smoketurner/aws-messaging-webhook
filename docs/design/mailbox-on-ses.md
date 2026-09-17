@@ -34,7 +34,7 @@ an SES receipt over SNS, already persisted to the events table, and already publ
 own stream, an authenticated API on the same router, and a second function for sending.
 
 ```
-                 template.yaml (Condition: HasMailDomain)
+                 template.yaml (Condition: cHasMailDomain)
  ┌──────────────────────────────────────────────────────────────────────┐
  │ MX/DKIM/SPF/DMARC ─► SES receipt rule ─► S3 (raw MIME)               │
  │                                       └─► SNS topic ─► webhook fn    │

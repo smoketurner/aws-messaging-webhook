@@ -560,7 +560,7 @@ pub fn test_mail_config() -> MailConfig {
 }
 
 /// A harness with the mailbox configured. [`harness`] leaves `mail` unset,
-/// which is what a stack without `MailDomain` looks like, so every mailbox
+/// which is what a stack without `pMailDomain` looks like, so every mailbox
 /// test needs this instead.
 pub async fn mail_harness() -> Harness {
     let mut harness = harness_with(HarnessOptions::default()).await;

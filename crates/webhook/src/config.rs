@@ -284,7 +284,7 @@ fn parse_bool_flag(name: &str, raw: Option<&str>) -> anyhow::Result<bool> {
     }
 }
 
-/// `ApiKeysParameterName` must be an absolute SSM parameter path.
+/// `pApiKeysParameterName` must be an absolute SSM parameter path.
 fn validate_api_keys_parameter(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         name.starts_with('/'),
