@@ -360,12 +360,12 @@ Resources:
                 Resource: !Ref pApiKeysKmsKeyArn
               - !Ref AWS::NoValue
 
+  # Unnamed like the rest: each function's LoggingConfig points at its own
+  # group by reference, and the WebhookLogGroupName output carries the
+  # generated name. Lambda's basic execution policy covers any log group.
   rFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      # The function itself is unnamed (CloudFormation generates it), so this
-      # is the readable, stack-scoped name an operator searches logs by.
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
       RetentionInDays: !Ref pLogRetentionDays
 
   rEventsTable:
@@ -893,7 +893,6 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-mail-sender"
       RetentionInDays: !Ref pLogRetentionDays
 
   # Send-state items only, and only while they are queued. The filter keeps
@@ -1042,6 +1041,9 @@ Outputs:
   WebhookFunctionName:
     Description: Generated name of the webhook function, for aws lambda invoke and sam logs.
     Value: !Ref rWebhookFunction
+  WebhookLogGroupName:
+    Description: CloudWatch log group the webhook function writes to.
+    Value: !Ref rFunctionLogGroup
   EventBusName:
     Value: !Ref rEventBus
   EventBusArn:
@@ -1090,6 +1092,10 @@ Outputs:
     Condition: cHasMailDomain
     Description: Generated name of the mail sender function, for the operator resend and sweep commands.
     Value: !Ref rMailSenderFunction
+  MailSenderLogGroupName:
+    Condition: cHasMailDomain
+    Description: CloudWatch log group the mail sender writes to.
+    Value: !Ref rMailSenderLogGroup
   MailSenderDlqUrl:
     Condition: cHasMailDomain
     Description: SQS DLQ for sends that failed every retry. A message here is mail that did not go out.
