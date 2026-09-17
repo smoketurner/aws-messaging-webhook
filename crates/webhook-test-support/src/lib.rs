@@ -164,8 +164,13 @@ impl MailStore for FakeServices {
         self.mail.get_inbox(inbox).await
     }
 
-    async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
-        self.mail.ensure_inbox(inbox, now).await
+    async fn ensure_inbox(
+        &self,
+        inbox: &InboxId,
+        email: &str,
+        now: &str,
+    ) -> Result<Inbox, MailStoreError> {
+        self.mail.ensure_inbox(inbox, email, now).await
     }
 
     async fn message_exists(

@@ -41,7 +41,11 @@ async fn seeded() -> Harness {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
+        .ensure_inbox(
+            &InboxId(INBOX.to_owned()),
+            &format!("{INBOX}@example.com"),
+            "2026-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     h
@@ -134,7 +138,11 @@ async fn a_page_token_from_another_inbox_is_rejected() {
     let h = seeded().await;
     h.state
         .services
-        .ensure_inbox(&InboxId("billing".to_owned()), "2026-01-01T00:00:00.000Z")
+        .ensure_inbox(
+            &InboxId("billing".to_owned()),
+            "billing@example.com",
+            "2026-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     for hour in 9..12 {

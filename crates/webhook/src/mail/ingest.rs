@@ -252,7 +252,7 @@ async fn resolve_recipient<T: Services>(
     }
 
     let now = time::format(time::now_ms());
-    match state.services.ensure_inbox(&inbox_id, &now).await {
+    match state.services.ensure_inbox(&inbox_id, address, &now).await {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }

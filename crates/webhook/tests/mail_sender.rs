@@ -49,7 +49,11 @@ async fn seeded() -> Harness {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
+        .ensure_inbox(
+            &InboxId(INBOX.to_owned()),
+            &format!("{INBOX}@example.com"),
+            "2026-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     h

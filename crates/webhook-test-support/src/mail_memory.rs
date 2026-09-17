@@ -400,6 +400,7 @@ impl MailStore for MailMemoryStore {
     fn ensure_inbox(
         &self,
         inbox: &InboxId,
+        email: &str,
         now: &str,
     ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send {
         use aws_messaging_webhook::mail::keys;
@@ -417,7 +418,7 @@ impl MailStore for MailMemoryStore {
         }
         let inbox_record = Inbox {
             inbox_id: inbox.clone(),
-            email: inbox.as_str().to_owned(),
+            email: email.to_owned(),
             display_name: None,
             metadata: None,
             created_at: now.to_owned(),
@@ -916,16 +917,17 @@ mod tests {
         let store = MailMemoryStore::default();
         let inbox = InboxId("support".to_owned());
         let created = store
-            .ensure_inbox(&inbox, "2026-01-01T00:00:00.000Z")
+            .ensure_inbox(&inbox, "support@example.com", "2026-01-01T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(created.inbox_id, inbox);
+        assert_eq!(created.email, "support@example.com");
 
         let fetched = store.get_inbox(&inbox).await.unwrap().unwrap();
         assert_eq!(fetched.created_at, created.created_at);
 
         let ensured_again = store
-            .ensure_inbox(&inbox, "2026-01-02T00:00:00.000Z")
+            .ensure_inbox(&inbox, "support@example.com", "2026-01-02T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(ensured_again.created_at, created.created_at);

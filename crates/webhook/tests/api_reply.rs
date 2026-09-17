@@ -43,7 +43,11 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), AT)
+        .ensure_inbox(
+            &InboxId(INBOX.to_owned()),
+            &format!("{INBOX}@example.com"),
+            AT,
+        )
         .await
         .unwrap();
 

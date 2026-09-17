@@ -572,6 +572,14 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
             .is_none(),
         "no inbox may be created for an unconfigured recipient"
     );
+    let created = h
+        .fake()
+        .mail
+        .get_inbox(&aws_messaging_webhook::mail::InboxId("support".to_owned()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(created.email, "support@example.com");
 }
 
 /// A direct `mail::ingest::ingest_inbound` call — see the module doc for why

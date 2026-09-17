@@ -602,11 +602,16 @@ impl MailStore for AwsServices {
         }
     }
 
-    async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
+    async fn ensure_inbox(
+        &self,
+        inbox: &InboxId,
+        email: &str,
+        now: &str,
+    ) -> Result<Inbox, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let record = Inbox {
             inbox_id: inbox.clone(),
-            email: inbox.as_str().to_owned(),
+            email: email.to_owned(),
             display_name: None,
             metadata: None,
             created_at: now.to_owned(),
