@@ -30,7 +30,9 @@ use crate::mail::store::{
     EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
 use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
-use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use crate::mail::txn::{
+    CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases, taken_aliases,
+};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
 /// `Retry`/`VersionConflict` loops at most this many times before giving
@@ -534,6 +536,9 @@ enum Attempt {
     Committed,
     /// The transaction was cancelled or is in progress.
     Decision(TxnDecision),
+    /// Cancelled only because these alias keys already belong to an earlier
+    /// message; retry without them.
+    AliasTaken(Vec<String>),
 }
 
 impl AwsServices {
@@ -559,7 +564,12 @@ impl AwsServices {
                                 .iter()
                                 .map(|reason| map_cancellation_reason(reason.code()))
                                 .collect();
-                            return Ok(Attempt::Decision(decode_cancellation(kind, ops, &reasons)));
+                            return Ok(match decode_cancellation(kind, ops, &reasons) {
+                                TxnDecision::AliasTaken => {
+                                    Attempt::AliasTaken(taken_aliases(ops, &reasons))
+                                }
+                                decision => Attempt::Decision(decision),
+                            });
                         }
                         TransactWriteItemsError::TransactionInProgressException(_) => {
                             return Ok(Attempt::Decision(TxnDecision::Retry));
@@ -774,6 +784,7 @@ impl MailStore for AwsServices {
     }
 
     async fn insert_message(&self, msg: &MailMessage) -> Result<InsertOutcome, MailStoreError> {
+        let mut taken = Vec::new();
         for _attempt in 0..=MAX_TXN_RETRIES {
             // Read the thread consistently, compute its new state in
             // Rust, then plan the whole transaction fresh — re-read on every
@@ -786,13 +797,18 @@ impl MailStore for AwsServices {
                 None => new_thread(msg),
             };
 
-            let ops = crate::mail::plan::plan_insert(msg, thread_before.as_ref(), &thread_after)?;
+            let mut ops =
+                crate::mail::plan::plan_insert(msg, thread_before.as_ref(), &thread_after)?;
+            drop_taken_aliases(&mut ops, &taken);
 
             match self.attempt_transaction(TxnKind::Insert, &ops).await? {
                 Attempt::Committed => return Ok(InsertOutcome::Fresh),
                 Attempt::Decision(TxnDecision::Duplicate) => return Ok(InsertOutcome::Duplicate),
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                Attempt::Decision(TxnDecision::Permanent | TxnDecision::KeyExists) => {
+                Attempt::AliasTaken(keys) => taken.extend(keys),
+                Attempt::Decision(
+                    TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::AliasTaken,
+                ) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "ingest transaction for message {} was cancelled",
                         msg.message_id
@@ -853,6 +869,7 @@ impl MailStore for AwsServices {
         key: Option<&SendKey>,
         now_epoch: u64,
     ) -> Result<EnqueueOutcome, MailStoreError> {
+        let mut taken = Vec::new();
         for _attempt in 0..=MAX_TXN_RETRIES {
             // The thread is re-read on every attempt: a concurrent send into
             // the same thread moves its version.
@@ -862,7 +879,7 @@ impl MailStore for AwsServices {
                 None => new_thread(msg),
             };
 
-            let ops = crate::mail::plan::plan_enqueue(
+            let mut ops = crate::mail::plan::plan_enqueue(
                 msg,
                 state,
                 key,
@@ -870,6 +887,7 @@ impl MailStore for AwsServices {
                 &thread_after,
                 now_epoch,
             )?;
+            drop_taken_aliases(&mut ops, &taken);
 
             match self.attempt_transaction(TxnKind::Enqueue, &ops).await? {
                 Attempt::Committed => return Ok(EnqueueOutcome::Committed),
@@ -878,7 +896,8 @@ impl MailStore for AwsServices {
                     return Ok(EnqueueOutcome::AlreadyQueued);
                 }
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                Attempt::Decision(TxnDecision::Permanent) => {
+                Attempt::AliasTaken(keys) => taken.extend(keys),
+                Attempt::Decision(TxnDecision::Permanent | TxnDecision::AliasTaken) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "enqueue transaction for message {} was cancelled",
                         msg.message_id
@@ -981,7 +1000,7 @@ impl MailStore for AwsServices {
                 // Lost the race: re-read, and the status check above settles
                 // it.
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                Attempt::Decision(_) => return Ok(None),
+                Attempt::Decision(_) | Attempt::AliasTaken(_) => return Ok(None),
             }
         }
         Err(MailStoreError::Conflict)
@@ -993,6 +1012,7 @@ impl MailStore for AwsServices {
         outcome: MarkOutcome<'_>,
         now: &str,
     ) -> Result<(), MailStoreError> {
+        let mut taken = Vec::new();
         for _attempt in 0..=MAX_TXN_RETRIES {
             let Some(msg) = self.get_message(&state.inbox_id, &state.message_id).await? else {
                 return Err(MailStoreError::Permanent(anyhow!(
@@ -1016,7 +1036,7 @@ impl MailStore for AwsServices {
                 let after = apply_label_patch(&before, &added, &removed, now);
                 Some((before, after))
             };
-            let ops = crate::mail::plan::plan_mark(
+            let mut ops = crate::mail::plan::plan_mark(
                 state,
                 &after,
                 &msg,
@@ -1025,10 +1045,12 @@ impl MailStore for AwsServices {
                 ses_message_id,
                 now,
             )?;
+            drop_taken_aliases(&mut ops, &taken);
 
             match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
                 Attempt::Committed => return Ok(()),
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                Attempt::AliasTaken(keys) => taken.extend(keys),
                 Attempt::Decision(_) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "marking send {} was cancelled",
@@ -1098,8 +1120,12 @@ impl MailStore for AwsServices {
                 Attempt::Committed => return Ok(Some(new_labels)),
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
                 Attempt::Decision(
-                    TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::Duplicate,
-                ) => {
+                    TxnDecision::Permanent
+                    | TxnDecision::KeyExists
+                    | TxnDecision::Duplicate
+                    | TxnDecision::AliasTaken,
+                )
+                | Attempt::AliasTaken(_) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "label patch for message {message_id} was cancelled"
                     )));

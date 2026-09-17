@@ -153,6 +153,10 @@ version-conditioned on what was read, and the `Message-ID` alias. The failed con
 message *is* the idempotency signal — a redelivery cancels the whole transaction, so the thread
 is not double-counted.
 
+An alias belongs to the first message written under it. A transaction whose only failed checks
+are aliases that already exist — a second message reusing a `Message-ID`, or a send whose SES
+id is already known — is retried without those aliases rather than failed.
+
 SES publishes a setup notification (`mail.messageId` `AMAZON_SES_SETUP_NOTIFICATION`) whenever
 a receipt rule changes. It carries no mail and is acknowledged without being persisted or
 published.

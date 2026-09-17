@@ -20,6 +20,10 @@ pub enum TxnDecision {
     /// A version- or status-conditioned check lost: the caller re-reads and
     /// decides.
     VersionConflict,
+    /// Only `Message-ID` alias writes lost their check: those aliases already
+    /// belong to an earlier message. The first writer keeps an alias, so the
+    /// caller drops the ones [`taken_aliases`] names and commits the rest.
+    AliasTaken,
     /// Anything else: log and surface as a permanent failure.
     Permanent,
 }
@@ -137,9 +141,42 @@ pub fn decode_cancellation(
         }
     }
 
-    // Step 5: anything else, including a failed check on an unconditioned op
+    // Step 5: the only failed checks are alias writes.
+    if !taken_aliases(ops, reasons).is_empty()
+        && ops.iter().zip(reasons).all(|(op, reason)| {
+            *reason != CancellationReason::ConditionalCheckFailed
+                || matches!(op.op, WriteOp::AliasFirstWriter { .. })
+        })
+    {
+        return TxnDecision::AliasTaken;
+    }
+
+    // Step 6: anything else, including a failed check on an unconditioned op
     // — which DynamoDB never reports, since it only cancels a conditioned one.
     TxnDecision::Permanent
+}
+
+/// The alias keys (`pk`) whose first-writer check failed in a cancelled
+/// transaction.
+#[must_use]
+pub fn taken_aliases(ops: &[PlannedOp], reasons: &[CancellationReason]) -> Vec<String> {
+    let mut taken = Vec::new();
+    for (op, reason) in ops.iter().zip(reasons) {
+        if *reason == CancellationReason::ConditionalCheckFailed
+            && let WriteOp::AliasFirstWriter { pk, .. } = &op.op
+        {
+            taken.push(pk.clone());
+        }
+    }
+    taken
+}
+
+/// Removes the alias writes for keys an earlier message already holds.
+pub fn drop_taken_aliases(ops: &mut Vec<PlannedOp>, taken: &[String]) {
+    ops.retain(|op| match &op.op {
+        WriteOp::AliasFirstWriter { pk, .. } => !taken.contains(pk),
+        WriteOp::Put { .. } | WriteOp::Update { .. } | WriteOp::Delete { .. } => true,
+    });
 }
 
 #[cfg(test)]
@@ -181,6 +218,75 @@ mod tests {
                 cond: Cond::None,
             },
         )
+    }
+
+    fn alias(pk: &str) -> PlannedOp {
+        op(
+            OpRole::RfcAlias,
+            WriteOp::AliasFirstWriter {
+                pk: pk.to_owned(),
+                sk: "RFC".to_owned(),
+                message_id: "mid-2".to_owned(),
+                thread_id: "tid-2".to_owned(),
+                expires_at: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn a_taken_alias_alone_is_alias_taken_and_names_its_key() {
+        let mut ops = vec![
+            not_exists_put(OpRole::Message),
+            version_put(OpRole::Thread, 0),
+            alias("RFC#support#taken@example.com"),
+            alias("RFC#support#free@example.com"),
+        ];
+        let reasons = vec![
+            CancellationReason::None,
+            CancellationReason::None,
+            CancellationReason::ConditionalCheckFailed,
+            CancellationReason::None,
+        ];
+        assert_eq!(
+            decode_cancellation(TxnKind::Insert, &ops, &reasons),
+            TxnDecision::AliasTaken
+        );
+        let taken = taken_aliases(&ops, &reasons);
+        assert_eq!(taken, vec!["RFC#support#taken@example.com"]);
+
+        drop_taken_aliases(&mut ops, &taken);
+        assert_eq!(ops.len(), 3);
+        assert!(ops.iter().any(|o| matches!(
+            &o.op,
+            WriteOp::AliasFirstWriter { pk, .. } if pk == "RFC#support#free@example.com"
+        )));
+    }
+
+    #[test]
+    fn a_taken_alias_with_another_failed_check_is_not_alias_taken() {
+        let ops = vec![
+            version_put(OpRole::Thread, 0),
+            alias("RFC#support#taken@example.com"),
+        ];
+        let reasons = vec![
+            CancellationReason::ConditionalCheckFailed,
+            CancellationReason::ConditionalCheckFailed,
+        ];
+        assert_eq!(
+            decode_cancellation(TxnKind::Insert, &ops, &reasons),
+            TxnDecision::VersionConflict
+        );
+
+        // A redelivered message's own alias is also taken, but the message
+        // itself existing is what decides.
+        let ops = vec![
+            not_exists_put(OpRole::Message),
+            alias("RFC#support#taken@example.com"),
+        ];
+        assert_eq!(
+            decode_cancellation(TxnKind::Insert, &ops, &reasons),
+            TxnDecision::Duplicate
+        );
     }
 
     #[test]

@@ -17,7 +17,9 @@ use aws_messaging_webhook::mail::store::{
     EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
 use aws_messaging_webhook::mail::thread::{ThreadState, apply_message, new_thread};
-use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use aws_messaging_webhook::mail::txn::{
+    CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases, taken_aliases,
+};
 use aws_messaging_webhook::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 use serde_dynamo::{AttributeValue, Item};
 
@@ -42,6 +44,8 @@ enum Commit {
     Applied,
     /// At least one condition failed.
     Cancelled(TxnDecision),
+    /// Only these alias keys' checks failed; retry without them.
+    AliasTaken(Vec<String>),
 }
 
 #[derive(Default)]
@@ -279,8 +283,10 @@ impl MailMemoryStore {
         }
 
         if !all_ok {
-            let decision = decode_cancellation(TxnKind::Insert, ops, &reasons);
-            return Ok(Commit::Cancelled(decision));
+            return Ok(match decode_cancellation(TxnKind::Insert, ops, &reasons) {
+                TxnDecision::AliasTaken => Commit::AliasTaken(taken_aliases(ops, &reasons)),
+                decision => Commit::Cancelled(decision),
+            });
         }
 
         for planned in ops {
@@ -495,6 +501,7 @@ impl MailStore for MailMemoryStore {
         use aws_messaging_webhook::mail::plan::plan_insert;
 
         let result = (|| {
+            let mut taken = Vec::new();
             for _attempt in 0..=MAX_RETRIES {
                 let thread_before: Option<ThreadState> = self
                     .get_item(
@@ -512,14 +519,18 @@ impl MailStore for MailMemoryStore {
                     None => new_thread(msg),
                 };
 
-                let ops = plan_insert(msg, thread_before.as_ref(), &thread_after)?;
+                let mut ops = plan_insert(msg, thread_before.as_ref(), &thread_after)?;
+                drop_taken_aliases(&mut ops, &taken);
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(InsertOutcome::Fresh),
                     Commit::Cancelled(TxnDecision::Duplicate) => {
                         return Ok(InsertOutcome::Duplicate);
                     }
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(TxnDecision::Permanent | TxnDecision::KeyExists) => {
+                    Commit::AliasTaken(keys) => taken.extend(keys),
+                    Commit::Cancelled(
+                        TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::AliasTaken,
+                    ) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "ingest transaction for message {} was cancelled",
                             msg.message_id
@@ -559,6 +570,7 @@ impl MailStore for MailMemoryStore {
         use aws_messaging_webhook::mail::plan::plan_enqueue;
 
         let result = (|| {
+            let mut taken = Vec::new();
             for _attempt in 0..=MAX_RETRIES {
                 let thread_before: Option<ThreadState> = self
                     .get_item(
@@ -576,7 +588,7 @@ impl MailStore for MailMemoryStore {
                     None => new_thread(msg),
                 };
 
-                let ops = plan_enqueue(
+                let mut ops = plan_enqueue(
                     msg,
                     state,
                     key,
@@ -584,6 +596,7 @@ impl MailStore for MailMemoryStore {
                     &thread_after,
                     now_epoch,
                 )?;
+                drop_taken_aliases(&mut ops, &taken);
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(EnqueueOutcome::Committed),
                     Commit::Cancelled(TxnDecision::KeyExists) => {
@@ -593,7 +606,8 @@ impl MailStore for MailMemoryStore {
                         return Ok(EnqueueOutcome::AlreadyQueued);
                     }
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(TxnDecision::Permanent) => {
+                    Commit::AliasTaken(keys) => taken.extend(keys),
+                    Commit::Cancelled(TxnDecision::Permanent | TxnDecision::AliasTaken) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "enqueue transaction for message {} was cancelled",
                             msg.message_id
@@ -688,7 +702,7 @@ impl MailStore for MailMemoryStore {
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(Some(after)),
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(_) => return Ok(None),
+                    Commit::Cancelled(_) | Commit::AliasTaken(_) => return Ok(None),
                 }
             }
             Err(MailStoreError::Conflict)
@@ -707,6 +721,7 @@ impl MailStore for MailMemoryStore {
         use aws_messaging_webhook::mail::send::mark_transition;
 
         let result = (|| {
+            let mut taken = Vec::new();
             for _attempt in 0..=MAX_RETRIES {
                 let Some(item) = self.get_item(
                     &keys::inbox_pk(state.inbox_id.as_str()),
@@ -745,7 +760,7 @@ impl MailStore for MailMemoryStore {
                     );
                     Some((before, after))
                 };
-                let ops = plan_mark(
+                let mut ops = plan_mark(
                     state,
                     &after,
                     &msg,
@@ -754,9 +769,11 @@ impl MailStore for MailMemoryStore {
                     ses_message_id,
                     now,
                 )?;
+                drop_taken_aliases(&mut ops, &taken);
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(()),
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
+                    Commit::AliasTaken(keys) => taken.extend(keys),
                     Commit::Cancelled(_) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "marking send {} was cancelled",
@@ -833,8 +850,12 @@ impl MailStore for MailMemoryStore {
                     Commit::Applied => return Ok(Some(new_labels)),
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
                     Commit::Cancelled(
-                        TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::Duplicate,
-                    ) => {
+                        TxnDecision::Permanent
+                        | TxnDecision::KeyExists
+                        | TxnDecision::Duplicate
+                        | TxnDecision::AliasTaken,
+                    )
+                    | Commit::AliasTaken(_) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "label patch for message {message_id} was cancelled"
                         )));

@@ -581,6 +581,52 @@ async fn the_ses_setup_notification_is_acknowledged_and_ignored() {
     );
 }
 
+/// Two deliveries of one message — the same `Message-ID` under different SES
+/// ids, as a mailing list resend produces — are two messages. The second's
+/// alias is already taken, which must not fail its ingest; it joins the
+/// first's thread.
+#[tokio::test]
+async fn a_message_reusing_a_known_message_id_joins_that_thread() {
+    let h = mail_harness().await;
+    let raw = Bytes::from_static(include_bytes!("fixtures/mail/plain.eml"));
+    h.fake()
+        .objects
+        .seed("inbound/msg-1", raw.clone(), "message/rfc822");
+    h.fake()
+        .objects
+        .seed("inbound/msg-2", raw, "message/rfc822");
+    for (ses_id, key) in [("ses-1", "inbound/msg-1"), ("ses-2", "inbound/msg-2")] {
+        let body = wrapped(
+            &h,
+            &ses_inbound_s3(
+                ses_id,
+                TS,
+                &["support@example.com"],
+                BUCKET,
+                key,
+                "PASS",
+                "PASS",
+                "PASS",
+            ),
+        );
+        assert_eq!(
+            post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+            StatusCode::OK
+        );
+    }
+
+    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let first = expected_message_id("ses-1", TS);
+    let second = h
+        .fake()
+        .mail
+        .get_message(&inbox, &expected_message_id("ses-2", TS))
+        .await
+        .unwrap()
+        .expect("the second delivery was stored");
+    assert_eq!(second.thread_id, first);
+}
+
 #[tokio::test]
 async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let h = mail_harness().await;
