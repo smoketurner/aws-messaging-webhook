@@ -14,8 +14,7 @@ use crate::mail::mime::{ParseError, ParsedAttachment, parse_inbound};
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
 use crate::mail::{
-    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, ids, is_valid_local_part, labels,
-    size, thread, time,
+    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, ids, labels, size, thread, time,
 };
 use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
@@ -78,7 +77,7 @@ async fn run<T: Services>(
         tracing::info!(
             event = "ingest_skipped",
             reason = "no_resolvable_inbox",
-            "no recipient resolved to a stored, configured or auto-creatable inbox"
+            "no recipient resolved to the configured inbox"
         );
         return finish(resolution.had_transient, "ingest_skipped");
     }
@@ -204,9 +203,9 @@ fn normalized_recipients(receipt: &SesReceipt) -> Vec<String> {
 }
 
 /// Resolves one normalized recipient address to an inbox, appending it to
-/// `resolution.inboxes` on success. A domain mismatch, an unknown
-/// non-catch-all local part, or an invalid catch-all local part is skipped
-/// rather than failing the message, logged at WARN with a `reason`: a
+/// `resolution.inboxes` on success. A domain mismatch or a local part other
+/// than `MAIL_INBOX` is skipped rather than failing the message, logged at
+/// WARN with a `reason`: a
 /// recipient SES accepted but we don't store is a configuration error worth
 /// seeing in a default INFO deployment. This is a per-recipient
 /// skip, so unlike the whole-message skips above it does not increment
@@ -229,6 +228,15 @@ async fn resolve_recipient<T: Services>(
         );
         return;
     }
+    if local != mail_config.inbox {
+        tracing::warn!(
+            event = "ingest_skipped",
+            reason = "unknown_inbox",
+            recipient = address,
+            "recipient local part is not MAIL_INBOX"
+        );
+        return;
+    }
     let inbox_id = InboxId(local.to_owned());
 
     match state.services.get_inbox(&inbox_id).await {
@@ -239,32 +247,6 @@ async fn resolve_recipient<T: Services>(
         Ok(None) => {}
         Err(error) => {
             record_resolution_error(resolution, error);
-            return;
-        }
-    }
-
-    let is_configured = mail_config
-        .inboxes
-        .iter()
-        .any(|configured| configured == local);
-    let catch_all_eligible = mail_config.catch_all && mail_config.auto_create_inboxes;
-    if !is_configured {
-        if !catch_all_eligible {
-            tracing::warn!(
-                event = "ingest_skipped",
-                reason = "unknown_inbox",
-                recipient = address,
-                "recipient local part is not stored, configured or auto-creatable"
-            );
-            return;
-        }
-        if !is_valid_local_part(local) {
-            tracing::warn!(
-                event = "ingest_skipped",
-                reason = "invalid_local_part",
-                recipient = address,
-                "catch-all local part fails the inbound grammar"
-            );
             return;
         }
     }

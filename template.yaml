@@ -66,25 +66,13 @@ Parameters:
     Description: >-
       Receiving domain and sending identity of the mailbox, e.g.
       mail.example.com. Empty (the default) creates no mail resource.
-  pMailAddresses:
+  pMailInbox:
     Type: String
     Default: ""
-    # A String, not a CommaDelimitedList, capped at 10 entries: the receipt-rule
-    # recipients and InboxIds are built from ten fixed slots (see Conditions).
-    AllowedPattern: ^$|^[a-z0-9._+-]{1,64}(,[a-z0-9._+-]{1,64}){0,9}$
+    AllowedPattern: ^$|^[a-z0-9._+-]{1,64}$
     Description: >-
-      Comma-separated local parts (at most 10), each an inbox at pMailDomain,
-      e.g. hello,support. Required unless pMailCatchAll is true.
-  pMailCatchAll:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: true makes the receipt rule accept every address at pMailDomain.
-  pMailAutoCreateInboxes:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: With pMailCatchAll, whether mail to an unknown local part creates an inbox.
+      Local part of the one inbox at pMailDomain, e.g. hello for
+      hello@mail.example.com. Required when pMailDomain is set.
   pMailSenderMaxConcurrency:
     Type: Number
     Default: 2
@@ -149,13 +137,11 @@ Parameters:
     Description: Lifetime of presigned attachment and raw-message download URLs.
 
 Rules:
-  MailAddressesRequired:
-    RuleCondition: !And
-      - !Not [!Equals [!Ref pMailDomain, ""]]
-      - !Equals [!Ref pMailCatchAll, "false"]
+  MailInboxRequired:
+    RuleCondition: !Not [!Equals [!Ref pMailDomain, ""]]
     Assertions:
-      - Assert: !Not [!Equals [!Ref pMailAddresses, ""]]
-        AssertDescription: pMailAddresses must list at least one local part unless pMailCatchAll is true.
+      - Assert: !Not [!Equals [!Ref pMailInbox, ""]]
+        AssertDescription: pMailInbox is required when pMailDomain is set.
 
 Conditions:
   cIsProd: !Equals [!Ref pStage, prod]
@@ -166,26 +152,11 @@ Conditions:
   cHasHostedZone: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pHostedZoneId, ""]]]
   cNoHostedZone: !And [!Condition cHasMailDomain, !Equals [!Ref pHostedZoneId, ""]]
   cCreateReceiptRuleSet: !And [!Condition cHasMailDomain, !Equals [!Ref pExistingReceiptRuleSetName, ""]]
-  cIsCatchAll: !Equals [!Ref pMailCatchAll, "true"]
   cHasMailBucketName: !Not [!Equals [!Ref pMailBucketName, ""]]
   cHasApiKeys: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pApiKeysParameterName, ""]]]
   cHasApiKeysKmsKey: !And [!Condition cHasApiKeys, !Not [!Equals [!Ref pApiKeysKmsKeyArn, ""]]]
   cHasAllowedTopics: !Not [!Equals [!Ref pAllowedTopics, ""]]
   cAllowlistMailTopics: !And [!Condition cHasMailDomain, !Condition cHasAllowedTopics]
-  # Address slots, which cap pMailAddresses at 10 local parts. CloudFormation
-  # cannot map over a list and a Fn::Join delimiter must be a literal, so
-  # "local@pMailDomain" is built per slot. The list is padded with ten empty
-  # entries so every Select index exists.
-  cHasMailAddress0: !Not [!Equals [!Ref pMailAddresses, ""]]
-  cHasMailAddress1: !Not [!Equals [!Select [1, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress2: !Not [!Equals [!Select [2, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress3: !Not [!Equals [!Select [3, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress4: !Not [!Equals [!Select [4, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress5: !Not [!Equals [!Select [5, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress6: !Not [!Equals [!Select [6, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress7: !Not [!Equals [!Select [7, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress8: !Not [!Equals [!Select [8, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
-  cHasMailAddress9: !Not [!Equals [!Select [9, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]], ""]]
 
 Resources:
   rWebhookFunction:
@@ -230,9 +201,7 @@ Resources:
           MAIL_DOMAIN: !If [cHasMailDomain, !Ref pMailDomain, !Ref AWS::NoValue]
           MAIL_TABLE_NAME: !If [cHasMailDomain, !Ref rMailTable, !Ref AWS::NoValue]
           MAIL_BUCKET: !If [cHasMailDomain, !Ref rMailBucket, !Ref AWS::NoValue]
-          MAIL_INBOXES: !If [cHasMailDomain, !Ref pMailAddresses, !Ref AWS::NoValue]
-          MAIL_CATCH_ALL: !If [cHasMailDomain, !Ref pMailCatchAll, !Ref AWS::NoValue]
-          MAIL_AUTO_CREATE_INBOXES: !If [cHasMailDomain, !Ref pMailAutoCreateInboxes, !Ref AWS::NoValue]
+          MAIL_INBOX: !If [cHasMailDomain, !Ref pMailInbox, !Ref AWS::NoValue]
           SES_CONFIGURATION_SET: !If [cHasMailDomain, !Ref rMailConfigurationSet, !Ref AWS::NoValue]
           MAIL_IDENTITY_ARN: !If
             - cHasMailDomain
@@ -644,23 +613,8 @@ Resources:
         Enabled: true
         ScanEnabled: true
         TlsPolicy: !Ref pReceiptTlsPolicy
-        Recipients: !If
-          - cIsCatchAll
-          - [!Ref pMailDomain]
-          - !Split
-            - ","
-            - !Join
-              - ""
-              - - !Sub ["${L}@${pMailDomain}", {L: !Select [0, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}]
-                - !If [cHasMailAddress1, !Sub [",${L}@${pMailDomain}", {L: !Select [1, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress2, !Sub [",${L}@${pMailDomain}", {L: !Select [2, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress3, !Sub [",${L}@${pMailDomain}", {L: !Select [3, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress4, !Sub [",${L}@${pMailDomain}", {L: !Select [4, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress5, !Sub [",${L}@${pMailDomain}", {L: !Select [5, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress6, !Sub [",${L}@${pMailDomain}", {L: !Select [6, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress7, !Sub [",${L}@${pMailDomain}", {L: !Select [7, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress8, !Sub [",${L}@${pMailDomain}", {L: !Select [8, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-                - !If [cHasMailAddress9, !Sub [",${L}@${pMailDomain}", {L: !Select [9, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
+        Recipients:
+          - !Sub "${pMailInbox}@${pMailDomain}"
         Actions:
           - S3Action:
               BucketName: !Ref rMailBucket
@@ -853,9 +807,7 @@ Resources:
           MAIL_DOMAIN: !Ref pMailDomain
           MAIL_TABLE_NAME: !Ref rMailTable
           MAIL_BUCKET: !Ref rMailBucket
-          MAIL_INBOXES: !Ref pMailAddresses
-          MAIL_CATCH_ALL: !Ref pMailCatchAll
-          MAIL_AUTO_CREATE_INBOXES: !Ref pMailAutoCreateInboxes
+          MAIL_INBOX: !Ref pMailInbox
           SES_CONFIGURATION_SET: !Ref rMailConfigurationSet
           MAIL_IDENTITY_ARN: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${pMailDomain}"
           ATTACHMENT_URL_TTL_SECONDS: !Ref pAttachmentUrlTtlSeconds
@@ -1074,24 +1026,9 @@ Outputs:
   MailConfigurationSetName:
     Condition: cHasMailDomain
     Value: !Ref rMailConfigurationSet
-  InboxIds:
+  InboxAddress:
     Condition: cHasMailDomain
-    Description: Configured inbox ids (addresses). Catch-all inboxes appear on first mail.
-    Value: !If
-      - cHasMailAddress0
-      - !Join
-        - ""
-        - - !Sub ["${L}@${pMailDomain}", {L: !Select [0, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}]
-          - !If [cHasMailAddress1, !Sub [",${L}@${pMailDomain}", {L: !Select [1, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress2, !Sub [",${L}@${pMailDomain}", {L: !Select [2, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress3, !Sub [",${L}@${pMailDomain}", {L: !Select [3, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress4, !Sub [",${L}@${pMailDomain}", {L: !Select [4, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress5, !Sub [",${L}@${pMailDomain}", {L: !Select [5, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress6, !Sub [",${L}@${pMailDomain}", {L: !Select [6, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress7, !Sub [",${L}@${pMailDomain}", {L: !Select [7, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress8, !Sub [",${L}@${pMailDomain}", {L: !Select [8, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-          - !If [cHasMailAddress9, !Sub [",${L}@${pMailDomain}", {L: !Select [9, !Split [",", !Join [",", [!Ref pMailAddresses, ",,,,,,,,,"]]]]}], ""]
-      - !Sub "none configured (catch-all on ${pMailDomain})"
+    Value: !Sub "${pMailInbox}@${pMailDomain}"
   ApiBaseUrl:
     Condition: cHasMailDomain
     Description: Base URL of the mailbox API.

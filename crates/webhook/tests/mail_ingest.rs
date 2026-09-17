@@ -44,9 +44,7 @@ fn test_mail_config() -> MailConfig {
         domain: DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: BUCKET.to_owned(),
-        inboxes: vec!["support".to_owned(), "sales".to_owned()],
-        catch_all: false,
-        auto_create_inboxes: false,
+        inbox: "support".to_owned(),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),
@@ -519,7 +517,7 @@ async fn transient_s3_error_returns_500() {
 }
 
 #[tokio::test]
-async fn multi_recipient_inserts_into_every_target_inbox() {
+async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let h = mail_harness().await;
     h.fake().objects.seed(
         "inbound/msg-1",
@@ -545,18 +543,35 @@ async fn multi_recipient_inserts_into_every_target_inbox() {
     );
 
     let message_id = expected_message_id("ses-1", TS);
-    for local in ["support", "sales"] {
+    let stored = |local: &str| {
         let inbox = aws_messaging_webhook::mail::InboxId(local.to_owned());
-        assert!(
-            h.fake()
-                .mail
+        let fake = h.fake();
+        let message_id = message_id.clone();
+        async move {
+            fake.mail
                 .get_message(&inbox, &message_id)
                 .await
                 .unwrap()
-                .is_some(),
-            "{local} must have received its own copy"
-        );
-    }
+                .is_some()
+        }
+    };
+    assert!(
+        stored("support").await,
+        "the configured inbox must receive the message"
+    );
+    assert!(
+        !stored("sales").await,
+        "a recipient other than MAIL_INBOX must be skipped"
+    );
+    assert!(
+        h.fake()
+            .mail
+            .get_inbox(&aws_messaging_webhook::mail::InboxId("sales".to_owned()))
+            .await
+            .unwrap()
+            .is_none(),
+        "no inbox may be created for an unconfigured recipient"
+    );
 }
 
 /// A direct `mail::ingest::ingest_inbound` call — see the module doc for why

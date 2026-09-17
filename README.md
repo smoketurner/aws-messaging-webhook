@@ -199,7 +199,7 @@ function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB mes
 
 ```bash
 sam deploy --parameter-overrides \
-  "pAllowedTopics=<your-account-id> pMailDomain=mail.example.com pMailAddresses=hello,support \
+  "pAllowedTopics=<your-account-id> pMailDomain=mail.example.com pMailInbox=hello \
    pApiKeysParameterName=/aws-messaging-webhook/dev/api-keys pHostedZoneId=<zone-id>"
 ```
 
@@ -208,9 +208,7 @@ sam deploy --parameter-overrides \
 | Parameter | Default | Notes |
 |---|---|---|
 | `pMailDomain` | *(empty)* | Receiving domain and sending identity, e.g. `mail.example.com`. Empty disables every mail resource |
-| `pMailAddresses` | *(empty)* | Comma-separated local parts, **at most 10** (e.g. `hello,support`). Each becomes the inbox `<local>@<pMailDomain>`. Required unless `pMailCatchAll=true`. The cap exists because CloudFormation can't map over a list, so the template builds the recipient addresses from ten fixed slots |
-| `pMailCatchAll` | `false` | `true` makes the receipt rule accept every address at the domain |
-| `pMailAutoCreateInboxes` | `false` | With catch-all, whether mail to an unknown local part creates an inbox |
+| `pMailInbox` | *(empty)* | Local part of the one inbox, e.g. `hello` for `hello@<pMailDomain>`. Required when `pMailDomain` is set; the receipt rule accepts only that address |
 | `pMailBucketName` | *(empty)* | Empty lets CloudFormation generate the bucket name |
 | `pMailRetentionDays` | `365` | S3 expiration for inbound raw MIME, attachments and sent raw MIME |
 | `pHostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
@@ -268,7 +266,7 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    Add `--key-id <pApiKeysKmsKeyArn>` when you use a customer-managed key. To rotate, overwrite
    the parameter with both entries, move clients to the new key, then remove the old entry.
 
-The API is served under the `ApiBaseUrl` output; `InboxIds` lists the configured inboxes.
+The API is served under the `ApiBaseUrl` output; `InboxAddress` is the inbox's address.
 
 ### Mailbox API
 

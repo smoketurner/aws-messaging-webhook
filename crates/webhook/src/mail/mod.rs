@@ -70,8 +70,7 @@ pub const THREAD_ATTACHMENT_ROUTE_MAX_KEYS: usize = 500;
 // ---------------------------------------------------------------------------
 
 /// An inbox identifier: the local part of an inbound address (e.g.
-/// `support` for `support@example.com`), or the domain itself for a
-/// catch-all inbox.
+/// `support` for `support@example.com`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InboxId(pub String);
 
@@ -262,9 +261,7 @@ pub enum PutOutcome {
 }
 
 /// A local part valid for an inbound mail address:
-/// `^[a-z0-9._+-]{1,64}$`. The single definition `config.rs` (parsing
-/// `MAIL_INBOXES`) and the catch-all check in `mail::ingest` both use —
-/// previously duplicated in each.
+/// `^[a-z0-9._+-]{1,64}$`, which `config.rs` requires of `MAIL_INBOX`.
 #[must_use]
 pub(crate) fn is_valid_local_part(part: &str) -> bool {
     !part.is_empty()
