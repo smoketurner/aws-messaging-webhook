@@ -117,6 +117,16 @@ mem_forget = "deny"
 module_name_repetitions = "allow"
 similar_names = "allow"
 
+# Test harnesses sign SNS envelopes with a freshly generated 2048-bit RSA key,
+# and unoptimized key generation takes seconds per harness. Optimizing just the
+# two crates that do the math takes the test suite from minutes to seconds
+# without slowing the rest of a debug build.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
 # Smaller deploy artifact and marginally faster cold start; slower `sam build`.
 # Deliberately NOT set: `panic = "abort"` — lambda_runtime catches handler
 # panics via unwinding, turning them into a 502 (SNS retries) while keeping the
