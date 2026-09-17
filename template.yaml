@@ -903,6 +903,23 @@ Resources:
               Resource:
                 - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"
                 - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${MailConfigurationSet}"
+            # MailSenderStreamMapping is a standalone resource, so SAM grants
+            # none of the stream or on-failure permissions it needs.
+            - Sid: MailStreamRead
+              Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+              Resource: !GetAtt MailTable.StreamArn
+            - Sid: ListStreams
+              Effect: Allow
+              Action: dynamodb:ListStreams
+              Resource: "*"
+            - Sid: SenderOnFailureDlq
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt MailSenderDlq.Arn
 
   MailSenderLogGroup:
     Type: AWS::Logs::LogGroup
