@@ -447,7 +447,7 @@ Find them in the sweep's log line (`sends_outcome_unknown`) or by querying `BySt
 decide:
 
 ```bash
-sender=aws-messaging-webhook-dev-mail-sender
+sender=$(output MailSenderFunctionName)
 
 # Send it again, accepting that the recipient may get two copies.
 aws lambda invoke --function-name "$sender" --payload \
@@ -473,7 +473,7 @@ queue=$(output AsyncInvokeDlqUrl)
 msg=$(aws sqs receive-message --queue-url "$queue" --max-number-of-messages 1)
 echo "$msg" | jq -r '.Messages[0].Body' | jq '.requestPayload' > /tmp/replay.json
 
-aws lambda invoke --function-name aws-messaging-webhook-dev-webhook \
+aws lambda invoke --function-name "$(output WebhookFunctionName)" \
   --payload file:///tmp/replay.json /dev/stdout
 
 # Once it succeeds, drop the DLQ message.

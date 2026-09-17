@@ -181,7 +181,6 @@ Resources:
         # Workspace build: pick the webhook binary explicitly.
         Binary: aws-messaging-webhook
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-webhook"
       # Mail ingest parses up to 40 MB of MIME inside one invocation.
       MemorySize: !If [cHasMailDomain, 512, 256]
       Timeout: !If [cHasMailDomain, 90, 10]
@@ -364,6 +363,8 @@ Resources:
   rFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
+      # The function itself is unnamed (CloudFormation generates it), so this
+      # is the readable, stack-scoped name an operator searches logs by.
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
       RetentionInDays: !Ref pLogRetentionDays
 
@@ -398,7 +399,6 @@ Resources:
   rPublishDlq:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${AWS::StackName}-publish-dlq"
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
 
@@ -706,7 +706,6 @@ Resources:
     Type: AWS::SQS::Queue
     Condition: cHasMailDomain
     Properties:
-      QueueName: !Sub "${AWS::StackName}-mail-sender-dlq"
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
 
@@ -718,7 +717,6 @@ Resources:
   rAsyncInvokeDlq:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${AWS::StackName}-async-invoke-dlq"
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
 
@@ -792,7 +790,6 @@ Resources:
       BuildProperties:
         Binary: aws-messaging-webhook
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-mail-sender"
       # Holds the assembled message and its base64 form in memory at once.
       MemorySize: 1024
       Timeout: 120
@@ -1042,6 +1039,9 @@ Outputs:
   WebhookFunctionArn:
     Description: Function ARN for direct SNS -> Lambda subscriptions.
     Value: !GetAtt rWebhookFunction.Arn
+  WebhookFunctionName:
+    Description: Generated name of the webhook function, for aws lambda invoke and sam logs.
+    Value: !Ref rWebhookFunction
   EventBusName:
     Value: !Ref rEventBus
   EventBusArn:
@@ -1086,6 +1086,10 @@ Outputs:
     Condition: cHasMailDomain
     Description: Receipt rule set holding the mail rule. Activate it once after the first deploy.
     Value: !If [cCreateReceiptRuleSet, !Ref rMailReceiptRuleSet, !Ref pExistingReceiptRuleSetName]
+  MailSenderFunctionName:
+    Condition: cHasMailDomain
+    Description: Generated name of the mail sender function, for the operator resend and sweep commands.
+    Value: !Ref rMailSenderFunction
   MailSenderDlqUrl:
     Condition: cHasMailDomain
     Description: SQS DLQ for sends that failed every retry. A message here is mail that did not go out.
