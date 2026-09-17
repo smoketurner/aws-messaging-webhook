@@ -605,8 +605,6 @@ Resources:
   rMailReceiptRuleSet:
     Type: AWS::SES::ReceiptRuleSet
     Condition: cCreateReceiptRuleSet
-    Properties:
-      RuleSetName: !Sub "${AWS::StackName}-mail"
 
   rMailReceiptRule:
     Type: AWS::SES::ReceiptRule
@@ -619,6 +617,9 @@ Resources:
     Properties:
       RuleSetName: !If [cCreateReceiptRuleSet, !Ref rMailReceiptRuleSet, !Ref pExistingReceiptRuleSetName]
       Rule:
+        # The one name the stack still sets: the bucket and topic policies
+        # scope their SES condition to this rule's ARN, and referencing the
+        # rule from a policy the rule itself depends on would be a cycle.
         Name: !Sub "${AWS::StackName}-inbound"
         Enabled: true
         ScanEnabled: true
