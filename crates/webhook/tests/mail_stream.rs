@@ -1,6 +1,7 @@
-//! The mail table's DynamoDB Streams relay: `message.received*`
-//! on a `MSG#` INSERT, nothing on any other mail-table item or on a MODIFY,
-//! and the existing events-table relay left unaffected.
+//! The mail table's DynamoDB Streams relay: `message.received*` on a `MSG#`
+//! INSERT, `message.<label>` on a MODIFY that adds a system label, nothing
+//! on any other mail-table item, and the existing events-table relay left
+//! unaffected.
 //!
 //! Stream images are built with `serde_dynamo::to_item` on
 //! [`aws_messaging_webhook::mail::MailMessage`] — never hand-parsed
@@ -107,6 +108,33 @@ fn mail_stream_event(event_name: &str, new_image: &Value, sequence: &str) -> Val
             }
         }]
     })
+}
+
+/// One MODIFY record carrying both images, the shape the relay diffs labels
+/// from (the table streams `NEW_AND_OLD_IMAGES`).
+fn mail_modify_event(old_image: &Value, new_image: &Value, sequence: &str) -> Value {
+    let mut event = mail_stream_event("MODIFY", new_image, sequence);
+    event["Records"][0]["dynamodb"]["OldImage"] = old_image.clone();
+    event["Records"][0]["dynamodb"]["StreamViewType"] = json!("NEW_AND_OLD_IMAGES");
+    event
+}
+
+/// One stream event carrying several records, each an INSERT of `msg` with
+/// its own sequence number.
+fn mail_stream_batch(messages: &[MailMessage]) -> Value {
+    let records: Vec<Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, msg)| {
+            let event = mail_stream_event(
+                "INSERT",
+                &message_new_image(msg),
+                &format!("seq-{}", index + 1),
+            );
+            event["Records"][0].clone()
+        })
+        .collect();
+    json!({ "Records": records })
 }
 
 /// A minimal non-`MSG#` mail-table item image: only the key attributes the
@@ -243,8 +271,67 @@ async fn spam_takes_precedence_over_unauthenticated_on_the_stream_path() {
     assert_eq!(published[0].detail_type, "message.received.spam");
 }
 
+/// The sender's `queued` → `sent` relabel, and each delivery label an SES
+/// event adds afterwards, publish their own lifecycle event carrying the
+/// message's identifiers and current labels.
 #[tokio::test]
-async fn modify_on_a_message_item_publishes_nothing() {
+async fn modify_publishes_an_event_for_each_system_label_added() {
+    let h = harness().await;
+    let mut queued = sample_message();
+    queued.labels = vec!["queued".to_owned()];
+    let mut sent = queued.clone();
+    sent.labels = vec!["sent".to_owned()];
+
+    let event = mail_modify_event(
+        &message_new_image(&queued),
+        &message_new_image(&sent),
+        "seq-sent",
+    );
+    invoke(h.state.clone(), event).await.unwrap();
+
+    let mut delivered = sent.clone();
+    delivered.labels = vec!["sent".to_owned(), "delivered".to_owned()];
+    let event = mail_modify_event(
+        &message_new_image(&sent),
+        &message_new_image(&delivered),
+        "seq-delivered",
+    );
+    let result = invoke(h.state.clone(), event).await.unwrap();
+
+    assert_eq!(result, json!({ "batchItemFailures": [] }));
+    let published = h.fake().published.lock().unwrap();
+    let types: Vec<&str> = published
+        .iter()
+        .map(|event| event.detail_type.as_str())
+        .collect();
+    assert_eq!(types, vec!["message.sent", "message.delivered"]);
+    assert_eq!(published[1].detail["meta"]["messageId"], "mid-1");
+    assert_eq!(
+        published[1].detail["message"]["labels"],
+        json!(["sent", "delivered"])
+    );
+}
+
+/// A MODIFY that adds no system label — a user's own label, a read receipt,
+/// a promotion repoint or a metadata write — publishes nothing.
+#[tokio::test]
+async fn modify_without_a_new_system_label_publishes_nothing() {
+    let h = harness().await;
+    let msg = sample_message();
+    let mut read = msg.clone();
+    read.labels = vec!["received".to_owned(), "invoices".to_owned()];
+
+    let event = mail_modify_event(&message_new_image(&msg), &message_new_image(&read), "seq-5");
+    let result = invoke(h.state.clone(), event).await.unwrap();
+
+    assert_eq!(result, json!({ "batchItemFailures": [] }));
+    assert!(h.fake().published.lock().unwrap().is_empty());
+}
+
+/// Without an old image there is nothing to diff, so a MODIFY publishes
+/// nothing rather than re-announcing the message's whole label set.
+#[tokio::test]
+async fn modify_without_an_old_image_publishes_nothing() {
     let h = harness().await;
     let msg = sample_message();
     let event = mail_stream_event("MODIFY", &message_new_image(&msg), "seq-5");
@@ -253,6 +340,42 @@ async fn modify_on_a_message_item_publishes_nothing() {
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     assert!(h.fake().published.lock().unwrap().is_empty());
+}
+
+/// A failed record ends the batch: the event-source mapping restarts from
+/// the reported sequence number, so publishing the records after it would
+/// publish them a second time on that redelivery.
+#[tokio::test]
+async fn a_batch_stops_at_its_first_failed_record() {
+    let h = harness().await;
+    let messages: Vec<MailMessage> = ["mid-1", "mid-2", "mid-3"]
+        .iter()
+        .map(|id| {
+            let mut msg = sample_message();
+            msg.message_id = (*id).to_owned();
+            msg
+        })
+        .collect();
+    for msg in &messages {
+        store_content(&h, msg, MessageContent::default()).await;
+    }
+    // The second record's publish fails; the first has already succeeded.
+    *h.fake().fail_publish_at.lock().unwrap() = Some(1);
+
+    let result = invoke(h.state.clone(), mail_stream_batch(&messages))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result,
+        json!({ "batchItemFailures": [{ "itemIdentifier": "seq-2" }] })
+    );
+    let published = h.fake().published.lock().unwrap();
+    let ids: Vec<&str> = published
+        .iter()
+        .map(|event| event.detail["meta"]["messageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["mid-1"]);
 }
 
 #[tokio::test]

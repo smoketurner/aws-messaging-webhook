@@ -73,6 +73,12 @@ async fn run<T: Services>(
         resolve_recipient(state, mail_config, &recipient, &mut resolution).await;
     }
     if resolution.inboxes.is_empty() {
+        if resolution.had_permanent {
+            // Already logged and counted as a failure by
+            // `record_resolution_error`: the message was addressed to an
+            // inbox we serve but couldn't read, not to one we don't serve.
+            return finish(resolution.had_transient, "ingest_failed");
+        }
         metrics::counter!(names::INGEST_SKIPPED).increment(1);
         tracing::info!(
             event = "ingest_skipped",
@@ -88,7 +94,12 @@ async fn run<T: Services>(
     let inboxes = std::mem::take(&mut resolution.inboxes);
     let targets = fresh_targets(state, inboxes, &message_id_str, &mut resolution).await;
     if targets.is_empty() {
-        return finish(resolution.had_transient, "ingest_duplicate");
+        let outcome = if resolution.had_permanent {
+            "ingest_failed"
+        } else {
+            "ingest_duplicate"
+        };
+        return finish(resolution.had_transient, outcome);
     }
 
     let budget = deadline
@@ -109,7 +120,9 @@ async fn run<T: Services>(
     .await;
 
     if let Ok(result) = outcome {
-        finish(resolution.had_transient, result?)
+        let result = result
+            .map_err(|error| record_ingest_error(error, &event.mail.message_id, &message_id_str))?;
+        finish(resolution.had_transient, result)
     } else {
         metrics::counter!(names::INGEST_TIMEOUTS).increment(1);
         tracing::warn!(
@@ -169,6 +182,25 @@ async fn fresh_targets<T: Services>(
         }
     }
     targets
+}
+
+/// Logs and counts an ingest that ended in a permanent failure — a missing
+/// or oversized object, malformed MIME, a denied store — naming both the SES
+/// message id (what an operator has from the bounce or the SES console) and
+/// the message id this service would have given it. A transient failure is
+/// left alone: the redelivery it recruits is the outcome, not a loss.
+fn record_ingest_error(error: ActionError, ses_message_id: &str, message_id: &str) -> ActionError {
+    if error.kind == crate::actions::ActionErrorKind::Permanent {
+        metrics::counter!(names::INGEST_FAILURES).increment(1);
+        tracing::error!(
+            error = ?error.source,
+            ses_message_id,
+            message_id,
+            event = "ingest_failure",
+            "inbound message could not be ingested"
+        );
+    }
+    error
 }
 
 /// Combines the per-recipient resolution outcome with the fetch/parse/insert
@@ -246,10 +278,25 @@ async fn resolve_recipient<T: Services>(
     }
 }
 
+/// Records a store failure met while resolving an inbox. A transient one
+/// fails the action so the message is redelivered; a permanent one (a denied
+/// table, a malformed item) cannot be retried into success, so it is logged
+/// and counted here — it would otherwise be indistinguishable from "this
+/// message was addressed to an inbox we don't serve".
 fn record_resolution_error(resolution: &mut InboxResolution, error: MailStoreError) {
-    match map_store_error(error).kind {
+    let error = map_store_error(error);
+    match error.kind {
         crate::actions::ActionErrorKind::Transient => resolution.had_transient = true,
-        crate::actions::ActionErrorKind::Permanent => resolution.had_permanent = true,
+        crate::actions::ActionErrorKind::Permanent => {
+            resolution.had_permanent = true;
+            metrics::counter!(names::INGEST_FAILURES).increment(1);
+            tracing::error!(
+                error = ?error.source,
+                event = "ingest_failure",
+                reason = "inbox_resolution",
+                "permanent store error resolving the recipient's inbox"
+            );
+        }
     }
 }
 
@@ -763,6 +810,25 @@ mod tests {
     #[test]
     fn object_key_has_the_documented_shape() {
         assert_eq!(object_key("mid-1", "att-1"), "attachments/mid-1/att-1");
+    }
+
+    /// A store failure while resolving the recipient's inbox is either
+    /// worth a redelivery or a failure we report — never the silent
+    /// "addressed to an inbox we don't serve" skip it used to look like.
+    #[test]
+    fn a_resolution_failure_is_recorded_by_kind() {
+        let mut resolution = InboxResolution::default();
+        record_resolution_error(
+            &mut resolution,
+            MailStoreError::Transient(anyhow::anyhow!("throttled")),
+        );
+        assert!(resolution.had_transient);
+        assert!(!resolution.had_permanent);
+
+        let mut resolution = InboxResolution::default();
+        record_resolution_error(&mut resolution, MailStoreError::NotFound);
+        assert!(resolution.had_permanent);
+        assert!(!resolution.had_transient);
     }
 
     #[test]

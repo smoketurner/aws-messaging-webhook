@@ -2,8 +2,10 @@
 //! them to the `PutEvents` entry size, mirroring the size-reduction ladder
 //! `crate::publish::build_outbound` applies to the SMS and SES pipeline.
 //!
-//! Only received-mail events are built here; sent and delivery events are
-//! not implemented yet.
+//! Two kinds of event are built here: the `message.received*` event for a
+//! message item's INSERT, and the `message.<label>` events for the system
+//! labels a later MODIFY adds (the sender's `queued` → `sent` relabel and
+//! the delivery labels `actions::apply_delivery_label` writes).
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -43,25 +45,26 @@ fn received_event_type(labels: &[String]) -> &'static str {
     }
 }
 
-/// Builds the `message.received*` events for a newly-inserted message item
-/// on an INSERT: plain, `.spam`, or `.unauthenticated` depending on
-/// the message's labels. Returns an empty list for any other INSERT (e.g. a
-/// `queued` outbound message) — only a `received` label produces an event
-/// today.
-#[must_use]
-pub fn build_mail_events(
-    msg: &MailMessage,
-    content: &MessageContent,
-    event_source: &str,
-) -> Vec<MailEvent> {
-    if !msg.labels.iter().any(|label| label == "received") {
-        return Vec::new();
+/// The `message.<label>` event a newly-added system label publishes, if it
+/// publishes one. `received`, `queued`, `unread`, `spam`, `trash` and
+/// `unauthenticated` are absent: the first two are part of a message's
+/// INSERT (the `received` event covers one and a queued send publishes
+/// nothing), and the rest are mailbox state a consumer reads from the item
+/// rather than lifecycle transitions.
+fn label_event_type(label: &str) -> Option<&'static str> {
+    match label {
+        "sent" => Some("message.sent"),
+        "delivered" => Some("message.delivered"),
+        "bounced" => Some("message.bounced"),
+        "complained" => Some("message.complained"),
+        "rejected" => Some("message.rejected"),
+        "opened" => Some("message.opened"),
+        _ => None,
     }
-    let event_type = received_event_type(&msg.labels);
-    // ts_ms is the message's own timestamp for a received event.
-    let ts_ms = time::parse(&msg.timestamp).unwrap_or(0);
-    let event_id = ids::event_id(msg.inbox_id.as_str(), &msg.message_id, event_type, ts_ms);
+}
 
+/// The identifiers every mail event's `meta` carries.
+fn event_meta(msg: &MailMessage) -> Value {
     let mut meta = json!({
         "messageId": msg.message_id,
         "inboxId": msg.inbox_id.as_str(),
@@ -70,6 +73,26 @@ pub fn build_mail_events(
     if let Some(ses_message_id) = &msg.ses_message_id {
         meta["sesMessageId"] = json!(ses_message_id);
     }
+    meta
+}
+
+/// Builds the `message.received*` event for a newly-inserted message item on
+/// an INSERT: plain, `.spam`, or `.unauthenticated` depending on the
+/// message's labels. `None` for any other INSERT (e.g. a `queued` outbound
+/// message), whose lifecycle publishes from [`build_label_events`] instead.
+#[must_use]
+pub fn build_received_event(
+    msg: &MailMessage,
+    content: &MessageContent,
+    event_source: &str,
+) -> Option<MailEvent> {
+    if !msg.labels.iter().any(|label| label == "received") {
+        return None;
+    }
+    let event_type = received_event_type(&msg.labels);
+    // ts_ms is the message's own timestamp for a received event.
+    let ts_ms = time::parse(&msg.timestamp).unwrap_or(0);
+    let event_id = ids::event_id(msg.inbox_id.as_str(), &msg.message_id, event_type, ts_ms);
 
     // The stored thread_snapshot as of this message's arrival; a
     // received message always carries one, so an absent
@@ -77,21 +100,86 @@ pub fn build_mail_events(
     // whole relay record over a data shape that shouldn't occur.
     let thread = msg.thread_snapshot.clone().unwrap_or_default();
 
+    let mut message = wire::Message::new(msg, content);
+    // A body larger than the whole entry cap cannot survive the ladder
+    // below, so it is dropped before the detail is built rather than after:
+    // a content document is up to 80 MB, and serializing one only to measure
+    // it is the relay's most expensive avoidable step.
+    let cap = entry_cap(event_type, event_source);
+    if message.html.as_ref().is_some_and(|html| html.len() > cap) {
+        message.html = None;
+    }
+    if message.text.as_ref().is_some_and(|text| text.len() > cap) {
+        message.text = None;
+    }
+
     let mut detail = json!({
         "type": "event",
         "event_type": event_type,
         "event_id": event_id,
-        "message": to_json(&wire::Message::new(msg, content)),
+        "message": to_json(&message),
         "thread": to_json(&thread),
         "schemaVersion": SCHEMA_VERSION,
-        "meta": meta,
+        "meta": event_meta(msg),
     });
     cap_mail_detail(&mut detail, event_type, event_source);
 
-    vec![MailEvent {
+    Some(MailEvent {
         detail_type: event_type,
         detail,
-    }]
+    })
+}
+
+/// Builds the lifecycle events for the labels `msg` gained since
+/// `old_labels`: one `message.<label>` per newly-added system label, in the
+/// message's label order. A label that was already there, one a PATCH added,
+/// and a removed label all publish nothing, so a MODIFY that only touches
+/// mailbox state (a read receipt, a user's own label) is silent.
+///
+/// The event carries the list-view message (no body): these fire on every
+/// delivery notification for a message whose content document is already
+/// published with its `received`/send event, so re-reading it per label
+/// would cost an S3 GET for a payload the consumer has.
+#[must_use]
+pub fn build_label_events(
+    msg: &MailMessage,
+    old_labels: &[String],
+    event_source: &str,
+) -> Vec<MailEvent> {
+    let mut events = Vec::new();
+    for label in &msg.labels {
+        if old_labels.contains(label) {
+            continue;
+        }
+        let Some(event_type) = label_event_type(label) else {
+            continue;
+        };
+        // ts_ms is when the label was applied — `updated_at` is the write
+        // that added it, so a replay of the same stream record rebuilds the
+        // same event id while a later label gets its own.
+        let ts_ms = time::parse(&msg.updated_at).unwrap_or(0);
+        let event_id = ids::event_id(msg.inbox_id.as_str(), &msg.message_id, event_type, ts_ms);
+        let mut detail = json!({
+            "type": "event",
+            "event_type": event_type,
+            "event_id": event_id,
+            "message": to_json(&wire::MessageItem::from(msg)),
+            "schemaVersion": SCHEMA_VERSION,
+            "meta": event_meta(msg),
+        });
+        cap_mail_detail(&mut detail, event_type, event_source);
+        events.push(MailEvent {
+            detail_type: event_type,
+            detail,
+        });
+    }
+    events
+}
+
+/// The detail budget for one entry: the `PutEvents` cap less the
+/// `detail_type` and event `Source` that ride along with it.
+fn entry_cap(detail_type: &str, event_source: &str) -> usize {
+    PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(detail_type.len() + event_source.len())
 }
 
 /// Reduces an oversized mail detail to fit the `PutEvents` entry cap:
@@ -101,8 +189,7 @@ pub fn build_mail_events(
 /// `crate::publish::build_outbound`'s ladder, reserving `detail_type` plus
 /// the configured event `Source` as `PutEvents` entry headroom the same way.
 pub fn cap_mail_detail(detail: &mut Value, detail_type: &str, event_source: &str) {
-    let envelope = detail_type.len() + event_source.len();
-    let cap = PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(envelope);
+    let cap = entry_cap(detail_type, event_source);
     if detail_bytes(detail) <= cap {
         return;
     }
@@ -160,6 +247,12 @@ mod tests {
 
     const EVENT_SOURCE: &str = "aws-messaging-webhook";
 
+    /// The received event a message builds, which every test here expects to
+    /// exist.
+    fn received(msg: &MailMessage, content: &MessageContent) -> MailEvent {
+        build_received_event(msg, content, EVENT_SOURCE).expect("message is labelled received")
+    }
+
     fn sample_content() -> MessageContent {
         MessageContent {
             text: Some("Hello there".to_owned()),
@@ -215,9 +308,7 @@ mod tests {
     fn plain_received_message_builds_one_event_with_the_golden_payload() {
         let msg = sample_message();
         let content = sample_content();
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
+        let event = received(&msg, &content);
         assert_eq!(event.detail_type, "message.received");
         assert_eq!(event.detail["type"], "event");
         assert_eq!(event.detail["event_type"], "message.received");
@@ -263,8 +354,8 @@ mod tests {
             updated_at: "2026-01-15T09:31:00.000Z".to_owned(),
         });
 
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        let thread = &events[0].detail["thread"];
+        let event = received(&msg, &content);
+        let thread = &event.detail["thread"];
         assert_eq!(thread["message_count"], 2);
         assert_eq!(thread["subject"], "Hello");
         assert_eq!(
@@ -283,9 +374,9 @@ mod tests {
             "spam".to_owned(),
             "unauthenticated".to_owned(),
         ];
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        assert_eq!(events[0].detail_type, "message.received.spam");
-        assert_eq!(events[0].detail["event_type"], "message.received.spam");
+        let event = received(&msg, &content);
+        assert_eq!(event.detail_type, "message.received.spam");
+        assert_eq!(event.detail["event_type"], "message.received.spam");
     }
 
     #[test]
@@ -293,8 +384,8 @@ mod tests {
         let mut msg = sample_message();
         let content = sample_content();
         msg.labels = vec!["received".to_owned(), "unauthenticated".to_owned()];
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        assert_eq!(events[0].detail_type, "message.received.unauthenticated");
+        let event = received(&msg, &content);
+        assert_eq!(event.detail_type, "message.received.unauthenticated");
     }
 
     #[test]
@@ -302,16 +393,116 @@ mod tests {
         let mut msg = sample_message();
         let content = sample_content();
         msg.labels = vec!["queued".to_owned()];
-        assert!(build_mail_events(&msg, &content, EVENT_SOURCE).is_empty());
+        assert!(build_received_event(&msg, &content, EVENT_SOURCE).is_none());
     }
 
     #[test]
     fn event_id_is_stable_across_a_replay_of_the_same_record() {
         let msg = sample_message();
         let content = sample_content();
-        let a = build_mail_events(&msg, &content, EVENT_SOURCE);
-        let b = build_mail_events(&msg, &content, EVENT_SOURCE);
-        assert_eq!(a[0].detail["event_id"], b[0].detail["event_id"]);
+        let a = received(&msg, &content);
+        let b = received(&msg, &content);
+        assert_eq!(a.detail["event_id"], b.detail["event_id"]);
+    }
+
+    /// A label a MODIFY added publishes its lifecycle event, carrying the
+    /// list-view message (identifiers, labels and metadata, no body).
+    #[test]
+    fn a_newly_added_delivery_label_builds_its_event() {
+        let mut msg = sample_message();
+        msg.labels = vec!["sent".to_owned(), "delivered".to_owned()];
+        let events = build_label_events(&msg, &["sent".to_owned()], EVENT_SOURCE);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail_type, "message.delivered");
+        assert_eq!(events[0].detail["event_type"], "message.delivered");
+        assert_eq!(events[0].detail["meta"]["messageId"], "mid-1");
+        assert_eq!(events[0].detail["message"]["message_id"], "mid-1");
+        assert_eq!(
+            events[0].detail["message"]["labels"],
+            json!(["sent", "delivered"])
+        );
+        assert_eq!(events[0].detail["message"]["text"], Value::Null);
+    }
+
+    /// The sender's `queued` → `sent` relabel is the message's send event.
+    #[test]
+    fn the_queued_to_sent_relabel_builds_the_sent_event() {
+        let mut msg = sample_message();
+        msg.labels = vec!["sent".to_owned()];
+        let events = build_label_events(&msg, &["queued".to_owned()], EVENT_SOURCE);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail_type, "message.sent");
+    }
+
+    /// Every delivery label SES events apply has an event of its own, and
+    /// several arriving in one write publish one event each.
+    #[test]
+    fn each_added_delivery_label_builds_its_own_event() {
+        let mut msg = sample_message();
+        msg.labels = vec![
+            "sent".to_owned(),
+            "bounced".to_owned(),
+            "complained".to_owned(),
+            "rejected".to_owned(),
+            "opened".to_owned(),
+        ];
+        let events = build_label_events(&msg, &["sent".to_owned()], EVENT_SOURCE);
+        let types: Vec<&str> = events.iter().map(|event| event.detail_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message.bounced",
+                "message.complained",
+                "message.rejected",
+                "message.opened",
+            ]
+        );
+    }
+
+    /// A write that re-states labels the message already had — the common
+    /// case, since every MODIFY carries the whole label list — publishes
+    /// nothing.
+    #[test]
+    fn unchanged_labels_build_nothing() {
+        let mut msg = sample_message();
+        msg.labels = vec!["sent".to_owned(), "delivered".to_owned()];
+        let old = vec!["sent".to_owned(), "delivered".to_owned()];
+        assert!(build_label_events(&msg, &old, EVENT_SOURCE).is_empty());
+    }
+
+    /// Mailbox state — a user's own label, a read receipt, a trashed or
+    /// spam-marked message — is not a lifecycle transition.
+    #[test]
+    fn user_and_mailbox_state_labels_build_nothing() {
+        let mut msg = sample_message();
+        msg.labels = vec![
+            "received".to_owned(),
+            "unread".to_owned(),
+            "trash".to_owned(),
+            "spam".to_owned(),
+            "invoices".to_owned(),
+        ];
+        let old = vec!["received".to_owned()];
+        assert!(build_label_events(&msg, &old, EVENT_SOURCE).is_empty());
+    }
+
+    /// The label event's id is derived from the write that applied it, so a
+    /// redelivered stream record rebuilds the same id a consumer already
+    /// saw, while a later label gets its own.
+    #[test]
+    fn label_event_ids_are_stable_per_write_and_distinct_per_label() {
+        let mut msg = sample_message();
+        msg.labels = vec!["sent".to_owned(), "delivered".to_owned()];
+        let old = vec!["sent".to_owned()];
+        let first = build_label_events(&msg, &old, EVENT_SOURCE);
+        let replay = build_label_events(&msg, &old, EVENT_SOURCE);
+        assert_eq!(first[0].detail["event_id"], replay[0].detail["event_id"]);
+
+        let mut opened = msg.clone();
+        opened.labels.push("opened".to_owned());
+        opened.updated_at = "2026-01-15T10:00:00.000Z".to_owned();
+        let later = build_label_events(&opened, &msg.labels, EVENT_SOURCE);
+        assert_ne!(first[0].detail["event_id"], later[0].detail["event_id"]);
     }
 
     fn entry_bytes(event: &MailEvent, event_source: &str) -> usize {
@@ -323,10 +514,10 @@ mod tests {
         let msg = sample_message();
         let mut content = sample_content();
         content.html = Some("x".repeat(300_000));
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        assert_eq!(events[0].detail["message"]["html"], Value::Null);
-        assert_eq!(events[0].detail["message"]["text"], "Hello there");
-        assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
+        let event = received(&msg, &content);
+        assert_eq!(event.detail["message"]["html"], Value::Null);
+        assert_eq!(event.detail["message"]["text"], "Hello there");
+        assert!(entry_bytes(&event, EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
     }
 
     #[test]
@@ -336,9 +527,9 @@ mod tests {
         content.html = Some("x".repeat(150_000));
         content.text = Some("y".repeat(150_000));
         content.headers = BTreeMap::from([("X-Big".to_owned(), "z".repeat(50_000))]);
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        let detail = &events[0].detail;
-        assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
+        let event = received(&msg, &content);
+        let detail = &event.detail;
+        assert!(entry_bytes(&event, EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
         // meta always survives.
         assert_eq!(detail["meta"]["messageId"], "mid-1");
     }
@@ -363,9 +554,9 @@ mod tests {
                 content_id: None,
             })
             .collect();
-        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-        let detail = &events[0].detail;
-        assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
+        let event = received(&msg, &content);
+        let detail = &event.detail;
+        assert!(entry_bytes(&event, EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
         assert_eq!(detail["message"]["payloadOmitted"], json!(true));
         assert_eq!(detail["message"]["ids"]["messageId"], "mid-1");
         assert_eq!(detail["meta"]["messageId"], "mid-1");
@@ -377,7 +568,7 @@ mod tests {
         /// source) must stay under the `PutEvents` cap — the same guarantee
         /// `publish.rs::build_outbound` gives the SMS/SES pipeline.
         #[test]
-        fn build_mail_events_never_exceeds_putevents_entry_cap(
+        fn a_received_event_never_exceeds_the_putevents_entry_cap(
             html_len in 0usize..600_000,
             text_len in 0usize..600_000,
         ) {
@@ -385,9 +576,9 @@ mod tests {
             let mut content = sample_content();
             content.html = Some("x".repeat(html_len));
             content.text = Some("y".repeat(text_len));
-            let events = build_mail_events(&msg, &content, EVENT_SOURCE);
-            prop_assert_eq!(events.len(), 1);
-            prop_assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
+            let event = build_received_event(&msg, &content, EVENT_SOURCE);
+            let event = event.expect("a received message always builds an event");
+            prop_assert!(entry_bytes(&event, EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
         }
     }
 }

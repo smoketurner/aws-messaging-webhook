@@ -256,7 +256,7 @@ fn mail_store_error(error: crate::mail::store::MailStoreError) -> ActionError {
         // A version conflict means someone else was writing the same message;
         // a redelivery re-reads and applies the label onto their result.
         MailStoreError::Conflict => ActionError::transient(anyhow::anyhow!("mail store conflict")),
-        other => ActionError::permanent(anyhow::anyhow!("{other}")),
+        other => ActionError::permanent(anyhow::Error::from(other)),
     }
 }
 

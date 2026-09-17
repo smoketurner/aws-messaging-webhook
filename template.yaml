@@ -929,8 +929,10 @@ Resources:
         OnFailure:
           Destination: !GetAtt rMailSenderDlq.Arn
 
-  # The mail relay: message items only (sk MSG#). Send-state, marker, key,
-  # alias, thread and inbox items never invoke the relay.
+  # The mail relay: message items only (sk MSG#). An INSERT publishes a
+  # received message, a MODIFY the system labels that write added (sent,
+  # delivered, bounced, complained, rejected, opened). Send-state, marker,
+  # key, alias, thread and inbox items never invoke the relay.
   rMailStreamMapping:
     Type: AWS::Lambda::EventSourceMapping
     Condition: cHasMailDomain
