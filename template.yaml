@@ -92,8 +92,9 @@ Parameters:
     Default: 365
     MinValue: 1
     Description: >-
-      S3 expiration for inbound raw MIME, attachments and sent raw MIME. Never
-      applies to outbox/.
+      How long a message is kept: S3 expiration for inbound raw MIME,
+      attachments, message content documents and sent raw MIME, and the TTL on
+      mail table message, thread and alias items. Never applies to outbox/.
   pHostedZoneId:
     Type: String
     Default: ""
@@ -213,6 +214,7 @@ Resources:
             - !Ref AWS::NoValue
           API_KEYS_PARAMETER: !If [cHasApiKeys, !Ref pApiKeysParameterName, !Ref AWS::NoValue]
           ATTACHMENT_URL_TTL_SECONDS: !If [cHasMailDomain, !Ref pAttachmentUrlTtlSeconds, !Ref AWS::NoValue]
+          MAIL_RETENTION_DAYS: !If [cHasMailDomain, !Ref pMailRetentionDays, !Ref AWS::NoValue]
       Events:
         # The stream relay: the sole publisher of event details to EventBridge.
         # Retries a failed publish, bisects a poison batch, reports per-record
@@ -312,6 +314,7 @@ Resources:
                 Resource:
                   - !Sub "${rMailBucket.Arn}/inbound/*"
                   - !Sub "${rMailBucket.Arn}/attachments/*"
+                  - !Sub "${rMailBucket.Arn}/messages/*"
                   - !Sub "${rMailBucket.Arn}/sent/*"
                   - !Sub "${rMailBucket.Arn}/outbox/*"
               - !Ref AWS::NoValue
@@ -322,6 +325,7 @@ Resources:
                 Action: s3:PutObject
                 Resource:
                   - !Sub "${rMailBucket.Arn}/attachments/*"
+                  - !Sub "${rMailBucket.Arn}/messages/*"
                   - !Sub "${rMailBucket.Arn}/outbox/*"
               - !Ref AWS::NoValue
             # Without ListBucket, S3 answers GetObject/HeadObject on a missing
@@ -529,6 +533,12 @@ Resources:
             Status: Enabled
             Prefix: attachments/
             ExpirationInDays: !Ref pMailRetentionDays
+          # Message content documents. Mail table items carry a TTL of the
+          # same length, so a message and its content age out together.
+          - Id: expire-messages
+            Status: Enabled
+            Prefix: messages/
+            ExpirationInDays: !Ref pMailRetentionDays
           - Id: expire-sent
             Status: Enabled
             Prefix: sent/
@@ -549,7 +559,7 @@ Resources:
             Principal:
               Service: ses.amazonaws.com
             Action: s3:PutObject
-            Resource: !Sub "${rMailBucket.Arn}/inbound/*"
+            Resource: !Sub "${rMailBucket.Arn}/inbound/raw/*"
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
@@ -622,7 +632,7 @@ Resources:
         Actions:
           - S3Action:
               BucketName: !Ref rMailBucket
-              ObjectKeyPrefix: inbound/
+              ObjectKeyPrefix: inbound/raw/
               TopicArn: !Ref rMailInboundTopic
 
   # The mailbox table. Its stream has exactly two readers — the relay
@@ -817,6 +827,7 @@ Resources:
           SES_CONFIGURATION_SET: !Ref rMailConfigurationSet
           MAIL_IDENTITY_ARN: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${pMailDomain}"
           ATTACHMENT_URL_TTL_SECONDS: !Ref pAttachmentUrlTtlSeconds
+          MAIL_RETENTION_DAYS: !Ref pMailRetentionDays
       Events:
         # A sender killed between claiming a send and recording its outcome
         # leaves the state `sending` with nobody working on it and no stream

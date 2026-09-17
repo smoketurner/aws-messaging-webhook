@@ -210,7 +210,7 @@ sam deploy --parameter-overrides \
 | `pMailDomain` | *(empty)* | Receiving domain and sending identity, e.g. `mail.example.com`. Empty disables every mail resource |
 | `pMailInbox` | *(empty)* | Local part of the one inbox, e.g. `hello` for `hello@<pMailDomain>`. Required when `pMailDomain` is set; the receipt rule accepts only that address |
 | `pMailBucketName` | *(empty)* | Empty lets CloudFormation generate the bucket name |
-| `pMailRetentionDays` | `365` | S3 expiration for inbound raw MIME, attachments and sent raw MIME |
+| `pMailRetentionDays` | `365` | How long a message is kept: S3 expiration for raw MIME, attachments and message content, and the TTL on its mail table items |
 | `pHostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
 | `pDmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
 | `pReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
@@ -291,7 +291,7 @@ Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streame
 function. The URL carries its own authorization — the API key is not needed to follow it, and
 anyone holding the URL can fetch the object until it expires. A message whose raw object or
 attachment has passed `pMailRetentionDays`, and an attachment that was dropped for size, answer
-`404`: the metadata survives in the table, but there is nothing stored to hand back.
+`404`, since there is nothing stored to hand back.
 
 `PATCH` takes `{"add_labels": …, "remove_labels": …}`, each either one label or a list. Labels
 are lowercased, trimmed and deduplicated. There is no "mark as read" endpoint: removing the
@@ -387,9 +387,13 @@ client follows the token.
 - **Mail table stream.** The mail table's stream has at most two readers, the stream relay and
   the mail sender, which is DynamoDB's recommended ceiling. A third consumer needs Kinesis Data
   Streams for DynamoDB.
-- **Retention.** Objects under `inbound/`, `attachments/` and `sent/` expire after
-  `pMailRetentionDays`, but mail table items stay. After that, raw-message and attachment
-  downloads for older messages return 404. Nothing under `outbox/` expires.
+- **Storage layout.** SES writes raw MIME under `inbound/raw/`. Each message's bodies, headers,
+  `References`, `Reply-To` and verdicts are stored as `messages/<inbox>/<message_id>.json`; the
+  mail table item holds only what lists, threads, labels and send status need.
+- **Retention.** Objects under `inbound/`, `attachments/`, `messages/` and `sent/` expire after
+  `pMailRetentionDays`, and the message's mail table items carry a TTL of the same length, so a
+  message ages out whole. DynamoDB removes expired items within a few days of their TTL.
+  Nothing under `outbox/` expires.
 - The mail bucket and mail table are retained when the stack or the mailbox is deleted.
 
 ### Mail metrics

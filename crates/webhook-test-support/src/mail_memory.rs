@@ -72,25 +72,18 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         direction: aws_messaging_webhook::mail::Direction::Inbound,
         rfc_message_id: format!("<{message_id}@example.com>"),
         in_reply_to: None,
-        references: Vec::new(),
         labels: vec!["received".to_owned(), "unread".to_owned()],
         timestamp: "00000001-0000".to_owned(),
         from: "sender@example.com".to_owned(),
-        reply_to: Vec::new(),
         to: vec![format!("{inbox}@example.com")],
         cc: Vec::new(),
         bcc: Vec::new(),
         subject: "Hello".to_owned(),
         preview: "Hello there".to_owned(),
         size: 1_000,
-        text: Some("hello there".to_owned()),
-        html: None,
-        body_truncated: false,
-        headers: std::collections::BTreeMap::new(),
         attachments: Vec::new(),
         attachments_truncated: false,
         raw_s3_key: Some("inbound/x".to_owned()),
-        verdicts: None,
         thread_snapshot: None,
         delivery: std::collections::BTreeMap::new(),
         send_status: None,
@@ -98,6 +91,7 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         version: 0,
         created_at: "2026-01-01T00:00:00.000Z".to_owned(),
         updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        expires_at: 0,
     }
 }
 
@@ -220,8 +214,13 @@ impl MailMemoryStore {
                 sk,
                 message_id,
                 thread_id,
+                expires_at,
             } => {
                 let mut item = Item::default();
+                item.inner_mut().insert(
+                    "expires_at".to_owned(),
+                    AttributeValue::N(expires_at.to_string()),
+                );
                 item.inner_mut().insert(
                     "message_id".to_owned(),
                     AttributeValue::S(message_id.clone()),

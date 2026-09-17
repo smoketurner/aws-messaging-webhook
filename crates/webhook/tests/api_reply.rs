@@ -3,6 +3,7 @@
 //! `POST …/messages/{id}/reply`: what a reply inherits from the message it
 //! answers.
 
+use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::send::SendSpec;
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, MailMessage, ids, send, time};
@@ -38,6 +39,18 @@ async fn post(h: &Harness, path: &str, body: &Value) -> (StatusCode, Value) {
 }
 
 /// Seeds one inbound message to reply to, letting the caller shape it.
+/// Stores the original message's content document, as ingest would have.
+async fn store_content(h: &Harness, message_id: &str, message_content: MessageContent) {
+    content::store(
+        &h.state.services,
+        &InboxId(INBOX.to_owned()),
+        message_id,
+        &message_content,
+    )
+    .await
+    .unwrap();
+}
+
 async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     let h = mail_harness().await;
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
@@ -117,9 +130,15 @@ async fn an_existing_re_prefix_is_not_repeated() {
 #[tokio::test]
 async fn reply_to_on_the_original_wins_over_its_sender() {
     // A sender that asked for replies elsewhere gets them there.
-    let (h, original_id) = seeded(|m| {
-        m.reply_to = vec!["desk@example.net".to_owned()];
-    })
+    let (h, original_id) = seeded(|_| {}).await;
+    store_content(
+        &h,
+        &original_id,
+        MessageContent {
+            reply_to: vec!["desk@example.net".to_owned()],
+            ..MessageContent::default()
+        },
+    )
     .await;
 
     let (_, response) = post(
@@ -207,9 +226,15 @@ async fn an_explicit_recipient_overrides_the_derived_one() {
 
 #[tokio::test]
 async fn the_references_chain_grows_from_the_original() {
-    let (h, original_id) = seeded(|m| {
-        m.references = vec!["<first@example.net>".to_owned()];
-    })
+    let (h, original_id) = seeded(|_| {}).await;
+    store_content(
+        &h,
+        &original_id,
+        MessageContent {
+            references: vec!["<first@example.net>".to_owned()],
+            ..MessageContent::default()
+        },
+    )
     .await;
 
     let (_, response) = post(

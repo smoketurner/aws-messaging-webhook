@@ -12,7 +12,7 @@ use serde_dynamo::AttributeValue;
 use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::MailStoreError;
 use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
-use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys, size};
+use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys};
 
 /// Which role a planned op plays in its transaction — used by
 /// [`crate::mail::txn::decode_cancellation`] to interpret a cancellation
@@ -91,6 +91,9 @@ pub enum WriteOp {
         sk: String,
         message_id: String,
         thread_id: String,
+        /// The aliased message's TTL: an alias outliving its message would
+        /// thread a later reply into a thread that no longer exists.
+        expires_at: u64,
     },
 }
 
@@ -376,6 +379,10 @@ pub fn plan_mark(
             "message_id".to_owned(),
             AttributeValue::S(msg.message_id.clone()),
         );
+        item.inner_mut().insert(
+            "expires_at".to_owned(),
+            AttributeValue::N(msg.expires_at.to_string()),
+        );
         ops.push(PlannedOp {
             role: OpRole::SesRef,
             op: WriteOp::Put {
@@ -451,14 +458,11 @@ pub fn plan_patch(
 /// Builds the message item's `Put`. For an inbound message the
 /// `thread_snapshot` is populated here from `thread_after` — the
 /// caller-computed thread state that already includes this message — on a
-/// clone of `msg`, then `fit_item` is re-run, since the injected snapshot can
-/// push the item back over the size budget after ingest already fit it
-/// without one. `msg` itself, and every other planned op, is unaffected.
+/// clone of `msg`. `msg` itself, and every other planned op, is unaffected.
 fn message_put(msg: &MailMessage, thread_after: &ThreadState) -> Result<PlannedOp, MailStoreError> {
     let mut item_source = msg.clone();
     if matches!(msg.direction, Direction::Inbound) {
         item_source.thread_snapshot = Some(ThreadSnapshot::from(thread_after));
-        size::fit_item(&mut item_source);
     }
 
     let message_keys = [
@@ -544,6 +548,7 @@ fn push_rfc_alias_op(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
                 sk: keys::rfc_alias_sk().to_owned(),
                 message_id: msg.message_id.clone(),
                 thread_id: msg.thread_id.clone(),
+                expires_at: msg.expires_at,
             },
         });
     }
@@ -572,25 +577,18 @@ mod tests {
             direction: Direction::Inbound,
             rfc_message_id: format!("<{message_id}@example.com>"),
             in_reply_to: None,
-            references: Vec::new(),
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),
             timestamp: "00000001-0000".to_owned(),
             from: "sender@example.com".to_owned(),
-            reply_to: Vec::new(),
             to: vec!["support@example.com".to_owned()],
             cc: Vec::new(),
             bcc: Vec::new(),
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             size: 1_000,
-            text: Some("hello there".to_owned()),
-            html: None,
-            body_truncated: false,
-            headers: BTreeMap::new(),
             attachments: Vec::new(),
             attachments_truncated: false,
             raw_s3_key: Some("inbound/x".to_owned()),
-            verdicts: None,
             thread_snapshot: None,
             delivery: BTreeMap::new(),
             send_status: None,
@@ -598,6 +596,7 @@ mod tests {
             version: 0,
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            expires_at: 0,
         }
     }
 
@@ -619,6 +618,48 @@ mod tests {
             panic!("expected a Put");
         };
         assert_eq!(*cond, Cond::NotExists);
+    }
+
+    /// An alias or SES reference outliving its message would point a later
+    /// reply or delivery event at a message that no longer exists.
+    #[test]
+    fn lookup_items_expire_with_their_message() {
+        let mut msg = message("support", "tid-1", "mid-1", &["received", "unread"]);
+        msg.expires_at = 1_900_000_000;
+        let thread = new_thread(&msg);
+        assert_eq!(thread.expires_at, msg.expires_at);
+
+        let ops = plan_insert(&msg, None, &thread).unwrap();
+        let WriteOp::AliasFirstWriter { expires_at, .. } =
+            &ops.iter().find(|o| o.role == OpRole::RfcAlias).unwrap().op
+        else {
+            panic!("expected an alias write");
+        };
+        assert_eq!(*expires_at, msg.expires_at);
+
+        let mut outbound = msg.clone();
+        outbound.direction = Direction::Outbound;
+        outbound.labels = vec!["queued".to_owned()];
+        let claimed = queued_state(&outbound, None).claimed("2026-01-01T00:00:01.000Z");
+        let sent = claimed.sent("2026-01-01T00:00:02.000Z");
+        let ops = plan_mark(
+            &claimed,
+            &sent,
+            &outbound,
+            &["sent".to_owned()],
+            None,
+            Some("ses-1"),
+            "2026-01-01T00:00:02.000Z",
+        )
+        .unwrap();
+        let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::SesRef).unwrap().op
+        else {
+            panic!("expected an SES reference put");
+        };
+        assert_eq!(
+            item.inner().get("expires_at"),
+            Some(&AttributeValue::N(msg.expires_at.to_string()))
+        );
     }
 
     #[test]

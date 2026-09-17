@@ -559,6 +559,7 @@ pub fn test_mail_config() -> MailConfig {
         region: "us-east-1".to_owned(),
         send_rate: 1,
         unknown_outbox_retention_days: 30,
+        retention_days: 365,
     }
 }
 

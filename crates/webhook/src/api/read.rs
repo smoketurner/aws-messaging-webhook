@@ -21,7 +21,7 @@ use crate::mail::objects::{self, ObjectError};
 use crate::mail::store::{ListQuery, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
-use crate::mail::{InboxId, MailMessage, time};
+use crate::mail::{InboxId, MailMessage, content, time};
 use crate::state::{AppState, Services};
 
 /// How many store round-trips one list request may spend filling a page.
@@ -179,7 +179,8 @@ pub async fn list_messages<T: Services>(
 /// # Errors
 ///
 /// [`ApiError::NotFound`] when the inbox holds no such message; a store
-/// failure mapped by [`store_failure`].
+/// failure mapped by [`store_failure`], or a content document read failure
+/// mapped by [`object_failure`].
 pub async fn get_message<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path((inbox_id, message_id)): Path<(String, String)>,
@@ -190,7 +191,10 @@ pub async fn get_message<T: Services>(
         .await
         .map_err(store_failure)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(wire::Message::from(&message)))
+    let content = content::load(&state.services, &message)
+        .await
+        .map_err(object_failure)?;
+    Ok(Json(wire::Message::new(&message, &content)))
 }
 
 /// `GET /v0/inboxes/{inbox_id}/messages/{message_id}/raw`
@@ -373,12 +377,15 @@ pub async fn get_thread<T: Services>(
         .map_err(store_failure)?
         .ok_or(ApiError::NotFound)?;
 
-    let messages = view
-        .messages
-        .items
-        .iter()
-        .map(wire::Message::from)
-        .collect();
+    // One document read per message on the page; a page is bounded by the
+    // request limit.
+    let mut messages = Vec::with_capacity(view.messages.items.len());
+    for message in &view.messages.items {
+        let content = content::load(&state.services, message)
+            .await
+            .map_err(object_failure)?;
+        messages.push(wire::Message::new(message, &content));
+    }
     Ok(Json(wire::Thread::new(
         &view.thread,
         messages,

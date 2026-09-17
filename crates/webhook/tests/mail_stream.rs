@@ -13,10 +13,18 @@
 
 use std::collections::BTreeMap;
 
+use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ThreadSnapshot, keys};
 use serde_dynamo::AttributeValue;
 use serde_json::{Value, json};
-use webhook_test_support::{harness, invoke};
+use webhook_test_support::{Harness, harness, invoke};
+
+/// Stores a message's content document where the relay reads it.
+async fn store_content(h: &Harness, msg: &MailMessage, message_content: MessageContent) {
+    content::store(h.fake(), &msg.inbox_id, &msg.message_id, &message_content)
+        .await
+        .unwrap();
+}
 
 fn sample_message() -> MailMessage {
     MailMessage {
@@ -27,25 +35,18 @@ fn sample_message() -> MailMessage {
         direction: Direction::Inbound,
         rfc_message_id: "<mid-1@example.com>".to_owned(),
         in_reply_to: None,
-        references: Vec::new(),
         labels: vec!["received".to_owned(), "unread".to_owned()],
         timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
         from: "sender@example.com".to_owned(),
-        reply_to: Vec::new(),
         to: vec!["support@example.com".to_owned()],
         cc: Vec::new(),
         bcc: Vec::new(),
         subject: "Hello".to_owned(),
         preview: "Hello there".to_owned(),
         size: 1234,
-        text: Some("Hello there".to_owned()),
-        html: Some("<p>Hello there</p>".to_owned()),
-        body_truncated: false,
-        headers: BTreeMap::new(),
         attachments: Vec::new(),
         attachments_truncated: false,
         raw_s3_key: Some("inbound/x".to_owned()),
-        verdicts: None,
         thread_snapshot: Some(ThreadSnapshot {
             thread_id: "tid-1".to_owned(),
             subject: "Hello".to_owned(),
@@ -64,6 +65,7 @@ fn sample_message() -> MailMessage {
         version: 1,
         created_at: "2026-01-15T09:30:00.000Z".to_owned(),
         updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+        expires_at: 0,
     }
 }
 
@@ -118,6 +120,15 @@ fn key_only_image(pk: &str, sk: &str) -> Value {
 async fn insert_received_publishes_one_event_with_the_golden_payload() {
     let h = harness().await;
     let msg = sample_message();
+    store_content(
+        &h,
+        &msg,
+        MessageContent {
+            text: Some("Hello there".to_owned()),
+            ..MessageContent::default()
+        },
+    )
+    .await;
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-1");
 
     let result = invoke(h.state.clone(), event).await.unwrap();
@@ -141,6 +152,7 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
     assert_eq!(detail["meta"]["sesMessageId"], "ses-1");
     assert_eq!(detail["message"]["message_id"], "mid-1");
     assert_eq!(detail["message"]["from"], "sender@example.com");
+    assert_eq!(detail["message"]["text"], "Hello there");
     assert_eq!(detail["thread"]["thread_id"], "tid-1");
     assert_eq!(detail["thread"]["message_count"], 1);
     assert_eq!(
@@ -289,8 +301,17 @@ async fn event_id_is_stable_across_a_replay_of_the_same_record() {
 #[tokio::test]
 async fn oversized_html_is_dropped_before_falling_back() {
     let h = harness().await;
-    let mut msg = sample_message();
-    msg.html = Some("x".repeat(300_000));
+    let msg = sample_message();
+    store_content(
+        &h,
+        &msg,
+        MessageContent {
+            text: Some("Hello there".to_owned()),
+            html: Some("x".repeat(300_000)),
+            ..MessageContent::default()
+        },
+    )
+    .await;
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-big");
 
     invoke(h.state.clone(), event).await.unwrap();

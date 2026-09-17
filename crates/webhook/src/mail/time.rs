@@ -27,6 +27,14 @@ pub fn now_ms() -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The DynamoDB TTL (epoch seconds) for a mail item written at `now_ms`,
+/// `retention_days` later: the same span the mail bucket's lifecycle rules
+/// keep the item's objects, so both age out together.
+#[must_use]
+pub fn expires_at(now_ms: u64, retention_days: u32) -> u64 {
+    now_ms / 1_000 + u64::from(retention_days) * 86_400
+}
+
 /// Formats `epoch_ms` as a fixed-width, millisecond-precision UTC timestamp:
 /// `YYYY-MM-DDTHH:MM:SS.sssZ` (24 bytes). Holds the fixed-width guarantee for
 /// any year in 0000–9999 (any epoch millisecond value this application will

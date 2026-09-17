@@ -8,7 +8,7 @@
 
 use aws_messaging_webhook::mail::send::{SendSpec, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, send};
+use aws_messaging_webhook::mail::{InboxId, content, send};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
@@ -118,6 +118,12 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     assert_eq!(spec.envelope.to, vec!["recipient@example.com"]);
     assert_eq!(spec.subject, "Hello");
     assert_eq!(spec.text.as_deref(), Some("the body"));
+
+    // The body is stored in the message's content document, and the item
+    // carries a TTL.
+    let message_content = content::load(&h.state.services, &message).await.unwrap();
+    assert_eq!(message_content.text.as_deref(), Some("the body"));
+    assert!(message.expires_at > 0);
 }
 
 #[tokio::test]

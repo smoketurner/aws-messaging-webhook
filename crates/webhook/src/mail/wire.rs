@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mail::content::MessageContent;
 use crate::mail::{AttachmentMeta, MailMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,8 +94,10 @@ pub struct Message {
     pub headers: BTreeMap<String, String>,
 }
 
-impl From<&MailMessage> for Message {
-    fn from(msg: &MailMessage) -> Self {
+impl Message {
+    /// The full view: the item's fields with its stored content.
+    #[must_use]
+    pub fn new(msg: &MailMessage, content: &MessageContent) -> Self {
         Self {
             inbox_id: msg.inbox_id.as_str().to_owned(),
             thread_id: msg.thread_id.clone(),
@@ -106,19 +109,19 @@ impl From<&MailMessage> for Message {
             size: msg.size,
             updated_at: msg.updated_at.clone(),
             created_at: msg.created_at.clone(),
-            reply_to: msg.reply_to.clone(),
+            reply_to: content.reply_to.clone(),
             cc: msg.cc.clone(),
             bcc: msg.bcc.clone(),
             subject: Some(msg.subject.clone()),
             preview: Some(msg.preview.clone()),
-            text: msg.text.clone(),
-            html: msg.html.clone(),
+            text: content.text.clone(),
+            html: content.html.clone(),
             extracted_text: None,
             extracted_html: None,
             attachments: msg.attachments.iter().map(Attachment::from).collect(),
             in_reply_to: msg.in_reply_to.clone(),
-            references: msg.references.clone(),
-            headers: msg.headers.clone(),
+            references: content.references.clone(),
+            headers: content.headers.clone(),
         }
     }
 }
@@ -396,21 +399,15 @@ mod tests {
             direction: Direction::Inbound,
             rfc_message_id: "<mid-1@example.com>".to_owned(),
             in_reply_to: Some("<orig@example.com>".to_owned()),
-            references: vec!["<orig@example.com>".to_owned()],
             labels: vec!["received".to_owned(), "unread".to_owned()],
             timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
             from: "sender@example.com".to_owned(),
-            reply_to: vec!["sender@example.com".to_owned()],
             to: vec!["support@example.com".to_owned()],
             cc: Vec::new(),
             bcc: Vec::new(),
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             size: 1234,
-            text: Some("Hello there".to_owned()),
-            html: Some("<p>Hello there</p>".to_owned()),
-            body_truncated: false,
-            headers: BTreeMap::from([("X-Test".to_owned(), "1".to_owned())]),
             attachments: vec![AttachmentMeta {
                 attachment_id: "att-1".to_owned(),
                 object_key: Some("attachments/mid-1/att-1".to_owned()),
@@ -422,7 +419,6 @@ mod tests {
             }],
             attachments_truncated: false,
             raw_s3_key: Some("inbound/x".to_owned()),
-            verdicts: None,
             thread_snapshot: None,
             delivery: BTreeMap::new(),
             send_status: None,
@@ -430,12 +426,21 @@ mod tests {
             version: 1,
             created_at: "2026-01-15T09:30:00.000Z".to_owned(),
             updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+            expires_at: 0,
         }
     }
 
     #[test]
     fn message_golden_shape() {
-        let wire = Message::from(&sample_message());
+        let content = MessageContent {
+            text: Some("Hello there".to_owned()),
+            html: Some("<p>Hello there</p>".to_owned()),
+            headers: BTreeMap::from([("X-Test".to_owned(), "1".to_owned())]),
+            references: vec!["<orig@example.com>".to_owned()],
+            reply_to: vec!["sender@example.com".to_owned()],
+            verdicts: None,
+        };
+        let wire = Message::new(&sample_message(), &content);
         let value = serde_json::to_value(&wire).unwrap();
         assert_eq!(
             value,

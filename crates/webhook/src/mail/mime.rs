@@ -8,6 +8,7 @@ use mail_parser::{
     MimeHeaders,
 };
 
+use crate::mail::content::MessageContent;
 use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, Direction, HEADER_NAME_MAX,
     HEADER_VALUE_MAX, HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, InboxId, MailMessage,
@@ -32,18 +33,21 @@ pub struct ParsedAttachment {
 }
 
 /// A parsed inbound message, before thread resolution and item assembly:
-/// [`MailMessage`]'s content fields plus the kept attachment parts, which
-/// have not yet been written to S3 or given deterministic ids.
+/// [`MailMessage`]'s summary fields, the [`MessageContent`] document, and the
+/// kept attachment parts, which have not yet been written to S3 or given
+/// deterministic ids.
 ///
 /// `message`'s identity, threading and bookkeeping fields (`inbox_id`,
 /// `thread_id`, `message_id`, `labels`, `timestamp`, `attachments`,
-/// `raw_s3_key`, `verdicts`, `thread_snapshot`, `delivery`, `version`,
-/// `created_at`, `updated_at`, …) are placeholders — ingest resolves one
-/// per matching inbox and overwrites them; only the content fields
-/// [`parse_inbound`] documents are meaningful here.
+/// `raw_s3_key`, `thread_snapshot`, `delivery`, `version`, `created_at`,
+/// `updated_at`, `expires_at`, …) are placeholders — ingest resolves one
+/// per matching inbox and overwrites them; only the fields [`parse_inbound`]
+/// documents are meaningful here. `content.verdicts` is likewise filled in
+/// by ingest from the SES receipt.
 #[derive(Debug, Clone)]
 pub struct ParsedInbound {
     pub message: MailMessage,
+    pub content: MessageContent,
     pub attachments: Vec<ParsedAttachment>,
 }
 
@@ -127,25 +131,18 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         direction: Direction::Inbound,
         rfc_message_id,
         in_reply_to,
-        references,
         labels: Vec::new(),
         timestamp: String::new(),
         from,
-        reply_to,
         to,
         cc,
         bcc,
         subject,
         preview,
         size: u64::try_from(raw.len()).unwrap_or(u64::MAX),
-        text,
-        html,
-        body_truncated: false,
-        headers,
         attachments: Vec::new(),
         attachments_truncated: attachment_count > ATTACHMENTS_MAX,
         raw_s3_key: None,
-        verdicts: None,
         thread_snapshot: None,
         delivery: BTreeMap::new(),
         send_status: None,
@@ -153,10 +150,21 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         version: 0,
         created_at: String::new(),
         updated_at: String::new(),
+        expires_at: 0,
+    };
+
+    let content = MessageContent {
+        text,
+        html,
+        headers,
+        references,
+        reply_to,
+        verdicts: None,
     };
 
     Ok(ParsedInbound {
         message,
+        content,
         attachments,
     })
 }
@@ -343,8 +351,8 @@ mod tests {
         assert_eq!(parsed.message.to, ["Bob Recipient <bob@example.com>"]);
         assert_eq!(parsed.message.subject, "Plain text hello");
         assert_eq!(parsed.message.rfc_message_id, "<plain-1@example.com>");
-        assert!(parsed.message.text.unwrap().contains("Hello Bob"));
-        assert!(parsed.message.html.is_none());
+        assert!(parsed.content.text.unwrap().contains("Hello Bob"));
+        assert!(parsed.content.html.is_none());
         assert!(parsed.attachments.is_empty());
         assert!(!parsed.message.attachments_truncated);
     }
@@ -352,8 +360,8 @@ mod tests {
     #[test]
     fn multipart_alternative_keeps_both_bodies() {
         let parsed = fixture!("multipart-alternative.eml");
-        assert_eq!(parsed.message.text.unwrap().trim(), "Plain body.");
-        assert!(parsed.message.html.unwrap().contains("HTML body."));
+        assert_eq!(parsed.content.text.unwrap().trim(), "Plain body.");
+        assert!(parsed.content.html.unwrap().contains("HTML body."));
     }
 
     #[test]
@@ -376,7 +384,7 @@ mod tests {
             Some("<plain-1@example.com>")
         );
         assert_eq!(
-            parsed.message.references,
+            parsed.content.references,
             ["<root-0@example.com>", "<plain-1@example.com>"]
         );
     }
@@ -384,7 +392,7 @@ mod tests {
     #[test]
     fn inline_text_parts_are_concatenated_with_newline() {
         let parsed = fixture!("inline-text-parts.eml");
-        assert_eq!(parsed.message.text.unwrap(), "First part.\nSecond part.");
+        assert_eq!(parsed.content.text.unwrap(), "First part.\nSecond part.");
     }
 
     #[test]
@@ -467,8 +475,8 @@ mod tests {
     #[test]
     fn addresses_and_headers_stay_within_caps() {
         let parsed = fixture!("plain.eml");
-        assert!(parsed.message.headers.contains_key("Subject"));
-        assert!(parsed.message.headers.contains_key("From"));
+        assert!(parsed.content.headers.contains_key("Subject"));
+        assert!(parsed.content.headers.contains_key("From"));
     }
 
     /// A 1 MB body, generated at test time.
@@ -479,8 +487,7 @@ mod tests {
             "From: alice@example.com\r\nTo: bob@example.com\r\nSubject: big body\r\nMessage-ID: <big-body-1@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}"
         );
         let parsed = parse_inbound(raw.as_bytes()).unwrap();
-        assert_eq!(parsed.message.text.unwrap().len(), 1_000_000);
-        assert!(!parsed.message.body_truncated);
+        assert_eq!(parsed.content.text.unwrap().len(), 1_000_000);
     }
 
     /// A ≈ 30 MB message, generated at test time.
@@ -501,7 +508,7 @@ mod tests {
     #[test]
     fn text_only_message_has_no_html_fallback() {
         let parsed = fixture!("plain.eml");
-        assert!(parsed.message.html.is_none());
-        assert!(parsed.message.text.is_some());
+        assert!(parsed.content.html.is_none());
+        assert!(parsed.content.text.is_some());
     }
 }

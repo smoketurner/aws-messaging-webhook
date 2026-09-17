@@ -77,6 +77,9 @@ pub struct ThreadState {
     pub version: u64,
     pub created_at: String,
     pub updated_at: String,
+    /// DynamoDB TTL (epoch seconds): that of its newest message, so a thread
+    /// outlives every message in it and then ages out with the last one.
+    pub expires_at: u64,
 }
 
 /// Resolves an `In-Reply-To`/`References` header set to the ordered
@@ -171,6 +174,7 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
         version: 0,
         created_at: msg.created_at.clone(),
         updated_at: msg.updated_at.clone(),
+        expires_at: msg.expires_at,
     }
 }
 
@@ -215,6 +219,7 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     next.timestamp.clone_from(&msg.timestamp);
     next.version += 1;
     next.updated_at.clone_from(&msg.updated_at);
+    next.expires_at = next.expires_at.max(msg.expires_at);
     next
 }
 
@@ -304,25 +309,18 @@ mod tests {
             direction,
             rfc_message_id: "<mid-1@example.com>".to_owned(),
             in_reply_to: None,
-            references: Vec::new(),
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),
             timestamp: "00000001-0000".to_owned(),
             from: "sender@example.com".to_owned(),
-            reply_to: Vec::new(),
             to: vec!["support@example.com".to_owned()],
             cc: Vec::new(),
             bcc: Vec::new(),
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             size: 1_000,
-            text: Some("hello there".to_owned()),
-            html: None,
-            body_truncated: false,
-            headers: BTreeMap::new(),
             attachments: Vec::new(),
             attachments_truncated: false,
             raw_s3_key: Some("inbound/x".to_owned()),
-            verdicts: None,
             thread_snapshot: None,
             delivery: BTreeMap::new(),
             send_status: None,
@@ -330,6 +328,7 @@ mod tests {
             version: 0,
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            expires_at: 0,
         }
     }
 

@@ -5,6 +5,9 @@
 //! these reads return are the ones ingest would actually write.
 
 use aws_messaging_webhook::mail::store::MailStore as _;
+use std::collections::BTreeMap;
+
+use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::{InboxId, ids, time};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -286,14 +289,22 @@ async fn a_bad_query_parameter_reports_every_problem_at_once() {
 #[tokio::test]
 async fn fetching_one_message_returns_the_body_a_list_omits() {
     let h = seeded().await;
-    insert(&h, "2026-01-01T09:00:00.000Z", "t1", |m| {
-        m.text = Some("the full body".to_owned());
-        m.headers.insert("X-Custom".to_owned(), "yes".to_owned());
-    })
-    .await;
+    insert(&h, "2026-01-01T09:00:00.000Z", "t1", |_| {}).await;
 
     let (_, list) = get(&h, &format!("/v0/inboxes/{INBOX}/messages")).await;
     let id = list["messages"][0]["message_id"].as_str().unwrap();
+    content::store(
+        &h.state.services,
+        &InboxId(INBOX.to_owned()),
+        id,
+        &MessageContent {
+            text: Some("the full body".to_owned()),
+            headers: BTreeMap::from([("X-Custom".to_owned(), "yes".to_owned())]),
+            ..MessageContent::default()
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         list["messages"][0]["text"].is_null(),
         "list view omits text"

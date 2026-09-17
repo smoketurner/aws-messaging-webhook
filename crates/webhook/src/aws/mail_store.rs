@@ -405,7 +405,8 @@ fn to_transact_item(table_name: &str, op: &WriteOp) -> Result<TransactWriteItem,
             sk,
             message_id,
             thread_id,
-        } => alias_transact_item(table_name, pk, sk, message_id, thread_id),
+            expires_at,
+        } => alias_transact_item(table_name, pk, sk, message_id, thread_id, *expires_at),
     }
 }
 
@@ -512,6 +513,7 @@ fn alias_transact_item(
     sk: &str,
     message_id: &str,
     thread_id: &str,
+    expires_at: u64,
 ) -> Result<TransactWriteItem, MailStoreError> {
     let put = Put::builder()
         .table_name(table_name)
@@ -519,6 +521,7 @@ fn alias_transact_item(
         .item("sk", DynamoAv::S(sk.to_owned()))
         .item("message_id", DynamoAv::S(message_id.to_owned()))
         .item("thread_id", DynamoAv::S(thread_id.to_owned()))
+        .item("expires_at", DynamoAv::N(expires_at.to_string()))
         .condition_expression("attribute_not_exists(pk)")
         .build()
         .map_err(|e| MailStoreError::Permanent(anyhow!("building alias Put: {e}")))?;

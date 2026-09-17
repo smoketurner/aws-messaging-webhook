@@ -23,7 +23,7 @@ use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::mail::ids::inbound_message_id;
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::time::parse as parse_ts;
-use aws_messaging_webhook::mail::{ids, ingest};
+use aws_messaging_webhook::mail::{content, ids, ingest};
 use aws_messaging_webhook::model::ses_inbound::SesInboundNotification;
 use aws_messaging_webhook::state::AppState;
 use axum::body::Bytes;
@@ -52,6 +52,7 @@ fn test_mail_config() -> MailConfig {
         region: "us-east-1".to_owned(),
         send_rate: 1,
         unknown_outbox_retention_days: 30,
+        retention_days: 365,
     }
 }
 
@@ -173,6 +174,41 @@ async fn plain_message_ingests_and_creates_a_thread() {
     assert!(stored.labels.contains(&"received".to_owned()));
     assert!(stored.labels.contains(&"unread".to_owned()));
     assert!(!stored.labels.contains(&"spam".to_owned()));
+
+    // The body, headers and verdicts live in the content document, not the
+    // item.
+    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    assert!(
+        stored_content
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("Hello Bob"))
+    );
+    assert!(stored_content.headers.contains_key("Subject"));
+    assert_eq!(
+        stored_content.verdicts.as_ref().unwrap()["spam"],
+        "PASS",
+        "verdicts come from the SES receipt"
+    );
+
+    // The item and its thread expire with the bucket's lifecycle.
+    let retention_secs = 365 * 86_400;
+    let now_secs = aws_messaging_webhook::mail::time::now_ms() / 1_000;
+    assert!(
+        stored.expires_at > now_secs + retention_secs - 60
+            && stored.expires_at <= now_secs + retention_secs,
+        "expires_at {} is not retention_days from now",
+        stored.expires_at
+    );
+    let thread = h
+        .fake()
+        .mail
+        .get_thread(&inbox, &message_id, 1, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .thread;
+    assert_eq!(thread.expires_at, stored.expires_at);
     assert!(
         h.fake().calls().contains(&"persist:ses-1".to_owned()),
         "the SES receipt is persisted as the outbox entry, keyed by the SES message id, before ingest runs: {:?}",

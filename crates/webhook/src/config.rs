@@ -69,6 +69,10 @@ pub struct MailConfig {
     /// `MailUnknownOutboxRetentionDays`: how long an `unknown` send outcome
     /// stays resolvable before its outbox objects expire (default 30, min 1).
     pub unknown_outbox_retention_days: u32,
+    /// `pMailRetentionDays`: how long mail items and their S3 objects are
+    /// kept. Items carry a DynamoDB TTL this far out, matching the bucket's
+    /// lifecycle expiry.
+    pub retention_days: u32,
 }
 
 impl Config {
@@ -191,6 +195,8 @@ impl MailConfig {
             Some(raw) => parse_positive_u32("MAIL_SEND_RATE", &raw)?,
             None => 1,
         };
+        let retention_days =
+            parse_positive_u32("MAIL_RETENTION_DAYS", &require("MAIL_RETENTION_DAYS")?)?;
         let unknown_outbox_retention_days = match optional("MAIL_UNKNOWN_OUTBOX_RETENTION_DAYS") {
             Some(raw) => parse_positive_u32("MAIL_UNKNOWN_OUTBOX_RETENTION_DAYS", &raw)?,
             None => 30,
@@ -208,6 +214,7 @@ impl MailConfig {
             region,
             send_rate,
             unknown_outbox_retention_days,
+            retention_days,
         }))
     }
 }
