@@ -236,11 +236,19 @@ fn validate_inbox(inbox: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `pApiKeysParameterName` must be an absolute SSM parameter path.
+/// `pApiKeysParameterName` must be an absolute SSM parameter path outside
+/// the `aws` and `ssm` prefixes, which SSM reserves in any case.
 fn validate_api_keys_parameter(name: &str) -> anyhow::Result<()> {
+    let Some(path) = name.strip_prefix('/') else {
+        anyhow::bail!("API_KEYS_PARAMETER must start with \"/\", got {name:?}");
+    };
+    let reserved = ["aws", "ssm"].iter().any(|prefix| {
+        path.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    });
     anyhow::ensure!(
-        name.starts_with('/'),
-        "API_KEYS_PARAMETER must start with \"/\", got {name:?}"
+        !reserved,
+        "API_KEYS_PARAMETER must not start with \"/aws\" or \"/ssm\" (reserved by SSM), got {name:?}"
     );
     Ok(())
 }
@@ -332,6 +340,16 @@ mod tests {
     fn api_keys_parameter_requires_leading_slash() {
         assert!(validate_api_keys_parameter("/prod/api-keys").is_ok());
         assert!(validate_api_keys_parameter("prod/api-keys").is_err());
+    }
+
+    #[test]
+    fn api_keys_parameter_rejects_reserved_prefixes() {
+        assert!(validate_api_keys_parameter("/aws-messaging-webhook/dev/api-keys").is_err());
+        assert!(validate_api_keys_parameter("/AWS/api-keys").is_err());
+        assert!(validate_api_keys_parameter("/ssm/api-keys").is_err());
+        assert!(validate_api_keys_parameter("/SsM-keys").is_err());
+        assert!(validate_api_keys_parameter("/messaging-webhook/dev/api-keys").is_ok());
+        assert!(validate_api_keys_parameter("/a").is_ok());
     }
 
     #[test]

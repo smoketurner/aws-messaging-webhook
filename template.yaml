@@ -120,10 +120,11 @@ Parameters:
   pApiKeysParameterName:
     Type: String
     Default: ""
-    AllowedPattern: ^$|^/[A-Za-z0-9_./-]{1,1010}$
+    # SSM reserves names beginning with aws or ssm, in any case.
+    AllowedPattern: ^$|^/(?![Aa][Ww][Ss]|[Ss][Ss][Mm])[A-Za-z0-9_./-]{1,1010}$
     Description: >-
-      Name, starting with "/", of the SecureString SSM parameter holding the
-      /v0 API key hashes. Create the parameter after deploy.
+      Name, starting with "/" but not "/aws" or "/ssm", of the SecureString SSM
+      parameter holding the /v0 API key hashes. Create the parameter after deploy.
   pApiKeysKmsKeyArn:
     Type: String
     Default: ""

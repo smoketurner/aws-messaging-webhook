@@ -200,7 +200,7 @@ function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB mes
 ```bash
 sam deploy --parameter-overrides \
   "pAllowedTopics=<your-account-id> pMailDomain=mail.example.com pMailInbox=hello \
-   pApiKeysParameterName=/aws-messaging-webhook/dev/api-keys pHostedZoneId=<zone-id>"
+   pApiKeysParameterName=/messaging-webhook/dev/api-keys pHostedZoneId=<zone-id>"
 ```
 
 ### Mailbox parameters
@@ -215,7 +215,7 @@ sam deploy --parameter-overrides \
 | `pDmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
 | `pReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
 | `pExistingReceiptRuleSetName` | *(empty)* | Empty creates a rule set. Set it to add the rule to a rule set that is already active in the region |
-| `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Must start with `/` |
+| `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Must start with `/`, and not with `/aws` or `/ssm`, which SSM reserves |
 | `pApiKeysKmsKeyArn` | *(empty)* | Customer-managed KMS key that encrypts that parameter; empty means `aws/ssm` |
 | `pAttachmentUrlTtlSeconds` | `900` | Lifetime of presigned download URLs, 60–3600 |
 
@@ -258,7 +258,7 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    ```bash
    key="am_$(openssl rand -hex 24)"
    hash=$(printf '%s' "$key" | openssl dgst -sha256 -r | cut -d' ' -f1)
-   aws ssm put-parameter --name /aws-messaging-webhook/dev/api-keys --type SecureString \
+   aws ssm put-parameter --name /messaging-webhook/dev/api-keys --type SecureString \
      --value "{\"keys\":[{\"id\":\"key_1\",\"sha256\":\"$hash\"}]}"
    echo "$key"   # hand this to the client; it isn't stored anywhere
    ```
