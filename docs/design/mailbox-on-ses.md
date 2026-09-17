@@ -79,7 +79,9 @@ lives in one of these shapes:
 
 Message, thread, RFC alias and SES reference items carry an `expires_at` TTL of
 `pMailRetentionDays`, the same span the bucket keeps the message's objects, so a message ages
-out whole. A thread takes the TTL of its newest message.
+out whole. A thread takes the TTL of its newest message. A send state takes its message's TTL
+once the send settles (sent or failed); a queued, sending or `unknown` send has none, so nothing
+an operator may still need expires.
 
 ### Message content lives in S3
 
@@ -140,9 +142,16 @@ For each envelope recipient the rule matched: resolve the inbox, fetch the raw M
 `inbound/raw/`, parse it, extract attachments to S3, resolve the thread, write the content
 document, and commit.
 
-Thread resolution walks `In-Reply-To` then `References`, nearest first, against the RFC aliases
-for that inbox; first hit wins. No hit starts a new thread. There is deliberately no
-subject-based merging: a false join is worse than a split thread.
+Thread resolution tries the message's own `Message-ID`, then `In-Reply-To`, then `References`
+nearest first, against the RFC aliases for that inbox; first hit wins. No hit starts a new
+thread. There is deliberately no subject-based merging: a false join is worse than a split
+thread.
+
+SES writes its own `Message-ID` over the one a sent message carries, so recipients reply to
+`<sesMessageId@email.amazonses.com>` (or the `<region>.amazonses.com` form outside us-east-1).
+Marking a send sent registers both forms as aliases of the sent message. A message sent to this
+inbox arrives back under that id, and the own-`Message-ID` lookup puts the copy in the sent
+message's thread.
 
 Labels are assigned from the receipt's verdicts — `received` and `unread` always, `spam` when
 quarantined, `unauthenticated` when SPF, DKIM or DMARC failed. These select the event type and
@@ -152,6 +161,14 @@ The commit is one transaction: the message conditioned on not existing, the thre
 version-conditioned on what was read, and the `Message-ID` alias. The failed condition on the
 message *is* the idempotency signal — a redelivery cancels the whole transaction, so the thread
 is not double-counted.
+
+An alias belongs to the first message written under it. A transaction whose only failed checks
+are aliases that already exist — a second message reusing a `Message-ID`, or a send whose SES
+id is already known — is retried without those aliases rather than failed.
+
+SES publishes a setup notification (`mail.messageId` `AMAZON_SES_SETUP_NOTIFICATION`) whenever
+a receipt rule changes. It carries no mail and is acknowledged without being persisted or
+published.
 
 An S3 pointer is followed only when the bucket equals `MAIL_BUCKET`. A receipt naming another
 bucket is a permanent skip: never follow a pointer the operator did not configure.

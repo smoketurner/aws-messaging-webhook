@@ -25,7 +25,7 @@ use crate::mail::build::{BuildError, BuiltPart, build_outbound};
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
 use crate::mail::objects::ObjectError;
 use crate::mail::send::{self, SendFailure, SendSpec, SendState, SendStatus};
-use crate::mail::store::{MailStoreError, MarkOutcome};
+use crate::mail::store::{MailStoreError, MarkOutcome, SesSent};
 use crate::mail::url_policy;
 use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
 use crate::metrics::names;
@@ -430,6 +430,11 @@ async fn record_outcome<T: Services>(
     outcome: SendOutcome,
     now: &str,
 ) -> Result<Handled, SenderError> {
+    let config = state
+        .config
+        .mail
+        .as_ref()
+        .ok_or(SenderError::NotConfigured)?;
     let message_id = claimed.message_id.as_str();
     match outcome {
         SendOutcome::Sent { ses_message_id } => {
@@ -437,9 +442,10 @@ async fn record_outcome<T: Services>(
                 .services
                 .mark_send(
                     claimed,
-                    MarkOutcome::Sent {
-                        ses_message_id: &ses_message_id,
-                    },
+                    MarkOutcome::Sent(SesSent {
+                        message_id: &ses_message_id,
+                        region: &config.region,
+                    }),
                     now,
                 )
                 .await

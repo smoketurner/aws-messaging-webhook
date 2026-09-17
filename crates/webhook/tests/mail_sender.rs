@@ -12,7 +12,7 @@ use aws_messaging_webhook::mail::sender::{
     Handled, Resolution, handle_send, resolve_unknown, sweep,
 };
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, send};
+use aws_messaging_webhook::mail::{InboxId, ids, send, time};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
@@ -115,6 +115,12 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
         .unwrap();
     assert_eq!(message.labels, vec!["sent"]);
     assert_eq!(thread_labels(&h, &message.thread_id).await, vec!["sent"]);
+    // A settled send's state ages out with its message.
+    assert!(message.expires_at > 0);
+    assert_eq!(
+        state_of(&h, &message_id).expires_at,
+        Some(message.expires_at)
+    );
     assert_eq!(message.send_status.as_deref(), Some("sent"));
     assert_eq!(
         message.ses_message_id.as_deref(),
@@ -172,6 +178,80 @@ async fn an_ambiguous_outcome_is_never_resent() {
         .unwrap();
     assert_eq!(message.labels, vec!["queued"]);
     assert_eq!(message.send_status.as_deref(), Some("unknown"));
+    // Nothing may expire a send an operator still has to resolve.
+    assert_eq!(state_of(&h, &message_id).expires_at, None);
+}
+
+/// SES writes its own `Message-ID` over ours, so a message sent to this inbox
+/// arrives back carrying the SES form. The copy joins the sent message's
+/// thread rather than starting one, and a reply from anyone else naming that
+/// id would do the same.
+#[tokio::test]
+async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
+    let h = seeded().await;
+    let message_id = queued(
+        &h,
+        &json!({
+            "to": format!("{INBOX}@example.com"),
+            "subject": "Note to self",
+            "text": "the body",
+        }),
+    )
+    .await;
+    handle_send(&h.state, &message_id).await.unwrap();
+
+    let raw = format!(
+        "From: {INBOX}@example.com\r\nTo: {INBOX}@example.com\r\nSubject: Note to self\r\nMessage-ID: <ses-{message_id}@email.amazonses.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nthe body\r\n"
+    );
+    h.fake().objects.seed(
+        "inbound/raw/copy",
+        axum::body::Bytes::from(raw),
+        "message/rfc822",
+    );
+    let received_at = "2026-01-01T00:05:00.000Z";
+    let inner = json!({
+        "notificationType": "Received",
+        "mail": { "messageId": "inbound-copy", "timestamp": received_at },
+        "receipt": {
+            "recipients": [format!("{INBOX}@example.com")],
+            "timestamp": received_at,
+            "spamVerdict": { "status": "PASS" },
+            "virusVerdict": { "status": "PASS" },
+            "spfVerdict": { "status": "PASS" },
+            "dkimVerdict": { "status": "PASS" },
+            "dmarcVerdict": { "status": "PASS" },
+            "action": {
+                "type": "S3",
+                "bucketName": webhook_test_support::MAIL_BUCKET,
+                "objectKey": "inbound/raw/copy",
+            },
+        },
+    });
+    let status = webhook_test_support::post(
+        h.state.clone(),
+        "/webhooks/ses/inbound",
+        &webhook_test_support::wrapped(&h, &inner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let copy_id = ids::inbound_message_id("inbound-copy", time::parse(received_at).unwrap());
+    let copy = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &copy_id.to_string())
+        .await
+        .unwrap()
+        .expect("the copy was stored");
+    assert_eq!(copy.thread_id, message_id);
+    let thread = h
+        .state
+        .services
+        .get_thread(&InboxId(INBOX.to_owned()), &message_id, 10, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.thread.message_count, 2);
 }
 
 #[tokio::test]

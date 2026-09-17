@@ -10,9 +10,9 @@
 use serde_dynamo::AttributeValue;
 
 use crate::mail::send::{SendKey, SendState, SendStatus};
-use crate::mail::store::MailStoreError;
+use crate::mail::store::{MailStoreError, SesSent};
 use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
-use crate::mail::{Direction, MailMessage, ThreadSnapshot, keys};
+use crate::mail::{Direction, MailMessage, ThreadSnapshot, ids, keys};
 
 /// Which role a planned op plays in its transaction — used by
 /// [`crate::mail::txn::decode_cancellation`] to interpret a cancellation
@@ -306,7 +306,7 @@ pub fn plan_mark(
     msg: &MailMessage,
     new_labels: &[String],
     thread: Option<(&ThreadState, &ThreadState)>,
-    ses_message_id: Option<&str>,
+    ses: Option<SesSent<'_>>,
     now: &str,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
     debug_assert!(
@@ -334,10 +334,10 @@ pub fn plan_mark(
     } else {
         set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
     }
-    if let Some(ses_message_id) = ses_message_id {
+    if let Some(ses) = ses {
         set.push((
             "ses_message_id".to_owned(),
-            AttributeValue::S(ses_message_id.to_owned()),
+            AttributeValue::S(ses.message_id.to_owned()),
         ));
         set.push(("sent_at".to_owned(), AttributeValue::S(now.to_owned())));
     }
@@ -359,13 +359,21 @@ pub fn plan_mark(
         ops.push(thread_put(Some(thread_before), thread_after)?);
     }
 
-    if let Some(ses_message_id) = ses_message_id {
+    if let Some(ses) = ses {
+        // SES writes its own `Message-ID` over ours, so replies to this
+        // message, and its copy if it was sent to this inbox, name the SES
+        // forms. A redrive finds these already taken, which the caller
+        // resolves by dropping them.
+        for rfc_id in ids::ses_rfc_ids(ses.message_id, ses.region) {
+            push_alias(&mut ops, msg, &rfc_id);
+        }
+
         // Unconditioned: a redrive that marks the same send again should
         // rewrite this rather than cancel the whole transaction.
         let mut item = serde_dynamo::Item::default();
         item.inner_mut().insert(
             "pk".to_owned(),
-            AttributeValue::S(keys::ses_ref_pk(ses_message_id)),
+            AttributeValue::S(keys::ses_ref_pk(ses.message_id)),
         );
         item.inner_mut().insert(
             "sk".to_owned(),
@@ -536,10 +544,15 @@ fn thread_put(
     })
 }
 
-/// Pushes the `Message-ID` alias op, skipping ids over
-/// [`ALIAS_ID_MAX_BYTES`].
+/// Pushes the alias op for `msg`'s own `Message-ID`.
 fn push_rfc_alias_op(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
-    let stripped = strip_angle_brackets(&msg.rfc_message_id);
+    push_alias(ops, msg, &msg.rfc_message_id);
+}
+
+/// Pushes an alias op mapping `rfc_id` to `msg` and its thread, skipping ids
+/// over [`ALIAS_ID_MAX_BYTES`].
+fn push_alias(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
+    let stripped = strip_angle_brackets(rfc_id);
     if stripped.len() <= ALIAS_ID_MAX_BYTES {
         ops.push(PlannedOp {
             role: OpRole::RfcAlias,
@@ -648,10 +661,36 @@ mod tests {
             &outbound,
             &["sent".to_owned()],
             None,
-            Some("ses-1"),
+            Some(SesSent {
+                message_id: "ses-1",
+                region: "eu-west-1",
+            }),
             "2026-01-01T00:00:02.000Z",
         )
         .unwrap();
+
+        // Both forms SES may write over our `Message-ID` resolve to the sent
+        // message, and expire with it.
+        let mut aliases: Vec<(&str, u64)> = ops
+            .iter()
+            .filter_map(|o| match &o.op {
+                WriteOp::AliasFirstWriter {
+                    pk,
+                    message_id,
+                    expires_at,
+                    ..
+                } if message_id == &outbound.message_id => Some((pk.as_str(), *expires_at)),
+                _ => None,
+            })
+            .collect();
+        aliases.sort_unstable();
+        assert_eq!(
+            aliases,
+            vec![
+                ("RFC#support#ses-1@email.amazonses.com", msg.expires_at),
+                ("RFC#support#ses-1@eu-west-1.amazonses.com", msg.expires_at),
+            ]
+        );
         let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::SesRef).unwrap().op
         else {
             panic!("expected an SES reference put");

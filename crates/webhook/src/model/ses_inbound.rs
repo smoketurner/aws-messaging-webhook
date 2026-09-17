@@ -15,6 +15,19 @@ pub struct SesInboundNotification {
     pub receipt: SesReceipt,
 }
 
+/// The `mail.messageId` of the test notification SES publishes whenever a
+/// receipt rule is created or changed. It carries no mail.
+const SETUP_NOTIFICATION_MESSAGE_ID: &str = "AMAZON_SES_SETUP_NOTIFICATION";
+
+impl SesInboundNotification {
+    /// Whether this is SES checking that it can publish to the topic, rather
+    /// than a received message.
+    #[must_use]
+    pub fn is_setup_notification(&self) -> bool {
+        self.mail.message_id == SETUP_NOTIFICATION_MESSAGE_ID
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SesReceipt {

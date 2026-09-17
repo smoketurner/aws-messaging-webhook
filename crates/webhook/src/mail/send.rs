@@ -131,8 +131,9 @@ impl SendFailure {
 ///
 /// Mirrors the item's attributes one-to-one so it round-trips through
 /// `serde_dynamo`, the same way [`crate::mail::thread::ThreadState`] does.
-/// It is never deleted: it is small, and it is what maps a stray SES event
-/// back to an inbox when the message item cannot yet be found.
+/// It is never deleted explicitly. Once the send settles it takes its
+/// message's TTL, so the two age out together; until then it has none, since
+/// a queued, sending or unknown send must stay findable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendState {
     pub inbox_id: InboxId,
@@ -170,6 +171,9 @@ pub struct SendState {
     pub idempotency_key_pk: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// DynamoDB TTL (epoch seconds), set only once the send has settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 impl SendState {
@@ -201,6 +205,7 @@ impl SendState {
             idempotency_key_pk,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
+            expires_at: None,
         }
     }
 }
@@ -420,7 +425,11 @@ pub fn mark_transition<'a>(
     msg: &crate::mail::MailMessage,
     outcome: crate::mail::store::MarkOutcome<'a>,
     now: &str,
-) -> (SendState, Vec<String>, Option<&'a str>) {
+) -> (
+    SendState,
+    Vec<String>,
+    Option<crate::mail::store::SesSent<'a>>,
+) {
     use crate::mail::store::MarkOutcome;
 
     let relabel = |remove: &str, add: &str| {
@@ -437,14 +446,20 @@ pub fn mark_transition<'a>(
         labels
     };
 
+    // A settled send ages out with its message.
+    let settled = |next: SendState| SendState {
+        expires_at: Some(msg.expires_at),
+        ..next
+    };
+
     match outcome {
-        MarkOutcome::Sent { ses_message_id } => (
-            state.sent(now),
+        MarkOutcome::Sent(sent) => (
+            settled(state.sent(now)),
             relabel("queued", "sent"),
-            Some(ses_message_id),
+            Some(sent),
         ),
         MarkOutcome::Failed(failure) => (
-            state.failed(failure, now),
+            settled(state.failed(failure, now)),
             relabel("queued", "rejected"),
             None,
         ),
@@ -454,7 +469,7 @@ pub fn mark_transition<'a>(
         MarkOutcome::Released => (state.released(now), msg.labels.clone(), None),
         // The operator is asserting the outcome SES never gave us, so the
         // message is labelled as if it had.
-        MarkOutcome::ClosedSent => (state.sent(now), relabel("queued", "sent"), None),
+        MarkOutcome::ClosedSent => (settled(state.sent(now)), relabel("queued", "sent"), None),
         MarkOutcome::Resumed => (state.resumed(now), msg.labels.clone(), None),
     }
 }
