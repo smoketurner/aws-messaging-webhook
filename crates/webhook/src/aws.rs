@@ -14,6 +14,7 @@ use aws_sdk_eventbridge::types::PutEventsRequestEntry;
 use aws_sdk_pinpointsmsvoicev2::types::MessageFeedbackStatus;
 use aws_sdk_sesv2::config::Builder as SesConfigBuilder;
 use aws_sdk_sesv2::config::retry::RetryConfig;
+use aws_sdk_sesv2::config::timeout::TimeoutConfig;
 use aws_sdk_sesv2::operation::send_email::SendEmailOutput;
 use aws_sdk_sesv2::types::{
     Destination as SesDestination, EmailContent, MessageTag, RawMessage, SuppressionListReason,
@@ -510,8 +511,18 @@ impl SesApi for AwsServices {
             .customize()
             // One attempt, always. A retry of a call that already succeeded
             // would send the message a second time, and SendEmail has no
-            // idempotency token to prevent that.
-            .config_override(SesConfigBuilder::new().retry_config(RetryConfig::disabled()))
+            // idempotency token to prevent that. The timeout bounds the call
+            // well inside the time the sender keeps back for it; running out
+            // is an unknown outcome, never a retry.
+            .config_override(
+                SesConfigBuilder::new()
+                    .retry_config(RetryConfig::disabled())
+                    .timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_timeout(SES_CALL_TIMEOUT)
+                            .build(),
+                    ),
+            )
             .send()
             .await;
 
@@ -519,13 +530,15 @@ impl SesApi for AwsServices {
     }
 }
 
+/// How long one `SendEmail` call may take before its outcome is unknown.
+pub const SES_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Turns one `SendEmail` result into a [`SendOutcome`].
 ///
 /// The split that matters is between a definite refusal and an answer that
-/// never arrived. A service error carries an HTTP status, so SES has replied
-/// and its answer is authoritative: 4xx other than 429 is a permanent
-/// refusal, 429 and 5xx are worth retrying. Everything else — a timeout, a
-/// dropped connection, a response that could not be parsed — means the
+/// may have come after the message was accepted. See
+/// [`classify_send_status`] for service errors. Everything else — a timeout,
+/// a dropped connection, a response that could not be parsed — means the
 /// request may have been received and acted on, so it is `Unknown` and the
 /// message is never resent without an operator saying so.
 fn classify_send_result<E>(result: Result<SendEmailOutput, SdkError<E>>) -> SendOutcome
@@ -544,17 +557,26 @@ where
     let reason = DisplayErrorContext(&error).to_string();
     match &error {
         SdkError::ServiceError(context) => {
-            let status = context.raw().status().as_u16();
-            if status == 429 || status >= 500 {
-                SendOutcome::Retryable { reason }
-            } else {
-                SendOutcome::Failed { reason }
-            }
+            classify_send_status(context.raw().status().as_u16(), reason)
         }
         // Rejected before anything was sent: nothing reached SES.
         SdkError::ConstructionFailure(_) => SendOutcome::Failed { reason },
         // The request may be in flight or already handled.
         _ => SendOutcome::Unknown { reason },
+    }
+}
+
+/// Classifies an HTTP status SES answered `SendEmail` with.
+///
+/// 429 and 503 are refusals to take the request at all, so retrying cannot
+/// send twice. 500, 502 and 504 can come back after SES accepted the message,
+/// so they are `Unknown`. Any other 5xx is treated the same way. Other 4xx
+/// are definite, permanent refusals.
+fn classify_send_status(status: u16, reason: String) -> SendOutcome {
+    match status {
+        429 | 503 => SendOutcome::Retryable { reason },
+        500..=599 => SendOutcome::Unknown { reason },
+        _ => SendOutcome::Failed { reason },
     }
 }
 
@@ -580,6 +602,39 @@ mod tests {
             ),
             "a timeout leaves the outcome genuinely unknown"
         );
+    }
+
+    /// Only statuses that mean SES did not take the request are retried; one
+    /// that may follow an accepted message is unknown.
+    #[test]
+    fn send_statuses_retry_only_on_a_clear_refusal() {
+        for status in [429, 503] {
+            assert!(
+                matches!(
+                    classify_send_status(status, String::new()),
+                    SendOutcome::Retryable { .. }
+                ),
+                "{status} should be retryable"
+            );
+        }
+        for status in [500, 502, 504] {
+            assert!(
+                matches!(
+                    classify_send_status(status, String::new()),
+                    SendOutcome::Unknown { .. }
+                ),
+                "{status} should be unknown"
+            );
+        }
+        for status in [400, 403, 404] {
+            assert!(
+                matches!(
+                    classify_send_status(status, String::new()),
+                    SendOutcome::Failed { .. }
+                ),
+                "{status} should be a failure"
+            );
+        }
     }
 
     /// A request that was never built cannot have reached SES, so it is a
