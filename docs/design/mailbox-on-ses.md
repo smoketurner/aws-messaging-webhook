@@ -316,8 +316,12 @@ API destination selecting `$.detail` — no code — plus an additive `schemaVer
 | Event | Emitted when |
 |---|---|
 | `message.received` / `.spam` / `.unauthenticated` | A message INSERT labelled `received` |
-| `message.sent` | A message INSERT labelled `sent` |
+| `message.sent` | The sender relabels a message `queued` → `sent` |
 | `message.delivered`, `.bounced`, `.complained`, `.rejected`, `.opened` | An SES event resolves to a mailbox message and adds its label |
+
+The received event carries the message with its body and its thread snapshot. The rest are
+label transitions on a message the consumer has already seen, so they carry the list view —
+identifiers, labels, addresses, subject and preview — and no body.
 
 Delivery labels are **added, never removed**. These events arrive out of order under
 at-least-once delivery, so a message that both bounced and was opened should say both rather

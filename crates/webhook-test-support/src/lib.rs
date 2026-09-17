@@ -27,7 +27,7 @@ pub mod mail_memory;
 pub mod objects;
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,6 +80,12 @@ pub struct FakeServices {
     pub persist_outcome: Mutex<Option<PersistOutcome>>,
     pub fail_persist: AtomicBool,
     pub fail_publish: AtomicBool,
+    /// The 0-based publish attempt that fails, for a stream batch whose
+    /// middle record fails while the others would succeed. Every other
+    /// attempt follows `fail_publish`.
+    pub fail_publish_at: Mutex<Option<usize>>,
+    /// How many publishes have been attempted, failures included.
+    pub publish_attempts: AtomicUsize,
     pub action_error: Mutex<Option<ActionErrorKind>>,
     /// Email addresses whose suppression call fails with a permanent error,
     /// simulating SES `BadRequestException` for a malformed recipient. Other
@@ -381,7 +387,9 @@ impl PublishEvents for FakeServices {
         event: &OutboundEvent,
     ) -> impl Future<Output = Result<(), PublishError>> + Send {
         self.record(format!("publish:{}", event.detail_type));
-        let result = if self.fail_publish.load(Ordering::SeqCst) {
+        let attempt = self.publish_attempts.fetch_add(1, Ordering::SeqCst);
+        let fails_here = *self.fail_publish_at.lock().unwrap() == Some(attempt);
+        let result = if fails_here || self.fail_publish.load(Ordering::SeqCst) {
             Err(PublishError(anyhow!("simulated publish failure")))
         } else {
             self.published.lock().unwrap().push(event.clone());

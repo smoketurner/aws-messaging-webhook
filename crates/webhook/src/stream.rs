@@ -23,10 +23,13 @@
 //! items are told apart from the events-table's by `sk` prefix (`MSG#` for a
 //! message item; every other mail-table `sk` — `STATE`, `META`, `THR#…`,
 //! `MSGAT#…`, `THRAT#…`, `RFC`, `SESMSG#…`, `SENDKEY#…`, `SESCALL#…` — never
-//! publishes in P1). A `MSG#` image deserializes straight into
-//! [`crate::mail::MailMessage`] via `serde_dynamo::from_item`, never by
-//! hand-parsing the attribute JSON, so [`crate::mail::events::build_mail_events`]
-//! works from the same struct the store reads and writes.
+//! publishes). A message item's INSERT publishes the arrival of received
+//! mail and its MODIFYs publish the system labels each write added, so a
+//! send and every SES delivery event reach the bus as they happen. A `MSG#`
+//! image deserializes straight into [`crate::mail::MailMessage`] via
+//! `serde_dynamo::from_item`, never by hand-parsing the attribute JSON, so
+//! [`crate::mail::events`] works from the same struct the store reads and
+//! writes.
 
 use aws_lambda_events::dynamodb::Event;
 use axum::body::Bytes;
@@ -36,7 +39,7 @@ use sns_message_verifier::SnsEnvelope;
 
 use crate::mail::MailMessage;
 use crate::mail::content;
-use crate::mail::events::build_mail_events;
+use crate::mail::events::{MailEvent, build_label_events, build_received_event};
 use crate::mail::objects::ObjectError;
 use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
@@ -48,6 +51,25 @@ use crate::store::EventRecord;
 pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
     match image.get(key) {
         Some(AttributeValue::S(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Reads a string collection from a stream image: a `String Set` (what
+/// `serde_dynamo` writes for a `Vec<String>`, and so what the stored
+/// `labels` attribute is) or a `List` of strings. `None` when the attribute
+/// is absent or holds anything else, which the caller tells apart from an
+/// empty collection.
+fn image_strings(image: &Item, key: &str) -> Option<Vec<String>> {
+    match image.get(key)? {
+        AttributeValue::Ss(values) => Some(values.clone()),
+        AttributeValue::L(values) => values
+            .iter()
+            .map(|value| match value {
+                AttributeValue::S(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
         _ => None,
     }
 }
@@ -117,14 +139,13 @@ pub async fn handle_stream<T: Services>(
             // MODIFY that changes it) — not on count-only bumps.
             publish_status_changed(state, new_image, &record.change.old_image).await
         } else if sk.starts_with("MSG#") {
-            // Mail-table message item. Only an INSERT with a `received`
-            // label publishes in P1; a MODIFY (labels-only, promotion
-            // repoints, metadata writes) never diffs `labels`, so it settles
-            // without publishing.
-            if record.event_name != "INSERT" {
-                continue;
+            // Mail-table message item: an INSERT publishes the arrival of
+            // received mail, a MODIFY the system labels it just gained.
+            if record.event_name == "INSERT" {
+                publish_mail_record(state, new_image).await
+            } else {
+                publish_mail_labels(state, new_image, &record.change.old_image).await
             }
-            publish_mail_record(state, new_image).await
         } else {
             // Every other mail-table item (STATE, META, THR#…, MSGAT#…,
             // THRAT#…, RFC, SESMSG#…, SENDKEY#…, SESCALL#…) never matches the
@@ -133,10 +154,21 @@ pub async fn handle_stream<T: Services>(
         };
         // Reconstruction / no-op cases settle without a retry; only a
         // transient publish failure recruits redelivery of this record.
+        //
+        // A reported failure stops the batch: the event-source mapping
+        // restarts from the lowest reported sequence number, redelivering
+        // every record after it too, so publishing those now would publish
+        // them twice.
+        //
+        // A record carrying no sequence number cannot be reported at all (a
+        // real stream event always carries one); the mapping advances past
+        // the batch either way, so the rest of it is still published rather
+        // than dropped.
         if published == RelayOutcome::Retry
             && let Some(sequence_number) = sequence_number
         {
             failures.push(json!({ "itemIdentifier": sequence_number }));
+            break;
         }
     }
 
@@ -210,13 +242,12 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
     }
 }
 
-/// Publishes the `message.received*` event(s) for one `MSG#` mail-table
-/// INSERT image, with the message's content document read back from S3.
-/// Returns [`RelayOutcome::Retry`] on a transient publish or document read
-/// failure; a deserialization failure is a deterministic bug (not a
-/// transient fault), so it is logged and returns [`RelayOutcome::Settled`]
-/// (an INSERT's absent or empty `OldImage` is never read here, so it can't
-/// cause this).
+/// Publishes the `message.received*` event for one `MSG#` mail-table INSERT
+/// image, with the message's content document read back from S3. Returns
+/// [`RelayOutcome::Retry`] on a transient publish or document read failure;
+/// a deserialization failure is a deterministic bug (not a transient fault),
+/// so it is logged and returns [`RelayOutcome::Settled`] (an INSERT's absent
+/// or empty `OldImage` is never read here, so it can't cause this).
 async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
     let msg: MailMessage = match serde_dynamo::from_item(image.clone()) {
         Ok(msg) => msg,
@@ -230,6 +261,9 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
         }
     };
 
+    // A queued send's INSERT publishes nothing (its lifecycle starts at the
+    // `sent` relabel), and reading its content document first would be an S3
+    // GET for an event that is never built.
     if !msg.labels.iter().any(|label| label == "received") {
         return RelayOutcome::Settled;
     }
@@ -258,7 +292,54 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
         }
     };
 
-    let events = build_mail_events(&msg, &content, &state.config.event_source);
+    let Some(event) = build_received_event(&msg, &content, &state.config.event_source) else {
+        return RelayOutcome::Settled;
+    };
+    publish_mail_events(state, &msg, vec![event]).await
+}
+
+/// Publishes the `message.<label>` events for one `MSG#` MODIFY: the system
+/// labels the write added (the sender's `queued` → `sent` relabel, and the
+/// `delivered`/`bounced`/`complained`/`rejected`/`opened` labels SES events
+/// apply). A write that adds no such label — a user's own label, a read
+/// receipt, a promotion repoint, a metadata write — publishes nothing.
+/// Same retry contract as [`publish_mail_record`].
+async fn publish_mail_labels<T: Services>(
+    state: &AppState<T>,
+    new_image: &Item,
+    old_image: &Item,
+) -> RelayOutcome {
+    let msg: MailMessage = match serde_dynamo::from_item(new_image.clone()) {
+        Ok(msg) => msg,
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                event = "stream_bad_mail_image",
+                "mail-table MSG# image did not deserialize into MailMessage"
+            );
+            return RelayOutcome::Settled;
+        }
+    };
+
+    // An old image without readable labels (a stream configured for new
+    // images only) would make every label look new, so it publishes nothing
+    // rather than re-announcing a message's whole label set on each write.
+    let Some(old_labels) = image_strings(old_image, "labels") else {
+        return RelayOutcome::Settled;
+    };
+    let events = build_label_events(&msg, &old_labels, &state.config.event_source);
+    if events.is_empty() {
+        return RelayOutcome::Settled;
+    }
+    publish_mail_events(state, &msg, events).await
+}
+
+/// Publishes already-built mail events, one `PutEvents` call each.
+async fn publish_mail_events<T: Services>(
+    state: &AppState<T>,
+    msg: &MailMessage,
+    events: Vec<MailEvent>,
+) -> RelayOutcome {
     let mut outcome = RelayOutcome::Settled;
     for event in events {
         let outbound = OutboundEvent {

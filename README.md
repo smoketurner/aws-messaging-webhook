@@ -594,9 +594,7 @@ read `detail.event.open.isBotEvent` (or `.click.isBotEvent`) off the `ses.open` 
 ### Mailbox events
 
 A mailbox stack's mail table stream additionally publishes mailbox detail-types on the same
-bus, `source` and `schemaVersion` contract as above. Only the inbound side is implemented;
-`message.sent`, `message.delivered`, `message.bounced`, `message.complained`,
-`message.rejected` and `message.opened` arrive with the sender and SES-event pipeline.
+bus, `source` and `schemaVersion` contract as above.
 
 `message.received`, `message.received.spam` (spam/virus verdict `FAIL`) or
 `message.received.unauthenticated` (SPF/DKIM/DMARC `FAIL`, spam/virus clean) fires once per
@@ -634,9 +632,20 @@ oversized detail is reduced the same way the SMS/SES pipeline's details are: `me
 `.text` and `.headers` drop first, then `thread` shrinks to `{thread_id}`, then `message` falls
 back to `{payloadOmitted, ids}`; `meta` is never dropped.
 
-A payload matching no known family, and mail-table writes that aren't a message INSERT (send
-state, marker, key and RFC-alias items, and thread housekeeping writes), publish nothing from
-the mail table stream.
+`message.sent` fires when the sender relabels a queued message `sent`, and `message.delivered`,
+`message.bounced`, `message.complained`, `message.rejected` and `message.opened` fire when the
+SES event for a sent message adds that label. Each carries the same `schemaVersion`, `meta`,
+`type`, `event_type` and `event_id` fields as above, with `message` in its list form — the
+identifiers, labels, addresses, subject and preview, without the body, which the consumer
+already has from the message's own event or the read API. Delivery labels are added, never
+removed, so a message that both bounced and was opened publishes both; a label arriving twice
+(an SES event redelivered, a stream record replayed) rebuilds the same `event_id`, which is
+what a consumer deduplicates on.
+
+A payload matching no known family, mail-table writes on anything but a message item (send
+state, marker, key and RFC-alias items, and thread housekeeping writes), and a message write
+that adds no system label (a read receipt, a user's own label, a metadata write) publish
+nothing from the mail table stream.
 
 ## Data model
 

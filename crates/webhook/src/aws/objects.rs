@@ -64,11 +64,28 @@ where
     }
 }
 
-/// `true` for the 412 Precondition Failed `put_object_if_absent` gets back
-/// when `if_none_match: *` loses the race — not an error, since that is the
-/// idempotent "already written" outcome.
-fn is_precondition_failed<E>(error: &SdkError<E>) -> bool {
-    matches!(error, SdkError::ServiceError(ctx) if ctx.raw().status().as_u16() == 412)
+/// The outcome of a conditional `PutObject` that came back an error: a 412
+/// is the idempotent "another writer got there first", and a 409
+/// `ConditionalRequestConflict` — S3's answer when two conditional writes to
+/// the same key overlap — is transient, since the write never reached a
+/// decision and a retry is what settles it. Everything else classifies as
+/// any other S3 failure does.
+fn put_if_absent_outcome<E>(error: &SdkError<E>) -> Result<PutOutcome, ObjectError>
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let status = match error {
+        SdkError::ServiceError(ctx) => Some(ctx.raw().status().as_u16()),
+        _ => None,
+    };
+    match status {
+        Some(412) => Ok(PutOutcome::AlreadyExists),
+        Some(409) => Err(ObjectError::Transient(anyhow!(
+            "PutObject: {}",
+            DisplayErrorContext(error)
+        ))),
+        _ => Err(classify_object_error("PutObject", error)),
+    }
 }
 
 impl AwsServices {
@@ -170,8 +187,7 @@ impl ObjectStore for AwsServices {
             .await;
         match result {
             Ok(_) => Ok(PutOutcome::Created),
-            Err(error) if is_precondition_failed(&error) => Ok(PutOutcome::AlreadyExists),
-            Err(error) => Err(classify_object_error("PutObject", &error)),
+            Err(error) => put_if_absent_outcome(&error),
         }
     }
 
@@ -220,5 +236,52 @@ impl ObjectStore for AwsServices {
             .await
             .map_err(|e| classify_object_error("GetObject(presign)", &e))?;
         Ok(presigned.uri().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::operation::put_object::PutObjectError;
+    use aws_smithy_types::body::SdkBody;
+
+    use super::*;
+
+    /// One S3 service error with the given HTTP status, as the SDK hands it
+    /// back from a failed `PutObject`.
+    fn service_error(status: u16) -> SdkError<PutObjectError> {
+        let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        SdkError::service_error(PutObjectError::unhandled("s3 error"), response)
+    }
+
+    #[test]
+    fn a_lost_if_none_match_race_is_the_already_written_outcome() {
+        assert!(matches!(
+            put_if_absent_outcome(&service_error(412)),
+            Ok(PutOutcome::AlreadyExists)
+        ));
+    }
+
+    /// Two conditional writes to one key overlap: S3 answers 409 without
+    /// deciding either, so the caller must retry rather than treat the
+    /// object as unwritable — which for ingest would drop the message.
+    #[test]
+    fn a_conditional_write_conflict_is_transient() {
+        assert!(matches!(
+            put_if_absent_outcome(&service_error(409)),
+            Err(ObjectError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn other_failures_classify_as_any_other_put_does() {
+        assert!(matches!(
+            put_if_absent_outcome(&service_error(403)),
+            Err(ObjectError::Permanent(_))
+        ));
+        assert!(matches!(
+            put_if_absent_outcome(&service_error(503)),
+            Err(ObjectError::Transient(_))
+        ));
     }
 }
