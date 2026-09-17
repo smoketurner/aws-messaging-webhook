@@ -79,7 +79,9 @@ lives in one of these shapes:
 
 Message, thread, RFC alias and SES reference items carry an `expires_at` TTL of
 `pMailRetentionDays`, the same span the bucket keeps the message's objects, so a message ages
-out whole. A thread takes the TTL of its newest message.
+out whole. A thread takes the TTL of its newest message. A send state takes its message's TTL
+once the send settles (sent or failed); a queued, sending or `unknown` send has none, so nothing
+an operator may still need expires.
 
 ### Message content lives in S3
 
