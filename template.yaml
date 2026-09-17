@@ -840,9 +840,13 @@ Resources:
               Resource:
                 - !GetAtt rMailTable.Arn
                 - !Sub "${rMailTable.Arn}/index/*"
+            # Nothing under outbox/ expires: the sender deletes a send's objects
+            # once its outcome is settled.
             - Sid: OutboxObjects
               Effect: Allow
-              Action: s3:GetObject
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
               Resource: !Sub "${rMailBucket.Arn}/outbox/*"
             - Sid: SentObjects
               Effect: Allow

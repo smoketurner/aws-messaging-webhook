@@ -532,7 +532,7 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
             tracing::warn!(
                 message_id,
                 key,
-                error = %error,
+                error = ?error,
                 event = "outbox_cleanup_failed",
                 "could not remove an outbox object; it will expire with retention"
             );
