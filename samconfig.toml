@@ -2,8 +2,6 @@ version = 0.1
 
 [default.global.parameters]
 region = "us-east-1"
-profile = "plock-admin"
-s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-nwao0jggejqu"
 
 [default.build.parameters]
 beta_features = true
@@ -13,6 +11,8 @@ parallel = true
 lint = true
 
 [default.deploy.parameters]
+profile = "plock-admin"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-nwao0jggejqu"
 stack_name = "aws-messaging-webhook-dev"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
