@@ -63,37 +63,16 @@ impl AwsServices {
         let index = query.index.name();
         let (pk_attr, sk_attr) = query.index.key_attributes();
 
-        let mut condition = "#pk = :pk".to_owned();
-        let mut values = std::collections::HashMap::from([(
-            ":pk".to_owned(),
-            DynamoAv::S(partition.to_owned()),
-        )]);
-        match (query.after, query.before) {
-            (Some(after), Some(before)) => {
-                condition.push_str(" AND #sk BETWEEN :after AND :before");
-                values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
-                values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
-            }
-            (Some(after), None) => {
-                condition.push_str(" AND #sk > :after");
-                values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
-            }
-            (None, Some(before)) => {
-                condition.push_str(" AND #sk < :before");
-                values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
-            }
-            (None, None) => {}
-        }
+        let key = KeyCondition::new(pk_attr, sk_attr, partition, query.after, query.before);
 
         let mut request = self
             .dynamo
             .query()
             .table_name(&table_name)
             .index_name(index)
-            .key_condition_expression(condition)
-            .expression_attribute_names("#pk", pk_attr)
-            .expression_attribute_names("#sk", sk_attr)
-            .set_expression_attribute_values(Some(values))
+            .key_condition_expression(key.expression)
+            .set_expression_attribute_names(Some(key.names))
+            .set_expression_attribute_values(Some(key.values))
             .scan_index_forward(query.ascending)
             .limit(i32::try_from(query.limit).unwrap_or(i32::MAX));
         if let Some(start) = query.start {
@@ -156,6 +135,55 @@ impl AwsServices {
             Some(item) => serde_dynamo::from_item(item)
                 .map(Some)
                 .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}"))),
+        }
+    }
+}
+
+/// A `Query` key condition with exactly the placeholders it uses: DynamoDB
+/// rejects a request whose `ExpressionAttributeNames` or
+/// `ExpressionAttributeValues` hold an entry the expression never mentions,
+/// so the sort-key name is declared only when a range bound needs it.
+struct KeyCondition {
+    expression: String,
+    names: HashMap<String, String>,
+    values: HashMap<String, DynamoAv>,
+}
+
+impl KeyCondition {
+    fn new(
+        pk_attr: &str,
+        sk_attr: &str,
+        partition: &str,
+        after: Option<&str>,
+        before: Option<&str>,
+    ) -> Self {
+        let mut expression = "#pk = :pk".to_owned();
+        let mut names = HashMap::from([("#pk".to_owned(), pk_attr.to_owned())]);
+        let mut values = HashMap::from([(":pk".to_owned(), DynamoAv::S(partition.to_owned()))]);
+        let range = match (after, before) {
+            (Some(after), Some(before)) => {
+                values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
+                values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
+                Some(" AND #sk BETWEEN :after AND :before")
+            }
+            (Some(after), None) => {
+                values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
+                Some(" AND #sk > :after")
+            }
+            (None, Some(before)) => {
+                values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
+                Some(" AND #sk < :before")
+            }
+            (None, None) => None,
+        };
+        if let Some(range) = range {
+            expression.push_str(range);
+            names.insert("#sk".to_owned(), sk_attr.to_owned());
+        }
+        Self {
+            expression,
+            names,
+            values,
         }
     }
 }
@@ -1131,5 +1159,54 @@ impl MailStore for AwsServices {
             )
             .await?;
         Ok(Some(ThreadView { thread, messages }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every declared placeholder must appear in the expression, and every
+    /// placeholder in the expression must be declared.
+    fn assert_placeholders_match(key: &KeyCondition) {
+        for name in key.names.keys() {
+            assert!(
+                key.expression.contains(name.as_str()),
+                "{name} declared but unused in {:?}",
+                key.expression
+            );
+        }
+        for value in key.values.keys() {
+            assert!(
+                key.expression.contains(value.as_str()),
+                "{value} declared but unused in {:?}",
+                key.expression
+            );
+        }
+        for token in key.expression.split_whitespace() {
+            if token.starts_with('#') {
+                assert!(key.names.contains_key(token), "{token} undeclared");
+            }
+            if token.starts_with(':') {
+                assert!(key.values.contains_key(token), "{token} undeclared");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unbounded_page_declares_only_the_partition_key() {
+        let key = KeyCondition::new("gsi1pk", "gsi1sk", "INBOXES", None, None);
+        assert_eq!(key.expression, "#pk = :pk");
+        assert!(!key.names.contains_key("#sk"));
+        assert_placeholders_match(&key);
+    }
+
+    #[test]
+    fn every_range_bound_declares_the_sort_key() {
+        for (after, before) in [(Some("a"), None), (None, Some("b")), (Some("a"), Some("b"))] {
+            let key = KeyCondition::new("gsi1pk", "gsi1sk", "INBOX#x#MSG", after, before);
+            assert_eq!(key.names.get("#sk").map(String::as_str), Some("gsi1sk"));
+            assert_placeholders_match(&key);
+        }
     }
 }
