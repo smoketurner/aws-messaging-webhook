@@ -389,6 +389,25 @@ impl SendState {
     }
 }
 
+/// Labels present in `after` but not `before`, and the reverse: the patch
+/// a status transition applies to the message's thread.
+#[must_use]
+pub fn label_changes(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    for label in after {
+        if !before.contains(label) {
+            added.push(label.clone());
+        }
+    }
+    let mut removed = Vec::new();
+    for label in before {
+        if !after.contains(label) {
+            removed.push(label.clone());
+        }
+    }
+    (added, removed)
+}
+
 /// Works out the new send state, the message's new labels, and the SES id to
 /// record, for one outcome.
 ///

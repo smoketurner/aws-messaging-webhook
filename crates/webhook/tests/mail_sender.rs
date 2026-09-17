@@ -44,6 +44,18 @@ async fn queued(h: &Harness, body: &Value) -> String {
     value["message_id"].as_str().unwrap().to_owned()
 }
 
+/// The labels on a thread, which roll up its messages' labels.
+async fn thread_labels(h: &Harness, thread_id: &str) -> Vec<String> {
+    h.state
+        .services
+        .get_thread(&InboxId(INBOX.to_owned()), thread_id, 1, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .thread
+        .labels
+}
+
 async fn seeded() -> Harness {
     let h = mail_harness().await;
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
@@ -102,6 +114,7 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
         .unwrap()
         .unwrap();
     assert_eq!(message.labels, vec!["sent"]);
+    assert_eq!(thread_labels(&h, &message.thread_id).await, vec!["sent"]);
     assert_eq!(message.send_status.as_deref(), Some("sent"));
     assert_eq!(
         message.ses_message_id.as_deref(),
@@ -184,6 +197,10 @@ async fn a_refused_send_is_recorded_rejected_and_not_retried() {
         .unwrap()
         .unwrap();
     assert_eq!(message.labels, vec!["rejected"]);
+    assert_eq!(
+        thread_labels(&h, &message.thread_id).await,
+        vec!["rejected"]
+    );
 }
 
 #[tokio::test]

@@ -723,7 +723,38 @@ impl MailStore for MailMemoryStore {
                 })?;
 
                 let (after, labels, ses_message_id) = mark_transition(state, &msg, outcome, now);
-                let ops = plan_mark(state, &after, &msg, &labels, ses_message_id, now)?;
+                let (added, removed) =
+                    aws_messaging_webhook::mail::send::label_changes(&msg.labels, &labels);
+                let thread = if added.is_empty() && removed.is_empty() {
+                    None
+                } else {
+                    let Some(thread_item) = self.get_item(
+                        &keys::inbox_pk(msg.inbox_id.as_str()),
+                        &keys::thread_sk(&msg.thread_id),
+                    ) else {
+                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                            "message {} refers to a thread that does not exist",
+                            msg.message_id
+                        )));
+                    };
+                    let before: ThreadState =
+                        serde_dynamo::from_item(thread_item).map_err(|e| {
+                            MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
+                        })?;
+                    let after = aws_messaging_webhook::mail::thread::apply_label_patch(
+                        &before, &added, &removed, now,
+                    );
+                    Some((before, after))
+                };
+                let ops = plan_mark(
+                    state,
+                    &after,
+                    &msg,
+                    &labels,
+                    thread.as_ref().map(|(before, after)| (before, after)),
+                    ses_message_id,
+                    now,
+                )?;
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(()),
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}

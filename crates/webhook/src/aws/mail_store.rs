@@ -998,8 +998,30 @@ impl MailStore for AwsServices {
                 )));
             };
             let (after, labels, ses_message_id) = mark_transition(state, &msg, outcome, now);
-            let ops =
-                crate::mail::plan::plan_mark(state, &after, &msg, &labels, ses_message_id, now)?;
+            let (added, removed) = crate::mail::send::label_changes(&msg.labels, &labels);
+            let thread = if added.is_empty() && removed.is_empty() {
+                None
+            } else {
+                let Some(before) = self.get_thread_state(&msg.inbox_id, &msg.thread_id).await?
+                else {
+                    return Err(MailStoreError::Permanent(anyhow!(
+                        "message {} refers to thread {}, which does not exist",
+                        msg.message_id,
+                        msg.thread_id
+                    )));
+                };
+                let after = apply_label_patch(&before, &added, &removed, now);
+                Some((before, after))
+            };
+            let ops = crate::mail::plan::plan_mark(
+                state,
+                &after,
+                &msg,
+                &labels,
+                thread.as_ref().map(|(before, after)| (before, after)),
+                ses_message_id,
+                now,
+            )?;
 
             match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
                 Attempt::Committed => return Ok(()),

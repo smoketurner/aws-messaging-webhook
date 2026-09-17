@@ -302,6 +302,7 @@ pub fn plan_mark(
     state_after: &SendState,
     msg: &MailMessage,
     new_labels: &[String],
+    thread: Option<(&ThreadState, &ThreadState)>,
     ses_message_id: Option<&str>,
     now: &str,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
@@ -310,7 +311,7 @@ pub fn plan_mark(
         "message labels must be sorted and deduplicated before planning"
     );
 
-    let mut ops = Vec::with_capacity(3);
+    let mut ops = Vec::with_capacity(4);
     ops.push(send_state_put(Some(state_before), state_after)?);
 
     let mut set = vec![
@@ -348,6 +349,12 @@ pub fn plan_mark(
             cond: Cond::VersionEquals(msg.version),
         },
     });
+
+    // The thread's labels roll up its messages', so a status label that moves
+    // on the message moves on the thread in the same transaction.
+    if let Some((thread_before, thread_after)) = thread {
+        ops.push(thread_put(Some(thread_before), thread_after)?);
+    }
 
     if let Some(ses_message_id) = ses_message_id {
         // Unconditioned: a redrive that marks the same send again should
