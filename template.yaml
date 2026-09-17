@@ -854,10 +854,11 @@ Resources:
               Action: s3:ListBucket
               Resource: !GetAtt rMailBucket.Arn
             # Scoped to this domain's identity and this stack's configuration
-            # set: the sender cannot send as another domain.
+            # set: the sender cannot send as another domain. The sender sends
+            # raw MIME, which SESv2 SendEmail authorizes as ses:SendRawEmail.
             - Sid: SendMail
               Effect: Allow
-              Action: ses:SendEmail
+              Action: ses:SendRawEmail
               Resource:
                 - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${pMailDomain}"
                 - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${rMailConfigurationSet}"
