@@ -138,11 +138,14 @@ Parameters:
     Description: Lifetime of presigned attachment and raw-message download URLs.
 
 Rules:
-  MailInboxRequired:
+  MailParametersRequired:
     RuleCondition: !Not [!Equals [!Ref pMailDomain, ""]]
     Assertions:
       - Assert: !Not [!Equals [!Ref pMailInbox, ""]]
         AssertDescription: pMailInbox is required when pMailDomain is set.
+      # Both functions refuse to start without it.
+      - Assert: !Not [!Equals [!Ref pApiKeysParameterName, ""]]
+        AssertDescription: pApiKeysParameterName is required when pMailDomain is set.
 
 Conditions:
   cIsProd: !Equals [!Ref pStage, prod]
@@ -809,6 +812,8 @@ Resources:
           MAIL_TABLE_NAME: !Ref rMailTable
           MAIL_BUCKET: !Ref rMailBucket
           MAIL_INBOX: !Ref pMailInbox
+          # Never read in sender mode, but the shared mail config requires it.
+          API_KEYS_PARAMETER: !Ref pApiKeysParameterName
           SES_CONFIGURATION_SET: !Ref rMailConfigurationSet
           MAIL_IDENTITY_ARN: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${pMailDomain}"
           ATTACHMENT_URL_TTL_SECONDS: !Ref pAttachmentUrlTtlSeconds
