@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod json;
 pub mod keys;
 pub mod labels;
 pub mod pagination;
@@ -22,10 +23,16 @@ pub mod unimplemented;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, delete, get, post};
 
 use crate::api::unimplemented::{method_not_allowed, not_implemented, unknown_route};
 use crate::state::{AppState, Services};
+
+/// The largest send or reply request body: a Lambda Function URL accepts at
+/// most 6 MB, so nothing larger can arrive. Base64 makes inline attachments
+/// about a third larger than their bytes; bigger files go by `url`.
+const SEND_BODY_BYTES: usize = 6 * 1024 * 1024;
 
 /// The `/v0` router, ready to nest. Auth wraps every route including the
 /// fallbacks, so an unauthenticated caller learns nothing about which paths
@@ -79,10 +86,15 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
             "/inboxes/{inbox_id}/messages/{message_id}",
             delete(not_implemented),
         )
-        .route("/inboxes/{inbox_id}/messages/send", post(send::send::<T>))
+        // Sends carry inline attachments, so they get the Function URL's own
+        // request limit rather than the 1 MiB every other route has.
+        .route(
+            "/inboxes/{inbox_id}/messages/send",
+            post(send::send::<T>).layer(DefaultBodyLimit::max(SEND_BODY_BYTES)),
+        )
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/reply",
-            post(send::reply::<T>),
+            post(send::reply::<T>).layer(DefaultBodyLimit::max(SEND_BODY_BYTES)),
         )
         .fallback(unknown_route)
         .method_not_allowed_fallback(method_not_allowed)

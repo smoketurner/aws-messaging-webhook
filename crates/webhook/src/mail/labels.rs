@@ -18,6 +18,15 @@ pub const SYSTEM_LABELS: [&str; 12] = [
     "opened",
 ];
 
+/// How many of `labels` are the caller's own rather than system labels.
+#[must_use]
+pub fn user_label_count(labels: &[String]) -> usize {
+    labels
+        .iter()
+        .filter(|label| !SYSTEM_LABELS.contains(&label.as_str()))
+        .count()
+}
+
 /// Every system label except `unread`, `spam` and `trash` — rejected on a
 /// PATCH request and in a send's `labels`.
 #[must_use]

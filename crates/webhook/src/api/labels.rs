@@ -15,15 +15,9 @@ use axum::extract::{Path, State};
 use serde::Deserialize;
 
 use crate::api::error::{ApiError, FieldError};
-use crate::mail::{InboxId, labels, time, wire};
+use crate::api::json::ApiJson;
+use crate::mail::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
 use crate::state::{AppState, Services};
-
-/// How many labels one request may add or remove. The thread's union is
-/// capped separately; this only keeps a single request bounded.
-const MAX_LABELS_PER_REQUEST: usize = 32;
-
-/// The longest a label may be, in bytes.
-const MAX_LABEL_BYTES: usize = 64;
 
 /// One label or a list of them.
 #[derive(Debug, Deserialize)]
@@ -70,10 +64,10 @@ fn clean(
             });
             continue;
         }
-        if label.len() > MAX_LABEL_BYTES {
+        if label.len() > LABEL_MAX_BYTES {
             errors.push(FieldError {
                 path: field.to_owned(),
-                message: format!("`{label}` is longer than {MAX_LABEL_BYTES} bytes"),
+                message: format!("`{label}` is longer than {LABEL_MAX_BYTES} bytes"),
             });
             continue;
         }
@@ -91,10 +85,13 @@ fn clean(
             cleaned.push(label);
         }
     }
-    if cleaned.len() > MAX_LABELS_PER_REQUEST {
+    // A request cannot name more labels than a message may carry; whether the
+    // result fits the message and thread caps is checked against what they
+    // already hold.
+    if cleaned.len() > MESSAGE_USER_LABEL_CAP {
         errors.push(FieldError {
             path: field.to_owned(),
-            message: format!("at most {MAX_LABELS_PER_REQUEST} labels per request"),
+            message: format!("at most {MESSAGE_USER_LABEL_CAP} labels per request"),
         });
     }
     cleaned.sort();
@@ -106,12 +103,13 @@ fn clean(
 /// # Errors
 ///
 /// [`ApiError::Validation`] for an empty, oversized, reserved or contradictory
-/// label; [`ApiError::NotFound`] when the inbox holds no such message; a
+/// label, or one that would leave the message or its thread over its label
+/// cap; [`ApiError::NotFound`] when the inbox holds no such message; a
 /// store failure otherwise.
 pub async fn update_labels<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path((inbox_id, message_id)): Path<(String, String)>,
-    Json(request): Json<UpdateRequest>,
+    ApiJson(request): ApiJson<UpdateRequest>,
 ) -> Result<Json<wire::MessageLabels>, ApiError> {
     let mut errors = Vec::new();
     let add = clean(request.add_labels, "add_labels", &mut errors);
@@ -181,7 +179,7 @@ mod tests {
         assert!(cleaned.is_empty());
         assert_eq!(errors.len(), 1);
 
-        let long = "x".repeat(MAX_LABEL_BYTES + 1);
+        let long = "x".repeat(LABEL_MAX_BYTES + 1);
         let (cleaned, errors) = clean_all(&[&long]);
         assert!(cleaned.is_empty());
         assert_eq!(errors.len(), 1);

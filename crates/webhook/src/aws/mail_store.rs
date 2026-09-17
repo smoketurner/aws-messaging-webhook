@@ -1205,7 +1205,7 @@ impl MailStore for AwsServices {
     }
 
     async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
-        let partition = format!("INBOX#{}#MSG", query.inbox.as_str());
+        let partition = keys::messages_partition(query.inbox.as_str());
         self.query_page(
             PageQuery::scoped(MailIndex::ByTime, &partition, query),
             "listing messages",
@@ -1214,7 +1214,7 @@ impl MailStore for AwsServices {
     }
 
     async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
-        let partition = format!("INBOX#{}#THR", query.inbox.as_str());
+        let partition = keys::threads_partition(query.inbox.as_str());
         self.query_page(
             PageQuery::scoped(MailIndex::ByTime, &partition, query),
             "listing threads",

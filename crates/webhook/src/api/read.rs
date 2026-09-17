@@ -18,7 +18,7 @@ use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
 use crate::mail::keys::{self, PageKey, decode_page_token, encode_page_token};
 use crate::mail::objects::{self, ObjectError};
-use crate::mail::store::{ListQuery, MailStoreError, Page};
+use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
 use crate::mail::{InboxId, MailMessage, content, time};
@@ -31,13 +31,17 @@ const MAX_FILL_PAGES: usize = 5;
 
 /// Accumulates up to `limit` items that pass `keep`.
 ///
-/// Each round asks only for what is still missing, so the running total never
-/// exceeds `limit` and the continuation can always be the last fetched page's
-/// own key — truncating a page in memory would strand the items after the cut
-/// with no token pointing at them.
+/// The first round asks for exactly `limit`, which is enough when nothing is
+/// filtered out. A later round means the filter is dropping items, so it asks
+/// for [`MAX_LIMIT`] at a time rather than only the few still missing — asking
+/// for less each round would spend the round budget on shrinking pages. When
+/// a round overshoots, the extra items are dropped and the continuation is
+/// built from the last item kept (`key_of`), so nothing after the cut is
+/// skipped.
 async fn fill<T, F, Fut>(
     query: &ListQuery,
     keep: impl Fn(&T) -> bool,
+    key_of: impl Fn(&T) -> PageKey,
     mut fetch: F,
 ) -> Result<(Vec<T>, Option<PageKey>), MailStoreError>
 where
@@ -48,20 +52,26 @@ where
     let mut collected: Vec<T> = Vec::with_capacity(limit);
     let mut start = query.start.clone();
 
-    for _ in 0..MAX_FILL_PAGES {
+    for round_number in 0..MAX_FILL_PAGES {
         let round = ListQuery {
-            limit: limit - collected.len(),
+            limit: if round_number == 0 { limit } else { MAX_LIMIT },
             start: start.clone(),
             ..query.clone()
         };
         let page = fetch(round).await?;
-        let next = page.next;
+        start = page.next;
         for item in page.items {
-            if keep(&item) {
-                collected.push(item);
+            if !keep(&item) {
+                continue;
             }
+            if collected.len() == limit {
+                // A matching item that does not fit: resume right after the
+                // last one returned, so this one opens the next page.
+                start = collected.last().map(&key_of);
+                break;
+            }
+            collected.push(item);
         }
-        start = next;
         // Exhausted the partition, or filled the page.
         if start.is_none() || collected.len() >= limit {
             break;
@@ -71,14 +81,22 @@ where
     Ok((collected, start))
 }
 
+/// The token scope for lists that take no time window or sort order: an inbox
+/// list and a thread's embedded messages.
+const UNSCOPED: &str = "";
+
 /// Turns a request's `page_token` into a store cursor, checking it was issued
-/// for the partition this request reads.
-fn cursor(request: &ListRequest, partition: &str) -> Result<Option<PageKey>, ApiError> {
+/// for the partition and query shape (`scope`) this request reads.
+fn cursor(
+    request: &ListRequest,
+    partition: &str,
+    scope: &str,
+) -> Result<Option<PageKey>, ApiError> {
     request
         .page_token
         .as_deref()
         .map(|token| {
-            decode_page_token(token, partition)
+            decode_page_token(token, partition, scope)
                 .map_err(|_| ApiError::field("page_token", "not a valid token for this request"))
         })
         .transpose()
@@ -95,7 +113,7 @@ pub async fn list_inboxes<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::InboxList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let start = cursor(&request, keys::inboxes_partition())?;
+    let start = cursor(&request, keys::inboxes_partition(), UNSCOPED)?;
 
     let page = state
         .services
@@ -108,7 +126,10 @@ pub async fn list_inboxes<T: Services>(
         count: inboxes.len(),
         limit: request.limit,
         inboxes,
-        next_page_token: page.next.as_ref().map(encode_page_token),
+        next_page_token: page
+            .next
+            .as_ref()
+            .map(|key| encode_page_token(key, UNSCOPED)),
     }))
 }
 
@@ -144,8 +165,9 @@ pub async fn list_messages<T: Services>(
 ) -> Result<Json<wire::MessageList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let inbox = InboxId(inbox_id);
-    let partition = format!("INBOX#{}#MSG", inbox.as_str());
-    let start = cursor(&request, &partition)?;
+    let partition = keys::messages_partition(inbox.as_str());
+    let scope = request.token_scope();
+    let start = cursor(&request, &partition, &scope)?;
     let (before, after) = request.message_bounds();
 
     let query = ListQuery {
@@ -160,6 +182,12 @@ pub async fn list_messages<T: Services>(
     let (messages, next) = fill(
         &query,
         |msg: &MailMessage| request.filters.matches_message(msg),
+        |msg: &MailMessage| PageKey {
+            partition: keys::messages_partition(msg.inbox_id.as_str()),
+            sort: msg.message_id.clone(),
+            table_pk: keys::inbox_pk(msg.inbox_id.as_str()),
+            table_sk: keys::message_sk(&msg.message_id),
+        },
         |round| async move { services.list_messages(&round).await },
     )
     .await
@@ -170,7 +198,7 @@ pub async fn list_messages<T: Services>(
         count: messages.len(),
         limit: request.limit,
         messages,
-        next_page_token: next.as_ref().map(encode_page_token),
+        next_page_token: next.as_ref().map(|key| encode_page_token(key, &scope)),
     }))
 }
 
@@ -319,8 +347,9 @@ pub async fn list_threads<T: Services>(
 ) -> Result<Json<wire::ThreadList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let inbox = InboxId(inbox_id);
-    let partition = format!("INBOX#{}#THR", inbox.as_str());
-    let start = cursor(&request, &partition)?;
+    let partition = keys::threads_partition(inbox.as_str());
+    let scope = request.token_scope();
+    let start = cursor(&request, &partition, &scope)?;
     let (before, after) = request.thread_bounds();
 
     let query = ListQuery {
@@ -335,6 +364,12 @@ pub async fn list_threads<T: Services>(
     let (threads, next) = fill(
         &query,
         |thread: &ThreadState| request.filters.matches_thread(thread),
+        |thread: &ThreadState| PageKey {
+            partition: keys::threads_partition(thread.inbox_id.as_str()),
+            sort: keys::thread_time_sort(&thread.timestamp, &thread.thread_id),
+            table_pk: keys::inbox_pk(thread.inbox_id.as_str()),
+            table_sk: keys::thread_sk(&thread.thread_id),
+        },
         |round| async move { services.list_threads(&round).await },
     )
     .await
@@ -345,7 +380,7 @@ pub async fn list_threads<T: Services>(
         count: threads.len(),
         limit: request.limit,
         threads,
-        next_page_token: next.as_ref().map(encode_page_token),
+        next_page_token: next.as_ref().map(|key| encode_page_token(key, &scope)),
     }))
 }
 
@@ -368,7 +403,7 @@ pub async fn get_thread<T: Services>(
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let inbox = InboxId(inbox_id);
     let partition = format!("THREAD#{}#{}", inbox.as_str(), thread_id);
-    let start = cursor(&request, &partition)?;
+    let start = cursor(&request, &partition, UNSCOPED)?;
 
     let view = state
         .services
@@ -390,21 +425,26 @@ pub async fn get_thread<T: Services>(
         &view.thread,
         messages,
         request.limit,
-        view.messages.next.as_ref().map(encode_page_token),
+        view.messages
+            .next
+            .as_ref()
+            .map(|key| encode_page_token(key, UNSCOPED)),
     )))
 }
 
-/// Maps a store failure onto the API's retry contract: a throttled or
+/// Maps a store failure onto the API's retry contract: a label cap the
+/// request would exceed is a 400 the client must change, a throttled or
 /// unreachable table is a 502 the client may retry, and anything else is a
-/// 500. Neither leaks the underlying error to the caller.
+/// 500 that does not leak the underlying error.
 pub(crate) fn store_failure(error: MailStoreError) -> ApiError {
     match error {
         MailStoreError::NotFound => ApiError::NotFound,
         MailStoreError::InvalidPageToken => {
             ApiError::field("page_token", "not a valid token for this request")
         }
+        MailStoreError::LabelLimit(message) => ApiError::field("labels", message),
         MailStoreError::Transient(source) => ApiError::BadGateway(source),
-        MailStoreError::Conflict | MailStoreError::LabelLimit(_) | MailStoreError::Permanent(_) => {
+        MailStoreError::Conflict | MailStoreError::Permanent(_) => {
             ApiError::Internal(anyhow::Error::new(error))
         }
     }
@@ -413,6 +453,84 @@ pub(crate) fn store_failure(error: MailStoreError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ITEMS: u32 = 30;
+
+    fn key(item: u32) -> PageKey {
+        PageKey {
+            partition: "p".to_owned(),
+            sort: item.to_string(),
+            table_pk: "p".to_owned(),
+            table_sk: item.to_string(),
+        }
+    }
+
+    /// Pages through `0..ITEMS` the way the store does: resume after the
+    /// start key, return at most `limit`, and a key only when more remain.
+    async fn page(round: ListQuery) -> Result<Page<u32>, MailStoreError> {
+        let from = round
+            .start
+            .as_ref()
+            .map_or(0, |start| start.sort.parse::<u32>().unwrap() + 1);
+        let items: Vec<u32> = (from..ITEMS).take(round.limit).collect();
+        let next = items
+            .last()
+            .filter(|last| **last + 1 < ITEMS)
+            .map(|last| key(*last));
+        Ok(Page { items, next })
+    }
+
+    fn query(limit: usize, start: Option<PageKey>) -> ListQuery {
+        ListQuery {
+            inbox: InboxId("support@example.com".to_owned()),
+            limit,
+            before: None,
+            after: None,
+            ascending: true,
+            start,
+        }
+    }
+
+    /// A rare match must not come back as a short page just because each
+    /// round asked for fewer items.
+    #[tokio::test]
+    async fn a_selective_filter_still_fills_the_page() {
+        let rare = |item: &u32| item % 10 == 9;
+        let (items, next) = fill(&query(2, None), rare, |item| key(*item), page)
+            .await
+            .unwrap();
+        assert_eq!(items, vec![9, 19]);
+
+        let (items, next) = fill(&query(2, next), rare, |item| key(*item), page)
+            .await
+            .unwrap();
+        assert_eq!(items, vec![29]);
+        assert!(next.is_none());
+    }
+
+    /// Items a round fetched past the page are not skipped: the next page
+    /// resumes right after the last one returned.
+    #[tokio::test]
+    async fn an_overfull_round_resumes_after_the_last_item_returned() {
+        let even = |item: &u32| item.is_multiple_of(2);
+        let mut seen = Vec::new();
+        let mut start = None;
+        loop {
+            let (items, next) = fill(&query(3, start), even, |item| key(*item), page)
+                .await
+                .unwrap();
+            assert!(items.len() <= 3);
+            seen.extend(items);
+            let Some(next) = next else { break };
+            start = Some(next);
+        }
+        assert_eq!(
+            seen,
+            (0..ITEMS)
+                .filter(|item| item.is_multiple_of(2))
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// The 500 body hides the cause, so the log is the only place it
     /// survives: the conversion must keep the SDK error as a source.

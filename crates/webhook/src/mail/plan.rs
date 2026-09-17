@@ -11,8 +11,11 @@ use serde_dynamo::AttributeValue;
 
 use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, SesSent};
-use crate::mail::thread::{THREAD_LABEL_TOTAL_CAP, ThreadState};
-use crate::mail::{Direction, MailMessage, ThreadSnapshot, ids, keys};
+use crate::mail::thread::ThreadState;
+use crate::mail::{
+    Direction, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP, ThreadSnapshot, ids,
+    keys, labels,
+};
 
 /// Which role a planned op plays in its transaction — used by
 /// [`crate::mail::txn::decode_cancellation`] to interpret a cancellation
@@ -138,24 +141,18 @@ const ALIAS_ID_MAX_BYTES: usize = 900;
 /// applying `msg` to it ([`crate::mail::thread::new_thread`] /
 /// [`crate::mail::thread::apply_message`]).
 ///
+/// Not capped by labels: an inbound message carries only system labels, a
+/// fixed set, so it can never push a thread over the user-label cap — and
+/// refusing it would lose the mail.
+///
 /// # Errors
 ///
-/// Returns [`MailStoreError::LabelLimit`] when `thread_after`'s label union
-/// exceeds [`THREAD_LABEL_TOTAL_CAP`], which keeps the thread item's label
-/// set clear of DynamoDB's item-size limit. It is permanent: a retry would
-/// plan the same oversized item.
+/// Propagates a serialization failure as [`MailStoreError::Permanent`].
 pub fn plan_insert(
     msg: &MailMessage,
     thread_before: Option<&ThreadState>,
     thread_after: &ThreadState,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
-    if thread_after.labels.len() > THREAD_LABEL_TOTAL_CAP {
-        return Err(MailStoreError::LabelLimit(format!(
-            "thread {} would carry {} labels, over the cap of {THREAD_LABEL_TOTAL_CAP}",
-            thread_after.thread_id,
-            thread_after.labels.len(),
-        )));
-    }
     debug_assert!(
         is_sorted_and_deduped(&msg.labels),
         "message labels must be sorted and deduplicated before planning"
@@ -184,8 +181,8 @@ pub fn plan_insert(
 ///
 /// # Errors
 ///
-/// [`MailStoreError::LabelLimit`] when the thread's union would exceed
-/// [`THREAD_LABEL_TOTAL_CAP`].
+/// [`MailStoreError::LabelLimit`] when the message or its thread would carry
+/// more user labels than their caps.
 pub fn plan_enqueue(
     msg: &MailMessage,
     state: &SendState,
@@ -194,13 +191,7 @@ pub fn plan_enqueue(
     thread_after: &ThreadState,
     now_epoch: u64,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
-    if thread_after.labels.len() > THREAD_LABEL_TOTAL_CAP {
-        return Err(MailStoreError::LabelLimit(format!(
-            "thread {} would carry {} labels, over the cap of {THREAD_LABEL_TOTAL_CAP}",
-            thread_after.thread_id,
-            thread_after.labels.len(),
-        )));
-    }
+    check_user_labels(&msg.labels, thread_after)?;
 
     let mut ops = Vec::with_capacity(5);
 
@@ -436,8 +427,8 @@ pub fn plan_mark(
 ///
 /// # Errors
 ///
-/// [`MailStoreError::LabelLimit`] when the thread's union would exceed
-/// [`THREAD_LABEL_TOTAL_CAP`].
+/// [`MailStoreError::LabelLimit`] when the message or its thread would carry
+/// more user labels than their caps.
 pub fn plan_patch(
     msg: &MailMessage,
     new_labels: &[String],
@@ -445,13 +436,7 @@ pub fn plan_patch(
     thread_after: &ThreadState,
     now: &str,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
-    if thread_after.labels.len() > THREAD_LABEL_TOTAL_CAP {
-        return Err(MailStoreError::LabelLimit(format!(
-            "thread {} would carry {} labels, over the cap of {THREAD_LABEL_TOTAL_CAP}",
-            thread_after.thread_id,
-            thread_after.labels.len(),
-        )));
-    }
+    check_user_labels(new_labels, thread_after)?;
     debug_assert!(
         is_sorted_and_deduped(new_labels),
         "message labels must be sorted and deduplicated before planning"
@@ -507,7 +492,7 @@ fn message_put(msg: &MailMessage, thread_after: &ThreadState) -> Result<PlannedO
         ),
         (
             "gsi1pk",
-            AttributeValue::S(format!("INBOX#{}#MSG", item_source.inbox_id.as_str())),
+            AttributeValue::S(keys::messages_partition(item_source.inbox_id.as_str())),
         ),
         ("gsi1sk", AttributeValue::S(item_source.message_id.clone())),
         (
@@ -544,13 +529,13 @@ fn thread_put(
         ),
         (
             "gsi1pk",
-            AttributeValue::S(format!("INBOX#{}#THR", thread_after.inbox_id.as_str())),
+            AttributeValue::S(keys::threads_partition(thread_after.inbox_id.as_str())),
         ),
         (
             "gsi1sk",
-            AttributeValue::S(format!(
-                "{}#{}",
-                thread_after.timestamp, thread_after.thread_id
+            AttributeValue::S(keys::thread_time_sort(
+                &thread_after.timestamp,
+                &thread_after.thread_id,
             )),
         ),
     ];
@@ -588,6 +573,33 @@ fn push_alias(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
             },
         });
     }
+}
+
+/// Rejects a write that would leave the message or its thread with more
+/// user labels than [`MESSAGE_USER_LABEL_CAP`] or [`THREAD_USER_LABEL_CAP`].
+///
+/// Only a caller's own labels are counted. System labels are a fixed set the
+/// pipeline applies, so counting them would let a thread full of user labels
+/// refuse the system labels an inbound message or a send outcome needs.
+fn check_user_labels(
+    message_labels: &[String],
+    thread_after: &ThreadState,
+) -> Result<(), MailStoreError> {
+    let on_message = labels::user_label_count(message_labels);
+    if on_message > MESSAGE_USER_LABEL_CAP {
+        return Err(MailStoreError::LabelLimit(format!(
+            "a message can carry at most {MESSAGE_USER_LABEL_CAP} labels of your own; \
+             this would leave it with {on_message}"
+        )));
+    }
+    let on_thread = labels::user_label_count(&thread_after.labels);
+    if on_thread > THREAD_USER_LABEL_CAP {
+        return Err(MailStoreError::LabelLimit(format!(
+            "a thread can carry at most {THREAD_USER_LABEL_CAP} labels of your own across its \
+             messages; this would leave it with {on_thread}"
+        )));
+    }
+    Ok(())
 }
 
 fn is_sorted_and_deduped(values: &[String]) -> bool {
@@ -877,16 +889,55 @@ mod tests {
         assert_eq!(stored.envelope.to, vec!["recipient@example.com"]);
     }
 
+    /// A thread full of user labels must still take the system labels an
+    /// inbound reply needs, or the mail would be lost.
     #[test]
-    fn plan_insert_rejects_a_thread_over_the_label_union_cap() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+    fn plan_insert_accepts_a_thread_full_of_user_labels() {
+        let msg = message(
+            "support@example.com",
+            "tid-1",
+            "mid-1",
+            &["received", "spam", "unread"],
+        );
         let mut thread = new_thread(&msg);
-        for i in 0..THREAD_LABEL_TOTAL_CAP {
+        for i in 0..THREAD_USER_LABEL_CAP {
             thread.labels.push(format!("label-{i:03}"));
         }
         thread.labels.sort();
-        msg.labels = vec!["received".to_owned()];
-        let err = plan_insert(&msg, None, &thread).unwrap_err();
+        assert!(plan_insert(&msg, None, &thread).is_ok());
+    }
+
+    #[test]
+    fn plan_patch_rejects_user_labels_over_the_thread_cap() {
+        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        let before = new_thread(&msg);
+        let mut after = before.clone();
+        for i in 0..=THREAD_USER_LABEL_CAP {
+            after.labels.push(format!("label-{i:03}"));
+        }
+        after.labels.sort();
+        let err = plan_patch(&msg, &msg.labels, &before, &after, "now").unwrap_err();
+        assert!(matches!(err, MailStoreError::LabelLimit(_)));
+
+        // System labels do not count toward the cap.
+        after.labels.truncate(THREAD_USER_LABEL_CAP);
+        after
+            .labels
+            .extend(["received".to_owned(), "unread".to_owned()]);
+        after.labels.sort();
+        assert!(plan_patch(&msg, &msg.labels, &before, &after, "now").is_ok());
+    }
+
+    #[test]
+    fn plan_patch_rejects_user_labels_over_the_message_cap() {
+        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        let thread = new_thread(&msg);
+        let mut labels: Vec<String> = (0..=MESSAGE_USER_LABEL_CAP)
+            .map(|i| format!("label-{i:03}"))
+            .collect();
+        labels.push("received".to_owned());
+        labels.sort();
+        let err = plan_patch(&msg, &labels, &thread, &thread, "now").unwrap_err();
         assert!(matches!(err, MailStoreError::LabelLimit(_)));
     }
 
@@ -955,7 +1006,7 @@ mod tests {
         #[test]
         fn plan_insert_writes_a_fixed_number_of_items_whatever_the_labels(
             message_label_count in 0usize..=4,
-            thread_label_count in 0usize..=THREAD_LABEL_TOTAL_CAP,
+            thread_label_count in 0usize..=THREAD_USER_LABEL_CAP,
         ) {
             let message_labels: Vec<String> = (0..message_label_count)
                 .map(|i| format!("m{i:02}"))

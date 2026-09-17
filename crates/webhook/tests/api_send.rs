@@ -50,6 +50,25 @@ async fn post(
     )
 }
 
+/// Sends a raw body with an optional content type, for the malformed-request
+/// cases the typed helper cannot produce.
+async fn post_raw(h: &Harness, body: Vec<u8>, content_type: Option<&str>) -> (StatusCode, Value) {
+    let mut request = Request::post(format!("/v0/inboxes/{INBOX}/messages/send"))
+        .header("authorization", format!("Bearer {KEY}"));
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    let response = aws_messaging_webhook::app::app(h.state.clone())
+        .oneshot(request.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn send_it(h: &Harness, body: &Value, key: Option<&str>) -> (StatusCode, Value) {
     post(h, &format!("/v0/inboxes/{INBOX}/messages/send"), body, key).await
 }
@@ -237,6 +256,108 @@ async fn the_same_key_with_a_different_request_is_a_conflict() {
 
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(response["name"], "ConflictError");
+}
+
+#[tokio::test]
+async fn moving_text_between_fields_is_a_different_request() {
+    // A fingerprint that runs fields together cannot tell these apart.
+    let h = seeded().await;
+    let mut first = body();
+    first["subject"] = json!("ab");
+    first["text"] = json!("c");
+    send_it(&h, &first, Some("key-1")).await;
+
+    let mut second = body();
+    second["subject"] = json!("a");
+    second["text"] = json!("bc");
+    let (status, _) = send_it(&h, &second, Some("key-1")).await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn renaming_an_attachment_is_a_different_request() {
+    let h = seeded().await;
+    let mut first = body();
+    first["attachments"] = json!([{
+        "content": STANDARD.encode("file bytes"),
+        "filename": "a.txt",
+        "content_type": "text/plain",
+    }]);
+    send_it(&h, &first, Some("key-1")).await;
+
+    let mut second = first.clone();
+    second["attachments"][0]["filename"] = json!("b.txt");
+    let (status, _) = send_it(&h, &second, Some("key-1")).await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_send_that_fails_to_commit_leaves_no_uploads_behind() {
+    // Nothing under outbox/ expires, so a failed commit must not strand its
+    // spec and parts there.
+    let h = seeded().await;
+    h.state
+        .services
+        .mail
+        .inject(webhook_test_support::mail_memory::Injected::Transient);
+    let mut request = body();
+    request["attachments"] = json!([{
+        "content": STANDARD.encode("file bytes"),
+        "filename": "notes.txt",
+        "content_type": "text/plain",
+    }]);
+
+    let (status, _) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let objects = &h.state.services.objects;
+    let uploaded = objects.put_object_calls();
+    assert!(!uploaded.is_empty());
+    for key in &uploaded {
+        assert!(!objects.contains(key), "{key} was left behind");
+    }
+}
+
+/// Every failure a client can cause carries the JSON error body, including
+/// the ones the framework rejects before a handler runs.
+#[tokio::test]
+async fn malformed_requests_get_the_json_error_body() {
+    let h = seeded().await;
+
+    let (status, response) = post_raw(&h, b"{not json".to_vec(), Some("application/json")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response["name"], "ValidationError");
+    assert_eq!(response["errors"][0]["path"], "body");
+
+    let (status, response) = post_raw(&h, serde_json::to_vec(&body()).unwrap(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response["name"], "ValidationError");
+}
+
+#[tokio::test]
+async fn a_send_body_over_the_function_url_limit_is_too_large() {
+    let h = seeded().await;
+    let (status, body) = post_raw(&h, vec![b' '; 7 * 1024 * 1024], Some("application/json")).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["name"], "PayloadTooLargeError");
+}
+
+#[tokio::test]
+async fn a_send_body_over_one_mebibyte_is_accepted() {
+    // Inline attachments make sends larger than any webhook delivery.
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{
+        "content": STANDARD.encode(vec![b'x'; 2 * 1024 * 1024]),
+        "filename": "big.bin",
+        "content_type": "application/octet-stream",
+    }]);
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
 }
 
 #[tokio::test]

@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize};
 
 pub const MESSAGE_USER_LABEL_CAP: usize = 20;
 pub const THREAD_USER_LABEL_CAP: usize = 20;
-pub const PATCH_LABEL_CHANGES_CAP: usize = 10;
 /// Non-empty, no `#`, whitespace or control characters.
 pub const LABEL_MAX_BYTES: usize = 64;
 pub const SUBJECT_MAX_BYTES: usize = 2_000;

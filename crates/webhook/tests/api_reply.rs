@@ -124,6 +124,24 @@ async fn an_existing_re_prefix_is_not_repeated() {
 }
 
 #[tokio::test]
+async fn a_subject_starting_with_a_multi_byte_character_is_prefixed() {
+    for subject in ["🎉 Party", "ab€ total", "é"] {
+        let (h, original_id) = seeded(|m| m.subject = subject.to_owned()).await;
+
+        let (status, response) = post(
+            &h,
+            &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+            &body(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{subject}");
+        let spec = spec(&h, response["message_id"].as_str().unwrap());
+        assert_eq!(spec.subject, format!("Re: {subject}"));
+    }
+}
+
+#[tokio::test]
 async fn reply_to_on_the_original_wins_over_its_sender() {
     // A sender that asked for replies elsewhere gets them there.
     let (h, original_id) = seeded(|_| {}).await;

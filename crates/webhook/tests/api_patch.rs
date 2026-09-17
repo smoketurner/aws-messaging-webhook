@@ -181,6 +181,48 @@ async fn adding_a_label_makes_the_message_findable_by_it() {
     assert_eq!(list["messages"][0]["message_id"], ids[0]);
 }
 
+/// Labels a request would push past the thread's cap are the caller's to
+/// fix, so they are a 400, not a 500 that invites retrying forever.
+#[tokio::test]
+async fn labels_past_the_thread_cap_are_a_validation_error() {
+    let (h, ids) = seeded("t1", 2).await;
+    let first: Vec<String> = (0..15).map(|i| format!("first-{i:02}")).collect();
+    let second: Vec<String> = (0..6).map(|i| format!("second-{i:02}")).collect();
+
+    let (status, _) = patch(&h, &ids[0], json!({ "add_labels": first })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = patch(&h, &ids[1], json!({ "add_labels": second })).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["name"], "ValidationError");
+    assert_eq!(body["errors"][0]["path"], "labels");
+}
+
+/// A thread full of user labels still takes the system labels the pipeline
+/// applies, such as a delivery outcome.
+#[tokio::test]
+async fn a_thread_full_of_user_labels_still_takes_system_labels() {
+    let (h, ids) = seeded("t1", 1).await;
+    let full: Vec<String> = (0..20).map(|i| format!("mine-{i:02}")).collect();
+    let (status, _) = patch(&h, &ids[0], json!({ "add_labels": full })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let labels = h
+        .state
+        .services
+        .update_labels(
+            &InboxId(INBOX.to_owned()),
+            &ids[0],
+            &["bounced".to_owned()],
+            &[],
+            "2026-01-02T00:00:00.000Z",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(labels.contains(&"bounced".to_owned()));
+}
+
 #[tokio::test]
 async fn service_owned_labels_are_rejected() {
     let (h, ids) = seeded("t1", 1).await;
