@@ -425,7 +425,11 @@ pub fn mark_transition<'a>(
     msg: &crate::mail::MailMessage,
     outcome: crate::mail::store::MarkOutcome<'a>,
     now: &str,
-) -> (SendState, Vec<String>, Option<&'a str>) {
+) -> (
+    SendState,
+    Vec<String>,
+    Option<crate::mail::store::SesSent<'a>>,
+) {
     use crate::mail::store::MarkOutcome;
 
     let relabel = |remove: &str, add: &str| {
@@ -449,10 +453,10 @@ pub fn mark_transition<'a>(
     };
 
     match outcome {
-        MarkOutcome::Sent { ses_message_id } => (
+        MarkOutcome::Sent(sent) => (
             settled(state.sent(now)),
             relabel("queued", "sent"),
-            Some(ses_message_id),
+            Some(sent),
         ),
         MarkOutcome::Failed(failure) => (
             settled(state.failed(failure, now)),

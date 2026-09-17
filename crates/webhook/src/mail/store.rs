@@ -67,7 +67,7 @@ pub enum EnqueueOutcome {
 #[derive(Debug, Clone, Copy)]
 pub enum MarkOutcome<'a> {
     /// SES accepted it, and gave back its own id.
-    Sent { ses_message_id: &'a str },
+    Sent(SesSent<'a>),
     /// It will not be sent.
     Failed(SendFailure),
     /// SES may or may not have it. The message keeps its `queued` label,
@@ -81,6 +81,16 @@ pub enum MarkOutcome<'a> {
     /// An operator asked for an `unknown` send to be attempted again,
     /// accepting the risk that SES already has it.
     Resumed,
+}
+
+/// What SES said about a message it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SesSent<'a> {
+    /// The SES message id.
+    pub message_id: &'a str,
+    /// The region the message was sent through, which SES puts in the
+    /// `Message-ID` it writes over ours.
+    pub region: &'a str,
 }
 
 /// A thread plus one page of its messages, ascending.

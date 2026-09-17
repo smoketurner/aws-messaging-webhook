@@ -142,9 +142,16 @@ For each envelope recipient the rule matched: resolve the inbox, fetch the raw M
 `inbound/raw/`, parse it, extract attachments to S3, resolve the thread, write the content
 document, and commit.
 
-Thread resolution walks `In-Reply-To` then `References`, nearest first, against the RFC aliases
-for that inbox; first hit wins. No hit starts a new thread. There is deliberately no
-subject-based merging: a false join is worse than a split thread.
+Thread resolution tries the message's own `Message-ID`, then `In-Reply-To`, then `References`
+nearest first, against the RFC aliases for that inbox; first hit wins. No hit starts a new
+thread. There is deliberately no subject-based merging: a false join is worse than a split
+thread.
+
+SES writes its own `Message-ID` over the one a sent message carries, so recipients reply to
+`<sesMessageId@email.amazonses.com>` (or the `<region>.amazonses.com` form outside us-east-1).
+Marking a send sent registers both forms as aliases of the sent message. A message sent to this
+inbox arrives back under that id, and the own-`Message-ID` lookup puts the copy in the sent
+message's thread.
 
 Labels are assigned from the receipt's verdicts — `received` and `unread` always, `spam` when
 quarantined, `unauthenticated` when SPF, DKIM or DMARC failed. These select the event type and

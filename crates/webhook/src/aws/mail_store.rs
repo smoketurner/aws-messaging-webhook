@@ -1020,7 +1020,7 @@ impl MailStore for AwsServices {
                     state.message_id
                 )));
             };
-            let (after, labels, ses_message_id) = mark_transition(state, &msg, outcome, now);
+            let (after, labels, ses) = mark_transition(state, &msg, outcome, now);
             let (added, removed) = crate::mail::send::label_changes(&msg.labels, &labels);
             let thread = if added.is_empty() && removed.is_empty() {
                 None
@@ -1042,7 +1042,7 @@ impl MailStore for AwsServices {
                 &msg,
                 &labels,
                 thread.as_ref().map(|(before, after)| (before, after)),
-                ses_message_id,
+                ses,
                 now,
             )?;
             drop_taken_aliases(&mut ops, &taken);

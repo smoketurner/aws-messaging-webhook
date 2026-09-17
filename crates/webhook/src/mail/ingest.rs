@@ -485,7 +485,20 @@ async fn insert_into_inbox<T: Services>(
         .iter()
         .map(|id| strip_angle_brackets(id).to_owned())
         .collect();
-    let candidates = thread::candidate_ids(in_reply_to, &references);
+    // The message's own `Message-ID` goes first: when this inbox already
+    // holds a message by that id — its own send arriving back, since SES
+    // writes the same id over ours on both copies — the copy joins that
+    // message's thread.
+    let own_id = strip_angle_brackets(&template.rfc_message_id);
+    let mut candidates = Vec::new();
+    if !own_id.is_empty() {
+        candidates.push(own_id.to_owned());
+    }
+    for candidate in thread::candidate_ids(in_reply_to, &references) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
     let thread_hit = state
         .services
         .resolve_rfc_ids(inbox_id, &candidates)
