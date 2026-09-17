@@ -1056,7 +1056,7 @@ fn object_failure(error: ObjectError) -> ApiError {
     match error {
         ObjectError::Transient(source) => ApiError::BadGateway(source),
         ObjectError::NotFound | ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
-            ApiError::Internal(anyhow::anyhow!("{error}"))
+            ApiError::Internal(anyhow::Error::new(error))
         }
     }
 }

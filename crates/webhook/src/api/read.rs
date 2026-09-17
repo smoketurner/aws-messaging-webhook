@@ -297,7 +297,7 @@ fn object_failure(error: ObjectError) -> ApiError {
         ObjectError::NotFound => ApiError::NotFound,
         ObjectError::Transient(source) => ApiError::BadGateway(source),
         ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
-            ApiError::Internal(anyhow::anyhow!("{error}"))
+            ApiError::Internal(anyhow::Error::new(error))
         }
     }
 }
@@ -398,7 +398,42 @@ pub(crate) fn store_failure(error: MailStoreError) -> ApiError {
         }
         MailStoreError::Transient(source) => ApiError::BadGateway(source),
         MailStoreError::Conflict | MailStoreError::LabelLimit(_) | MailStoreError::Permanent(_) => {
-            ApiError::Internal(anyhow::anyhow!("{error}"))
+            ApiError::Internal(anyhow::Error::new(error))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 500 body hides the cause, so the log is the only place it
+    /// survives: the conversion must keep the SDK error as a source.
+    #[test]
+    fn a_permanent_store_failure_keeps_its_cause() {
+        let error = store_failure(MailStoreError::Permanent(anyhow::anyhow!(
+            "Query(ByTime): AccessDeniedException"
+        )));
+        let ApiError::Internal(source) = error else {
+            panic!("expected an internal error, got {error:?}");
+        };
+        assert!(
+            format!("{source:?}").contains("AccessDeniedException"),
+            "cause missing from {source:?}"
+        );
+    }
+
+    #[test]
+    fn a_permanent_object_failure_keeps_its_cause() {
+        let error = object_failure(ObjectError::Permanent(anyhow::anyhow!(
+            "GetObject: AccessDenied"
+        )));
+        let ApiError::Internal(source) = error else {
+            panic!("expected an internal error, got {error:?}");
+        };
+        assert!(
+            format!("{source:?}").contains("AccessDenied"),
+            "cause missing from {source:?}"
+        );
     }
 }
