@@ -23,6 +23,8 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use url::Host;
+
 use crate::mail::url_policy::{self, AttachmentUrl, UrlRejected};
 
 /// How many hops a redirect chain may take.
@@ -87,31 +89,6 @@ pub trait AttachmentFetcher: Send + Sync {
     ) -> impl Future<Output = Result<Fetched, FetchError>> + Send;
 }
 
-/// Resolves a host and keeps only the addresses that may be connected to.
-///
-/// # Errors
-///
-/// [`FetchError::NotFound`] when nothing resolves, and
-/// [`FetchError::Blocked`] when any address is not public — any, not all: a
-/// name that resolves to both a public and a private address is a rebinding
-/// attempt, not a usable host.
-async fn vetted_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| FetchError::Transient(anyhow::anyhow!("resolving {host}: {e}")))?
-        .collect();
-
-    if resolved.is_empty() {
-        return Err(FetchError::NotFound);
-    }
-    for address in &resolved {
-        if !url_policy::is_public_ip(address.ip()) {
-            return Err(FetchError::Blocked(UrlRejected::HostNotPublic));
-        }
-    }
-    Ok(resolved)
-}
-
 /// The real fetcher.
 pub struct HttpAttachmentFetcher {
     /// Addresses exempted from the public-address rule, for tests pointing at
@@ -173,22 +150,42 @@ impl HttpAttachmentFetcher {
         url_policy::is_public_ip(address) || self.extra_public.contains(&address)
     }
 
-    /// Resolves and vets, honoring the test exemption.
-    async fn addresses(&self, url: &AttachmentUrl) -> Result<Vec<SocketAddr>, FetchError> {
-        let host = url
-            .as_url()
-            .host_str()
-            .ok_or(FetchError::Blocked(UrlRejected::NoHost))?;
+    /// The addresses to connect to for `url`, each vetted, and the domain
+    /// they were resolved for.
+    ///
+    /// An IP-literal host is connected to as is; only a domain goes to the
+    /// resolver, bounded by [`CONNECT_TIMEOUT`]. The domain is `None` for a
+    /// literal, which has nothing to pin.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::NotFound`] when nothing resolves, and
+    /// [`FetchError::Blocked`] when any address is not public — any, not all:
+    /// a name that resolves to both a public and a private address is a
+    /// rebinding attempt, not a usable host.
+    async fn addresses(
+        &self,
+        url: &AttachmentUrl,
+    ) -> Result<(Option<String>, Vec<SocketAddr>), FetchError> {
         let port = url.as_url().port_or_known_default().unwrap_or(443);
+        let (domain, resolved) = match url.host() {
+            Host::Ipv4(ip) => (None, vec![SocketAddr::new(IpAddr::V4(ip), port)]),
+            Host::Ipv6(ip) => (None, vec![SocketAddr::new(IpAddr::V6(ip), port)]),
+            Host::Domain(domain) => {
+                let resolved: Vec<SocketAddr> =
+                    tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((domain, port)))
+                        .await
+                        .map_err(|_| {
+                            FetchError::Transient(anyhow::anyhow!("resolving {domain} timed out"))
+                        })?
+                        .map_err(|e| {
+                            FetchError::Transient(anyhow::anyhow!("resolving {domain}: {e}"))
+                        })?
+                        .collect();
+                (Some(domain.to_owned()), resolved)
+            }
+        };
 
-        if self.extra_public.is_empty() {
-            return vetted_addresses(host, port).await;
-        }
-
-        let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| FetchError::Transient(anyhow::anyhow!("resolving {host}: {e}")))?
-            .collect();
         if resolved.is_empty() {
             return Err(FetchError::NotFound);
         }
@@ -197,7 +194,7 @@ impl HttpAttachmentFetcher {
                 return Err(FetchError::Blocked(UrlRejected::HostNotPublic));
             }
         }
-        Ok(resolved)
+        Ok((domain, resolved))
     }
 
     /// A client pinned to `addresses` for `host`, so the connection goes to
@@ -207,7 +204,11 @@ impl HttpAttachmentFetcher {
         clippy::unused_self,
         reason = "kept a method so the https_only decision stays with the fetcher's other rules"
     )]
-    fn client(&self, host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client, FetchError> {
+    fn client(
+        &self,
+        domain: Option<&str>,
+        addresses: &[SocketAddr],
+    ) -> Result<reqwest::Client, FetchError> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TOTAL_TIMEOUT)
@@ -219,7 +220,9 @@ impl HttpAttachmentFetcher {
         {
             builder = builder.https_only(true);
         }
-        builder = builder.resolve_to_addrs(host, addresses);
+        if let Some(domain) = domain {
+            builder = builder.resolve_to_addrs(domain, addresses);
+        }
         builder
             .build()
             .map_err(|e| FetchError::Transient(anyhow::anyhow!("building the client: {e}")))
@@ -231,13 +234,8 @@ impl AttachmentFetcher for HttpAttachmentFetcher {
         let mut current = url.clone();
 
         for _hop in 0..=MAX_REDIRECTS {
-            let host = current
-                .as_url()
-                .host_str()
-                .ok_or(FetchError::Blocked(UrlRejected::NoHost))?
-                .to_owned();
-            let addresses = self.addresses(&current).await?;
-            let client = self.client(&host, &addresses)?;
+            let (domain, addresses) = self.addresses(&current).await?;
+            let client = self.client(domain.as_deref(), &addresses)?;
 
             let response = client
                 .get(current.as_str())
@@ -349,6 +347,25 @@ mod tests {
         let port = server.address().port();
         let raw = format!("http://localhost:{port}{path}");
         url_policy::parse_attachment_url_allowing_http(&raw).unwrap()
+    }
+
+    /// `Url::host_str` keeps the brackets on an IPv6 literal, which no
+    /// resolver accepts; a literal is connected to directly instead.
+    #[tokio::test]
+    async fn an_ip_literal_host_is_used_without_resolving() {
+        let fetcher = HttpAttachmentFetcher::new();
+        for (raw, expected) in [
+            (
+                "https://[2606:4700:4700::1111]/a.pdf",
+                "[2606:4700:4700::1111]:443",
+            ),
+            ("https://1.1.1.1/a.pdf", "1.1.1.1:443"),
+        ] {
+            let url = url_policy::parse_attachment_url(raw).unwrap();
+            let (domain, addresses) = fetcher.addresses(&url).await.unwrap();
+            assert_eq!(domain, None, "{raw}");
+            assert_eq!(addresses, vec![expected.parse::<SocketAddr>().unwrap()]);
+        }
     }
 
     #[tokio::test]
