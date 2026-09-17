@@ -615,7 +615,12 @@ mod tests {
 
     #[test]
     fn plan_insert_for_a_new_thread_writes_the_message_thread_and_alias() {
-        let msg = message("support", "tid-1", "mid-1", &["received", "unread"]);
+        let msg = message(
+            "support@example.com",
+            "tid-1",
+            "mid-1",
+            &["received", "unread"],
+        );
         let thread = new_thread(&msg);
         let ops = plan_insert(&msg, None, &thread).unwrap();
 
@@ -637,7 +642,12 @@ mod tests {
     /// reply or delivery event at a message that no longer exists.
     #[test]
     fn lookup_items_expire_with_their_message() {
-        let mut msg = message("support", "tid-1", "mid-1", &["received", "unread"]);
+        let mut msg = message(
+            "support@example.com",
+            "tid-1",
+            "mid-1",
+            &["received", "unread"],
+        );
         msg.expires_at = 1_900_000_000;
         let thread = new_thread(&msg);
         assert_eq!(thread.expires_at, msg.expires_at);
@@ -687,8 +697,14 @@ mod tests {
         assert_eq!(
             aliases,
             vec![
-                ("RFC#support#ses-1@email.amazonses.com", msg.expires_at),
-                ("RFC#support#ses-1@eu-west-1.amazonses.com", msg.expires_at),
+                (
+                    "RFC#support@example.com#ses-1@email.amazonses.com",
+                    msg.expires_at
+                ),
+                (
+                    "RFC#support@example.com#ses-1@eu-west-1.amazonses.com",
+                    msg.expires_at
+                ),
             ]
         );
         let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::SesRef).unwrap().op
@@ -703,9 +719,19 @@ mod tests {
 
     #[test]
     fn plan_insert_for_an_existing_thread_conditions_on_the_version_it_read() {
-        let first = message("support", "tid-1", "mid-1", &["received", "unread"]);
+        let first = message(
+            "support@example.com",
+            "tid-1",
+            "mid-1",
+            &["received", "unread"],
+        );
         let before = new_thread(&first);
-        let mut second = message("support", "tid-1", "mid-2", &["received", "unread"]);
+        let mut second = message(
+            "support@example.com",
+            "tid-1",
+            "mid-2",
+            &["received", "unread"],
+        );
         second.timestamp = "00000002-0000".to_owned();
         let after = apply_message(&before, &second);
 
@@ -735,7 +761,7 @@ mod tests {
     fn plan_enqueue_commits_the_message_and_its_send_state_together() {
         // A queued message without its state item would never be claimed, so
         // both must be in the same transaction, and both must be new.
-        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, None);
@@ -764,7 +790,7 @@ mod tests {
     fn plan_enqueue_puts_the_idempotency_key_first_and_lets_an_expired_one_go() {
         // The key op leads so a cancellation names the replay before any
         // other conflict, and an expired key must be reusable.
-        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, Some("SENDKEY#abc"));
@@ -803,7 +829,7 @@ mod tests {
     fn plan_enqueue_indexes_the_send_state_by_its_status() {
         // The sweep finds work through the status index, so a queued send has
         // to be in the queued partition.
-        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, None);
@@ -830,7 +856,7 @@ mod tests {
 
     #[test]
     fn plan_insert_rejects_a_thread_over_the_label_union_cap() {
-        let mut msg = message("support", "tid-1", "mid-1", &["received"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
         let mut thread = new_thread(&msg);
         for i in 0..THREAD_LABEL_TOTAL_CAP {
             thread.labels.push(format!("label-{i:03}"));
@@ -843,9 +869,19 @@ mod tests {
 
     #[test]
     fn plan_insert_populates_thread_snapshot_from_thread_after_for_inbound_messages() {
-        let first = message("support", "tid-1", "mid-1", &["received", "unread"]);
+        let first = message(
+            "support@example.com",
+            "tid-1",
+            "mid-1",
+            &["received", "unread"],
+        );
         let before = new_thread(&first);
-        let mut second = message("support", "tid-1", "mid-2", &["received", "unread"]);
+        let mut second = message(
+            "support@example.com",
+            "tid-1",
+            "mid-2",
+            &["received", "unread"],
+        );
         second.timestamp = "00000002-0000".to_owned();
         second.from = "other@example.com".to_owned();
         let after = apply_message(&before, &second);
@@ -867,7 +903,7 @@ mod tests {
 
     #[test]
     fn plan_insert_leaves_an_outbound_messages_thread_snapshot_untouched() {
-        let mut msg = message("support", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
 
@@ -882,7 +918,7 @@ mod tests {
 
     #[test]
     fn plan_insert_skips_an_oversized_rfc_alias() {
-        let mut msg = message("support", "tid-1", "mid-1", &["received"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
         msg.rfc_message_id = format!("<{}@example.com>", "x".repeat(ALIAS_ID_MAX_BYTES + 10));
         let thread = new_thread(&msg);
         let ops = plan_insert(&msg, None, &thread).unwrap();
@@ -901,7 +937,7 @@ mod tests {
             let message_labels: Vec<String> = (0..message_label_count)
                 .map(|i| format!("m{i:02}"))
                 .collect();
-            let mut msg = message("support", "tid-1", "mid-1", &[]);
+            let mut msg = message("support@example.com", "tid-1", "mid-1", &[]);
             msg.labels = message_labels;
 
             let mut before = new_thread(&msg);

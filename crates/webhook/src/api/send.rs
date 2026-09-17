@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::api::error::{ApiError, FieldError};
-use crate::config::MailConfig;
 use crate::mail::objects::ObjectError;
 use crate::mail::send::{
     self as send_mod, Envelope, SendKey, SendSpec, SendState, SendStatus, SpecAttachment,
@@ -665,7 +664,7 @@ async fn enqueue<T: Services>(
     // A reply joins the original's thread; anything else starts its own.
     let thread_id = original.map_or_else(|| message_id.clone(), |(o, _)| o.thread_id.clone());
 
-    let mut spec = build_spec(&inbox, config, &validated, &message_id, &thread_id, &now);
+    let mut spec = build_spec(&inbox, &validated, &message_id, &thread_id, &now);
     if let Some((original, original_content)) = original {
         spec.in_reply_to = Some(original.rfc_message_id.clone());
         spec.references = threading_references(original, &original_content.references);
@@ -813,7 +812,7 @@ fn reply_recipients(
     }
     // A message this inbox sent is replied to by writing to its recipients
     // again, not to itself.
-    if original.from.split('@').next() == Some(inbox.as_str()) {
+    if original.from.eq_ignore_ascii_case(inbox.as_str()) {
         return original.to.clone();
     }
     vec![original.from.clone()]
@@ -829,7 +828,7 @@ fn reply_all_recipients(
     let direct = reply_recipients(inbox, original, original_reply_to);
     let mut out = Vec::new();
     for address in original.to.iter().chain(&original.cc) {
-        let is_self = address.split('@').next() == Some(inbox.as_str());
+        let is_self = address.eq_ignore_ascii_case(inbox.as_str());
         if !is_self && !direct.contains(address) && !out.contains(address) {
             out.push(address.clone());
         }
@@ -916,7 +915,6 @@ fn hex(bytes: &[u8]) -> String {
 /// Builds the spec the sender will assemble the message from.
 fn build_spec(
     inbox: &InboxId,
-    config: &MailConfig,
     send: &ValidatedSend,
     message_id: &str,
     thread_id: &str,
@@ -956,7 +954,7 @@ fn build_spec(
         message_id: message_id.to_owned(),
         thread_id: thread_id.to_owned(),
         inbox_id: inbox.clone(),
-        from: format!("{}@{}", inbox.as_str(), config.domain),
+        from: inbox.as_str().to_owned(),
         display_name: None,
         envelope: Envelope {
             to: send.to.clone(),
@@ -967,7 +965,7 @@ fn build_spec(
         subject: send.subject.clone(),
         text: send.text.clone(),
         html: send.html.clone(),
-        rfc_message_id: ids::our_rfc_message_id(message_id, &config.domain),
+        rfc_message_id: ids::our_rfc_message_id(message_id, inbox.domain()),
         in_reply_to: None,
         references: Vec::new(),
         headers: send.headers.clone(),

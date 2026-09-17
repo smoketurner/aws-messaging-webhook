@@ -15,7 +15,7 @@ use webhook_test_support::mail_memory::sample_message;
 use webhook_test_support::{Harness, mail_harness};
 
 const KEY: &str = "am_live_key";
-const INBOX: &str = "support";
+const INBOX: &str = "support@example.com";
 const AT: &str = "2026-01-01T09:00:00.000Z";
 
 async fn post(h: &Harness, path: &str, body: &Value) -> (StatusCode, Value) {
@@ -56,11 +56,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(
-            &InboxId(INBOX.to_owned()),
-            &format!("{INBOX}@example.com"),
-            AT,
-        )
+        .ensure_inbox(&InboxId(INBOX.to_owned()), AT)
         .await
         .unwrap();
 
@@ -69,7 +65,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     let mut msg = sample_message(INBOX, &id, "thread-1");
     AT.clone_into(&mut msg.timestamp);
     "customer@example.net".clone_into(&mut msg.from);
-    msg.to = vec![format!("{INBOX}@example.com")];
+    msg.to = vec![INBOX.to_owned()];
     "Order 42".clone_into(&mut msg.subject);
     "<original@example.net>".clone_into(&mut msg.rfc_message_id);
     adjust(&mut msg);
@@ -157,11 +153,12 @@ async fn reply_all_copies_the_others_but_never_this_inbox() {
     // Replying to all must not send the message back to the inbox that sent
     // it, which would loop.
     let (h, original_id) = seeded(|m| {
-        m.to = vec![
-            format!("{INBOX}@example.com"),
-            "colleague@example.net".to_owned(),
+        m.to = vec![INBOX.to_owned(), "colleague@example.net".to_owned()];
+        // Shares this inbox's local part at another domain: someone else.
+        m.cc = vec![
+            "watcher@example.net".to_owned(),
+            "support@example.net".to_owned(),
         ];
-        m.cc = vec!["watcher@example.net".to_owned()];
     })
     .await;
 
@@ -178,10 +175,14 @@ async fn reply_all_copies_the_others_but_never_this_inbox() {
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(
         spec.envelope.cc,
-        vec!["colleague@example.net", "watcher@example.net"]
+        vec![
+            "colleague@example.net",
+            "watcher@example.net",
+            "support@example.net"
+        ]
     );
     assert!(
-        !spec.envelope.cc.iter().any(|a| a.starts_with(INBOX)),
+        !spec.envelope.cc.iter().any(|a| a == INBOX),
         "this inbox must not be copied on its own reply"
     );
 }

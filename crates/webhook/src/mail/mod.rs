@@ -68,8 +68,9 @@ pub const THREAD_ATTACHMENT_ROUTE_MAX_KEYS: usize = 500;
 // Core storage types
 // ---------------------------------------------------------------------------
 
-/// An inbox identifier: the local part of an inbound address (e.g.
-/// `support` for `support@example.com`).
+/// An inbox identifier: the inbox's full address (e.g.
+/// `support@example.com`). Keeping the domain in the
+/// id keeps stored keys and API paths independent of any one mail domain.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InboxId(pub String);
 
@@ -77,6 +78,12 @@ impl InboxId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The domain part of the address; empty for an id without one.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        self.0.split_once('@').map_or("", |(_, domain)| domain)
     }
 }
 

@@ -44,7 +44,7 @@ fn test_mail_config() -> MailConfig {
         domain: DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: BUCKET.to_owned(),
-        inbox: "support".to_owned(),
+        inbox: "support@example.com".to_owned(),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),
@@ -158,7 +158,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
     assert_eq!(status, StatusCode::OK);
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     let stored = h
         .fake()
         .mail
@@ -244,7 +244,7 @@ async fn direct_sns_invocation_also_ingests() {
     assert!(result.is_ok(), "{result:?}");
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     assert!(
         h.fake()
             .mail
@@ -308,7 +308,7 @@ async fn reply_threads_under_its_parent() {
     );
     let reply_id = expected_message_id("ses-2", reply_ts);
 
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     let reply = h
         .fake()
         .mail
@@ -349,7 +349,7 @@ async fn spam_message_gets_the_spam_label() {
     );
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     let stored = h
         .fake()
         .mail
@@ -388,7 +388,7 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
     );
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     let stored = h
         .fake()
         .mail
@@ -455,7 +455,7 @@ async fn missing_s3_pointer_skips() {
     );
     // No S3 pointer means nothing was ever fetched or inserted; a configured
     // inbox is never even created for a receipt that carries no pointer.
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     assert!(h.fake().mail.get_inbox(&inbox).await.unwrap().is_none());
 }
 
@@ -482,7 +482,7 @@ async fn wrong_bucket_is_a_permanent_skip() {
         StatusCode::OK
     );
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     assert!(
         h.fake()
             .mail
@@ -516,7 +516,7 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
         "a permanent ingest failure is logged and counted, not surfaced as a 5xx"
     );
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     assert!(
         h.fake()
             .mail
@@ -615,7 +615,7 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
         );
     }
 
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     let first = expected_message_id("ses-1", TS);
     let second = h
         .fake()
@@ -640,7 +640,11 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
         &ses_inbound_s3(
             "ses-1",
             TS,
-            &["support@example.com", "sales@example.com"],
+            &[
+                "support@example.com",
+                "sales@example.com",
+                "support@example.net",
+            ],
             BUCKET,
             "inbound/msg-1",
             "PASS",
@@ -667,17 +671,23 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
         }
     };
     assert!(
-        stored("support").await,
+        stored("support@example.com").await,
         "the configured inbox must receive the message"
     );
     assert!(
-        !stored("sales").await,
+        !stored("sales@example.com").await,
         "a recipient other than MAIL_INBOX must be skipped"
+    );
+    assert!(
+        !stored("support@example.net").await,
+        "the inbox's local part at another domain is a different address"
     );
     assert!(
         h.fake()
             .mail
-            .get_inbox(&aws_messaging_webhook::mail::InboxId("sales".to_owned()))
+            .get_inbox(&aws_messaging_webhook::mail::InboxId(
+                "sales@example.com".to_owned()
+            ))
             .await
             .unwrap()
             .is_none(),
@@ -686,7 +696,9 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let created = h
         .fake()
         .mail
-        .get_inbox(&aws_messaging_webhook::mail::InboxId("support".to_owned()))
+        .get_inbox(&aws_messaging_webhook::mail::InboxId(
+            "support@example.com".to_owned(),
+        ))
         .await
         .unwrap()
         .unwrap();
@@ -822,7 +834,7 @@ async fn resume_skips_an_already_present_part() {
         "an already-present part is skipped, never put"
     );
 
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     let stored = state
         .services
         .mail
@@ -924,7 +936,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     assert_eq!(first.unwrap(), "ingested");
 
     let message_id = inbound_message_id("ses-1", envelope_ms);
-    let inbox = aws_messaging_webhook::mail::InboxId("support".to_owned());
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
     assert!(
         state
             .services

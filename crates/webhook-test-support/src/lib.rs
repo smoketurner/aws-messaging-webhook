@@ -164,13 +164,8 @@ impl MailStore for FakeServices {
         self.mail.get_inbox(inbox).await
     }
 
-    async fn ensure_inbox(
-        &self,
-        inbox: &InboxId,
-        email: &str,
-        now: &str,
-    ) -> Result<Inbox, MailStoreError> {
-        self.mail.ensure_inbox(inbox, email, now).await
+    async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
+        self.mail.ensure_inbox(inbox, now).await
     }
 
     async fn message_exists(
@@ -551,7 +546,7 @@ pub fn test_mail_config() -> MailConfig {
         domain: MAIL_DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: MAIL_BUCKET.to_owned(),
-        inbox: "support".to_owned(),
+        inbox: "support@example.com".to_owned(),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),

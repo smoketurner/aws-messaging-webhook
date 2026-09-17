@@ -11,7 +11,7 @@ serialization boundary is this project's own design.
 
 ## What it does
 
-1. **Receives.** The SAM template takes a domain and a list of local parts and provisions the
+1. **Receives.** The SAM template takes a domain and an inbox's local part and provisions the
    AWS side: the SES domain identity, DNS, an S3 bucket for raw mail, the receipt rule set, the
    SNS topics and the wiring into the function. `sam deploy` remains the whole deployment.
 2. **Ingests.** Each received message is fetched from S3, parsed, and stored as message, thread
@@ -64,8 +64,10 @@ sending, and so a slow send cannot occupy the function serving the API.
 
 ## The mail table
 
-A second DynamoDB table, keyed by inbox and message rather than by SNS message id. Every item
-lives in one of these shapes:
+A second DynamoDB table, keyed by inbox and message rather than by SNS message id. An inbox id
+is the inbox's full address (`hello@mail.example.com`), so keys and API paths
+carry the domain and do not assume the stack serves only one. Every item lives in one of these
+shapes:
 
 | Item | `pk` | `sk` | Holds |
 |---|---|---|---|

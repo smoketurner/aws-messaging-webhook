@@ -203,9 +203,9 @@ fn normalized_recipients(receipt: &SesReceipt) -> Vec<String> {
 }
 
 /// Resolves one normalized recipient address to an inbox, appending it to
-/// `resolution.inboxes` on success. A domain mismatch or a local part other
-/// than `MAIL_INBOX` is skipped rather than failing the message, logged at
-/// WARN with a `reason`: a
+/// `resolution.inboxes` on success. An address other than `MAIL_INBOX` is
+/// skipped rather than failing the message, logged at WARN with a `reason`:
+/// a
 /// recipient SES accepted but we don't store is a configuration error worth
 /// seeing in a default INFO deployment. This is a per-recipient
 /// skip, so unlike the whole-message skips above it does not increment
@@ -216,28 +216,16 @@ async fn resolve_recipient<T: Services>(
     address: &str,
     resolution: &mut InboxResolution,
 ) {
-    let Some((local, domain)) = address.split_once('@') else {
-        return;
-    };
-    if !domain.eq_ignore_ascii_case(&mail_config.domain) {
-        tracing::warn!(
-            event = "ingest_skipped",
-            reason = "domain_mismatch",
-            recipient = address,
-            "recipient domain does not match MAIL_DOMAIN"
-        );
-        return;
-    }
-    if local != mail_config.inbox {
+    if address != mail_config.inbox {
         tracing::warn!(
             event = "ingest_skipped",
             reason = "unknown_inbox",
             recipient = address,
-            "recipient local part is not MAIL_INBOX"
+            "recipient is not MAIL_INBOX"
         );
         return;
     }
-    let inbox_id = InboxId(local.to_owned());
+    let inbox_id = InboxId(address.to_owned());
 
     match state.services.get_inbox(&inbox_id).await {
         Ok(Some(_)) => {
@@ -252,7 +240,7 @@ async fn resolve_recipient<T: Services>(
     }
 
     let now = time::format(time::now_ms());
-    match state.services.ensure_inbox(&inbox_id, address, &now).await {
+    match state.services.ensure_inbox(&inbox_id, &now).await {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }
