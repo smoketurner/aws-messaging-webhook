@@ -464,8 +464,23 @@ so a replay that partly succeeded before resolves to the same ids rather than du
 signature is re-verified on replay, which works as long as the signing certificate is still
 valid; that holds comfortably within the queue's 14-day retention.
 
-`rMailSenderDlq` holds sends that exhausted their retries. Replay one the same way, against the
-sender function.
+**A send stuck in `queued`.** `rMailSenderDlq` receives a record when the sender exhausts its
+retries on a queued send. The queue is fed by the mail table's stream, so its messages carry only
+the stream position (`DDBStreamBatchInfo`), not the send, and can't be replayed. The send state
+in the table is the source of truth: once the cause is fixed, re-trigger the sender by stamping
+`requeued_at` on the send, which is the change the sender acts on. The condition leaves a send
+that has moved on untouched.
+
+```bash
+aws dynamodb update-item --table-name "$(output MailTableName)" \
+  --key '{"pk":{"S":"OUTBOX#<message-id>"},"sk":{"S":"STATE"}}' \
+  --update-expression 'SET requeued_at = :now' \
+  --condition-expression 'send_status = :queued AND attribute_not_exists(requeued_at)' \
+  --expression-attribute-values "{\":now\":{\"S\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"},\":queued\":{\"S\":\"queued\"}}"
+```
+
+The sender only reacts to `requeued_at` appearing, so for a send that already carries one, run a
+`REMOVE requeued_at` update first. Then delete the DLQ message.
 
 ## EventBridge contract
 
