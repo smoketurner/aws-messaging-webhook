@@ -157,6 +157,19 @@ async fn process_notification<T: Services>(
 ) -> Result<Response, AppError> {
     let envelope = &verified.envelope;
     let event = DomainEvent::classify(&envelope.message);
+    // SES sends this whenever a receipt rule changes. It is not mail, so it is
+    // acknowledged without being persisted, ingested or published.
+    if let DomainEvent::SesInbound { event: inbound, .. } = &event
+        && inbound.is_setup_notification()
+    {
+        tracing::info!(
+            topic_arn = envelope.topic_arn,
+            sns_message_id = envelope.message_id,
+            event = "ses_setup_notification",
+            "acknowledged SES receipt rule setup notification"
+        );
+        return Ok(StatusCode::OK.into_response());
+    }
     if let Some(family) = event.family() {
         if let Ingress::Http(expected) = ingress
             && family != expected

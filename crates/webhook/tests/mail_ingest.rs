@@ -552,6 +552,35 @@ async fn transient_s3_error_returns_500() {
     );
 }
 
+/// SES publishes a test notification whenever a receipt rule changes. It is
+/// not mail: nothing is persisted, ingested or published for it.
+#[tokio::test]
+async fn the_ses_setup_notification_is_acknowledged_and_ignored() {
+    let h = mail_harness().await;
+    let body = wrapped(
+        &h,
+        &ses_inbound_s3(
+            "AMAZON_SES_SETUP_NOTIFICATION",
+            TS,
+            &["recipient@example.com"],
+            BUCKET,
+            "inbound/raw/AMAZON_SES_SETUP_NOTIFICATION",
+            "PASS",
+            "PASS",
+            "PASS",
+        ),
+    );
+
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        h.fake().calls().is_empty(),
+        "nothing may be persisted or published: {:?}",
+        h.fake().calls()
+    );
+}
+
 #[tokio::test]
 async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let h = mail_harness().await;

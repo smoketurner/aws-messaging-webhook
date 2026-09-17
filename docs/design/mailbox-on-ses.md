@@ -153,6 +153,10 @@ version-conditioned on what was read, and the `Message-ID` alias. The failed con
 message *is* the idempotency signal — a redelivery cancels the whole transaction, so the thread
 is not double-counted.
 
+SES publishes a setup notification (`mail.messageId` `AMAZON_SES_SETUP_NOTIFICATION`) whenever
+a receipt rule changes. It carries no mail and is acknowledged without being persisted or
+published.
+
 An S3 pointer is followed only when the bucket equals `MAIL_BUCKET`. A receipt naming another
 bucket is a permanent skip: never follow a pointer the operator did not configure.
 
