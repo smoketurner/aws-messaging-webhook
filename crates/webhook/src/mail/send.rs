@@ -101,8 +101,13 @@ pub enum SendFailure {
     AttachmentFetchFailed,
     /// Repeated transient failures fetching an attachment.
     AttachmentFetchUnavailable,
+    /// The object store refused the spec or a stored part (for example
+    /// access denied), or stayed unavailable across every attempt.
+    OutboxUnavailable,
     /// The assembled message exceeds what SES accepts.
     MessageTooLarge,
+    /// The message could not be assembled from its spec and parts.
+    BuildFailed,
     /// SES refused it: a bad address, an unverified identity, a paused
     /// account.
     Rejected,
@@ -119,7 +124,9 @@ impl SendFailure {
             Self::SendSpecMissing => "send_spec_missing",
             Self::AttachmentFetchFailed => "attachment_fetch_failed",
             Self::AttachmentFetchUnavailable => "attachment_fetch_unavailable",
+            Self::OutboxUnavailable => "outbox_unavailable",
             Self::MessageTooLarge => "message_too_large",
+            Self::BuildFailed => "build_failed",
             Self::Rejected => "rejected",
             Self::SesUnavailable => "ses_unavailable",
             Self::ClosedByOperator => "closed_by_operator",
@@ -146,6 +153,12 @@ pub struct SendState {
     /// send from one whose sender died.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sending_at: Option<String>,
+    /// When the sender, holding the current claim, was about to call SES.
+    /// Written before the call, so a claim that went stale with this set may
+    /// already have been sent, and the sweep treats it as `unknown` rather
+    /// than sending it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ses_call_at: Option<String>,
     /// Set by a release to hand the record back for another attempt; its
     /// absent-to-present transition is what re-triggers the sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +208,7 @@ impl SendState {
             version: 0,
             envelope,
             sending_at: None,
+            ses_call_at: None,
             requeued_at: None,
             transient_failures: 0,
             last_fetch_failure_at: None,
@@ -307,9 +321,21 @@ impl SendState {
             send_status: SendStatus::Sending,
             version: self.version + 1,
             sending_at: Some(now.to_owned()),
+            ses_call_at: None,
             // Cleared so a later release can set it again and re-trigger the
             // sender through its absent-to-present transition.
             requeued_at: None,
+            updated_at: now.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// The state just before the claimed send calls SES.
+    #[must_use]
+    pub fn calling_ses(&self, now: &str) -> Self {
+        Self {
+            version: self.version + 1,
+            ses_call_at: Some(now.to_owned()),
             updated_at: now.to_owned(),
             ..self.clone()
         }
@@ -371,6 +397,7 @@ impl SendState {
             send_status: SendStatus::Queued,
             version: self.version + 1,
             sending_at: None,
+            ses_call_at: None,
             requeued_at: Some(now.to_owned()),
             transient_failures: 0,
             operator_resend_at: Some(now.to_owned()),
@@ -386,6 +413,7 @@ impl SendState {
             send_status: SendStatus::Queued,
             version: self.version + 1,
             sending_at: None,
+            ses_call_at: None,
             requeued_at: Some(now.to_owned()),
             transient_failures: self.transient_failures + 1,
             updated_at: now.to_owned(),

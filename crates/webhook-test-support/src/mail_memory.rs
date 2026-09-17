@@ -709,6 +709,28 @@ impl MailStore for MailMemoryStore {
         std::future::ready(result)
     }
 
+    fn note_ses_call(
+        &self,
+        claimed: &SendState,
+        now: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::plan::plan_ses_call;
+
+        let result = (|| {
+            let after = claimed.calling_ses(now);
+            let ops = plan_ses_call(claimed, &after)?;
+            for _attempt in 0..=MAX_RETRIES {
+                match self.attempt(&ops)? {
+                    Commit::Applied => return Ok(Some(after)),
+                    Commit::Cancelled(TxnDecision::Retry) => {}
+                    Commit::Cancelled(_) | Commit::AliasTaken(_) => return Ok(None),
+                }
+            }
+            Err(MailStoreError::Conflict)
+        })();
+        std::future::ready(result)
+    }
+
     fn mark_send(
         &self,
         state: &SendState,

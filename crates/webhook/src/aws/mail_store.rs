@@ -1022,6 +1022,26 @@ impl MailStore for AwsServices {
         Err(MailStoreError::Conflict)
     }
 
+    async fn note_ses_call(
+        &self,
+        claimed: &SendState,
+        now: &str,
+    ) -> Result<Option<SendState>, MailStoreError> {
+        let after = claimed.calling_ses(now);
+        let ops = crate::mail::plan::plan_ses_call(claimed, &after)?;
+        for attempt in 0..=MAX_TXN_RETRIES {
+            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+                Attempt::Committed => return Ok(Some(after)),
+                // Throttled or conflicting with another transaction: the same
+                // write is still the right one.
+                Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
+                // The state moved on under this sender: the claim is gone.
+                Attempt::Decision(_) | Attempt::AliasTaken(_) => return Ok(None),
+            }
+        }
+        Err(MailStoreError::Conflict)
+    }
+
     async fn mark_send(
         &self,
         state: &SendState,

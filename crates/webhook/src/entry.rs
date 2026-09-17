@@ -136,7 +136,9 @@ pub async fn dispatch<T: Services>(
         let report = crate::mail::sender::sweep(&state).await?;
         return Ok(serde_json::json!({
             "released": report.released,
+            "markedUnknown": report.marked_unknown,
             "stillWorking": report.still_working,
+            "errors": report.errors,
             "unknown": report.unknown,
         }));
     }
@@ -152,7 +154,12 @@ pub async fn dispatch<T: Services>(
             return match state.config.mode {
                 FunctionMode::Webhook => crate::stream::handle_stream(&state, payload).await,
                 FunctionMode::Sender => {
-                    crate::mail::sender::handle_sender_stream(&state, payload).await
+                    crate::mail::sender::handle_sender_stream(
+                        &state,
+                        payload,
+                        context_deadline(&context),
+                    )
+                    .await
                 }
             };
         }

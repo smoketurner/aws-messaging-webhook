@@ -98,6 +98,9 @@ pub struct FakeServices {
     /// The outcome the next `send_raw` returns, consumed once. Defaults to a
     /// successful send.
     pub send_outcome: Mutex<Option<SendOutcome>>,
+    /// How many transient mail-store failures to inject as `send_raw`
+    /// returns, so a test can make recording an accepted send fail.
+    pub store_failures_after_send: Mutex<usize>,
     /// URLs the fake fetcher serves, by URL string. A URL that is not here
     /// fails the way an unreachable host would.
     pub fetchable: Mutex<std::collections::HashMap<String, Vec<u8>>>,
@@ -243,6 +246,14 @@ impl MailStore for FakeServices {
         now: &str,
     ) -> Result<Option<SendState>, MailStoreError> {
         self.mail.claim_send(message_id, now).await
+    }
+
+    async fn note_ses_call(
+        &self,
+        claimed: &SendState,
+        now: &str,
+    ) -> Result<Option<SendState>, MailStoreError> {
+        self.mail.note_ses_call(claimed, now).await
     }
 
     async fn mark_send(
@@ -412,6 +423,9 @@ impl SmsVoiceApi for FakeServices {
 impl SesApi for FakeServices {
     fn send_raw(&self, request: &RawSend<'_>) -> impl Future<Output = SendOutcome> + Send {
         self.record(format!("send_raw:{}", request.message_id));
+        for _ in 0..std::mem::take(&mut *self.store_failures_after_send.lock().unwrap()) {
+            self.mail.inject(mail_memory::Injected::Transient);
+        }
         self.sent.lock().unwrap().push(SentMessage {
             message_id: request.message_id.to_owned(),
             raw: request.raw.to_vec(),

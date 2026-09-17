@@ -191,6 +191,17 @@ pub trait MailStore: Send + Sync {
         now: &str,
     ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
 
+    /// Records that the send `claimed` describes is about to call SES, and
+    /// returns the updated state.
+    ///
+    /// `None` means the claim was lost: the state is no longer `sending` at
+    /// that version, so this sender must not call SES.
+    fn note_ses_call(
+        &self,
+        claimed: &SendState,
+        now: &str,
+    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
+
     /// Records how a send ended, moving the state item and the message's
     /// mirrored status and labels together.
     fn mark_send(

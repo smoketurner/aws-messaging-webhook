@@ -359,7 +359,9 @@ instead of re-fetching a URL whose content may have changed in the meantime.
 
 A scheduled sweep runs every ten minutes. A sender killed between claiming a send and recording
 its outcome leaves the send `sending` with nobody working on it and no stream record to
-re-trigger it; the sweep releases claims older than fifteen minutes so they are attempted again.
+re-trigger it. The sweep looks at claims older than fifteen minutes: one whose sender never got
+as far as calling SES is released to be attempted again, and one whose sender recorded that it
+was about to call SES moves to `unknown`, since the message may already have gone out.
 That threshold is deliberately well beyond the sender's own timeout: taking a send away from a
 sender still working on it is how the same message gets delivered twice. Sends whose outcome is
 `unknown` are counted and left alone — SES may hold those, so only an operator can decide.
@@ -424,8 +426,8 @@ Two situations need a person. Both are driven by invoking the sender function di
 than through the API: they are rare, destructive and account-scoped, so `lambda:InvokeFunction`
 is a better gate than a bearer key.
 
-**A send whose outcome is `unknown`.** SES was called and no usable answer came back, so it may
-or may not hold the message. Nothing automatic will touch it — resending risks delivering twice.
+**A send whose outcome is `unknown`.** SES was called and no usable answer came back, or the
+sender died after calling it, so SES may or may not hold the message. Nothing automatic will touch it — resending risks delivering twice.
 Find them in the sweep's log line (`sends_outcome_unknown`) or by querying `ByStatus`, then
 decide:
 
