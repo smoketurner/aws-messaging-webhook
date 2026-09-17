@@ -302,7 +302,7 @@ mod tests {
 
     fn message(direction: Direction, labels: &[&str]) -> MailMessage {
         MailMessage {
-            inbox_id: InboxId("support".to_owned()),
+            inbox_id: InboxId("support@example.com".to_owned()),
             thread_id: "tid-1".to_owned(),
             message_id: "mid-1".to_owned(),
             ses_message_id: None,

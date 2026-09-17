@@ -198,7 +198,7 @@ mod tests {
         SendSpec {
             message_id: "mid-1".to_owned(),
             thread_id: "tid-1".to_owned(),
-            inbox_id: InboxId("support".to_owned()),
+            inbox_id: InboxId("support@example.com".to_owned()),
             from: "support@example.com".to_owned(),
             display_name: None,
             envelope: Envelope {

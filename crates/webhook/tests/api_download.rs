@@ -13,7 +13,7 @@ use webhook_test_support::mail_memory::sample_message;
 use webhook_test_support::{Harness, harness};
 
 const KEY: &str = "am_live_key";
-const INBOX: &str = "support";
+const INBOX: &str = "support@example.com";
 const AT: &str = "2026-01-01T09:00:00.000Z";
 
 async fn get(h: &Harness, path: &str) -> (StatusCode, Value) {
@@ -55,11 +55,7 @@ async fn seeded(
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(
-            &InboxId(INBOX.to_owned()),
-            &format!("{INBOX}@example.com"),
-            AT,
-        )
+        .ensure_inbox(&InboxId(INBOX.to_owned()), AT)
         .await
         .unwrap();
 

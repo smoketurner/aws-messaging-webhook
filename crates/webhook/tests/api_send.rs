@@ -18,7 +18,7 @@ use tower::ServiceExt as _;
 use webhook_test_support::{Harness, mail_harness};
 
 const KEY: &str = "am_live_key";
-const INBOX: &str = "support";
+const INBOX: &str = "support@example.com";
 
 async fn post(
     h: &Harness,
@@ -59,11 +59,7 @@ async fn seeded() -> Harness {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(
-            &InboxId(INBOX.to_owned()),
-            &format!("{INBOX}@example.com"),
-            "2026-01-01T00:00:00.000Z",
-        )
+        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
         .await
         .unwrap();
     h
@@ -110,7 +106,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     assert_eq!(message.labels, vec!["queued"]);
     assert_eq!(message.send_status.as_deref(), Some("queued"));
     assert_eq!(message.to, vec!["recipient@example.com"]);
-    assert_eq!(message.from, format!("{INBOX}@example.com"));
+    assert_eq!(message.from, INBOX.to_owned());
     assert_eq!(message.thread_id, thread_id);
 
     // The spec carries the real envelope for the sender.

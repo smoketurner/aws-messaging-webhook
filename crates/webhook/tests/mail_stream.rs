@@ -28,7 +28,7 @@ async fn store_content(h: &Harness, msg: &MailMessage, message_content: MessageC
 
 fn sample_message() -> MailMessage {
     MailMessage {
-        inbox_id: InboxId("support".to_owned()),
+        inbox_id: InboxId("support@example.com".to_owned()),
         thread_id: "tid-1".to_owned(),
         message_id: "mid-1".to_owned(),
         ses_message_id: Some("ses-1".to_owned()),
@@ -147,7 +147,7 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
     );
     assert_eq!(detail["schemaVersion"], 1);
     assert_eq!(detail["meta"]["messageId"], "mid-1");
-    assert_eq!(detail["meta"]["inboxId"], "support");
+    assert_eq!(detail["meta"]["inboxId"], "support@example.com");
     assert_eq!(detail["meta"]["threadId"], "tid-1");
     assert_eq!(detail["meta"]["sesMessageId"], "ses-1");
     assert_eq!(detail["message"]["message_id"], "mid-1");

@@ -23,7 +23,7 @@ use webhook_test_support::objects::ObjectFailure;
 use webhook_test_support::{Harness, mail_harness};
 
 const KEY: &str = "am_live_key";
-const INBOX: &str = "support";
+const INBOX: &str = "support@example.com";
 
 /// Queues one send through the real API and returns its message id.
 async fn queued(h: &Harness, body: &Value) -> String {
@@ -61,11 +61,7 @@ async fn seeded() -> Harness {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(
-            &InboxId(INBOX.to_owned()),
-            &format!("{INBOX}@example.com"),
-            "2026-01-01T00:00:00.000Z",
-        )
+        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
         .await
         .unwrap();
     h
@@ -192,7 +188,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
     let message_id = queued(
         &h,
         &json!({
-            "to": format!("{INBOX}@example.com"),
+            "to": INBOX.to_owned(),
             "subject": "Note to self",
             "text": "the body",
         }),
@@ -213,7 +209,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
         "notificationType": "Received",
         "mail": { "messageId": "inbound-copy", "timestamp": received_at },
         "receipt": {
-            "recipients": [format!("{INBOX}@example.com")],
+            "recipients": [INBOX.to_owned()],
             "timestamp": received_at,
             "spamVerdict": { "status": "PASS" },
             "virusVerdict": { "status": "PASS" },

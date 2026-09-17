@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn a_queued_state_starts_at_version_zero_with_no_claim() {
         let state = SendState::queued(
-            InboxId("support".to_owned()),
+            InboxId("support@example.com".to_owned()),
             "mid-1".to_owned(),
             "tid-1".to_owned(),
             Envelope {
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn a_send_state_round_trips_through_the_item_encoding() {
         let state = SendState::queued(
-            InboxId("support".to_owned()),
+            InboxId("support@example.com".to_owned()),
             "mid-1".to_owned(),
             "tid-1".to_owned(),
             Envelope {

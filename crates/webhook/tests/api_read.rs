@@ -17,7 +17,7 @@ use webhook_test_support::mail_memory::sample_message;
 use webhook_test_support::{Harness, harness};
 
 const KEY: &str = "am_live_key";
-const INBOX: &str = "support";
+const INBOX: &str = "support@example.com";
 
 async fn get(h: &Harness, path: &str) -> (StatusCode, Value) {
     let request = Request::get(path)
@@ -44,11 +44,7 @@ async fn seeded() -> Harness {
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(
-            &InboxId(INBOX.to_owned()),
-            &format!("{INBOX}@example.com"),
-            "2026-01-01T00:00:00.000Z",
-        )
+        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
         .await
         .unwrap();
     h
@@ -142,8 +138,7 @@ async fn a_page_token_from_another_inbox_is_rejected() {
     h.state
         .services
         .ensure_inbox(
-            &InboxId("billing".to_owned()),
-            "billing@example.com",
+            &InboxId("billing@example.com".to_owned()),
             "2026-01-01T00:00:00.000Z",
         )
         .await

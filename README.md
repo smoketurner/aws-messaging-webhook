@@ -266,7 +266,8 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    Add `--key-id <pApiKeysKmsKeyArn>` when you use a customer-managed key. To rotate, overwrite
    the parameter with both entries, move clients to the new key, then remove the old entry.
 
-The API is served under the `ApiBaseUrl` output; `InboxAddress` is the inbox's address.
+The API is served under the `ApiBaseUrl` output; `InboxAddress` is the inbox's address, which is
+also its `inbox_id` (for example `/v0/inboxes/hello@mail.example.com/messages`).
 
 ### Mailbox API
 
@@ -647,7 +648,7 @@ events table above, keyed by inbox and message rather than by SNS message id:
 | Item | `pk` | `sk` | Holds |
 |---|---|---|---|
 | Inbox | `INBOX#<inbox>` | `META` | email, display name, metadata, timestamps |
-| Message | `INBOX#<inbox>` | `MSG#<messageId>` | the full message: addresses, subject, body, labels, attachments, headers |
+| Message | `INBOX#<inbox>` | `MSG#<messageId>` | addresses, subject, preview, labels, attachment metadata, send status; the body and headers are in S3 |
 | Thread | `INBOX#<inbox>` | `THR#<threadId>` | rolled-up subject/preview/senders/recipients/labels, message count, size, newest attachments |
 | RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps an inbound or outbound `Message-ID` to the message/thread it belongs to, for reply threading |
 

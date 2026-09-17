@@ -405,7 +405,6 @@ impl MailStore for MailMemoryStore {
     fn ensure_inbox(
         &self,
         inbox: &InboxId,
-        email: &str,
         now: &str,
     ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send {
         use aws_messaging_webhook::mail::keys;
@@ -423,7 +422,7 @@ impl MailStore for MailMemoryStore {
         }
         let inbox_record = Inbox {
             inbox_id: inbox.clone(),
-            email: email.to_owned(),
+            email: inbox.as_str().to_owned(),
             display_name: None,
             metadata: None,
             created_at: now.to_owned(),
@@ -960,15 +959,15 @@ mod tests {
     use super::*;
 
     fn message(message_id: &str, thread_id: &str) -> MailMessage {
-        sample_message("support", message_id, thread_id)
+        sample_message("support@example.com", message_id, thread_id)
     }
 
     #[tokio::test]
     async fn ensure_inbox_creates_then_returns_the_same_inbox() {
         let store = MailMemoryStore::default();
-        let inbox = InboxId("support".to_owned());
+        let inbox = InboxId("support@example.com".to_owned());
         let created = store
-            .ensure_inbox(&inbox, "support@example.com", "2026-01-01T00:00:00.000Z")
+            .ensure_inbox(&inbox, "2026-01-01T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(created.inbox_id, inbox);
@@ -978,7 +977,7 @@ mod tests {
         assert_eq!(fetched.created_at, created.created_at);
 
         let ensured_again = store
-            .ensure_inbox(&inbox, "support@example.com", "2026-01-02T00:00:00.000Z")
+            .ensure_inbox(&inbox, "2026-01-02T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(ensured_again.created_at, created.created_at);
@@ -1051,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_rfc_ids_returns_none_for_unknown_candidates() {
         let store = MailMemoryStore::default();
-        let inbox = InboxId("support".to_owned());
+        let inbox = InboxId("support@example.com".to_owned());
         let hit = store
             .resolve_rfc_ids(&inbox, &["nope@example.com".to_owned()])
             .await

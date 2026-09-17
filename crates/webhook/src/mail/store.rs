@@ -106,12 +106,10 @@ pub trait MailStore: Send + Sync {
         inbox: &InboxId,
     ) -> impl Future<Output = Result<Option<Inbox>, MailStoreError>> + Send;
 
-    /// Creates the inbox if it doesn't exist. `email` is its full address;
-    /// the store has no domain of its own to build it from.
+    /// Creates the inbox if it doesn't exist. Its `email` is its id.
     fn ensure_inbox(
         &self,
         inbox: &InboxId,
-        email: &str,
         now: &str,
     ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send;
 

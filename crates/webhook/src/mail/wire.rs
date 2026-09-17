@@ -392,7 +392,7 @@ mod tests {
 
     fn sample_message() -> MailMessage {
         MailMessage {
-            inbox_id: InboxId("support".to_owned()),
+            inbox_id: InboxId("support@example.com".to_owned()),
             thread_id: "tid-1".to_owned(),
             message_id: "mid-1".to_owned(),
             ses_message_id: Some("ses-1".to_owned()),
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "inbox_id": "support",
+                "inbox_id": "support@example.com",
                 "thread_id": "tid-1",
                 "message_id": "mid-1",
                 "labels": ["received", "unread"],
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn inbox_golden_shape() {
         let inbox = crate::mail::Inbox {
-            inbox_id: InboxId("support".to_owned()),
+            inbox_id: InboxId("support@example.com".to_owned()),
             email: "support@example.com".to_owned(),
             display_name: Some("Support".to_owned()),
             metadata: None,
@@ -524,7 +524,7 @@ mod tests {
             value,
             json!({
                 "pod_id": "pod_default",
-                "inbox_id": "support",
+                "inbox_id": "support@example.com",
                 "email": "support@example.com",
                 "updated_at": "2026-01-15T09:30:00.000Z",
                 "created_at": "2026-01-15T09:30:00.000Z",

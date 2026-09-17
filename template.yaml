@@ -206,7 +206,7 @@ Resources:
           MAIL_DOMAIN: !If [cHasMailDomain, !Ref pMailDomain, !Ref AWS::NoValue]
           MAIL_TABLE_NAME: !If [cHasMailDomain, !Ref rMailTable, !Ref AWS::NoValue]
           MAIL_BUCKET: !If [cHasMailDomain, !Ref rMailBucket, !Ref AWS::NoValue]
-          MAIL_INBOX: !If [cHasMailDomain, !Ref pMailInbox, !Ref AWS::NoValue]
+          MAIL_INBOX: !If [cHasMailDomain, !Sub "${pMailInbox}@${pMailDomain}", !Ref AWS::NoValue]
           SES_CONFIGURATION_SET: !If [cHasMailDomain, !Ref rMailConfigurationSet, !Ref AWS::NoValue]
           MAIL_IDENTITY_ARN: !If
             - cHasMailDomain
@@ -821,7 +821,7 @@ Resources:
           MAIL_DOMAIN: !Ref pMailDomain
           MAIL_TABLE_NAME: !Ref rMailTable
           MAIL_BUCKET: !Ref rMailBucket
-          MAIL_INBOX: !Ref pMailInbox
+          MAIL_INBOX: !Sub "${pMailInbox}@${pMailDomain}"
           # Never read in sender mode, but the shared mail config requires it.
           API_KEYS_PARAMETER: !Ref pApiKeysParameterName
           SES_CONFIGURATION_SET: !Ref rMailConfigurationSet

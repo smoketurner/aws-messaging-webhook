@@ -52,7 +52,8 @@ pub struct MailConfig {
     /// [`Config::table_name`], which holds only SMS/SES messaging events.
     pub table_name: String,
     pub bucket: String,
-    /// The one inbox's local part (before `@domain`): the only recipient the
+    /// The one inbox's full address, at `domain`: its inbox id, and the only
+    /// recipient the
     /// receipt rule accepts.
     pub inbox: String,
     pub configuration_set: String,
@@ -177,7 +178,7 @@ impl MailConfig {
         let table_name = require("MAIL_TABLE_NAME")?;
         let bucket = require("MAIL_BUCKET")?;
         let inbox = require("MAIL_INBOX")?;
-        validate_inbox(&inbox)?;
+        validate_inbox(&inbox, &domain)?;
 
         let configuration_set = require("SES_CONFIGURATION_SET")?;
         let identity_arn = require("MAIL_IDENTITY_ARN")?;
@@ -231,14 +232,22 @@ fn parse_function_mode(raw: Option<&str>) -> anyhow::Result<FunctionMode> {
     }
 }
 
-/// `MAIL_INBOX` must be a bare local part matching `^[a-z0-9._+-]{1,64}$`
-/// exactly — no trimming, so a padded value is a hard error rather than
-/// silently fixed, matching the template's `AllowedPattern`.
-fn validate_inbox(inbox: &str) -> anyhow::Result<()> {
+/// `MAIL_INBOX` must be the inbox's full address: a local part matching
+/// `^[a-z0-9._+-]{1,64}$` exactly, at `MAIL_DOMAIN` — the domain the stack
+/// receives and sends for. No trimming or case folding, so a padded or
+/// mixed-case value is a hard error rather than silently fixed.
+fn validate_inbox(inbox: &str, domain: &str) -> anyhow::Result<()> {
+    let Some((local, inbox_domain)) = inbox.split_once('@') else {
+        anyhow::bail!("MAIL_INBOX {inbox:?} must be a full address, local@{domain}");
+    };
     anyhow::ensure!(
-        is_valid_local_part(inbox),
-        "MAIL_INBOX {inbox:?} is not a valid local part \
+        is_valid_local_part(local),
+        "MAIL_INBOX {inbox:?} has an invalid local part \
          (expected 1-64 bytes of [a-z0-9._+-], no whitespace, not empty)"
+    );
+    anyhow::ensure!(
+        inbox_domain == domain,
+        "MAIL_INBOX {inbox:?} must be at MAIL_DOMAIN {domain:?}"
     );
     Ok(())
 }
@@ -320,27 +329,32 @@ mod tests {
     }
 
     #[test]
-    fn inbox_accepts_a_local_part() {
-        assert!(validate_inbox("support").is_ok());
+    fn inbox_accepts_a_full_address_at_the_mail_domain() {
+        assert!(validate_inbox("support@example.com", "example.com").is_ok());
     }
 
-    /// A full address is rejected: `@` is not in the local-part character
-    /// class, and the domain comes from `MAIL_DOMAIN`.
     #[test]
-    fn inbox_rejects_a_full_address() {
-        assert!(validate_inbox("support@example.com").is_err());
+    fn inbox_rejects_a_bare_local_part() {
+        assert!(validate_inbox("support", "example.com").is_err());
+    }
+
+    #[test]
+    fn inbox_rejects_an_address_at_another_domain() {
+        assert!(validate_inbox("support@example.net", "example.com").is_err());
+        assert!(validate_inbox("support@mail.example.com", "example.com").is_err());
     }
 
     #[test]
     fn inbox_rejects_a_list() {
-        assert!(validate_inbox("support,billing").is_err());
+        assert!(validate_inbox("support@example.com,billing@example.com", "example.com").is_err());
     }
 
     #[test]
     fn inbox_rejects_empty_padded_and_uppercase_values() {
-        assert!(validate_inbox("").is_err());
-        assert!(validate_inbox(" support ").is_err());
-        assert!(validate_inbox("Support").is_err());
+        assert!(validate_inbox("", "example.com").is_err());
+        assert!(validate_inbox(" support@example.com ", "example.com").is_err());
+        assert!(validate_inbox("Support@example.com", "example.com").is_err());
+        assert!(validate_inbox("@example.com", "example.com").is_err());
     }
 
     #[test]
