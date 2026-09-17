@@ -23,7 +23,7 @@ use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::mail::ids::inbound_message_id;
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::time::parse as parse_ts;
-use aws_messaging_webhook::mail::{ids, ingest};
+use aws_messaging_webhook::mail::{content, ids, ingest};
 use aws_messaging_webhook::model::ses_inbound::SesInboundNotification;
 use aws_messaging_webhook::state::AppState;
 use axum::body::Bytes;
@@ -44,9 +44,7 @@ fn test_mail_config() -> MailConfig {
         domain: DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: BUCKET.to_owned(),
-        inboxes: vec!["support".to_owned(), "sales".to_owned()],
-        catch_all: false,
-        auto_create_inboxes: false,
+        inbox: "support".to_owned(),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),
@@ -54,6 +52,7 @@ fn test_mail_config() -> MailConfig {
         region: "us-east-1".to_owned(),
         send_rate: 1,
         unknown_outbox_retention_days: 30,
+        retention_days: 365,
     }
 }
 
@@ -175,6 +174,41 @@ async fn plain_message_ingests_and_creates_a_thread() {
     assert!(stored.labels.contains(&"received".to_owned()));
     assert!(stored.labels.contains(&"unread".to_owned()));
     assert!(!stored.labels.contains(&"spam".to_owned()));
+
+    // The body, headers and verdicts live in the content document, not the
+    // item.
+    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    assert!(
+        stored_content
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("Hello Bob"))
+    );
+    assert!(stored_content.headers.contains_key("Subject"));
+    assert_eq!(
+        stored_content.verdicts.as_ref().unwrap()["spam"],
+        "PASS",
+        "verdicts come from the SES receipt"
+    );
+
+    // The item and its thread expire with the bucket's lifecycle.
+    let retention_secs = 365 * 86_400;
+    let now_secs = aws_messaging_webhook::mail::time::now_ms() / 1_000;
+    assert!(
+        stored.expires_at > now_secs + retention_secs - 60
+            && stored.expires_at <= now_secs + retention_secs,
+        "expires_at {} is not retention_days from now",
+        stored.expires_at
+    );
+    let thread = h
+        .fake()
+        .mail
+        .get_thread(&inbox, &message_id, 1, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .thread;
+    assert_eq!(thread.expires_at, stored.expires_at);
     assert!(
         h.fake().calls().contains(&"persist:ses-1".to_owned()),
         "the SES receipt is persisted as the outbox entry, keyed by the SES message id, before ingest runs: {:?}",
@@ -519,7 +553,7 @@ async fn transient_s3_error_returns_500() {
 }
 
 #[tokio::test]
-async fn multi_recipient_inserts_into_every_target_inbox() {
+async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let h = mail_harness().await;
     h.fake().objects.seed(
         "inbound/msg-1",
@@ -545,18 +579,43 @@ async fn multi_recipient_inserts_into_every_target_inbox() {
     );
 
     let message_id = expected_message_id("ses-1", TS);
-    for local in ["support", "sales"] {
+    let stored = |local: &str| {
         let inbox = aws_messaging_webhook::mail::InboxId(local.to_owned());
-        assert!(
-            h.fake()
-                .mail
+        let fake = h.fake();
+        let message_id = message_id.clone();
+        async move {
+            fake.mail
                 .get_message(&inbox, &message_id)
                 .await
                 .unwrap()
-                .is_some(),
-            "{local} must have received its own copy"
-        );
-    }
+                .is_some()
+        }
+    };
+    assert!(
+        stored("support").await,
+        "the configured inbox must receive the message"
+    );
+    assert!(
+        !stored("sales").await,
+        "a recipient other than MAIL_INBOX must be skipped"
+    );
+    assert!(
+        h.fake()
+            .mail
+            .get_inbox(&aws_messaging_webhook::mail::InboxId("sales".to_owned()))
+            .await
+            .unwrap()
+            .is_none(),
+        "no inbox may be created for an unconfigured recipient"
+    );
+    let created = h
+        .fake()
+        .mail
+        .get_inbox(&aws_messaging_webhook::mail::InboxId("support".to_owned()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(created.email, "support@example.com");
 }
 
 /// A direct `mail::ingest::ingest_inbound` call — see the module doc for why

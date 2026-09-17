@@ -35,7 +35,9 @@ use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
 use crate::mail::MailMessage;
+use crate::mail::content;
 use crate::mail::events::build_mail_events;
+use crate::mail::objects::ObjectError;
 use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
 use crate::publish::{OutboundEvent, SCHEMA_VERSION, build_outbound};
@@ -209,7 +211,8 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
 }
 
 /// Publishes the `message.received*` event(s) for one `MSG#` mail-table
-/// INSERT image. Returns [`RelayOutcome::Retry`] on a transient publish
+/// INSERT image, with the message's content document read back from S3.
+/// Returns [`RelayOutcome::Retry`] on a transient publish or document read
 /// failure; a deserialization failure is a deterministic bug (not a
 /// transient fault), so it is logged and returns [`RelayOutcome::Settled`]
 /// (an INSERT's absent or empty `OldImage` is never read here, so it can't
@@ -227,7 +230,35 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
         }
     };
 
-    let events = build_mail_events(&msg, &state.config.event_source);
+    if !msg.labels.iter().any(|label| label == "received") {
+        return RelayOutcome::Settled;
+    }
+    let content = match content::load(&state.services, &msg).await {
+        Ok(content) => content,
+        Err(ObjectError::Transient(error)) => {
+            tracing::error!(
+                ?error,
+                message_id = msg.message_id,
+                event = "publish_failure",
+                "failed to read the message content document; will retry"
+            );
+            return RelayOutcome::Retry;
+        }
+        Err(error) => {
+            // Publishing without the content would drop the body for good;
+            // publishing nothing loses the event. Neither is recoverable by
+            // retrying a permanent failure, so publish what the item holds.
+            tracing::error!(
+                ?error,
+                message_id = msg.message_id,
+                event = "stream_bad_mail_content",
+                "message content document could not be read; publishing without it"
+            );
+            content::MessageContent::default()
+        }
+    };
+
+    let events = build_mail_events(&msg, &content, &state.config.event_source);
     let mut outcome = RelayOutcome::Settled;
     for event in events {
         let outbound = OutboundEvent {

@@ -8,6 +8,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::mail::content::MessageContent;
 use crate::mail::{MailMessage, ids, time, wire};
 use crate::publish::{PUT_EVENTS_ENTRY_CAP_BYTES, SCHEMA_VERSION, detail_bytes};
 
@@ -48,7 +49,11 @@ fn received_event_type(labels: &[String]) -> &'static str {
 /// `queued` outbound message) — only a `received` label produces an event
 /// today.
 #[must_use]
-pub fn build_mail_events(msg: &MailMessage, event_source: &str) -> Vec<MailEvent> {
+pub fn build_mail_events(
+    msg: &MailMessage,
+    content: &MessageContent,
+    event_source: &str,
+) -> Vec<MailEvent> {
     if !msg.labels.iter().any(|label| label == "received") {
         return Vec::new();
     }
@@ -76,7 +81,7 @@ pub fn build_mail_events(msg: &MailMessage, event_source: &str) -> Vec<MailEvent
         "type": "event",
         "event_type": event_type,
         "event_id": event_id,
-        "message": to_json(&wire::Message::from(msg)),
+        "message": to_json(&wire::Message::new(msg, content)),
         "thread": to_json(&thread),
         "schemaVersion": SCHEMA_VERSION,
         "meta": meta,
@@ -155,6 +160,14 @@ mod tests {
 
     const EVENT_SOURCE: &str = "aws-messaging-webhook";
 
+    fn sample_content() -> MessageContent {
+        MessageContent {
+            text: Some("Hello there".to_owned()),
+            html: Some("<p>Hello there</p>".to_owned()),
+            ..MessageContent::default()
+        }
+    }
+
     fn sample_message() -> MailMessage {
         MailMessage {
             inbox_id: InboxId("support".to_owned()),
@@ -164,25 +177,18 @@ mod tests {
             direction: Direction::Inbound,
             rfc_message_id: "<mid-1@example.com>".to_owned(),
             in_reply_to: None,
-            references: Vec::new(),
             labels: vec!["received".to_owned(), "unread".to_owned()],
             timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
             from: "sender@example.com".to_owned(),
-            reply_to: Vec::new(),
             to: vec!["support@example.com".to_owned()],
             cc: Vec::new(),
             bcc: Vec::new(),
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             size: 1234,
-            text: Some("Hello there".to_owned()),
-            html: Some("<p>Hello there</p>".to_owned()),
-            body_truncated: false,
-            headers: BTreeMap::new(),
             attachments: Vec::new(),
             attachments_truncated: false,
             raw_s3_key: Some("inbound/x".to_owned()),
-            verdicts: None,
             thread_snapshot: Some(ThreadSnapshot {
                 thread_id: "tid-1".to_owned(),
                 subject: "Hello".to_owned(),
@@ -201,13 +207,15 @@ mod tests {
             version: 1,
             created_at: "2026-01-15T09:30:00.000Z".to_owned(),
             updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+            expires_at: 0,
         }
     }
 
     #[test]
     fn plain_received_message_builds_one_event_with_the_golden_payload() {
         let msg = sample_message();
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let content = sample_content();
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.detail_type, "message.received");
@@ -237,6 +245,7 @@ mod tests {
     #[test]
     fn a_reply_publishes_the_accumulated_thread_state() {
         let mut msg = sample_message();
+        let content = sample_content();
         msg.message_id = "mid-2".to_owned();
         msg.thread_snapshot = Some(ThreadSnapshot {
             thread_id: "tid-1".to_owned(),
@@ -254,7 +263,7 @@ mod tests {
             updated_at: "2026-01-15T09:31:00.000Z".to_owned(),
         });
 
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         let thread = &events[0].detail["thread"];
         assert_eq!(thread["message_count"], 2);
         assert_eq!(thread["subject"], "Hello");
@@ -268,12 +277,13 @@ mod tests {
     #[test]
     fn spam_takes_precedence_over_unauthenticated() {
         let mut msg = sample_message();
+        let content = sample_content();
         msg.labels = vec![
             "received".to_owned(),
             "spam".to_owned(),
             "unauthenticated".to_owned(),
         ];
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         assert_eq!(events[0].detail_type, "message.received.spam");
         assert_eq!(events[0].detail["event_type"], "message.received.spam");
     }
@@ -281,23 +291,26 @@ mod tests {
     #[test]
     fn unauthenticated_without_spam() {
         let mut msg = sample_message();
+        let content = sample_content();
         msg.labels = vec!["received".to_owned(), "unauthenticated".to_owned()];
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         assert_eq!(events[0].detail_type, "message.received.unauthenticated");
     }
 
     #[test]
     fn no_received_label_builds_nothing() {
         let mut msg = sample_message();
+        let content = sample_content();
         msg.labels = vec!["queued".to_owned()];
-        assert!(build_mail_events(&msg, EVENT_SOURCE).is_empty());
+        assert!(build_mail_events(&msg, &content, EVENT_SOURCE).is_empty());
     }
 
     #[test]
     fn event_id_is_stable_across_a_replay_of_the_same_record() {
         let msg = sample_message();
-        let a = build_mail_events(&msg, EVENT_SOURCE);
-        let b = build_mail_events(&msg, EVENT_SOURCE);
+        let content = sample_content();
+        let a = build_mail_events(&msg, &content, EVENT_SOURCE);
+        let b = build_mail_events(&msg, &content, EVENT_SOURCE);
         assert_eq!(a[0].detail["event_id"], b[0].detail["event_id"]);
     }
 
@@ -307,9 +320,10 @@ mod tests {
 
     #[test]
     fn oversized_html_is_dropped_first() {
-        let mut msg = sample_message();
-        msg.html = Some("x".repeat(300_000));
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let msg = sample_message();
+        let mut content = sample_content();
+        content.html = Some("x".repeat(300_000));
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         assert_eq!(events[0].detail["message"]["html"], Value::Null);
         assert_eq!(events[0].detail["message"]["text"], "Hello there");
         assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
@@ -317,11 +331,12 @@ mod tests {
 
     #[test]
     fn oversized_html_and_text_falls_back_to_headers_then_payload_omitted() {
-        let mut msg = sample_message();
-        msg.html = Some("x".repeat(150_000));
-        msg.text = Some("y".repeat(150_000));
-        msg.headers = BTreeMap::from([("X-Big".to_owned(), "z".repeat(50_000))]);
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let msg = sample_message();
+        let mut content = sample_content();
+        content.html = Some("x".repeat(150_000));
+        content.text = Some("y".repeat(150_000));
+        content.headers = BTreeMap::from([("X-Big".to_owned(), "z".repeat(50_000))]);
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         let detail = &events[0].detail;
         assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
         // meta always survives.
@@ -334,8 +349,9 @@ mod tests {
         // reduction steps) stay well over the cap, forcing the final
         // `payloadOmitted` fallback.
         let mut msg = sample_message();
-        msg.html = Some("x".repeat(500_000));
-        msg.text = Some("y".repeat(500_000));
+        let mut content = sample_content();
+        content.html = Some("x".repeat(500_000));
+        content.text = Some("y".repeat(500_000));
         msg.attachments = (0..100)
             .map(|i| AttachmentMeta {
                 attachment_id: format!("att-{i}"),
@@ -347,7 +363,7 @@ mod tests {
                 content_id: None,
             })
             .collect();
-        let events = build_mail_events(&msg, EVENT_SOURCE);
+        let events = build_mail_events(&msg, &content, EVENT_SOURCE);
         let detail = &events[0].detail;
         assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
         assert_eq!(detail["message"]["payloadOmitted"], json!(true));
@@ -365,10 +381,11 @@ mod tests {
             html_len in 0usize..600_000,
             text_len in 0usize..600_000,
         ) {
-            let mut msg = sample_message();
-            msg.html = Some("x".repeat(html_len));
-            msg.text = Some("y".repeat(text_len));
-            let events = build_mail_events(&msg, EVENT_SOURCE);
+            let msg = sample_message();
+            let mut content = sample_content();
+            content.html = Some("x".repeat(html_len));
+            content.text = Some("y".repeat(text_len));
+            let events = build_mail_events(&msg, &content, EVENT_SOURCE);
             prop_assert_eq!(events.len(), 1);
             prop_assert!(entry_bytes(&events[0], EVENT_SOURCE) <= PUT_EVENTS_ENTRY_CAP_BYTES);
         }

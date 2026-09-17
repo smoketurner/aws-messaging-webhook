@@ -208,7 +208,7 @@ pub async fn resolve_unknown<T: Services>(
         .services
         .get_send_state(message_id)
         .await
-        .map_err(|e| store_error(&e))?
+        .map_err(store_error)?
     else {
         return Err(SenderError::Store(anyhow::anyhow!(
             "no send state for {message_id}"
@@ -230,7 +230,7 @@ pub async fn resolve_unknown<T: Services>(
         .services
         .mark_send(&send, outcome, &now)
         .await
-        .map_err(|e| store_error(&e))?;
+        .map_err(store_error)?;
 
     tracing::warn!(
         message_id,
@@ -284,7 +284,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
         .services
         .list_by_status(SendStatus::Sending, SWEEP_LIMIT)
         .await
-        .map_err(|e| store_error(&e))?
+        .map_err(store_error)?
     {
         let claimed_ms = stuck
             .sending_at
@@ -310,7 +310,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
         .services
         .list_by_status(SendStatus::Unknown, SWEEP_LIMIT)
         .await
-        .map_err(|e| store_error(&e))?
+        .map_err(store_error)?
         .len();
     if report.unknown > 0 {
         tracing::warn!(
@@ -344,7 +344,7 @@ pub async fn handle_send<T: Services>(
         .services
         .claim_send(message_id, &now)
         .await
-        .map_err(|e| store_error(&e))?
+        .map_err(store_error)?
     else {
         tracing::debug!(
             message_id,
@@ -443,7 +443,7 @@ async fn record_outcome<T: Services>(
                     now,
                 )
                 .await
-                .map_err(|e| store_error(&e))?;
+                .map_err(store_error)?;
             metrics::counter!(names::MESSAGES_SENT).increment(1);
             tracing::info!(
                 message_id,
@@ -492,7 +492,7 @@ async fn record_outcome<T: Services>(
                 .services
                 .mark_send(claimed, MarkOutcome::Unknown, now)
                 .await
-                .map_err(|e| store_error(&e))?;
+                .map_err(store_error)?;
             metrics::counter!(names::SEND_OUTCOME_UNKNOWN).increment(1);
             Ok(Handled::Unknown)
         }
@@ -532,7 +532,7 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
             tracing::warn!(
                 message_id,
                 key,
-                error = %error,
+                error = ?error,
                 event = "outbox_cleanup_failed",
                 "could not remove an outbox object; it will expire with retention"
             );
@@ -718,7 +718,7 @@ async fn fail<T: Services>(
         .services
         .mark_send(claimed, MarkOutcome::Failed(failure), now)
         .await
-        .map_err(|e| store_error(&e))?;
+        .map_err(store_error)?;
     metrics::counter!(names::SEND_FAILURES).increment(1);
     tracing::warn!(
         message_id = %claimed.message_id,
@@ -738,9 +738,9 @@ async fn release<T: Services>(
         .services
         .mark_send(claimed, MarkOutcome::Released, now)
         .await
-        .map_err(|e| store_error(&e))
+        .map_err(store_error)
 }
 
-fn store_error(error: &MailStoreError) -> SenderError {
-    SenderError::Store(anyhow::anyhow!("{error}"))
+fn store_error(error: MailStoreError) -> SenderError {
+    SenderError::Store(anyhow::Error::new(error))
 }

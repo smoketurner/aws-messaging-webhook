@@ -72,25 +72,18 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         direction: aws_messaging_webhook::mail::Direction::Inbound,
         rfc_message_id: format!("<{message_id}@example.com>"),
         in_reply_to: None,
-        references: Vec::new(),
         labels: vec!["received".to_owned(), "unread".to_owned()],
         timestamp: "00000001-0000".to_owned(),
         from: "sender@example.com".to_owned(),
-        reply_to: Vec::new(),
         to: vec![format!("{inbox}@example.com")],
         cc: Vec::new(),
         bcc: Vec::new(),
         subject: "Hello".to_owned(),
         preview: "Hello there".to_owned(),
         size: 1_000,
-        text: Some("hello there".to_owned()),
-        html: None,
-        body_truncated: false,
-        headers: std::collections::BTreeMap::new(),
         attachments: Vec::new(),
         attachments_truncated: false,
         raw_s3_key: Some("inbound/x".to_owned()),
-        verdicts: None,
         thread_snapshot: None,
         delivery: std::collections::BTreeMap::new(),
         send_status: None,
@@ -98,6 +91,7 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         version: 0,
         created_at: "2026-01-01T00:00:00.000Z".to_owned(),
         updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        expires_at: 0,
     }
 }
 
@@ -220,8 +214,13 @@ impl MailMemoryStore {
                 sk,
                 message_id,
                 thread_id,
+                expires_at,
             } => {
                 let mut item = Item::default();
+                item.inner_mut().insert(
+                    "expires_at".to_owned(),
+                    AttributeValue::N(expires_at.to_string()),
+                );
                 item.inner_mut().insert(
                     "message_id".to_owned(),
                     AttributeValue::S(message_id.clone()),
@@ -400,6 +399,7 @@ impl MailStore for MailMemoryStore {
     fn ensure_inbox(
         &self,
         inbox: &InboxId,
+        email: &str,
         now: &str,
     ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send {
         use aws_messaging_webhook::mail::keys;
@@ -417,7 +417,7 @@ impl MailStore for MailMemoryStore {
         }
         let inbox_record = Inbox {
             inbox_id: inbox.clone(),
-            email: inbox.as_str().to_owned(),
+            email: email.to_owned(),
             display_name: None,
             metadata: None,
             created_at: now.to_owned(),
@@ -722,7 +722,38 @@ impl MailStore for MailMemoryStore {
                 })?;
 
                 let (after, labels, ses_message_id) = mark_transition(state, &msg, outcome, now);
-                let ops = plan_mark(state, &after, &msg, &labels, ses_message_id, now)?;
+                let (added, removed) =
+                    aws_messaging_webhook::mail::send::label_changes(&msg.labels, &labels);
+                let thread = if added.is_empty() && removed.is_empty() {
+                    None
+                } else {
+                    let Some(thread_item) = self.get_item(
+                        &keys::inbox_pk(msg.inbox_id.as_str()),
+                        &keys::thread_sk(&msg.thread_id),
+                    ) else {
+                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
+                            "message {} refers to a thread that does not exist",
+                            msg.message_id
+                        )));
+                    };
+                    let before: ThreadState =
+                        serde_dynamo::from_item(thread_item).map_err(|e| {
+                            MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
+                        })?;
+                    let after = aws_messaging_webhook::mail::thread::apply_label_patch(
+                        &before, &added, &removed, now,
+                    );
+                    Some((before, after))
+                };
+                let ops = plan_mark(
+                    state,
+                    &after,
+                    &msg,
+                    &labels,
+                    thread.as_ref().map(|(before, after)| (before, after)),
+                    ses_message_id,
+                    now,
+                )?;
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(()),
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
@@ -916,16 +947,17 @@ mod tests {
         let store = MailMemoryStore::default();
         let inbox = InboxId("support".to_owned());
         let created = store
-            .ensure_inbox(&inbox, "2026-01-01T00:00:00.000Z")
+            .ensure_inbox(&inbox, "support@example.com", "2026-01-01T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(created.inbox_id, inbox);
+        assert_eq!(created.email, "support@example.com");
 
         let fetched = store.get_inbox(&inbox).await.unwrap().unwrap();
         assert_eq!(fetched.created_at, created.created_at);
 
         let ensured_again = store
-            .ensure_inbox(&inbox, "2026-01-02T00:00:00.000Z")
+            .ensure_inbox(&inbox, "support@example.com", "2026-01-02T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(ensured_again.created_at, created.created_at);

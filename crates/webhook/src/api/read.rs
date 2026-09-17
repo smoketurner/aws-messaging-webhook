@@ -21,7 +21,7 @@ use crate::mail::objects::{self, ObjectError};
 use crate::mail::store::{ListQuery, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
-use crate::mail::{InboxId, MailMessage, time};
+use crate::mail::{InboxId, MailMessage, content, time};
 use crate::state::{AppState, Services};
 
 /// How many store round-trips one list request may spend filling a page.
@@ -179,7 +179,8 @@ pub async fn list_messages<T: Services>(
 /// # Errors
 ///
 /// [`ApiError::NotFound`] when the inbox holds no such message; a store
-/// failure mapped by [`store_failure`].
+/// failure mapped by [`store_failure`], or a content document read failure
+/// mapped by [`object_failure`].
 pub async fn get_message<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path((inbox_id, message_id)): Path<(String, String)>,
@@ -190,7 +191,10 @@ pub async fn get_message<T: Services>(
         .await
         .map_err(store_failure)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(wire::Message::from(&message)))
+    let content = content::load(&state.services, &message)
+        .await
+        .map_err(object_failure)?;
+    Ok(Json(wire::Message::new(&message, &content)))
 }
 
 /// `GET /v0/inboxes/{inbox_id}/messages/{message_id}/raw`
@@ -297,7 +301,7 @@ fn object_failure(error: ObjectError) -> ApiError {
         ObjectError::NotFound => ApiError::NotFound,
         ObjectError::Transient(source) => ApiError::BadGateway(source),
         ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
-            ApiError::Internal(anyhow::anyhow!("{error}"))
+            ApiError::Internal(anyhow::Error::new(error))
         }
     }
 }
@@ -373,12 +377,15 @@ pub async fn get_thread<T: Services>(
         .map_err(store_failure)?
         .ok_or(ApiError::NotFound)?;
 
-    let messages = view
-        .messages
-        .items
-        .iter()
-        .map(wire::Message::from)
-        .collect();
+    // One document read per message on the page; a page is bounded by the
+    // request limit.
+    let mut messages = Vec::with_capacity(view.messages.items.len());
+    for message in &view.messages.items {
+        let content = content::load(&state.services, message)
+            .await
+            .map_err(object_failure)?;
+        messages.push(wire::Message::new(message, &content));
+    }
     Ok(Json(wire::Thread::new(
         &view.thread,
         messages,
@@ -398,7 +405,42 @@ pub(crate) fn store_failure(error: MailStoreError) -> ApiError {
         }
         MailStoreError::Transient(source) => ApiError::BadGateway(source),
         MailStoreError::Conflict | MailStoreError::LabelLimit(_) | MailStoreError::Permanent(_) => {
-            ApiError::Internal(anyhow::anyhow!("{error}"))
+            ApiError::Internal(anyhow::Error::new(error))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 500 body hides the cause, so the log is the only place it
+    /// survives: the conversion must keep the SDK error as a source.
+    #[test]
+    fn a_permanent_store_failure_keeps_its_cause() {
+        let error = store_failure(MailStoreError::Permanent(anyhow::anyhow!(
+            "Query(ByTime): AccessDeniedException"
+        )));
+        let ApiError::Internal(source) = error else {
+            panic!("expected an internal error, got {error:?}");
+        };
+        assert!(
+            format!("{source:?}").contains("AccessDeniedException"),
+            "cause missing from {source:?}"
+        );
+    }
+
+    #[test]
+    fn a_permanent_object_failure_keeps_its_cause() {
+        let error = object_failure(ObjectError::Permanent(anyhow::anyhow!(
+            "GetObject: AccessDenied"
+        )));
+        let ApiError::Internal(source) = error else {
+            panic!("expected an internal error, got {error:?}");
+        };
+        assert!(
+            format!("{source:?}").contains("AccessDenied"),
+            "cause missing from {source:?}"
+        );
     }
 }

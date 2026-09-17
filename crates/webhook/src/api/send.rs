@@ -40,7 +40,7 @@ use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, AttachmentMeta, Direction,
     HEADER_NAME_MAX, HEADER_VALUE_MAX, HEADERS_BUDGET, InboxId, LABEL_MAX_BYTES,
     MAX_OUTBOUND_DECODED_BYTES, MESSAGE_USER_LABEL_CAP, MailMessage, OUTBOUND_RECIPIENTS_MAX,
-    PREVIEW_CHARS, REFERENCES_MAX, SUBJECT_MAX_BYTES, ids, keys, labels, time,
+    PREVIEW_CHARS, REFERENCES_MAX, SUBJECT_MAX_BYTES, content, ids, keys, labels, time,
 };
 use crate::state::{AppState, Services};
 
@@ -607,14 +607,15 @@ pub async fn send<T: Services>(
 
 /// Validates, uploads and commits one outbound message.
 ///
-/// `original`, when present, is the message being replied to; its ids give
-/// the new message its thread and its threading headers.
+/// `original`, when present, is the message being replied to, with its
+/// content document; together they give the new message its thread and its
+/// threading headers.
 async fn enqueue<T: Services>(
     state: &AppState<T>,
     inbox: InboxId,
     request: SendRequest,
     headers: &HeaderMap,
-    original: Option<&MailMessage>,
+    original: Option<(&MailMessage, &content::MessageContent)>,
     route: &str,
 ) -> Result<Json<SendAccepted>, ApiError> {
     let key_hash = idempotency_key_hash(headers)?;
@@ -662,14 +663,25 @@ async fn enqueue<T: Services>(
     let now = time::format(now_ms);
     let message_id = ids::outbound_message_id().to_string();
     // A reply joins the original's thread; anything else starts its own.
-    let thread_id = original.map_or_else(|| message_id.clone(), |o| o.thread_id.clone());
+    let thread_id = original.map_or_else(|| message_id.clone(), |(o, _)| o.thread_id.clone());
 
     let mut spec = build_spec(&inbox, config, &validated, &message_id, &thread_id, &now);
-    if let Some(original) = original {
+    if let Some((original, original_content)) = original {
         spec.in_reply_to = Some(original.rfc_message_id.clone());
-        spec.references = threading_references(original);
+        spec.references = threading_references(original, &original_content.references);
     }
     upload_spec(&state.services, &spec, &validated).await?;
+    let message_content = content::MessageContent {
+        text: validated.text.clone(),
+        html: validated.html.clone(),
+        headers: validated.headers.clone(),
+        references: spec.references.clone(),
+        reply_to: validated.reply_to.clone(),
+        verdicts: None,
+    };
+    content::store(&state.services, &inbox, &message_id, &message_content)
+        .await
+        .map_err(object_failure)?;
 
     let state_item = SendState::queued(
         inbox.clone(),
@@ -683,7 +695,8 @@ async fn enqueue<T: Services>(
         key_hash.as_ref().map(|hash| keys::send_key_pk(hash)),
         &now,
     );
-    let message = queued_message(&inbox, &validated, &spec, &now);
+    let mut message = queued_message(&inbox, &validated, &spec, &now);
+    message.expires_at = time::expires_at(now_ms, config.retention_days);
     let key = key_hash.map(|hash| SendKey {
         key_hash: hash,
         inbox_id: inbox,
@@ -715,8 +728,8 @@ async fn enqueue<T: Services>(
 /// The `References` chain for a reply: the original's own chain plus the
 /// message being replied to, capped so a long thread cannot grow the header
 /// without bound.
-fn threading_references(original: &MailMessage) -> Vec<String> {
-    let mut references = original.references.clone();
+fn threading_references(original: &MailMessage, original_references: &[String]) -> Vec<String> {
+    let mut references = original_references.to_vec();
     if !references.contains(&original.rfc_message_id) {
         references.push(original.rfc_message_id.clone());
     }
@@ -753,14 +766,21 @@ pub async fn reply<T: Services>(
         .await
         .map_err(crate::api::read::store_failure)?
         .ok_or(ApiError::NotFound)?;
+    let original_content = content::load(&state.services, &original)
+        .await
+        .map_err(object_failure)?;
 
     let mut send = request.send;
     // Recipients default to whoever should receive a reply to the original,
     // unless the caller named its own.
     if send.to.is_none() && send.cc.is_none() && send.bcc.is_none() {
-        send.to = Some(Addresses::Many(reply_recipients(&inbox, &original)));
+        send.to = Some(Addresses::Many(reply_recipients(
+            &inbox,
+            &original,
+            &original_content.reply_to,
+        )));
         if request.reply_all {
-            let others = reply_all_recipients(&inbox, &original);
+            let others = reply_all_recipients(&inbox, &original, &original_content.reply_to);
             if !others.is_empty() {
                 send.cc = Some(Addresses::Many(others));
             }
@@ -770,14 +790,26 @@ pub async fn reply<T: Services>(
         send.subject = Some(reply_subject(&original.subject));
     }
 
-    enqueue(&state, inbox, send, &headers, Some(&original), "reply").await
+    enqueue(
+        &state,
+        inbox,
+        send,
+        &headers,
+        Some((&original, &original_content)),
+        "reply",
+    )
+    .await
 }
 
 /// Who a reply goes to: the original's `Reply-To` if it set one, else its
 /// sender.
-fn reply_recipients(inbox: &InboxId, original: &crate::mail::MailMessage) -> Vec<String> {
-    if !original.reply_to.is_empty() {
-        return original.reply_to.clone();
+fn reply_recipients(
+    inbox: &InboxId,
+    original: &crate::mail::MailMessage,
+    original_reply_to: &[String],
+) -> Vec<String> {
+    if !original_reply_to.is_empty() {
+        return original_reply_to.to_vec();
     }
     // A message this inbox sent is replied to by writing to its recipients
     // again, not to itself.
@@ -789,8 +821,12 @@ fn reply_recipients(inbox: &InboxId, original: &crate::mail::MailMessage) -> Vec
 
 /// The other participants, for `reply_all`. This inbox is excluded so a reply
 /// never arrives back in the inbox that sent it.
-fn reply_all_recipients(inbox: &InboxId, original: &crate::mail::MailMessage) -> Vec<String> {
-    let direct = reply_recipients(inbox, original);
+fn reply_all_recipients(
+    inbox: &InboxId,
+    original: &crate::mail::MailMessage,
+    original_reply_to: &[String],
+) -> Vec<String> {
+    let direct = reply_recipients(inbox, original, original_reply_to);
     let mut out = Vec::new();
     for address in original.to.iter().chain(&original.cc) {
         let is_self = address.split('@').next() == Some(inbox.as_str());
@@ -1002,21 +1038,15 @@ fn queued_message(
         direction: Direction::Outbound,
         rfc_message_id: spec.rfc_message_id.clone(),
         in_reply_to: spec.in_reply_to.clone(),
-        references: spec.references.clone(),
         labels,
         timestamp: now.to_owned(),
         from: spec.from.clone(),
-        reply_to: send.reply_to.clone(),
         to: send.to.clone(),
         cc: send.cc.clone(),
         bcc: send.bcc.clone(),
         subject: send.subject.clone(),
         preview: preview_of(send),
         size: 0,
-        text: send.text.clone(),
-        html: send.html.clone(),
-        body_truncated: false,
-        headers: send.headers.clone(),
         attachments: spec
             .attachments
             .iter()
@@ -1032,7 +1062,6 @@ fn queued_message(
             .collect(),
         attachments_truncated: false,
         raw_s3_key: None,
-        verdicts: None,
         thread_snapshot: None,
         delivery: BTreeMap::new(),
         send_status: Some(SendStatus::Queued.as_str().to_owned()),
@@ -1040,6 +1069,7 @@ fn queued_message(
         version: 0,
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
+        expires_at: 0,
     }
 }
 
@@ -1056,7 +1086,7 @@ fn object_failure(error: ObjectError) -> ApiError {
     match error {
         ObjectError::Transient(source) => ApiError::BadGateway(source),
         ObjectError::NotFound | ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
-            ApiError::Internal(anyhow::anyhow!("{error}"))
+            ApiError::Internal(anyhow::Error::new(error))
         }
     }
 }

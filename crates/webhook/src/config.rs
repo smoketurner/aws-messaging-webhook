@@ -52,11 +52,9 @@ pub struct MailConfig {
     /// [`Config::table_name`], which holds only SMS/SES messaging events.
     pub table_name: String,
     pub bucket: String,
-    /// Explicit inbound local parts (before `@domain`). May be empty only
-    /// when `catch_all` is true.
-    pub inboxes: Vec<String>,
-    pub catch_all: bool,
-    pub auto_create_inboxes: bool,
+    /// The one inbox's local part (before `@domain`): the only recipient the
+    /// receipt rule accepts.
+    pub inbox: String,
     pub configuration_set: String,
     pub identity_arn: String,
     /// SSM parameter name holding the bearer API key hashes; must start with
@@ -71,6 +69,10 @@ pub struct MailConfig {
     /// `MailUnknownOutboxRetentionDays`: how long an `unknown` send outcome
     /// stays resolvable before its outbox objects expire (default 30, min 1).
     pub unknown_outbox_retention_days: u32,
+    /// `pMailRetentionDays`: how long mail items and their S3 objects are
+    /// kept. Items carry a DynamoDB TTL this far out, matching the bucket's
+    /// lifecycle expiry.
+    pub retention_days: u32,
 }
 
 impl Config {
@@ -174,19 +176,8 @@ impl MailConfig {
 
         let table_name = require("MAIL_TABLE_NAME")?;
         let bucket = require("MAIL_BUCKET")?;
-        let catch_all = parse_bool_flag("MAIL_CATCH_ALL", optional("MAIL_CATCH_ALL").as_deref())?;
-        let auto_create_inboxes = parse_bool_flag(
-            "MAIL_AUTO_CREATE_INBOXES",
-            optional("MAIL_AUTO_CREATE_INBOXES").as_deref(),
-        )?;
-        let inboxes = match optional("MAIL_INBOXES") {
-            Some(raw) => parse_inbox_list(&raw)?,
-            None => Vec::new(),
-        };
-        anyhow::ensure!(
-            !inboxes.is_empty() || catch_all,
-            "MAIL_INBOXES must list at least one inbox unless MAIL_CATCH_ALL is true"
-        );
+        let inbox = require("MAIL_INBOX")?;
+        validate_inbox(&inbox)?;
 
         let configuration_set = require("SES_CONFIGURATION_SET")?;
         let identity_arn = require("MAIL_IDENTITY_ARN")?;
@@ -204,6 +195,8 @@ impl MailConfig {
             Some(raw) => parse_positive_u32("MAIL_SEND_RATE", &raw)?,
             None => 1,
         };
+        let retention_days =
+            parse_positive_u32("MAIL_RETENTION_DAYS", &require("MAIL_RETENTION_DAYS")?)?;
         let unknown_outbox_retention_days = match optional("MAIL_UNKNOWN_OUTBOX_RETENTION_DAYS") {
             Some(raw) => parse_positive_u32("MAIL_UNKNOWN_OUTBOX_RETENTION_DAYS", &raw)?,
             None => 30,
@@ -213,9 +206,7 @@ impl MailConfig {
             domain,
             table_name,
             bucket,
-            inboxes,
-            catch_all,
-            auto_create_inboxes,
+            inbox,
             configuration_set,
             identity_arn,
             api_keys_parameter,
@@ -223,6 +214,7 @@ impl MailConfig {
             region,
             send_rate,
             unknown_outbox_retention_days,
+            retention_days,
         }))
     }
 }
@@ -239,56 +231,31 @@ fn parse_function_mode(raw: Option<&str>) -> anyhow::Result<FunctionMode> {
     }
 }
 
-/// Maximum `MAIL_INBOXES` entries: the template expands the list into
-/// 10 conditional `!Select` slots (`Fn::Join`'s delimiter must be a literal,
-/// so `CloudFormation` can't map over an arbitrary-length list).
-const MAX_INBOXES: usize = 10;
-
-/// Splits a comma-separated `MAIL_INBOXES` value into validated local parts
-/// at most 10 entries, each matching `^[a-z0-9._+-]{1,64}$` exactly —
-/// no trimming, so a whitespace-padded or empty entry is a hard error rather
-/// than silently dropped, matching the template's `AllowedPattern`.
-fn parse_inbox_list(raw: &str) -> anyhow::Result<Vec<String>> {
-    if raw.is_empty() {
-        // `optional("MAIL_INBOXES")` already treats an empty env var as
-        // absent (so `MailConfig::from_env` never reaches this function with
-        // ""), but handle it here too so this function means the same thing
-        // to any caller: zero entries, not a one-element list holding "".
-        return Ok(Vec::new());
-    }
-    let parts: Vec<&str> = raw.split(',').collect();
+/// `MAIL_INBOX` must be a bare local part matching `^[a-z0-9._+-]{1,64}$`
+/// exactly — no trimming, so a padded value is a hard error rather than
+/// silently fixed, matching the template's `AllowedPattern`.
+fn validate_inbox(inbox: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        parts.len() <= MAX_INBOXES,
-        "MAIL_INBOXES must list at most {MAX_INBOXES} inboxes, got {}",
-        parts.len()
+        is_valid_local_part(inbox),
+        "MAIL_INBOX {inbox:?} is not a valid local part \
+         (expected 1-64 bytes of [a-z0-9._+-], no whitespace, not empty)"
     );
-    parts
-        .into_iter()
-        .map(|part| {
-            anyhow::ensure!(
-                is_valid_local_part(part),
-                "MAIL_INBOXES entry {part:?} is not a valid local part \
-                 (expected 1-64 bytes of [a-z0-9._+-], no whitespace, not empty)"
-            );
-            Ok(part.to_owned())
-        })
-        .collect()
+    Ok(())
 }
 
-fn parse_bool_flag(name: &str, raw: Option<&str>) -> anyhow::Result<bool> {
-    match raw {
-        None => Ok(false),
-        Some(raw) => raw
-            .parse::<bool>()
-            .with_context(|| format!("{name} must be true or false, got {raw:?}")),
-    }
-}
-
-/// `ApiKeysParameterName` must be an absolute SSM parameter path.
+/// `pApiKeysParameterName` must be an absolute SSM parameter path outside
+/// the `aws` and `ssm` prefixes, which SSM reserves in any case.
 fn validate_api_keys_parameter(name: &str) -> anyhow::Result<()> {
+    let Some(path) = name.strip_prefix('/') else {
+        anyhow::bail!("API_KEYS_PARAMETER must start with \"/\", got {name:?}");
+    };
+    let reserved = ["aws", "ssm"].iter().any(|prefix| {
+        path.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    });
     anyhow::ensure!(
-        name.starts_with('/'),
-        "API_KEYS_PARAMETER must start with \"/\", got {name:?}"
+        !reserved,
+        "API_KEYS_PARAMETER must not start with \"/aws\" or \"/ssm\" (reserved by SSM), got {name:?}"
     );
     Ok(())
 }
@@ -353,78 +320,43 @@ mod tests {
     }
 
     #[test]
-    fn inbox_list_accepts_zero_entries() {
-        assert_eq!(parse_inbox_list("").unwrap(), Vec::<String>::new());
+    fn inbox_accepts_a_local_part() {
+        assert!(validate_inbox("support").is_ok());
+    }
+
+    /// A full address is rejected: `@` is not in the local-part character
+    /// class, and the domain comes from `MAIL_DOMAIN`.
+    #[test]
+    fn inbox_rejects_a_full_address() {
+        assert!(validate_inbox("support@example.com").is_err());
     }
 
     #[test]
-    fn inbox_list_accepts_one_entry() {
-        assert_eq!(parse_inbox_list("support").unwrap(), vec!["support"]);
+    fn inbox_rejects_a_list() {
+        assert!(validate_inbox("support,billing").is_err());
     }
 
     #[test]
-    fn inbox_list_validates_each_entry() {
-        let inboxes = parse_inbox_list("support,billing,sales").unwrap();
-        assert_eq!(inboxes, vec!["support", "billing", "sales"]);
-    }
-
-    /// An empty entry (a stray or trailing comma) is a hard error, not
-    /// silently dropped.
-    #[test]
-    fn inbox_list_rejects_a_blank_entry() {
-        assert!(parse_inbox_list("support,,billing").is_err());
-        assert!(parse_inbox_list("support,billing,").is_err());
-    }
-
-    /// Entries are not trimmed, so surrounding whitespace is a local-part
-    /// validation failure rather than being silently stripped.
-    #[test]
-    fn inbox_list_rejects_whitespace_padded_entries() {
-        assert!(parse_inbox_list(" support ,billing").is_err());
-    }
-
-    #[test]
-    fn inbox_list_rejects_a_bad_character() {
-        assert!(parse_inbox_list("support,bad!char").is_err());
-    }
-
-    #[test]
-    fn inbox_list_rejects_an_uppercase_entry() {
-        assert!(parse_inbox_list("support,Billing").is_err());
-    }
-
-    /// A full address (rather than a bare local part) is rejected: `@` is
-    /// not in the local-part character class.
-    #[test]
-    fn inbox_list_rejects_a_full_address_entry() {
-        assert!(parse_inbox_list("support,billing@example.com").is_err());
-    }
-
-    #[test]
-    fn inbox_list_rejects_an_invalid_entry() {
-        assert!(parse_inbox_list("support,Not Valid").is_err());
-    }
-
-    /// At most 10 entries; the template expands into 10 `!Select` slots.
-    #[test]
-    fn inbox_list_accepts_ten_entries_and_rejects_eleven() {
-        let ten = (0..10)
-            .map(|i| format!("inbox{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        assert_eq!(parse_inbox_list(&ten).unwrap().len(), 10);
-
-        let eleven = (0..11)
-            .map(|i| format!("inbox{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        assert!(parse_inbox_list(&eleven).is_err());
+    fn inbox_rejects_empty_padded_and_uppercase_values() {
+        assert!(validate_inbox("").is_err());
+        assert!(validate_inbox(" support ").is_err());
+        assert!(validate_inbox("Support").is_err());
     }
 
     #[test]
     fn api_keys_parameter_requires_leading_slash() {
         assert!(validate_api_keys_parameter("/prod/api-keys").is_ok());
         assert!(validate_api_keys_parameter("prod/api-keys").is_err());
+    }
+
+    #[test]
+    fn api_keys_parameter_rejects_reserved_prefixes() {
+        assert!(validate_api_keys_parameter("/aws-messaging-webhook/dev/api-keys").is_err());
+        assert!(validate_api_keys_parameter("/AWS/api-keys").is_err());
+        assert!(validate_api_keys_parameter("/ssm/api-keys").is_err());
+        assert!(validate_api_keys_parameter("/SsM-keys").is_err());
+        assert!(validate_api_keys_parameter("/messaging-webhook/dev/api-keys").is_ok());
+        assert!(validate_api_keys_parameter("/a").is_ok());
     }
 
     #[test]

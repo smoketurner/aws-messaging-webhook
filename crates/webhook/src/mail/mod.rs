@@ -15,7 +15,6 @@ pub mod objects;
 pub mod plan;
 pub mod send;
 pub mod sender;
-pub mod size;
 pub mod store;
 pub mod time;
 pub mod txn;
@@ -23,6 +22,7 @@ pub mod url_policy;
 pub mod wire;
 
 pub mod build;
+pub mod content;
 pub mod events;
 pub mod fetch;
 pub mod ingest;
@@ -56,7 +56,6 @@ pub const HEADERS_BUDGET: usize = 32_000;
 pub const ATTACHMENTS_MAX: usize = 100;
 pub const ATTACHMENT_FIELD_MAX: usize = 255;
 pub const PREVIEW_CHARS: usize = 256;
-pub const ITEM_BUDGET_BYTES: usize = 380_000;
 /// SES receives up to 40 MB.
 pub const MAX_INBOUND_RAW_BYTES: u64 = 45_000_000;
 pub const MAX_OUTBOUND_DECODED_BYTES: u64 = 28_000_000;
@@ -70,8 +69,7 @@ pub const THREAD_ATTACHMENT_ROUTE_MAX_KEYS: usize = 500;
 // ---------------------------------------------------------------------------
 
 /// An inbox identifier: the local part of an inbound address (e.g.
-/// `support` for `support@example.com`), or the domain itself for a
-/// catch-all inbox.
+/// `support` for `support@example.com`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InboxId(pub String);
 
@@ -145,8 +143,7 @@ pub struct AttachmentMeta {
 /// the thread **including** the message it's attached to — a reply's
 /// `message_count` is the thread's real count, not 1. `senders`/`recipients`
 /// are capped at 20 even though the thread's own address sets may hold up
-/// to 50 (`mail::thread::THREAD_ADDRESS_SET_CAP`); `fit_item` may shrink
-/// them further (`recipients`, then `senders`) to hold the item budget.
+/// to 50 (`mail::thread::THREAD_ADDRESS_SET_CAP`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadSnapshot {
     pub thread_id: String,
@@ -164,8 +161,10 @@ pub struct ThreadSnapshot {
     pub updated_at: String,
 }
 
-/// The `Message` item. Field shrinking to fit [`ITEM_BUDGET_BYTES`] is
-/// [`size::fit_item`]'s job, not this type's.
+/// The `Message` item: what lists, threads, labels and send status read and
+/// update. The write-once content (bodies, headers, `References`,
+/// `Reply-To`, verdicts) lives in S3 as a [`content::MessageContent`], which
+/// keeps this item small. Every field here is bounded by the caps above.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailMessage {
     // Identity and threading.
@@ -178,10 +177,8 @@ pub struct MailMessage {
     pub rfc_message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<String>,
 
-    // Content.
+    // Summary.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -192,8 +189,6 @@ pub struct MailMessage {
     pub timestamp: String,
     pub from: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reply_to: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cc: Vec<String>,
@@ -202,13 +197,6 @@ pub struct MailMessage {
     pub subject: String,
     pub preview: String,
     pub size: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub html: Option<String>,
-    pub body_truncated: bool,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
 
     // Attachments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -218,8 +206,6 @@ pub struct MailMessage {
     pub raw_s3_key: Option<String>,
 
     // Inbound only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verdicts: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_snapshot: Option<ThreadSnapshot>,
 
@@ -237,6 +223,9 @@ pub struct MailMessage {
     pub version: u64,
     pub created_at: String,
     pub updated_at: String,
+    /// DynamoDB TTL (epoch seconds), matching the mail bucket's lifecycle
+    /// expiry so the item and its S3 objects age out together.
+    pub expires_at: u64,
 }
 
 /// Outcome of [`store::MailStore::insert_message`]. A redelivered ingest
@@ -262,9 +251,7 @@ pub enum PutOutcome {
 }
 
 /// A local part valid for an inbound mail address:
-/// `^[a-z0-9._+-]{1,64}$`. The single definition `config.rs` (parsing
-/// `MAIL_INBOXES`) and the catch-all check in `mail::ingest` both use —
-/// previously duplicated in each.
+/// `^[a-z0-9._+-]{1,64}$`, which `config.rs` requires of `MAIL_INBOX`.
 #[must_use]
 pub(crate) fn is_valid_local_part(part: &str) -> bool {
     !part.is_empty()

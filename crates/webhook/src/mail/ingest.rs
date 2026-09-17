@@ -14,8 +14,7 @@ use crate::mail::mime::{ParseError, ParsedAttachment, parse_inbound};
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
 use crate::mail::{
-    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, ids, is_valid_local_part, labels,
-    size, thread, time,
+    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, content, ids, labels, thread, time,
 };
 use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
@@ -78,7 +77,7 @@ async fn run<T: Services>(
         tracing::info!(
             event = "ingest_skipped",
             reason = "no_resolvable_inbox",
-            "no recipient resolved to a stored, configured or auto-creatable inbox"
+            "no recipient resolved to the configured inbox"
         );
         return finish(resolution.had_transient, "ingest_skipped");
     }
@@ -204,9 +203,9 @@ fn normalized_recipients(receipt: &SesReceipt) -> Vec<String> {
 }
 
 /// Resolves one normalized recipient address to an inbox, appending it to
-/// `resolution.inboxes` on success. A domain mismatch, an unknown
-/// non-catch-all local part, or an invalid catch-all local part is skipped
-/// rather than failing the message, logged at WARN with a `reason`: a
+/// `resolution.inboxes` on success. A domain mismatch or a local part other
+/// than `MAIL_INBOX` is skipped rather than failing the message, logged at
+/// WARN with a `reason`: a
 /// recipient SES accepted but we don't store is a configuration error worth
 /// seeing in a default INFO deployment. This is a per-recipient
 /// skip, so unlike the whole-message skips above it does not increment
@@ -229,6 +228,15 @@ async fn resolve_recipient<T: Services>(
         );
         return;
     }
+    if local != mail_config.inbox {
+        tracing::warn!(
+            event = "ingest_skipped",
+            reason = "unknown_inbox",
+            recipient = address,
+            "recipient local part is not MAIL_INBOX"
+        );
+        return;
+    }
     let inbox_id = InboxId(local.to_owned());
 
     match state.services.get_inbox(&inbox_id).await {
@@ -243,34 +251,8 @@ async fn resolve_recipient<T: Services>(
         }
     }
 
-    let is_configured = mail_config
-        .inboxes
-        .iter()
-        .any(|configured| configured == local);
-    let catch_all_eligible = mail_config.catch_all && mail_config.auto_create_inboxes;
-    if !is_configured {
-        if !catch_all_eligible {
-            tracing::warn!(
-                event = "ingest_skipped",
-                reason = "unknown_inbox",
-                recipient = address,
-                "recipient local part is not stored, configured or auto-creatable"
-            );
-            return;
-        }
-        if !is_valid_local_part(local) {
-            tracing::warn!(
-                event = "ingest_skipped",
-                reason = "invalid_local_part",
-                recipient = address,
-                "catch-all local part fails the inbound grammar"
-            );
-            return;
-        }
-    }
-
     let now = time::format(time::now_ms());
-    match state.services.ensure_inbox(&inbox_id, &now).await {
+    match state.services.ensure_inbox(&inbox_id, address, &now).await {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }
@@ -314,18 +296,24 @@ async fn ingest_into_targets<T: Services>(
     message_id_str: &str,
     received_ms: u64,
 ) -> Result<&'static str, ActionError> {
-    let (parsed_message, attachment_metas) =
+    let (mut parsed_message, mut parsed_content, attachment_metas) =
         fetch_parse_and_extract(state, key, message_id, message_id_str).await?;
 
     let verdict =
         labels::classify_inbound(event.receipt.is_quarantined(), auth_failed(&event.receipt));
     let message_labels = verdict_labels(verdict);
-    let now = time::format(time::now_ms());
+    let now_ms = time::now_ms();
+    let now = time::format(now_ms);
     let timestamp = time::format(received_ms);
+    parsed_content.verdicts = Some(verdicts_json(&event.receipt));
+    if let Some(mail) = &state.config.mail {
+        parsed_message.expires_at = time::expires_at(now_ms, mail.retention_days);
+    }
 
     let inserted = insert_into_all_targets(
         state,
         &parsed_message,
+        &parsed_content,
         targets,
         message_id_str,
         &message_labels,
@@ -357,7 +345,7 @@ async fn fetch_parse_and_extract<T: Services>(
     key: &str,
     message_id: Uuid,
     message_id_str: &str,
-) -> Result<(MailMessage, Vec<AttachmentMeta>), ActionError> {
+) -> Result<(MailMessage, content::MessageContent, Vec<AttachmentMeta>), ActionError> {
     let raw = state
         .services
         .get_object(key, MAX_INBOUND_RAW_BYTES)
@@ -394,7 +382,7 @@ async fn fetch_parse_and_extract<T: Services>(
         })
         .collect();
 
-    Ok((parsed.message, attachment_metas))
+    Ok((parsed.message, parsed.content, attachment_metas))
 }
 
 /// Inserts into every target inbox: each is attempted regardless of an
@@ -408,6 +396,7 @@ async fn fetch_parse_and_extract<T: Services>(
 async fn insert_into_all_targets<T: Services>(
     state: &AppState<T>,
     template: &MailMessage,
+    content: &content::MessageContent,
     targets: Vec<InboxId>,
     message_id_str: &str,
     message_labels: &[String],
@@ -424,6 +413,7 @@ async fn insert_into_all_targets<T: Services>(
         match insert_into_inbox(
             state,
             template,
+            content,
             &inbox_id,
             message_id_str,
             message_labels,
@@ -463,9 +453,10 @@ async fn insert_into_all_targets<T: Services>(
     Ok(inserted_any)
 }
 
-/// Builds and inserts this message's item for one target inbox: thread
-/// resolution, label assignment, `fit_item` to the item budget, then
-/// `insert_message` (`Duplicate` counts as success).
+/// Stores this message's content document and inserts its item for one
+/// target inbox: thread resolution, label assignment, the document, then
+/// `insert_message` (`Duplicate` counts as success). The document goes
+/// first so an item never exists without it.
 #[expect(
     clippy::too_many_arguments,
     reason = "one call site; see `ingest_into_targets`"
@@ -473,6 +464,7 @@ async fn insert_into_all_targets<T: Services>(
 async fn insert_into_inbox<T: Services>(
     state: &AppState<T>,
     template: &MailMessage,
+    content: &content::MessageContent,
     inbox_id: &InboxId,
     message_id: &str,
     message_labels: &[String],
@@ -488,7 +480,7 @@ async fn insert_into_inbox<T: Services>(
     // in `mail/plan.rs`) — candidates must be stripped the same way or every
     // lookup misses.
     let in_reply_to = template.in_reply_to.as_deref().map(strip_angle_brackets);
-    let references: Vec<String> = template
+    let references: Vec<String> = content
         .references
         .iter()
         .map(|id| strip_angle_brackets(id).to_owned())
@@ -510,7 +502,6 @@ async fn insert_into_inbox<T: Services>(
     msg.timestamp = timestamp.to_owned();
     msg.attachments = attachment_metas.to_vec();
     msg.raw_s3_key = Some(raw_key.to_owned());
-    msg.verdicts = Some(verdicts_json(&event.receipt));
     // `thread_snapshot` is left `None` here — `plan_insert` populates it
     // from `thread_after` (the thread's full state including this message,
     // computed from the versioned retry loop's consistent read), so a reply
@@ -519,7 +510,9 @@ async fn insert_into_inbox<T: Services>(
     msg.created_at = now.to_owned();
     msg.updated_at = now.to_owned();
 
-    size::fit_item(&mut msg);
+    content::store(&state.services, inbox_id, message_id, content)
+        .await
+        .map_err(map_object_error)?;
 
     state
         .services
@@ -555,8 +548,8 @@ fn auth_failed(receipt: &SesReceipt) -> bool {
     failed(&receipt.spf_verdict) || failed(&receipt.dkim_verdict) || failed(&receipt.dmarc_verdict)
 }
 
-/// A compact JSON summary of every verdict SES reported, stored on the
-/// message item's `verdicts` attribute.
+/// A compact JSON summary of every verdict SES reported, stored in the
+/// message's content document.
 fn verdicts_json(receipt: &SesReceipt) -> serde_json::Value {
     let status = |verdict: &Option<Verdict>| verdict.as_ref().map(|v| v.status.clone());
     serde_json::json!({

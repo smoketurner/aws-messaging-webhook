@@ -74,11 +74,11 @@ git clone https://github.com/smoketurner/aws-messaging-webhook
 cd aws-messaging-webhook
 sam build
 sam deploy --parameter-overrides \
-  "AllowedTopics=<your-account-id> OptOutListName=<your-opt-out-list>"
+  "pAllowedTopics=<your-account-id> pOptOutListName=<your-opt-out-list>"
 ```
 
 > [!IMPORTANT]
-> **`AllowedTopics` is load-bearing security.** Signature verification proves a message came
+> **`pAllowedTopics` is load-bearing security.** Signature verification proves a message came
 > from SNS — from *any* AWS account. The allowlist (12-digit account ids and/or TopicArn globs,
 > comma-separated) is what stops strangers from subscribing your public endpoint to their
 > topics. Empty = accept everything = development only.
@@ -91,7 +91,7 @@ sam deploy --parameter-overrides \
 ### Wire up topics
 
 Topics and subscriptions live outside the stack, next to your EUM/SES configuration. (The one
-exception is the two mail topics the stack creates and subscribes itself when `MailDomain` is
+exception is the two mail topics the stack creates and subscribes itself when `pMailDomain` is
 set; see [Mailbox](#mailbox).) To wire
 a topic to the Function URL (the HTTPS pathway), subscribe it to the matching webhook
 endpoint. The stack outputs each endpoint as a ready-to-use URL:
@@ -144,16 +144,16 @@ destination (SQS) on the function.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `Stage` | `dev` | `dev` or `prod`; `prod` enables DynamoDB deletion protection |
-| `AllowedTopics` | *(empty)* | Comma-separated account ids and/or TopicArn globs — see above |
-| `AutoResubscribe` | `true` | Re-subscribe when an unauthenticated `UnsubscribeURL` is abused |
-| `OptOutListName` | *(empty)* | EUM opt-out list updated by STOP/START keywords; empty disables that action |
-| `EventSource` | `aws-messaging-webhook` | `source` field on published EventBridge events |
-| `RawEventRetentionDays` | `30` | DynamoDB TTL for raw event items |
-| `AggregateRetentionDays` | `365` | DynamoDB TTL for the per-message aggregate item; kept longer than raw events so current state outlives them |
-| `LogLevel` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` (no `TRACE`; see [Upgrading from `LogLevel=TRACE`](#upgrading-from-logleveltrace)) |
-| `LogRetentionDays` | `30` | CloudWatch log retention |
-| `ConsumerAccountIds` | *(empty)* | Comma-separated 12-digit account ids allowed to assume the read-only consumer role (see [Consumer read access](#consumer-read-access)); empty grants none |
+| `pStage` | `dev` | `dev` or `prod`; `prod` enables DynamoDB deletion protection |
+| `pAllowedTopics` | *(empty)* | Comma-separated account ids and/or TopicArn globs — see above |
+| `pAutoResubscribe` | `true` | Re-subscribe when an unauthenticated `UnsubscribeURL` is abused |
+| `pOptOutListName` | *(empty)* | EUM opt-out list updated by STOP/START keywords; empty disables that action |
+| `pEventSource` | `aws-messaging-webhook` | `source` field on published EventBridge events |
+| `pRawEventRetentionDays` | `30` | DynamoDB TTL for raw event items |
+| `pAggregateRetentionDays` | `365` | DynamoDB TTL for the per-message aggregate item; kept longer than raw events so current state outlives them |
+| `pLogLevel` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` (no `TRACE`; see [Upgrading from `pLogLevel=TRACE`](#upgrading-from-plogleveltrace)) |
+| `pLogRetentionDays` | `30` | CloudWatch log retention |
+| `pConsumerAccountIds` | *(empty)* | Comma-separated 12-digit account ids allowed to assume the read-only consumer role (see [Consumer read access](#consumer-read-access)); empty grants none |
 
 ### Deployment contract
 
@@ -164,30 +164,30 @@ destination (SQS) on the function.
   oversized inbound payloads have their embedded content stripped from the EventBridge event
   (the DynamoDB raw record keeps whatever SNS delivered).
 - **SMS opt-out handling** fires only with self-managed opt-outs enabled on your numbers
-  (AWS-managed opt-outs intercept STOP before SNS ever sees it) and requires `OptOutListName`.
+  (AWS-managed opt-outs intercept STOP before SNS ever sees it) and requires `pOptOutListName`.
 - SNS topics and subscriptions deliberately live *outside* this stack, next to your EUM/SES
   configuration; the wiring commands above bridge the two after deploy. The exception is the
   two mail topics a mailbox stack owns (see [Mailbox](#mailbox)).
 
-### Upgrading from `LogLevel=TRACE`
+### Upgrading from `pLogLevel=TRACE`
 
-`TRACE` is no longer an allowed `LogLevel`: at that level the Lambda runtime logs raw
+`TRACE` is no longer an allowed `pLogLevel`: at that level the Lambda runtime logs raw
 invocation payloads and the AWS SDK logs full requests and responses, which leaks secrets.
 CloudFormation reuses a stack's previous parameter values on update, so a stack deployed with
-`LogLevel=TRACE` fails parameter validation on its next deploy. Pass a new level once:
+`pLogLevel=TRACE` fails parameter validation on its next deploy. Pass a new level once:
 
 ```bash
-sam deploy --parameter-overrides "LogLevel=DEBUG"
+sam deploy --parameter-overrides "pLogLevel=DEBUG"
 ```
 
 ## Mailbox
 
-Setting `MailDomain` also makes the stack a mailbox on SES. The stack
+Setting `pMailDomain` also makes the stack a mailbox on SES. The stack
 creates the SES identity and configuration set, a receipt rule that stores inbound mail in S3,
 the mail bucket and mail table, two SNS topics subscribed to the function, and (with
-`HostedZoneId`) the DNS records.
+`pHostedZoneId`) the DNS records.
 
-With `MailDomain` empty (the default), none of those resources exist, and the function keeps
+With `pMailDomain` empty (the default), none of those resources exist, and the function keeps
 its 10 s timeout, 256 MB of memory and its current environment. A mailbox stack runs the
 function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB message.
 
@@ -199,27 +199,25 @@ function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB mes
 
 ```bash
 sam deploy --parameter-overrides \
-  "AllowedTopics=<your-account-id> MailDomain=mail.example.com MailAddresses=hello,support \
-   ApiKeysParameterName=/aws-messaging-webhook/dev/api-keys HostedZoneId=<zone-id>"
+  "pAllowedTopics=<your-account-id> pMailDomain=mail.example.com pMailInbox=hello \
+   pApiKeysParameterName=/messaging-webhook/dev/api-keys pHostedZoneId=<zone-id>"
 ```
 
 ### Mailbox parameters
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `MailDomain` | *(empty)* | Receiving domain and sending identity, e.g. `mail.example.com`. Empty disables every mail resource |
-| `MailAddresses` | *(empty)* | Comma-separated local parts, **at most 10** (e.g. `hello,support`). Each becomes the inbox `<local>@<MailDomain>`. Required unless `MailCatchAll=true`. The cap exists because CloudFormation can't map over a list, so the template builds the recipient addresses from ten fixed slots |
-| `MailCatchAll` | `false` | `true` makes the receipt rule accept every address at the domain |
-| `MailAutoCreateInboxes` | `false` | With catch-all, whether mail to an unknown local part creates an inbox |
-| `MailBucketName` | *(empty)* | Empty lets CloudFormation generate the bucket name |
-| `MailRetentionDays` | `365` | S3 expiration for inbound raw MIME, attachments and sent raw MIME |
-| `HostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
-| `DmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
-| `ReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
-| `ExistingReceiptRuleSetName` | *(empty)* | Empty creates a rule set. Set it to add the rule to a rule set that is already active in the region |
-| `ApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Must start with `/` |
-| `ApiKeysKmsKeyArn` | *(empty)* | Customer-managed KMS key that encrypts that parameter; empty means `aws/ssm` |
-| `AttachmentUrlTtlSeconds` | `900` | Lifetime of presigned download URLs, 60–3600 |
+| `pMailDomain` | *(empty)* | Receiving domain and sending identity, e.g. `mail.example.com`. Empty disables every mail resource |
+| `pMailInbox` | *(empty)* | Local part of the one inbox, e.g. `hello` for `hello@<pMailDomain>`. Required when `pMailDomain` is set; the receipt rule accepts only that address |
+| `pMailBucketName` | *(empty)* | Empty lets CloudFormation generate the bucket name |
+| `pMailRetentionDays` | `365` | How long a message is kept: S3 expiration for raw MIME, attachments and message content, and the TTL on its mail table items |
+| `pHostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
+| `pDmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
+| `pReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
+| `pExistingReceiptRuleSetName` | *(empty)* | Empty creates a rule set. Set it to add the rule to a rule set that is already active in the region |
+| `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Required when `pMailDomain` is set. Must start with `/`, and not with `/aws` or `/ssm`, which SSM reserves |
+| `pApiKeysKmsKeyArn` | *(empty)* | Customer-managed KMS key that encrypts that parameter; empty means `aws/ssm` |
+| `pAttachmentUrlTtlSeconds` | `900` | Lifetime of presigned download URLs, 60–3600 |
 
 ### After the first deploy
 
@@ -231,7 +229,7 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
   --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 ```
 
-1. **Publish DNS** (skip if you set `HostedZoneId`). `output DnsRecords` lists the records:
+1. **Publish DNS** (skip if you set `pHostedZoneId`). `output DnsRecords` lists the records:
    - the domain's MX to `inbound-smtp.<region>.amazonaws.com`;
    - three DKIM CNAMEs;
    - the MAIL FROM domain `bounce.<domain>`, with an MX to `feedback-smtp.<region>.amazonses.com`
@@ -247,28 +245,28 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
 
 3. **Activate the receipt rule set.** A region has exactly one active rule set, so activating
    this one deactivates any other. If a rule set is already active, redeploy with
-   `ExistingReceiptRuleSetName` set to its name instead; the stack then only adds its rule.
+   `pExistingReceiptRuleSetName` set to its name instead; the stack then only adds its rule.
 
    ```bash
    aws ses set-active-receipt-rule-set --rule-set-name "$(output ReceiptRuleSetName)"
    ```
 
 4. **Create the API key parameter.** CloudFormation can't create a SecureString parameter. Its
-   name must start with `/` and equal `ApiKeysParameterName`. The value holds SHA-256 hashes,
+   name must start with `/` and equal `pApiKeysParameterName`. The value holds SHA-256 hashes,
    never the keys:
 
    ```bash
    key="am_$(openssl rand -hex 24)"
    hash=$(printf '%s' "$key" | openssl dgst -sha256 -r | cut -d' ' -f1)
-   aws ssm put-parameter --name /aws-messaging-webhook/dev/api-keys --type SecureString \
+   aws ssm put-parameter --name /messaging-webhook/dev/api-keys --type SecureString \
      --value "{\"keys\":[{\"id\":\"key_1\",\"sha256\":\"$hash\"}]}"
    echo "$key"   # hand this to the client; it isn't stored anywhere
    ```
 
-   Add `--key-id <ApiKeysKmsKeyArn>` when you use a customer-managed key. To rotate, overwrite
+   Add `--key-id <pApiKeysKmsKeyArn>` when you use a customer-managed key. To rotate, overwrite
    the parameter with both entries, move clients to the new key, then remove the old entry.
 
-The API is served under the `ApiBaseUrl` output; `InboxIds` lists the configured inboxes.
+The API is served under the `ApiBaseUrl` output; `InboxAddress` is the inbox's address.
 
 ### Mailbox API
 
@@ -292,8 +290,8 @@ answers `501` with a parseable body.
 Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streamed through the
 function. The URL carries its own authorization — the API key is not needed to follow it, and
 anyone holding the URL can fetch the object until it expires. A message whose raw object or
-attachment has passed `MailRetentionDays`, and an attachment that was dropped for size, answer
-`404`: the metadata survives in the table, but there is nothing stored to hand back.
+attachment has passed `pMailRetentionDays`, and an attachment that was dropped for size, answer
+`404`, since there is nothing stored to hand back.
 
 `PATCH` takes `{"add_labels": …, "remove_labels": …}`, each either one label or a list. Labels
 are lowercased, trimmed and deduplicated. There is no "mark as read" endpoint: removing the
@@ -381,17 +379,21 @@ client follows the token.
 - **Topology.** The stack owns two SNS topics, `MailInboundTopicArn` (receipt notifications)
   and `MailEventsTopicArn` (configuration-set events for sent mail). Both are subscribed to the
   function over the direct (lambda) pathway with per-topic invoke permissions, so there's no
-  wiring step. Every other topic stays outside the stack. When `AllowedTopics` is non-empty,
+  wiring step. Every other topic stays outside the stack. When `pAllowedTopics` is non-empty,
   the two mail topic ARNs are appended to the function's allowlist automatically.
 - **Retries.** Lambda's async queue retries a failed mail delivery twice, then sends it to
-  `MailIngestDlq` (`MailIngestDlqUrl` output). That on-failure destination applies to every
+  `rMailIngestDlq` (`MailIngestDlqUrl` output). That on-failure destination applies to every
   asynchronous invocation of the function, including direct SNS subscriptions you wired by hand.
 - **Mail table stream.** The mail table's stream has at most two readers, the stream relay and
   the mail sender, which is DynamoDB's recommended ceiling. A third consumer needs Kinesis Data
   Streams for DynamoDB.
-- **Retention.** Objects under `inbound/`, `attachments/` and `sent/` expire after
-  `MailRetentionDays`, but mail table items stay. After that, raw-message and attachment
-  downloads for older messages return 404. Nothing under `outbox/` expires.
+- **Storage layout.** SES writes raw MIME under `inbound/raw/`. Each message's bodies, headers,
+  `References`, `Reply-To` and verdicts are stored as `messages/<inbox>/<message_id>.json`; the
+  mail table item holds only what lists, threads, labels and send status need.
+- **Retention.** Objects under `inbound/`, `attachments/`, `messages/` and `sent/` expire after
+  `pMailRetentionDays`, and the message's mail table items carry a TTL of the same length, so a
+  message ages out whole. DynamoDB removes expired items within a few days of their TTL.
+  Nothing under `outbox/` expires.
 - The mail bucket and mail table are retained when the stack or the mailbox is deleted.
 
 ### Mail metrics
@@ -399,21 +401,21 @@ client follows the token.
 Mail ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as
 CloudWatch Embedded Metrics Format (EMF) in the stack-name namespace, each carrying a `function`
 dimension. The stack defines no alarms; build your own alarms or dashboards on these metrics and
-on the `MailIngestDlq` and `PublishDlq` queue depths.
+on the `rMailIngestDlq` and `rPublishDlq` queue depths.
 
 ### Disabling the mailbox
 
-SES refuses to delete the active rule set, so clearing `MailDomain` on a stack whose created
+SES refuses to delete the active rule set, so clearing `pMailDomain` on a stack whose created
 rule set is active fails the update. Deactivate it first:
 
 ```bash
 aws ses set-active-receipt-rule-set   # no name: deactivates the active rule set
 ```
 
-With `ExistingReceiptRuleSetName`, only the stack's rule is removed and no deactivation is
+With `pExistingReceiptRuleSetName`, only the stack's rule is removed and no deactivation is
 needed, but mail to the mailbox addresses then matches no rule. The mail bucket and mail table
 are retained, so delete them by hand if you don't need them. If you re-enable the mailbox with
-the same explicit `MailBucketName`, delete the retained bucket first.
+the same explicit `pMailBucketName`, delete the retained bucket first.
 
 ### Operator runbook
 
@@ -445,7 +447,7 @@ still in flight would race the sender holding it and resolving a finished one wo
 settled outcome. Closing as sent labels the message `sent` without an SES id; closing as failed
 labels it `rejected` with reason `closed_by_operator`.
 
-**Mail that failed to ingest.** Deliveries that exhausted their retries land in `MailIngestDlq`
+**Mail that failed to ingest.** Deliveries that exhausted their retries land in `rMailIngestDlq`
 carrying the original event, so replaying one is re-invoking the webhook function with it:
 
 ```bash
@@ -466,12 +468,27 @@ so a replay that partly succeeded before resolves to the same ids rather than du
 signature is re-verified on replay, which works as long as the signing certificate is still
 valid; that holds comfortably within the queue's 14-day retention.
 
-`MailSenderDlq` holds sends that exhausted their retries. Replay one the same way, against the
-sender function.
+**A send stuck in `queued`.** `rMailSenderDlq` receives a record when the sender exhausts its
+retries on a queued send. The queue is fed by the mail table's stream, so its messages carry only
+the stream position (`DDBStreamBatchInfo`), not the send, and can't be replayed. The send state
+in the table is the source of truth: once the cause is fixed, re-trigger the sender by stamping
+`requeued_at` on the send, which is the change the sender acts on. The condition leaves a send
+that has moved on untouched.
+
+```bash
+aws dynamodb update-item --table-name "$(output MailTableName)" \
+  --key '{"pk":{"S":"OUTBOX#<message-id>"},"sk":{"S":"STATE"}}' \
+  --update-expression 'SET requeued_at = :now' \
+  --condition-expression 'send_status = :queued AND attribute_not_exists(requeued_at)' \
+  --expression-attribute-values "{\":now\":{\"S\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"},\":queued\":{\"S\":\"queued\"}}"
+```
+
+The sender only reacts to `requeued_at` appearing, so for a send that already carries one, run a
+`REMOVE requeued_at` update first. Then delete the DLQ message.
 
 ## EventBridge contract
 
-Events publish to the `<stack-name>-events` bus with `source` = `EventSource` parameter
+Events publish to the `<stack-name>-events` bus with `source` = `pEventSource` parameter
 (default `aws-messaging-webhook`) and these detail-types:
 
 `sms.inbound`, `sms.delivery`, `mms.delivery`, `voice.delivery`, `ses.bounce`, `ses.complaint`, `ses.delivery`, `ses.send`,
@@ -610,12 +627,12 @@ the mail table stream.
 One DynamoDB table (`TableName` output):
 
 - **Event items** — `pk = MSG#<messageId>`, `sk = EVT#<timestamp>#<snsMessageId>`: the exact
-  raw body received, parse metadata, TTL via `expires_at` (`RawEventRetentionDays`, default 30).
+  raw body received, parse metadata, TTL via `expires_at` (`pRawEventRetentionDays`, default 30).
   The insert of each event item is what the stream relay turns into an EventBridge publish.
 - **Aggregate item** — same `pk`, `sk = AGG`: `current_status`, `first/last_event_at`,
   `open_count`, `last_opened_at`, `click_count`, `last_clicked_at`, `bot_open_count`,
   `bot_click_count` (opens/clicks SES flags `isBotEvent=Likely`), `bounce_type`. Its TTL
-  (`AggregateRetentionDays`, default 365) is kept longer than the raw events' so the rolled-up
+  (`pAggregateRetentionDays`, default 365) is kept longer than the raw events' so the rolled-up
   current state outlives them.
 
 A message's full timeline is one `Query` on `pk`; its current state is one `GetItem` on
@@ -659,7 +676,7 @@ them.
 
 When an EventBridge detail is published with `payloadOmitted` (over the 256 KB entry limit),
 or a consumer wants a message's full timeline, it fetches directly from DynamoDB. Cross-account
-consumers get read access through a role, not raw table grants: set `ConsumerAccountIds` to the
+consumers get read access through a role, not raw table grants: set `pConsumerAccountIds` to the
 12-digit account ids at deploy time and the stack creates `<stack-name>-consumer-read`
 (`ConsumerReadRoleArn` output), a role those accounts may assume. It allows `GetItem` /
 `BatchGetItem` / `Query` on the table only — no writes, no `Scan`, and no access to internal
@@ -668,7 +685,7 @@ indexes. A consumer assumes the role, then:
 - current state: `GetItem` on `pk = MSG#<messageId>`, `sk = AGG`
 - full timeline: `Query` on `pk = MSG#<messageId>`
 
-`meta.messageId` on every published detail is the `<messageId>`. Empty `ConsumerAccountIds`
+`meta.messageId` on every published detail is the `<messageId>`. Empty `pConsumerAccountIds`
 (the default) creates no role and grants no cross-account access.
 
 ## Operations
@@ -682,11 +699,11 @@ indexes. A consumer assumes the role, then:
   `unknown` — a sustained rate means a new AWS event shape or junk on a topic), `Duplicates`,
   `EventsPublished` (from the stream relay), `PublishFailures` (a relay publish that will be
   retried), `InternalErrors`, `ActionFailures`, `Resubscribes`, `SubscriptionsLost` (alarm on
-  this — a subscription was cancelled and, with `AutoResubscribe=false`, not re-attached),
+  this — a subscription was cancelled and, with `pAutoResubscribe=false`, not re-attached),
   `ColdStart` (Count = 1 on the first invocation of a new execution environment), and
   `Latency` (histogram, milliseconds per invocation — CloudWatch derives p50/p90/p99). All
   metrics carry a `function` dimension (the Lambda function name). Also alarm on the native
-  Lambda stream `IteratorAge` and the `PublishDlq` queue depth (`PublishDlqUrl` output): a
+  Lambda stream `IteratorAge` and the `rPublishDlq` queue depth (`PublishDlqUrl` output): a
   non-empty DLQ means events exhausted their publish retries.
 - The request path and the stream relay have independent durability. A transient failure in the
   request path (persist or a lifecycle action) returns 5xx so SNS redelivers; the conditional

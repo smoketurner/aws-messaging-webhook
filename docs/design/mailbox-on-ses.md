@@ -34,7 +34,7 @@ an SES receipt over SNS, already persisted to the events table, and already publ
 own stream, an authenticated API on the same router, and a second function for sending.
 
 ```
-                 template.yaml (Condition: HasMailDomain)
+                 template.yaml (Condition: cHasMailDomain)
  ┌──────────────────────────────────────────────────────────────────────┐
  │ MX/DKIM/SPF/DMARC ─► SES receipt rule ─► S3 (raw MIME)               │
  │                                       └─► SNS topic ─► webhook fn    │
@@ -70,12 +70,31 @@ lives in one of these shapes:
 | Item | `pk` | `sk` | Holds |
 |---|---|---|---|
 | Inbox | `INBOX#<inbox>` | `META` | email, display name, metadata, timestamps |
-| Message | `INBOX#<inbox>` | `MSG#<messageId>` | the full message: addresses, subject, body, labels, attachments, headers |
+| Message | `INBOX#<inbox>` | `MSG#<messageId>` | addresses, subject, preview, labels, attachment metadata, send status — not the body |
 | Thread | `INBOX#<inbox>` | `THR#<threadId>` | rolled-up subject, preview, senders, recipients, labels, counts, newest attachments |
 | RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps a `Message-ID` to its message and thread, for threading |
 | Send state | `OUTBOX#<messageId>` | `STATE` | status, envelope, claim and failure bookkeeping |
 | Send key | `SENDKEY#<sha256>` | `KEY` | what an `Idempotency-Key` resolves to |
 | SES reference | `SESMSG#<sesMessageId>` | `REF` | maps an SES id back to a message, for delivery events |
+
+Message, thread, RFC alias and SES reference items carry an `expires_at` TTL of
+`pMailRetentionDays`, the same span the bucket keeps the message's objects, so a message ages
+out whole. A thread takes the TTL of its newest message.
+
+### Message content lives in S3
+
+A message's bodies, headers, `References`, `Reply-To` and verdicts are written once to
+`messages/<inbox>/<messageId>.json` rather than onto the message item. They are most of a
+message's bytes and never change, while the item is rewritten on every label change, send-status
+transition and delivery event, and copied into both list indexes; DynamoDB bills each of those
+writes on the whole item. Keeping the content out keeps the item to a few KB whatever the mail
+looks like, and a body of any size is stored whole rather than truncated to fit.
+
+The document is written before the item's transaction, so an item never exists without it; an
+orphaned document from a transaction that failed is overwritten by the retry, since inbound ids
+are deterministic. Three readers need it: `GET` for one message or one thread, a reply (for the
+original's `References` and `Reply-To`), and the stream relay (for the `message.received` event
+body). List endpoints read only items.
 
 Three indexes: **ByTime** (`gsi1`) over inboxes, messages and threads ordered by time;
 **ByThread** (`gsi2`) over one thread's messages; **ByStatus** (`gsi3`, sparse) over send states
@@ -117,8 +136,9 @@ page size 20, maximum 100.
 
 ## Ingest
 
-For each envelope recipient the rule matched: resolve the inbox, fetch the raw MIME from S3,
-parse it, extract attachments to S3, resolve the thread, and commit.
+For each envelope recipient the rule matched: resolve the inbox, fetch the raw MIME from
+`inbound/raw/`, parse it, extract attachments to S3, resolve the thread, write the content
+document, and commit.
 
 Thread resolution walks `In-Reply-To` then `References`, nearest first, against the RFC aliases
 for that inbox; first hit wins. No hit starts a new thread. There is deliberately no

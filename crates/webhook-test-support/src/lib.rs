@@ -164,8 +164,13 @@ impl MailStore for FakeServices {
         self.mail.get_inbox(inbox).await
     }
 
-    async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
-        self.mail.ensure_inbox(inbox, now).await
+    async fn ensure_inbox(
+        &self,
+        inbox: &InboxId,
+        email: &str,
+        now: &str,
+    ) -> Result<Inbox, MailStoreError> {
+        self.mail.ensure_inbox(inbox, email, now).await
     }
 
     async fn message_exists(
@@ -546,9 +551,7 @@ pub fn test_mail_config() -> MailConfig {
         domain: MAIL_DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: MAIL_BUCKET.to_owned(),
-        inboxes: vec!["support".to_owned(), "sales".to_owned()],
-        catch_all: false,
-        auto_create_inboxes: false,
+        inbox: "support".to_owned(),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),
@@ -556,11 +559,12 @@ pub fn test_mail_config() -> MailConfig {
         region: "us-east-1".to_owned(),
         send_rate: 1,
         unknown_outbox_retention_days: 30,
+        retention_days: 365,
     }
 }
 
 /// A harness with the mailbox configured. [`harness`] leaves `mail` unset,
-/// which is what a stack without `MailDomain` looks like, so every mailbox
+/// which is what a stack without `pMailDomain` looks like, so every mailbox
 /// test needs this instead.
 pub async fn mail_harness() -> Harness {
     let mut harness = harness_with(HarnessOptions::default()).await;
