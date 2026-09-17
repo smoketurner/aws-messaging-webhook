@@ -163,6 +163,15 @@ Conditions:
   cHasAllowedTopics: !Not [!Equals [!Ref pAllowedTopics, ""]]
   cAllowlistMailTopics: !And [!Condition cHasMailDomain, !Condition cHasAllowedTopics]
 
+# Both functions are the same Rust binary on the same runtime; only their
+# FUNCTION_MODE, sizing and permissions differ.
+Globals:
+  Function:
+    CodeUri: .
+    Handler: bootstrap
+    Runtime: provided.al2023
+    Architectures: [arm64]
+
 Resources:
   rWebhookFunction:
     Type: AWS::Serverless::Function
@@ -172,11 +181,6 @@ Resources:
         # Workspace build: pick the webhook binary explicitly.
         Binary: aws-messaging-webhook
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-webhook"
-      CodeUri: .
-      Handler: bootstrap
-      Runtime: provided.al2023
-      Architectures: [arm64]
       # Mail ingest parses up to 40 MB of MIME inside one invocation.
       MemorySize: !If [cHasMailDomain, 512, 256]
       Timeout: !If [cHasMailDomain, 90, 10]
@@ -215,31 +219,6 @@ Resources:
           API_KEYS_PARAMETER: !If [cHasApiKeys, !Ref pApiKeysParameterName, !Ref AWS::NoValue]
           ATTACHMENT_URL_TTL_SECONDS: !If [cHasMailDomain, !Ref pAttachmentUrlTtlSeconds, !Ref AWS::NoValue]
           MAIL_RETENTION_DAYS: !If [cHasMailDomain, !Ref pMailRetentionDays, !Ref AWS::NoValue]
-      Events:
-        # The stream relay: the sole publisher of event details to EventBridge.
-        # Retries a failed publish, bisects a poison batch, reports per-record
-        # failures, and routes anything past the retry limit to the DLQ so a
-        # publish can never be silently lost.
-        StreamRelay:
-          Type: DynamoDB
-          Properties:
-            Stream: !GetAtt rEventsTable.StreamArn
-            StartingPosition: TRIM_HORIZON
-            BatchSize: 100
-            MaximumBatchingWindowInSeconds: 5
-            BisectBatchOnFunctionError: true
-            MaximumRetryAttempts: 10
-            FunctionResponseTypes:
-              - ReportBatchItemFailures
-            # Event-item INSERTs (the events) and aggregate INSERT/MODIFYs
-            # (status transitions). TTL REMOVEs are dropped. Event items are
-            # write-once, so they only ever INSERT.
-            FilterCriteria:
-              Filters:
-                - Pattern: '{"eventName":["INSERT","MODIFY"]}'
-            DestinationConfig:
-              OnFailure:
-                Destination: !GetAtt rPublishDlq.Arn
       Policies:
         - Statement:
             - Sid: PersistEvents
@@ -272,12 +251,33 @@ Resources:
               Effect: Allow
               Action: ses:PutSuppressedDestination
               Resource: "*"
+            # rEventsStreamMapping is a standalone resource rather than a SAM
+            # DynamoDB event, so these reads are granted here. The SAM event
+            # attaches AWSLambdaDynamoDBExecutionRole instead, which allows
+            # stream reads on every table in the account.
+            - Sid: EventsStreamRead
+              Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+              Resource: !GetAtt rEventsTable.StreamArn
+            - Sid: ListStreams
+              Effect: Allow
+              Action: dynamodb:ListStreams
+              Resource: "*"
             # The stream event-source mapping routes records that exhaust their
             # retries to this queue; the function role needs to write to it.
             - Sid: PublishOnFailureDlq
               Effect: Allow
               Action: sqs:SendMessage
               Resource: !GetAtt rPublishDlq.Arn
+            # The async-invoke on-failure destination is written by Lambda
+            # using this role.
+            - Sid: AsyncInvokeOnFailureDlq
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt rAsyncInvokeDlq.Arn
             # Mail statements. Transactions are authorized through the item
             # actions. No ses:SendEmail (only the sender sends) and no S3 delete.
             - !If
@@ -359,18 +359,13 @@ Resources:
                 Action: kms:Decrypt
                 Resource: !Ref pApiKeysKmsKeyArn
               - !Ref AWS::NoValue
-            - !If
-              - cHasMailDomain
-              - Sid: MailIngestOnFailureDlq
-                Effect: Allow
-                Action: sqs:SendMessage
-                Resource: !GetAtt rMailIngestDlq.Arn
-              - !Ref AWS::NoValue
 
+  # Unnamed like the rest: each function's LoggingConfig points at its own
+  # group by reference, and the WebhookLogGroupName output carries the
+  # generated name. Lambda's basic execution policy covers any log group.
   rFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
       RetentionInDays: !Ref pLogRetentionDays
 
   rEventsTable:
@@ -404,7 +399,6 @@ Resources:
   rPublishDlq:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${AWS::StackName}-publish-dlq"
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
 
@@ -413,11 +407,13 @@ Resources:
   # whose EventBridge payload was omitted for size, or a message's full
   # timeline. Base-table reads only — no write, no Scan, and no access to the
   # internal ReconcileIndex (scoped to the table ARN, not index ARNs).
+  # Unnamed on purpose: a RoleName makes the stack need CAPABILITY_NAMED_IAM,
+  # which turns setting pConsumerAccountIds into a failed deploy. Consumers
+  # take the ARN from the ConsumerReadRoleArn output.
   rConsumerReadRole:
     Type: AWS::IAM::Role
     Condition: cHasConsumers
     Properties:
-      RoleName: !Sub "${AWS::StackName}-consumer-read"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -609,8 +605,6 @@ Resources:
   rMailReceiptRuleSet:
     Type: AWS::SES::ReceiptRuleSet
     Condition: cCreateReceiptRuleSet
-    Properties:
-      RuleSetName: !Sub "${AWS::StackName}-mail"
 
   rMailReceiptRule:
     Type: AWS::SES::ReceiptRule
@@ -623,6 +617,9 @@ Resources:
     Properties:
       RuleSetName: !If [cCreateReceiptRuleSet, !Ref rMailReceiptRuleSet, !Ref pExistingReceiptRuleSetName]
       Rule:
+        # The one name the stack still sets: the bucket and topic policies
+        # scope their SES condition to this rule's ARN, and referencing the
+        # rule from a policy the rule itself depends on would be a cycle.
         Name: !Sub "${AWS::StackName}-inbound"
         Enabled: true
         ScanEnabled: true
@@ -703,37 +700,36 @@ Resources:
         PointInTimeRecoveryEnabled: true
       DeletionProtectionEnabled: !If [cIsProd, true, false]
 
-  rMailIngestDlq:
-    Type: AWS::SQS::Queue
-    Condition: cHasMailDomain
-    Properties:
-      QueueName: !Sub "${AWS::StackName}-mail-ingest-dlq"
-      MessageRetentionPeriod: 1209600 # 14 days
-      SqsManagedSseEnabled: true
-
-  # Separate from rMailIngestDlq: a message here is mail that failed to go
+  # Separate from rAsyncInvokeDlq: a message here is mail that failed to go
   # out, which is a different problem from mail that failed to come in, and
   # an operator should not have to tell them apart by reading payloads.
   rMailSenderDlq:
     Type: AWS::SQS::Queue
     Condition: cHasMailDomain
     Properties:
-      QueueName: !Sub "${AWS::StackName}-mail-sender-dlq"
       MessageRetentionPeriod: 1209600 # 14 days
       SqsManagedSseEnabled: true
 
-  # The mail topics invoke the function directly. Lambda's async queue retries
-  # a failed invocation twice; after that the event lands in rMailIngestDlq.
+  # Every asynchronous invocation of the function — the stack's mail topics and
+  # any SNS topic subscribed over the lambda protocol — retries twice in
+  # Lambda's async queue and then lands here. Unconditional: a stack without a
+  # mailbox still takes direct SNS invocations, and dropping those after two
+  # retries loses the event.
+  rAsyncInvokeDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
   rWebhookEventInvokeConfig:
     Type: AWS::Lambda::EventInvokeConfig
-    Condition: cHasMailDomain
     Properties:
       FunctionName: !Ref rWebhookFunction
       Qualifier: $LATEST
       MaximumRetryAttempts: 2
       DestinationConfig:
         OnFailure:
-          Destination: !GetAtt rMailIngestDlq.Arn
+          Destination: !GetAtt rAsyncInvokeDlq.Arn
 
   rMailInboundPermission:
     Type: AWS::Lambda::Permission
@@ -795,11 +791,6 @@ Resources:
       BuildProperties:
         Binary: aws-messaging-webhook
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-mail-sender"
-      CodeUri: .
-      Handler: bootstrap
-      Runtime: provided.al2023
-      Architectures: [arm64]
       # Holds the assembled message and its base64 form in memory at once.
       MemorySize: 1024
       Timeout: 120
@@ -814,9 +805,6 @@ Resources:
       Environment:
         Variables:
           FUNCTION_MODE: sender
-          TABLE_NAME: !Ref rEventsTable
-          EVENT_BUS_NAME: !Ref rEventBus
-          EVENT_SOURCE: !Ref pEventSource
           STACK_NAME: !Ref AWS::StackName
           MAIL_DOMAIN: !Ref pMailDomain
           MAIL_TABLE_NAME: !Ref rMailTable
@@ -840,6 +828,12 @@ Resources:
       Policies:
         - Version: "2012-10-17"
           Statement:
+            # TransactWriteItems authorizes through the item actions its
+            # writes use — PutItem/UpdateItem/DeleteItem/ConditionCheckItem —
+            # and is not itself an IAM action (see the API operations table in
+            # https://docs.aws.amazon.com/service-authorization/latest/reference/list_dynamodb.html).
+            # The sender's claim, SES-call marker and mark writes are Puts and
+            # Updates.
             - Sid: MailTableAccess
               Effect: Allow
               Action:
@@ -847,7 +841,6 @@ Resources:
                 - dynamodb:PutItem
                 - dynamodb:UpdateItem
                 - dynamodb:Query
-                - dynamodb:TransactWriteItems
               Resource:
                 - !GetAtt rMailTable.Arn
                 - !Sub "${rMailTable.Arn}/index/*"
@@ -901,7 +894,6 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-mail-sender"
       RetentionInDays: !Ref pLogRetentionDays
 
   # Send-state items only, and only while they are queued. The filter keeps
@@ -928,6 +920,33 @@ Resources:
       DestinationConfig:
         OnFailure:
           Destination: !GetAtt rMailSenderDlq.Arn
+
+  # The events-table relay: the sole publisher of event details to
+  # EventBridge. Retries a failed publish, bisects a poison batch, reports
+  # per-record failures, and routes anything past the retry limit to the DLQ
+  # so a publish can never be silently lost.
+  rEventsStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: rWebhookFunctionRole
+    Properties:
+      EventSourceArn: !GetAtt rEventsTable.StreamArn
+      FunctionName: !Ref rWebhookFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      # Event-item INSERTs (the events) and aggregate INSERT/MODIFYs (status
+      # transitions). TTL REMOVEs are dropped. Event items are write-once, so
+      # they only ever INSERT.
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["INSERT","MODIFY"]}'
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt rPublishDlq.Arn
 
   # The mail relay: message items only (sk MSG#). An INSERT publishes a
   # received message, a MODIFY the system labels that write added (sent,
@@ -1020,6 +1039,12 @@ Outputs:
   WebhookFunctionArn:
     Description: Function ARN for direct SNS -> Lambda subscriptions.
     Value: !GetAtt rWebhookFunction.Arn
+  WebhookFunctionName:
+    Description: Generated name of the webhook function, for aws lambda invoke and sam logs.
+    Value: !Ref rWebhookFunction
+  WebhookLogGroupName:
+    Description: CloudWatch log group the webhook function writes to.
+    Value: !Ref rFunctionLogGroup
   EventBusName:
     Value: !Ref rEventBus
   EventBusArn:
@@ -1029,6 +1054,9 @@ Outputs:
   PublishDlqUrl:
     Description: SQS DLQ for stream-relay events that exhausted their publish retries.
     Value: !Ref rPublishDlq
+  AsyncInvokeDlqUrl:
+    Description: SQS DLQ for direct (lambda-protocol) SNS deliveries that failed every async-invoke retry.
+    Value: !Ref rAsyncInvokeDlq
   ConsumerReadRoleArn:
     Condition: cHasConsumers
     Description: Role ARN for downstream consumers to assume for read-only table access.
@@ -1061,10 +1089,14 @@ Outputs:
     Condition: cHasMailDomain
     Description: Receipt rule set holding the mail rule. Activate it once after the first deploy.
     Value: !If [cCreateReceiptRuleSet, !Ref rMailReceiptRuleSet, !Ref pExistingReceiptRuleSetName]
-  MailIngestDlqUrl:
+  MailSenderFunctionName:
     Condition: cHasMailDomain
-    Description: SQS DLQ for mail SNS deliveries that failed every async-invoke retry.
-    Value: !Ref rMailIngestDlq
+    Description: Generated name of the mail sender function, for the operator resend and sweep commands.
+    Value: !Ref rMailSenderFunction
+  MailSenderLogGroupName:
+    Condition: cHasMailDomain
+    Description: CloudWatch log group the mail sender writes to.
+    Value: !Ref rMailSenderLogGroup
   MailSenderDlqUrl:
     Condition: cHasMailDomain
     Description: SQS DLQ for sends that failed every retry. A message here is mail that did not go out.

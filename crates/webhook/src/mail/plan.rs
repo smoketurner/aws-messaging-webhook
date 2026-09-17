@@ -224,7 +224,8 @@ pub fn plan_enqueue(
 /// The `Put` for a send-state item, version-conditioned on what was read.
 ///
 /// The index keys move with the status, which is what keeps the sweep's view
-/// of "queued" and "sending" accurate without a second write.
+/// of "queued" and "sending" accurate without a second write, and leave the
+/// item on the write that settles it.
 fn send_state_put(
     before: Option<&SendState>,
     after: &SendState,
@@ -238,16 +239,26 @@ fn send_state_put(
 }
 
 /// The send-state item with its keys, under an arbitrary condition.
+///
+/// A settled send carries no `ByStatus` keys. The index exists for the
+/// sweep, which only ever queries `sending` and `unknown`; writing the keys
+/// for `sent` and `failed` too would pay an index write on the one
+/// transaction every send is guaranteed to make and then keep the whole
+/// item (the index projects ALL) in the index until its TTL. Since these
+/// are `Put`s, dropping the attributes on the settling write is what
+/// removes the entry.
 fn send_state_op(state: &SendState, cond: Cond) -> Result<PlannedOp, MailStoreError> {
-    let state_keys = [
+    let mut state_keys = vec![
         ("pk", AttributeValue::S(keys::outbox_pk(&state.message_id))),
         ("sk", AttributeValue::S(keys::outbox_sk().to_owned())),
-        (
+    ];
+    if state.send_status.is_swept() {
+        state_keys.push((
             "gsi3pk",
             AttributeValue::S(format!("SENDSTATUS#{}", state.send_status.as_str())),
-        ),
-        ("gsi3sk", AttributeValue::S(state.message_id.clone())),
-    ];
+        ));
+        state_keys.push(("gsi3sk", AttributeValue::S(state.message_id.clone())));
+    }
     Ok(PlannedOp {
         role: OpRole::SendState,
         op: WriteOp::Put {
@@ -790,6 +801,45 @@ mod tests {
             key_pk.map(ToOwned::to_owned),
             "2026-01-01T00:00:00.000Z",
         )
+    }
+
+    /// The `ByStatus` index serves the sweep alone. A settled send is
+    /// nothing for the sweep to find, so its write drops the index keys
+    /// rather than keeping the whole item indexed until its TTL.
+    #[test]
+    fn only_a_sweepable_send_state_carries_the_status_index_keys() {
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
+        msg.direction = Direction::Outbound;
+        let queued = queued_state(&msg, None);
+        let now = "2026-01-01T00:00:10.000Z";
+
+        for (state, indexed) in [
+            (queued.clone(), true),
+            (queued.claimed(now), true),
+            (queued.unknown(now), true),
+            (queued.sent(now), false),
+            (
+                queued.failed(crate::mail::send::SendFailure::Rejected, now),
+                false,
+            ),
+        ] {
+            let op = send_state_op(&state, Cond::None).unwrap();
+            let WriteOp::Put { item, .. } = op.op else {
+                panic!("send state is written as a Put");
+            };
+            assert_eq!(
+                item.inner().contains_key("gsi3pk"),
+                indexed,
+                "{}",
+                state.send_status.as_str()
+            );
+            assert_eq!(
+                item.inner().contains_key("gsi3sk"),
+                indexed,
+                "{}",
+                state.send_status.as_str()
+            );
+        }
     }
 
     #[test]

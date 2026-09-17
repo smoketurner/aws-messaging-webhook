@@ -34,7 +34,7 @@ SNS → Lambda invocation. Then it:
 
 ```
 EUM two-way SMS ──────► SNS ─┐  POST /webhooks/… (https)   ┌─► DynamoDB (events + aggregates)
-EUM config set (DLR) ─► SNS ─┤  ─► Lambda Function URL ─┐  │        │ stream (NEW_IMAGE)
+EUM config set (DLR) ─► SNS ─┤  ─► Lambda Function URL ─┐  │        │ stream (NEW_AND_OLD_IMAGES)
 SES config set ───────► SNS ─┤  or direct invoke        ├──┤        ▼
 SES receipt rule ─────► SNS ─┘  (lambda protocol) ──────┘  │   stream relay ─► EventBridge bus ─► your apps
                                 verify → persist → act     └─► lifecycle actions (EUM/SES APIs)
@@ -136,9 +136,11 @@ aws sns subscribe --topic-arn <topic-arn> --protocol lambda \
 ```
 
 The retry behavior differs: SNS hands direct deliveries to Lambda's async-invoke queue, which
-retries a failed invocation **twice** and then drops it, while the HTTPS delivery policy
-retries far longer. If you need durability past two retries, configure an on-failure
-destination (SQS) on the function.
+retries a failed invocation **twice**, while the HTTPS delivery policy retries far longer.
+Anything past those two retries lands in the stack's `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl`
+output) carrying the original event, so nothing is dropped; alarm on its depth and replay from
+it (see [Operations](#operations)). Don't add your own on-failure destination — a function has
+one, and configuring a second replaces the stack's.
 
 ### Parameters
 
@@ -398,7 +400,7 @@ client follows the token.
   wiring step. Every other topic stays outside the stack. When `pAllowedTopics` is non-empty,
   the two mail topic ARNs are appended to the function's allowlist automatically.
 - **Retries.** Lambda's async queue retries a failed mail delivery twice, then sends it to
-  `rMailIngestDlq` (`MailIngestDlqUrl` output). That on-failure destination applies to every
+  `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl` output). That on-failure destination applies to every
   asynchronous invocation of the function, including direct SNS subscriptions you wired by hand.
 - **Mail table stream.** The mail table's stream has at most two readers, the stream relay and
   the mail sender, which is DynamoDB's recommended ceiling. A third consumer needs Kinesis Data
@@ -417,7 +419,7 @@ client follows the token.
 Mail ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as
 CloudWatch Embedded Metrics Format (EMF) in the stack-name namespace, each carrying a `function`
 dimension. The stack defines no alarms; build your own alarms or dashboards on these metrics and
-on the `rMailIngestDlq` and `rPublishDlq` queue depths.
+on the `rAsyncInvokeDlq` and `rPublishDlq` queue depths.
 
 ### Disabling the mailbox
 
@@ -445,7 +447,7 @@ Find them in the sweep's log line (`sends_outcome_unknown`) or by querying `BySt
 decide:
 
 ```bash
-sender=aws-messaging-webhook-dev-mail-sender
+sender=$(output MailSenderFunctionName)
 
 # Send it again, accepting that the recipient may get two copies.
 aws lambda invoke --function-name "$sender" --payload \
@@ -463,15 +465,15 @@ still in flight would race the sender holding it and resolving a finished one wo
 settled outcome. Closing as sent labels the message `sent` without an SES id; closing as failed
 labels it `rejected` with reason `closed_by_operator`.
 
-**Mail that failed to ingest.** Deliveries that exhausted their retries land in `rMailIngestDlq`
+**Mail that failed to ingest.** Deliveries that exhausted their retries land in `rAsyncInvokeDlq`
 carrying the original event, so replaying one is re-invoking the webhook function with it:
 
 ```bash
-queue=$(output MailIngestDlqUrl)
+queue=$(output AsyncInvokeDlqUrl)
 msg=$(aws sqs receive-message --queue-url "$queue" --max-number-of-messages 1)
 echo "$msg" | jq -r '.Messages[0].Body' | jq '.requestPayload' > /tmp/replay.json
 
-aws lambda invoke --function-name aws-messaging-webhook-dev-webhook \
+aws lambda invoke --function-name "$(output WebhookFunctionName)" \
   --payload file:///tmp/replay.json /dev/stdout
 
 # Once it succeeds, drop the DLQ message.
@@ -702,8 +704,8 @@ them.
 When an EventBridge detail is published with `payloadOmitted` (over the 256 KB entry limit),
 or a consumer wants a message's full timeline, it fetches directly from DynamoDB. Cross-account
 consumers get read access through a role, not raw table grants: set `pConsumerAccountIds` to the
-12-digit account ids at deploy time and the stack creates `<stack-name>-consumer-read`
-(`ConsumerReadRoleArn` output), a role those accounts may assume. It allows `GetItem` /
+12-digit account ids at deploy time and the stack creates a role those accounts may assume,
+whose ARN is the `ConsumerReadRoleArn` output. It allows `GetItem` /
 `BatchGetItem` / `Query` on the table only — no writes, no `Scan`, and no access to internal
 indexes. A consumer assumes the role, then:
 
