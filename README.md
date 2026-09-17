@@ -271,8 +271,9 @@ also its `inbox_id` (for example `/v0/inboxes/hello@mail.example.com/messages`).
 
 ### Mailbox API
 
-Every `/v0` route needs `Authorization: Bearer <key>`. Reads are implemented; everything else
-answers `501` with a parseable body.
+Every `/v0` route needs `Authorization: Bearer <key>`. Reads, label changes and sends are
+implemented; the remaining routes answer `501`. Every error, including a malformed JSON body, a
+missing content type and an oversized request, has a JSON body with a `name` and `message`.
 
 | Route | Returns |
 |---|---|
@@ -301,6 +302,10 @@ except `unread`, `spam`, `trash` and your own — are rejected with a `400`, as 
 both fields. A message's thread keeps a label until the last message carrying it gives it up, and
 relabelling does not count as thread activity, so it doesn't reorder a thread list.
 
+A message may carry at most 20 labels of your own, and a thread at most 20 across its messages;
+the service's own labels don't count toward either. A change that would exceed either cap is a
+`400` on `labels`, as is a request naming more than 20 labels.
+
 List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (default false),
 `before`, `after`, `labels`, `from`, `to`, `subject`, and the four `include_*` flags
 (`include_spam`, `include_blocked`, `include_unauthenticated`, `include_trash`).
@@ -313,14 +318,21 @@ List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (defau
   as a substring.
 - The `include_*` flags default to false and drop items carrying that label. Naming a label
   explicitly overrides the flag that would hide it, so `?labels=trash` returns trashed mail.
-- `page_token` is opaque and bound to the partition it was issued for: presenting one to a
-  different inbox is a `400`, not another inbox's data.
+- `page_token` is opaque and bound to the inbox, sort order and time window it was issued for:
+  presenting one to a different inbox, or with a different `ascending`, `before` or `after`, is
+  a `400`. The label and address filters may change between pages.
+- A filtered list can come back with fewer than `limit` items and a `next_page_token`; follow the
+  token to continue.
+- `GET /v0/inboxes` and the messages embedded in `GET …/threads/{thread_id}` take only `limit`
+  and `page_token`. A thread view includes every message in the thread, whatever its labels.
 
 ### Sending
 
 `POST …/messages/send` takes `to`/`cc`/`bcc` (one address or a list), `subject`, `text` and/or
 `html`, and optionally `reply_to`, `labels`, `headers` and `attachments`. Each attachment gives
-exactly one of `content` (base64) or `url`.
+exactly one of `content` (base64) or `url`. A send or reply request body may be up to 6 MiB, the
+Function URL's own limit (every other route takes 1 MiB); base64 makes inline content about a
+third larger than the file, so send larger attachments by `url`.
 
 **It queues; it does not send.** The response means the message is durably recorded, not that
 SES has accepted it. A separate sender function consumes the mail table's stream and makes the
@@ -328,8 +340,9 @@ SES call. This exists because SESv2 `SendEmail` has no idempotency token and the
 5xx on their own, so a synchronous send could deliver the same mail more than once.
 
 Send `Idempotency-Key` to make a retry safe. The same key with the same request returns the
-original ids; the same key with a *different* request is a `409`, since silently sending
-something the caller didn't ask for is worse than refusing. Keys are remembered for 24 hours.
+original ids; the same key with a *different* request — any field, any attachment's content or
+metadata, or the same key used on a different route or original message — is a `409`, since
+silently sending something the caller didn't ask for is worse than refusing. Keys are remembered for 24 hours.
 Without a key, a retry after a lost response can queue the message twice.
 
 Headers the service controls — `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`,

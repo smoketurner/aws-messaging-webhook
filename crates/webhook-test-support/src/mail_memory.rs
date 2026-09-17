@@ -943,7 +943,7 @@ impl MailStore for MailMemoryStore {
         &self,
         query: &ListQuery,
     ) -> impl Future<Output = Result<Page<MailMessage>, MailStoreError>> + Send {
-        let partition = format!("INBOX#{}#MSG", query.inbox.as_str());
+        let partition = aws_messaging_webhook::mail::keys::messages_partition(query.inbox.as_str());
         std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
     }
 
@@ -951,7 +951,7 @@ impl MailStore for MailMemoryStore {
         &self,
         query: &ListQuery,
     ) -> impl Future<Output = Result<Page<ThreadState>, MailStoreError>> + Send {
-        let partition = format!("INBOX#{}#THR", query.inbox.as_str());
+        let partition = aws_messaging_webhook::mail::keys::threads_partition(query.inbox.as_str());
         std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
     }
 

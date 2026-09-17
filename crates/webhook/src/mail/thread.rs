@@ -23,10 +23,6 @@ const THREAD_ADDRESS_SET_CAP: usize = 50;
 /// duplicated onto every message item rather than held once per thread.
 const THREAD_SNAPSHOT_ADDRESS_CAP: usize = 20;
 
-/// The thread's total label-union cap, keeping the thread item's label set
-/// clear of DynamoDB's 400 KB item limit.
-pub const THREAD_LABEL_TOTAL_CAP: usize = 32;
-
 /// The in-memory thread state a read-modify-write cycle computes:
 /// read the thread consistently, apply this message's effect in Rust, then
 /// `Put` it version-conditioned in the same transaction as the message.
@@ -107,7 +103,7 @@ pub fn candidate_ids(in_reply_to: Option<&str>, references: &[String]) -> Vec<St
 }
 
 /// Builds the sorted, deduplicated union of `existing` and `label`,
-/// respecting no cap (callers check [`THREAD_LABEL_TOTAL_CAP`] separately).
+/// respecting no cap (the planner checks the user-label caps).
 fn add_label(labels: &mut Vec<String>, label: &str) {
     if let Err(index) = labels.binary_search_by(|l| l.as_str().cmp(label)) {
         labels.insert(index, label.to_owned());

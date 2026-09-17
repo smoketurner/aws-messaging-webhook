@@ -127,6 +127,19 @@ impl ListRequest {
         )
     }
 
+    /// The query shape a page token is bound to: the sort order and time
+    /// window. A token is only valid for a request with the same shape, since
+    /// its start key must fall inside that request's key range.
+    #[must_use]
+    pub fn token_scope(&self) -> String {
+        format!(
+            "asc={};before={};after={}",
+            self.ascending,
+            self.before_ms.map_or_else(String::new, |ms| ms.to_string()),
+            self.after_ms.map_or_else(String::new, |ms| ms.to_string()),
+        )
+    }
+
     /// Parses and validates a raw query string.
     ///
     /// # Errors

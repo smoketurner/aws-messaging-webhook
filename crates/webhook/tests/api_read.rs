@@ -131,6 +131,42 @@ async fn a_page_token_walks_the_whole_list_without_gaps_or_repeats() {
 }
 
 #[tokio::test]
+async fn a_page_token_reused_with_a_different_order_or_window_is_rejected() {
+    // Its start key belongs to the original query's range; handing it to a
+    // different one would fail in the store instead of as a 400.
+    let h = seeded().await;
+    for hour in 9..12 {
+        insert(
+            &h,
+            &format!("2026-01-01T{hour:02}:00:00.000Z"),
+            "t1",
+            |_| {},
+        )
+        .await;
+    }
+    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?limit=1")).await;
+    let token = body["next_page_token"].as_str().unwrap().to_owned();
+
+    for changed in ["ascending=true", "after=2026-01-01T10:00:00Z"] {
+        let (status, body) = get(
+            &h,
+            &format!("/v0/inboxes/{INBOX}/messages?limit=1&{changed}&page_token={token}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}");
+        assert_eq!(body["errors"][0]["path"], "page_token");
+    }
+
+    // The same query shape still follows it.
+    let (status, _) = get(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages?limit=1&page_token={token}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn a_page_token_from_another_inbox_is_rejected() {
     // The token's partition is re-checked against the path, so a token can
     // never be replayed against an inbox it was not issued for.

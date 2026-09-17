@@ -23,6 +23,26 @@ pub fn inboxes_partition() -> &'static str {
     "INBOXES"
 }
 
+/// The `ByTime` partition listing an inbox's messages, sorted by message id.
+#[must_use]
+pub fn messages_partition(inbox_id: &str) -> String {
+    format!("INBOX#{inbox_id}#MSG")
+}
+
+/// The `ByTime` partition listing an inbox's threads, sorted by
+/// [`thread_time_sort`].
+#[must_use]
+pub fn threads_partition(inbox_id: &str) -> String {
+    format!("INBOX#{inbox_id}#THR")
+}
+
+/// A thread's `ByTime` sort key: last activity, then id, so a thread list
+/// orders by most recent activity.
+#[must_use]
+pub fn thread_time_sort(timestamp: &str, thread_id: &str) -> String {
+    format!("{timestamp}#{thread_id}")
+}
+
 #[must_use]
 pub fn message_sk(message_id: &str) -> String {
     format!("MSG#{message_id}")
@@ -109,10 +129,13 @@ pub struct PageKey {
 }
 
 /// The opaque page token: base64url JSON of the last *returned* item's
-/// key. Its partition is re-validated against the request that presents it;
-/// a mismatch is the caller's 400.
+/// key, plus the query shape it was issued for. Both are re-validated against
+/// the request that presents it; a mismatch is the caller's 400. Without the
+/// shape, a token reused with a different time window or sort order would hand
+/// DynamoDB a start key outside the new key condition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PageTokenPayload {
+    scope: String,
     partition: String,
     sort: String,
     table_pk: String,
@@ -124,15 +147,17 @@ struct PageTokenPayload {
 pub struct PageTokenError;
 
 /// Encodes a page key as an opaque token for the `next`/`before`/`after`
-/// response field.
+/// response field, bound to `scope`: the sort order and time window of the
+/// query that produced it.
 ///
 /// # Panics
 ///
 /// Never panics in practice: `PageTokenPayload` is plain owned strings, which
 /// `serde_json` always serializes successfully.
 #[must_use]
-pub fn encode_page_token(key: &PageKey) -> String {
+pub fn encode_page_token(key: &PageKey, scope: &str) -> String {
     let payload = PageTokenPayload {
+        scope: scope.to_owned(),
         partition: key.partition.clone(),
         sort: key.sort.clone(),
         table_pk: key.table_pk.clone(),
@@ -147,16 +172,21 @@ pub fn encode_page_token(key: &PageKey) -> String {
     URL_SAFE_NO_PAD.encode(json)
 }
 
-/// Decodes a page token, checking it was issued for `expected_partition`.
+/// Decodes a page token, checking it was issued for `expected_partition` and
+/// `expected_scope`.
 ///
 /// # Errors
 ///
 /// Returns [`PageTokenError`] for malformed base64/JSON, or a token issued
-/// for a different partition, which the caller sees as a 400.
-pub fn decode_page_token(token: &str, expected_partition: &str) -> Result<PageKey, PageTokenError> {
+/// for a different partition or query shape, which the caller sees as a 400.
+pub fn decode_page_token(
+    token: &str,
+    expected_partition: &str,
+    expected_scope: &str,
+) -> Result<PageKey, PageTokenError> {
     let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| PageTokenError)?;
     let payload: PageTokenPayload = serde_json::from_slice(&bytes).map_err(|_| PageTokenError)?;
-    if payload.partition != expected_partition {
+    if payload.partition != expected_partition || payload.scope != expected_scope {
         return Err(PageTokenError);
     }
     Ok(PageKey {
@@ -185,6 +215,18 @@ mod tests {
     }
 
     #[test]
+    fn a_page_token_is_refused_for_a_different_query_shape() {
+        let key = PageKey {
+            partition: "INBOX#support#MSG".to_owned(),
+            sort: "mid-9".to_owned(),
+            table_pk: "INBOX#support".to_owned(),
+            table_sk: "MSG#mid-9".to_owned(),
+        };
+        let token = encode_page_token(&key, "scope-a");
+        assert!(decode_page_token(&token, &key.partition, "scope-b").is_err());
+    }
+
+    #[test]
     fn page_token_round_trips() {
         let key = PageKey {
             partition: "INBOX#support#MSG".to_owned(),
@@ -192,8 +234,8 @@ mod tests {
             table_pk: "INBOX#support".to_owned(),
             table_sk: "MSG#mid-9".to_owned(),
         };
-        let token = encode_page_token(&key);
-        let decoded = decode_page_token(&token, &key.partition).unwrap();
+        let token = encode_page_token(&key, "scope-a");
+        let decoded = decode_page_token(&token, &key.partition, "scope-a").unwrap();
         assert_eq!(decoded, key);
     }
 
@@ -205,15 +247,15 @@ mod tests {
             table_pk: "INBOX#support".to_owned(),
             table_sk: "MSG#mid-9".to_owned(),
         };
-        let token = encode_page_token(&key);
-        assert!(decode_page_token(&token, "INBOX#billing#MSG").is_err());
+        let token = encode_page_token(&key, "scope-a");
+        assert!(decode_page_token(&token, "INBOX#billing#MSG", "scope-a").is_err());
     }
 
     #[test]
     fn page_token_rejects_malformed_input() {
-        assert!(decode_page_token("not-base64!!!", "p").is_err());
-        assert!(decode_page_token(&URL_SAFE_NO_PAD.encode("not json"), "p").is_err());
-        assert!(decode_page_token("", "p").is_err());
+        assert!(decode_page_token("not-base64!!!", "p", "").is_err());
+        assert!(decode_page_token(&URL_SAFE_NO_PAD.encode("not json"), "p", "").is_err());
+        assert!(decode_page_token("", "p", "").is_err());
     }
 
     proptest! {
@@ -225,8 +267,8 @@ mod tests {
             table_sk in "[A-Za-z0-9#_-]{1,80}",
         ) {
             let key = PageKey { partition: partition.clone(), sort, table_pk, table_sk };
-            let token = encode_page_token(&key);
-            prop_assert_eq!(decode_page_token(&token, &partition).unwrap(), key);
+            let token = encode_page_token(&key, "scope-a");
+            prop_assert_eq!(decode_page_token(&token, &partition, "scope-a").unwrap(), key);
         }
     }
 }

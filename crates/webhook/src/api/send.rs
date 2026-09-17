@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::api::error::{ApiError, FieldError};
+use crate::api::json::ApiJson;
 use crate::mail::objects::ObjectError;
 use crate::mail::send::{
     self as send_mod, Envelope, SendKey, SendSpec, SendState, SendStatus, SpecAttachment,
@@ -599,7 +600,7 @@ pub async fn send<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path(inbox_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<SendRequest>,
+    ApiJson(request): ApiJson<SendRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
     enqueue(&state, InboxId(inbox_id), request, &headers, None, "send").await
 }
@@ -635,27 +636,19 @@ async fn enqueue<T: Services>(
     }
 
     let validated = validate(request)?;
-    let request_hash = fingerprint(&inbox, &validated);
+    let request_hash = fingerprint(
+        &inbox,
+        route,
+        original.map(|(o, _)| o.message_id.as_str()),
+        &validated,
+    );
 
     // A live key for this request is answered from what it recorded, without
     // queuing anything a second time.
     if let Some(hash) = &key_hash
-        && let Some(existing) = state
-            .services
-            .get_send_key(hash)
-            .await
-            .map_err(crate::api::read::store_failure)?
+        && let Some(replayed) = replay_key(state, hash, &request_hash).await?
     {
-        return if existing.request_hash == request_hash {
-            Ok(Json(SendAccepted {
-                message_id: existing.message_id,
-                thread_id: existing.thread_id,
-            }))
-        } else {
-            Err(ApiError::Conflict(
-                "this Idempotency-Key was used for a different request".to_owned(),
-            ))
-        };
+        return Ok(Json(replayed));
     }
 
     let now_ms = time::now_ms();
@@ -698,29 +691,100 @@ async fn enqueue<T: Services>(
     message.expires_at = time::expires_at(now_ms, config.retention_days);
     let key = key_hash.map(|hash| SendKey {
         key_hash: hash,
-        inbox_id: inbox,
+        inbox_id: inbox.clone(),
         message_id: message_id.clone(),
         thread_id: thread_id.clone(),
-        request_hash,
+        request_hash: request_hash.clone(),
         route: route.to_owned(),
         created_at: now.clone(),
         expires_at: now_ms / 1_000 + KEY_TTL_SECONDS,
     });
 
-    match state
+    let committed = state
         .services
         .enqueue_send(&message, &state_item, key.as_ref(), now_ms / 1_000)
-        .await
-        .map_err(crate::api::read::store_failure)?
-    {
-        EnqueueOutcome::Committed | EnqueueOutcome::AlreadyQueued => Ok(Json(SendAccepted {
+        .await;
+    match committed {
+        Ok(EnqueueOutcome::Committed | EnqueueOutcome::AlreadyQueued) => Ok(Json(SendAccepted {
             message_id,
             thread_id,
         })),
-        // Another request won the key between the read above and the commit.
-        EnqueueOutcome::KeyExists => Err(ApiError::Conflict(
-            "this Idempotency-Key is already in use".to_owned(),
-        )),
+        // Another request committed under the same key between the read above
+        // and this commit: answer the way that request would be answered on a
+        // replay, and drop what this one uploaded.
+        Ok(EnqueueOutcome::KeyExists) => {
+            discard_uploads(&state.services, &inbox, &spec).await;
+            let hash = key
+                .as_ref()
+                .map(|key| key.key_hash.as_str())
+                .unwrap_or_default();
+            match replay_key(state, hash, &request_hash).await? {
+                Some(replayed) => Ok(Json(replayed)),
+                // Gone again already (expired): a retry will queue it afresh.
+                None => Err(ApiError::Conflict(
+                    "this Idempotency-Key is already in use".to_owned(),
+                )),
+            }
+        }
+        Err(error) => {
+            discard_uploads(&state.services, &inbox, &spec).await;
+            Err(crate::api::read::store_failure(error))
+        }
+    }
+}
+
+/// What a live `Idempotency-Key` recorded: the original ids when `request_hash`
+/// matches, a `409` when the key was used for a different request, `None` when
+/// there is no live key.
+async fn replay_key<T: Services>(
+    state: &AppState<T>,
+    key_hash: &str,
+    request_hash: &str,
+) -> Result<Option<SendAccepted>, ApiError> {
+    let Some(existing) = state
+        .services
+        .get_send_key(key_hash)
+        .await
+        .map_err(crate::api::read::store_failure)?
+    else {
+        return Ok(None);
+    };
+    if existing.request_hash == request_hash {
+        Ok(Some(SendAccepted {
+            message_id: existing.message_id,
+            thread_id: existing.thread_id,
+        }))
+    } else {
+        Err(ApiError::Conflict(
+            "this Idempotency-Key was used for a different request".to_owned(),
+        ))
+    }
+}
+
+/// Removes what a send uploaded before its commit failed: the spec, inline
+/// parts and content document. Nothing under `outbox/` expires, so leaving
+/// them would keep them forever. Best effort: the request has already failed,
+/// and a leftover object is harmless.
+async fn discard_uploads<T: Services>(services: &T, inbox: &InboxId, spec: &SendSpec) {
+    let mut keys = vec![
+        send_mod::spec_key(&spec.message_id),
+        content::content_key(inbox, &spec.message_id),
+    ];
+    keys.extend(
+        spec.attachments
+            .iter()
+            .filter_map(|attachment| attachment.object_key.clone()),
+    );
+    for key in keys {
+        if let Err(error) = services.delete_object(&key).await {
+            tracing::warn!(
+                message_id = %spec.message_id,
+                key,
+                error = ?error,
+                event = "send_upload_cleanup_failed",
+                "could not remove an object uploaded for a send that was not queued"
+            );
+        }
     }
 }
 
@@ -756,7 +820,7 @@ pub async fn reply<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path((inbox_id, message_id)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(request): Json<ReplyRequest>,
+    ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
     let inbox = InboxId(inbox_id);
     let original = state
@@ -839,7 +903,12 @@ fn reply_all_recipients(
 /// Prefixes `Re:` unless the subject already carries one.
 fn reply_subject(original: &str) -> String {
     let trimmed = original.trim();
-    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("re:") {
+    // `get` rather than indexing: a subject whose third byte falls inside a
+    // multi-byte character (an emoji, say) must not panic.
+    if trimmed
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("re:"))
+    {
         return trimmed.to_owned();
     }
     format!("Re: {trimmed}")
@@ -863,53 +932,58 @@ fn idempotency_key_hash(headers: &HeaderMap) -> Result<Option<String>, ApiError>
             format!("must be 1 to {IDEMPOTENCY_KEY_MAX_BYTES} characters"),
         ));
     }
-    Ok(Some(sha256_hex(value.as_bytes())))
+    Ok(Some(format!("{:x}", Sha256::digest(value.as_bytes()))))
 }
 
 /// A fingerprint of what a request asked for, so the same key presented with
-/// a different request can be told apart. Attachment bytes are included, so
-/// swapping a file while reusing a key is a conflict rather than a replay.
-fn fingerprint(inbox: &InboxId, send: &ValidatedSend) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(inbox.as_str().as_bytes());
-    for list in [&send.to, &send.cc, &send.bcc, &send.reply_to, &send.labels] {
-        for value in list {
-            hasher.update(b"\x00");
-            hasher.update(value.as_bytes());
-        }
-        hasher.update(b"\x01");
-    }
-    hasher.update(send.subject.as_bytes());
-    hasher.update(send.text.as_deref().unwrap_or_default().as_bytes());
-    hasher.update(send.html.as_deref().unwrap_or_default().as_bytes());
-    for (name, value) in &send.headers {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\x00");
-        hasher.update(value.as_bytes());
-    }
-    for attachment in &send.attachments {
-        match &attachment.source {
-            AttachmentSource::Inline(bytes) => hasher.update(bytes),
-            AttachmentSource::Url(url) => hasher.update(url.as_str().as_bytes()),
-        }
-    }
-    hex(&hasher.finalize())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex(&hasher.finalize())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+/// a different request can be told apart.
+///
+/// Built from canonical JSON, so field boundaries are unambiguous (a subject
+/// and text of `"ab"` and `"c"` differ from `"a"` and `"bc"`). It covers the
+/// route and the message being replied to, so a key reused across `send` and
+/// `reply` or across originals is a conflict, and every attachment field,
+/// with inline bytes by digest so swapping a file is a conflict too.
+fn fingerprint(
+    inbox: &InboxId,
+    route: &str,
+    original_message_id: Option<&str>,
+    send: &ValidatedSend,
+) -> String {
+    let attachments: Vec<serde_json::Value> = send
+        .attachments
+        .iter()
+        .map(|attachment| {
+            let source = match &attachment.source {
+                AttachmentSource::Inline(bytes) => {
+                    serde_json::json!({ "sha256": format!("{:x}", Sha256::digest(bytes)) })
+                }
+                AttachmentSource::Url(url) => serde_json::json!({ "url": url.as_str() }),
+            };
+            serde_json::json!({
+                "source": source,
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "content_disposition": attachment.content_disposition,
+                "content_id": attachment.content_id,
+            })
+        })
+        .collect();
+    let canonical = serde_json::json!({
+        "inbox": inbox.as_str(),
+        "route": route,
+        "original_message_id": original_message_id,
+        "to": send.to,
+        "cc": send.cc,
+        "bcc": send.bcc,
+        "reply_to": send.reply_to,
+        "subject": send.subject,
+        "text": send.text,
+        "html": send.html,
+        "labels": send.labels,
+        "headers": send.headers,
+        "attachments": attachments,
+    });
+    format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 /// Builds the spec the sender will assemble the message from.
