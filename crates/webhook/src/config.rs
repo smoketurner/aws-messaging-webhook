@@ -84,8 +84,8 @@ impl Config {
     /// Returns an error naming the variable when a required variable is
     /// missing or a value fails to parse.
     pub fn from_env() -> anyhow::Result<(Self, TopicAllowlist)> {
-        let table_name = require("TABLE_NAME")?;
-        let event_bus_name = require("EVENT_BUS_NAME")?;
+        let mode = parse_function_mode(optional("FUNCTION_MODE").as_deref())?;
+        let (table_name, event_bus_name) = events_targets(mode, optional)?;
         let event_source =
             optional("EVENT_SOURCE").unwrap_or_else(|| "aws-messaging-webhook".to_owned());
 
@@ -142,7 +142,6 @@ impl Config {
             }
         };
 
-        let mode = parse_function_mode(optional("FUNCTION_MODE").as_deref())?;
         let mail = MailConfig::from_env()?;
 
         Ok((
@@ -185,9 +184,11 @@ impl MailConfig {
         let api_keys_parameter = require("API_KEYS_PARAMETER")?;
         validate_api_keys_parameter(&api_keys_parameter)?;
 
+        // Matches pAttachmentUrlTtlSeconds' template default, so a stack
+        // that leaves the variable unset behaves the same either way.
         let attachment_url_ttl = match optional("ATTACHMENT_URL_TTL_SECONDS") {
             Some(raw) => parse_ttl_seconds(&raw)?,
-            None => Duration::from_secs(3600),
+            None => Duration::from_mins(15),
         };
 
         let region = require("AWS_REGION")?;
@@ -294,6 +295,24 @@ fn require(name: &str) -> anyhow::Result<String> {
     optional(name).with_context(|| format!("required environment variable {name} is not set"))
 }
 
+/// The events table and bus, read through `lookup`.
+///
+/// Required in webhook mode. The sender neither persists events nor
+/// publishes them, so requiring them there would only force the template to
+/// hand the sender values it never reads.
+fn events_targets(
+    mode: FunctionMode,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<(String, String)> {
+    let read = |name: &str| match mode {
+        FunctionMode::Webhook => {
+            lookup(name).with_context(|| format!("required environment variable {name} is not set"))
+        }
+        FunctionMode::Sender => Ok(lookup(name).unwrap_or_default()),
+    };
+    Ok((read("TABLE_NAME")?, read("EVENT_BUS_NAME")?))
+}
+
 /// Reads a variable, treating unset and empty as absent.
 fn optional(name: &str) -> Option<String> {
     match std::env::var(name) {
@@ -305,6 +324,24 @@ fn optional(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sender runs without the events table and bus; the webhook half
+    /// cannot, and says which variable is missing.
+    #[test]
+    fn only_webhook_mode_requires_the_events_table_and_bus() {
+        let unset = |_: &str| None;
+        let (table, bus) = events_targets(FunctionMode::Sender, unset).unwrap();
+        assert!(table.is_empty());
+        assert!(bus.is_empty());
+
+        let error = events_targets(FunctionMode::Webhook, unset).unwrap_err();
+        assert!(error.to_string().contains("TABLE_NAME"), "{error}");
+
+        let set = |name: &str| Some(format!("{name}-value"));
+        let (table, bus) = events_targets(FunctionMode::Webhook, set).unwrap();
+        assert_eq!(table, "TABLE_NAME-value");
+        assert_eq!(bus, "EVENT_BUS_NAME-value");
+    }
 
     #[test]
     fn function_mode_defaults_to_webhook() {

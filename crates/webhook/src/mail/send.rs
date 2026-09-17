@@ -52,6 +52,19 @@ impl SendStatus {
         }
     }
 
+    /// Whether a send in this state belongs in the `ByStatus` index. The
+    /// index serves the sweep alone, which looks for sends stuck `sending`
+    /// and for the `unknown` ones awaiting an operator; `queued` is there
+    /// because a send is queued before any sender sees it, and only the
+    /// settled states (`sent`, `failed`) are left out.
+    #[must_use]
+    pub fn is_swept(self) -> bool {
+        match self {
+            Self::Queued | Self::Sending | Self::Unknown => true,
+            Self::Sent | Self::Failed => false,
+        }
+    }
+
     /// The coarse status mirrored onto the message item, if any. `sending` is
     /// deliberately invisible there.
     #[must_use]
