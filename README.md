@@ -193,9 +193,11 @@ Events publish to the `<stack-name>-events` bus with `source` = `pEventSource` (
 | `subscription.changed` | Auto-re-subscribe fired |
 | `unknown` | An unparseable payload, forwarded verbatim |
 
-An event over EventBridge's 256 KB entry limit publishes with its `event` replaced by
-`{ "payloadOmitted": true, … }`. `meta.messageId` always survives, so consumers fetch the full
-record from DynamoDB. SES inbound raw MIME drops first; the pointer form is the fallback.
+An event over EventBridge's 256 KB entry limit is reduced in three steps: SES inbound raw MIME
+drops, then `event` becomes `{ "payloadOmitted": true, … }`, then `meta` keeps only
+`messageId`, `snsMessageId`, `webhookPath` and `s3`. Those four are the fields this service
+bounds, so a reduced entry always fits. Everything the caller sent is still in DynamoDB, and
+`meta.messageId` finds it.
 
 Detail shape:
 
