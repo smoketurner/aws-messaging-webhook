@@ -452,8 +452,7 @@ live in the mail bucket; `raw_s3_key` and each attachment's `object_key` point a
 A mailbox stack publishes mailbox events on the same bus and `source` as the SMS and SES events.
 Each event's detail-type is its `event_type`, and its detail is the reference mailbox API's
 webhook payload exactly: `type` (always `"event"`), `event_type`, `event_id` and one
-event-specific object. There is no `schemaVersion` or `meta`. To have the stack deliver them to
-an HTTP endpoint, see [Delivering to a webhook](#delivering-to-a-webhook).
+event-specific object. To have the stack deliver them to an HTTP endpoint, see [Delivering to a webhook](#delivering-to-a-webhook).
 
 | Event | Fires | Object |
 |---|---|---|
@@ -482,9 +481,7 @@ aws ssm put-parameter --name /messaging-webhook/dev/mail-webhook-secret --type S
   --value "$(openssl rand -hex 32)"
 ```
 
-CloudFormation can't read a SecureString into an EventBridge connection: its `ssm-secure`
-dynamic reference works only on a fixed list of resource properties, and connections aren't on
-it. So the deploy reads the parameter and passes the value as the `NoEcho` parameter
+The deploy reads the parameter and passes the value as the `NoEcho` parameter
 `pMailWebhookSecret`, which CloudFormation masks in its console and API output:
 
 ```bash
@@ -501,15 +498,15 @@ live in `samconfig.toml`. The secret must not.
 
 Every request carries these headers:
 
-- `x-webhook-secret`: the secret's value. EventBridge can't sign requests, so the receiver
-  authenticates each one by comparing this header in constant time.
+- `x-webhook-secret`: the secret's value. The receiver authenticates each request by comparing
+  this header in constant time.
 - `webhook-id`: the event's `event_id`. It stays the same across retries and redeliveries, so
   the receiver deduplicates on it.
 
 The receiver has 5 seconds to answer, so it should acknowledge first and do the work after.
 EventBridge retries `401`, `407`, `409`, `429`, `5xx` and timeouts for up to 24 hours and 185
-attempts. It doesn't retry any other `4xx`. There is no dead-letter queue, so an event that runs
-out of retries, or gets a `4xx` that isn't retried, is dropped. A wrong secret should therefore
+attempts. It doesn't retry any other `4xx`. An event that runs out of retries, or gets a `4xx`
+that isn't retried, is dropped. A wrong secret should therefore
 get a `401`, which is retried, rather than a `403`, which drops the event. Delivery is at least
 once and unordered.
 
@@ -595,7 +592,6 @@ rebuilds the same id. Consumers deduplicate on it.
 
 The mailbox publishes nothing for:
 
-- `message.received.blocked` and `domain.verified`, which this service has no equivalent of;
 - an SES `Send`, `Click`, `DeliveryDelay`, `Rendering Failure` or `Subscription` event;
 - a write to anything but a message item: send state, markers, keys, RFC aliases, thread
   housekeeping;

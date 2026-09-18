@@ -243,7 +243,7 @@ Three `meta` fields are conditional, and absent rather than null when they don't
 `schemaVersion` is on every detail from this pipeline, including `subscription.changed`, so
 consumers have one field to switch on as the contract evolves. These three additions are
 meta-only, so it stays 1. The mailbox's `message.*` events are the exception: they follow the
-reference mailbox API's webhook payloads exactly, with no `schemaVersion` or `meta` (see
+reference mailbox API's webhook payloads exactly (see
 [README_MAILBOX.md](README_MAILBOX.md#mailbox-events)).
 
 The relay also emits `message.status.changed` when an aggregate's `current_status` transitions:

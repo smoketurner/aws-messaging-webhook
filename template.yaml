@@ -178,9 +178,6 @@ Parameters:
       HTTPS endpoint that receives the mailbox's message.* events as webhook
       POSTs (the event detail as the body) through an EventBridge API
       destination. Empty (the default) creates no destination.
-  # Read from the SecureString parameter at deploy time rather than through a
-  # dynamic reference: ssm-secure resolves only in a fixed list of resource
-  # properties, and AWS::Events::Connection is not among them.
   pMailWebhookSecret:
     Type: String
     Default: ""
@@ -1233,8 +1230,7 @@ Resources:
 
   # Delivers the mailbox events to pMailWebhookUrl. The body is the event's
   # detail, which is the reference mailbox API's webhook payload, so the
-  # receiver parses it unchanged. EventBridge can't sign a request, so the
-  # receiver authenticates it by the secret header instead.
+  # receiver parses it unchanged and authenticates it by the secret header.
   rMailWebhookConnection:
     Type: AWS::Events::Connection
     Condition: cHasMailWebhook
@@ -1303,9 +1299,6 @@ Resources:
             # deduplicates on.
             HeaderParameters:
               webhook-id: $.detail.event_id
-          # No dead-letter queue: nothing would watch it. An event that
-          # outlasts these retries, or gets a 4xx EventBridge doesn't retry,
-          # is dropped.
           RetryPolicy:
             MaximumRetryAttempts: 185
             MaximumEventAgeInSeconds: 86400
