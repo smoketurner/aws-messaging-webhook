@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use aws_messaging_webhook::api::keys::KeyCache;
 use aws_messaging_webhook::aws::AwsServices;
@@ -34,18 +33,16 @@ async fn main() -> Result<(), lambda_http::Error> {
         dangerous_subscribe_url_prefix = Some(prefix);
     }
 
+    // One client for both users — fetching signing certificates and
+    // confirming subscriptions — so they share a connection pool. It never
+    // follows redirects, which both of them depend on.
+    let http = sns_message_verifier::no_redirect_client()?;
     let state = Arc::new(AppState {
         services,
         api_keys: KeyCache::new(),
-        verifier: verifier.build()?,
+        verifier: verifier.http_client(http.clone()).build()?,
         allowlist,
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            // Never follow redirects: validate_subscribe_url restricts the
-            // initial host to SNS, but following a 3xx off that host would be
-            // SSRF from the Lambda's network context.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
+        http,
         config,
         dangerous_subscribe_url_prefix,
     });

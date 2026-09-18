@@ -43,6 +43,7 @@ impl SnsVerifier {
     pub fn builder() -> SnsVerifierBuilder {
         SnsVerifierBuilder {
             dangerous_allow_prefix: None,
+            http: None,
         }
     }
 
@@ -86,9 +87,28 @@ impl SnsVerifier {
     }
 }
 
+/// An HTTP client with a 5 second overall timeout that never follows
+/// redirects.
+///
+/// Both users of one need exactly this: fetching a signing certificate,
+/// where a redirect off the allowed host would defeat the host policy that
+/// anchors the whole scheme, and confirming a subscription, where following
+/// a 3xx off SNS would be SSRF from the Lambda's network context.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::CertFetch`] if the client cannot be constructed.
+pub fn no_redirect_client() -> Result<reqwest::Client, VerifyError> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 /// Builder for [`SnsVerifier`].
 pub struct SnsVerifierBuilder {
     dangerous_allow_prefix: Option<String>,
+    http: Option<reqwest::Client>,
 }
 
 impl SnsVerifierBuilder {
@@ -103,21 +123,31 @@ impl SnsVerifierBuilder {
         self
     }
 
-    /// Builds the verifier. Uses an HTTP client with a 5 second overall
-    /// timeout.
+    /// Fetches certificates with `http` instead of a client of its own, so a
+    /// caller that already has one shares its connection pool.
+    ///
+    /// The client must not follow redirects: the `SigningCertURL` host policy
+    /// is this scheme's trust anchor, and a redirect off an allowed host
+    /// would defeat it. [`no_redirect_client`] builds one that satisfies
+    /// this.
+    #[must_use]
+    pub fn http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    /// Builds the verifier. Without [`Self::http_client`], it gets its own
+    /// client from [`no_redirect_client`].
     ///
     /// # Errors
     ///
     /// Returns [`VerifyError::CertFetch`] if the default HTTP client cannot
     /// be constructed.
     pub fn build(self) -> Result<SnsVerifier, VerifyError> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            // Never follow redirects: the SigningCertURL host policy is the
-            // trust anchor, and a redirect off an allowed host to an
-            // attacker would defeat it and let a forged certificate verify.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let http = match self.http {
+            Some(http) => http,
+            None => no_redirect_client()?,
+        };
         Ok(SnsVerifier {
             http,
             cache: cert::CertCache::default(),

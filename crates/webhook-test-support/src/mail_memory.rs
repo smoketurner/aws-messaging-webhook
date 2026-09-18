@@ -327,13 +327,16 @@ impl MailMemoryStore {
         if !query.ascending {
             rows.reverse();
         }
-        let more = rows.len() > query.limit;
         rows.truncate(query.limit);
+        // Mirror DynamoDB's LastEvaluatedKey, including the case callers trip
+        // over: a `Query` that stops because it hit its limit returns a key
+        // even when nothing is left, so a full page always carries a token
+        // and following it can land on an empty page.
+        let filled = rows.len() == query.limit;
 
-        // Mirror DynamoDB's LastEvaluatedKey: the index key plus the table
-        // key for the same item, so a token from the fake exercises the same
-        // continuation path as a real one.
-        let next = more.then(|| {
+        // The index key plus the table key for the same item, so a token from
+        // the fake exercises the same continuation path as a real one.
+        let next = filled.then(|| {
             rows.last().and_then(|(sort, item)| {
                 Some(PageKey {
                     partition: partition.to_owned(),
@@ -434,38 +437,10 @@ impl MailStore for MailMemoryStore {
             });
             return std::future::ready(result);
         }
-        let inbox_record = Inbox {
-            inbox_id: inbox.clone(),
-            email: inbox.as_str().to_owned(),
-            display_name: None,
-            metadata: None,
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
+        let (inbox_record, item) = match aws_messaging_webhook::mail::plan::inbox_item(inbox, now) {
+            Ok(built) => built,
+            Err(error) => return std::future::ready(Err(error)),
         };
-        let mut item: Item = match serde_dynamo::to_item(&inbox_record) {
-            Ok(item) => item,
-            Err(e) => {
-                return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
-                    "serializing inbox: {e}"
-                ))));
-            }
-        };
-        item.inner_mut().insert(
-            "pk".to_owned(),
-            AttributeValue::S(keys::inbox_pk(inbox.as_str())),
-        );
-        item.inner_mut().insert(
-            "sk".to_owned(),
-            AttributeValue::S(keys::inbox_sk().to_owned()),
-        );
-        item.inner_mut().insert(
-            "gsi1pk".to_owned(),
-            AttributeValue::S(keys::inboxes_partition().to_owned()),
-        );
-        item.inner_mut().insert(
-            "gsi1sk".to_owned(),
-            AttributeValue::S(inbox.as_str().to_owned()),
-        );
         guard.items.insert(key, item);
         std::future::ready(Ok(inbox_record))
     }
@@ -888,6 +863,37 @@ mod tests {
         let after = store.get_message(&inbox, "mid-1").await.unwrap().unwrap();
         assert_eq!(after.version, before.version);
         assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    /// DynamoDB returns a `LastEvaluatedKey` whenever a query stops at its
+    /// limit, even with nothing left, so a full page always carries a token
+    /// and following it can land on an empty page. A caller that treats a
+    /// token as "there is more" would loop or mislead, so this double has to
+    /// reproduce it.
+    #[tokio::test]
+    async fn a_full_page_carries_a_token_that_leads_to_an_empty_page() {
+        let store = MailMemoryStore::default();
+        let inbox = InboxId("support@example.com".to_owned());
+        for id in ["mid-1", "mid-2"] {
+            store.insert_message(&message(id, id)).await.unwrap();
+        }
+
+        let query = |start: Option<PageKey>| ListQuery {
+            inbox: inbox.clone(),
+            limit: 2,
+            before: None,
+            after: None,
+            ascending: true,
+            start,
+        };
+
+        let page = store.list_messages(&query(None)).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        let next = page.next.expect("a full page carries a continuation key");
+
+        let page = store.list_messages(&query(Some(next))).await.unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
     }
 
     #[tokio::test]

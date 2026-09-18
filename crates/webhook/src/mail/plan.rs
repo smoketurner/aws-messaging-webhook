@@ -98,6 +98,82 @@ fn item_with_keys<T: serde::Serialize>(
     Ok(item)
 }
 
+/// The inbox record and the item both stores write for it: its keys, and
+/// the single `ByTime` partition every inbox shares so `GET /v0/inboxes` is
+/// one query (there are few enough inboxes for that to stay cheap).
+///
+/// # Errors
+///
+/// Propagates a serialization failure as [`MailStoreError::Permanent`].
+pub fn inbox_item(
+    inbox: &crate::mail::InboxId,
+    now: &str,
+) -> Result<(crate::mail::Inbox, serde_dynamo::Item), MailStoreError> {
+    let record = crate::mail::Inbox {
+        inbox_id: inbox.clone(),
+        email: inbox.as_str().to_owned(),
+        display_name: None,
+        metadata: None,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
+    let item = item_with_keys(
+        &record,
+        [
+            ("pk", AttributeValue::S(keys::inbox_pk(inbox.as_str()))),
+            ("sk", AttributeValue::S(keys::inbox_sk().to_owned())),
+            (
+                "gsi1pk",
+                AttributeValue::S(keys::inboxes_partition().to_owned()),
+            ),
+            ("gsi1sk", AttributeValue::S(inbox.as_str().to_owned())),
+        ],
+    )?;
+    Ok((record, item))
+}
+
+/// The version bump and label rewrite every message update shares: a new
+/// version, `updated_at`, and the labels — removed rather than written empty,
+/// since DynamoDB has no empty string set.
+fn message_label_update(
+    msg: &MailMessage,
+    new_labels: &[String],
+    now: &str,
+) -> (Vec<(String, AttributeValue)>, Vec<String>) {
+    let mut set = vec![
+        (
+            "version".to_owned(),
+            AttributeValue::N((msg.version + 1).to_string()),
+        ),
+        ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
+    ];
+    let mut remove = Vec::new();
+    if new_labels.is_empty() {
+        remove.push("labels".to_owned());
+    } else {
+        set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
+    }
+    (set, remove)
+}
+
+/// One planned op writing a message's new labels under its version.
+fn message_label_op(
+    msg: &MailMessage,
+    set: Vec<(String, AttributeValue)>,
+    remove: Vec<String>,
+) -> PlannedOp {
+    PlannedOp {
+        role: OpRole::Message,
+        op: WriteOp::Update {
+            pk: keys::inbox_pk(msg.inbox_id.as_str()),
+            sk: keys::message_sk(&msg.message_id),
+            set,
+            remove,
+            cond: Cond::VersionEquals(msg.version),
+        },
+    }
+}
+
 /// Strips a `Message-ID` header value's surrounding `<`/`>`, if present.
 fn strip_angle_brackets(rfc_id: &str) -> &str {
     rfc_id
@@ -319,23 +395,11 @@ pub fn plan_mark(
     let mut ops = Vec::with_capacity(4);
     ops.push(send_state_put(Some(state_before), state_after)?);
 
-    let mut set = vec![
-        (
-            "version".to_owned(),
-            AttributeValue::N((msg.version + 1).to_string()),
-        ),
-        ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
-        (
-            "send_status".to_owned(),
-            AttributeValue::S(state_after.send_status.as_str().to_owned()),
-        ),
-    ];
-    let mut remove = Vec::new();
-    if new_labels.is_empty() {
-        remove.push("labels".to_owned());
-    } else {
-        set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
-    }
+    let (mut set, remove) = message_label_update(msg, new_labels, now);
+    set.push((
+        "send_status".to_owned(),
+        AttributeValue::S(state_after.send_status.as_str().to_owned()),
+    ));
     if let Some(ses) = ses {
         set.push((
             "ses_message_id".to_owned(),
@@ -344,16 +408,7 @@ pub fn plan_mark(
         set.push(("sent_at".to_owned(), AttributeValue::S(now.to_owned())));
     }
 
-    ops.push(PlannedOp {
-        role: OpRole::Message,
-        op: WriteOp::Update {
-            pk: keys::inbox_pk(msg.inbox_id.as_str()),
-            sk: keys::message_sk(&msg.message_id),
-            set,
-            remove,
-            cond: Cond::VersionEquals(msg.version),
-        },
-    });
+    ops.push(message_label_op(msg, set, remove));
 
     // The thread's labels roll up its messages', so a status label that moves
     // on the message moves on the thread in the same transaction.
@@ -430,31 +485,10 @@ pub fn plan_patch(
         "message labels must be sorted and deduplicated before planning"
     );
 
-    let mut set = vec![
-        (
-            "version".to_owned(),
-            AttributeValue::N((msg.version + 1).to_string()),
-        ),
-        ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
-    ];
-    let mut remove = Vec::new();
-    if new_labels.is_empty() {
-        remove.push("labels".to_owned());
-    } else {
-        set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
-    }
+    let (set, remove) = message_label_update(msg, new_labels, now);
 
     Ok(vec![
-        PlannedOp {
-            role: OpRole::Message,
-            op: WriteOp::Update {
-                pk: keys::inbox_pk(msg.inbox_id.as_str()),
-                sk: keys::message_sk(&msg.message_id),
-                set,
-                remove,
-                cond: Cond::VersionEquals(msg.version),
-            },
-        },
+        message_label_op(msg, set, remove),
         thread_put(Some(thread_before), thread_after)?,
     ])
 }

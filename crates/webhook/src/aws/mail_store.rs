@@ -148,7 +148,11 @@ impl KeyCondition {
             (Some(after), Some(before)) => {
                 values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
                 values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
-                Some(" AND #sk BETWEEN :after AND :before")
+                // Not BETWEEN, which includes both ends: `ListQuery`'s bounds
+                // are exclusive, and they are exclusive in the one-sided
+                // cases below, so an item exactly on a bound must not depend
+                // on whether the caller gave the other one.
+                Some(" AND #sk > :after AND #sk < :before")
             }
             (Some(after), None) => {
                 values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
@@ -578,34 +582,7 @@ impl MailStore for AwsServices {
 
     async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
-        let record = Inbox {
-            inbox_id: inbox.clone(),
-            email: inbox.as_str().to_owned(),
-            display_name: None,
-            metadata: None,
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        };
-        let mut item: serde_dynamo::Item = serde_dynamo::to_item(&record)
-            .map_err(|e| MailStoreError::Permanent(anyhow!("serializing inbox: {e}")))?;
-        item.inner_mut().insert(
-            "pk".to_owned(),
-            DynamoAv::S(keys::inbox_pk(inbox.as_str())).into(),
-        );
-        item.inner_mut().insert(
-            "sk".to_owned(),
-            DynamoAv::S(keys::inbox_sk().to_owned()).into(),
-        );
-        // Every inbox shares one index partition so `GET /v0/inboxes` is a
-        // single query; there are few enough inboxes for that to stay cheap.
-        item.inner_mut().insert(
-            "gsi1pk".to_owned(),
-            DynamoAv::S(keys::inboxes_partition().to_owned()).into(),
-        );
-        item.inner_mut().insert(
-            "gsi1sk".to_owned(),
-            DynamoAv::S(inbox.as_str().to_owned()).into(),
-        );
+        let (record, item) = crate::mail::plan::inbox_item(inbox, now)?;
 
         let mut builder = self.dynamo.put_item().table_name(table_name.clone());
         for (name, value) in item.inner() {
@@ -950,39 +927,44 @@ impl MailStore for AwsServices {
         start: Option<PageKey>,
     ) -> Result<Option<ThreadView>, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
-        let thread = self
+        // Messages of one thread, oldest first: ByThread is keyed by the
+        // message id, which orders by time. The thread item and its messages
+        // are independent reads, so they go out together rather than one
+        // after the other.
+        let partition = keys::thread_messages_partition(inbox.as_str(), thread_id);
+        let read_thread = self
             .dynamo
             .get_item()
             .table_name(&table_name)
             .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
             .key("sk", DynamoAv::S(keys::thread_sk(thread_id)))
-            .send()
-            .await
+            .send();
+        let read_messages = self.query_page(
+            PageQuery {
+                index: MailIndex::ByThread,
+                partition: &partition,
+                limit,
+                before: None,
+                after: None,
+                ascending: true,
+                start: start.as_ref(),
+            },
+            "listing thread messages",
+        );
+        let (thread, messages) = tokio::join!(read_thread, read_messages);
+
+        let thread = thread
             .map_err(|e| store_error_from_sdk("GetItem(thread)", &e))?
             .item;
         let Some(thread) = thread else {
+            // The messages query may have run for nothing; a thread that
+            // doesn't exist is the rarer case than one that does.
             return Ok(None);
         };
         let thread: ThreadState = serde_dynamo::from_item(thread)
             .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}")))?;
+        let messages = messages?;
 
-        // Messages of one thread, oldest first: ByThread is keyed by the
-        // message id, which orders by time.
-        let partition = keys::thread_messages_partition(inbox.as_str(), thread_id);
-        let messages = self
-            .query_page(
-                PageQuery {
-                    index: MailIndex::ByThread,
-                    partition: &partition,
-                    limit,
-                    before: None,
-                    after: None,
-                    ascending: true,
-                    start: start.as_ref(),
-                },
-                "listing thread messages",
-            )
-            .await?;
         Ok(Some(ThreadView { thread, messages }))
     }
 }
@@ -1023,6 +1005,20 @@ mod tests {
         let key = KeyCondition::new("gsi1pk", "gsi1sk", "INBOXES", None, None);
         assert_eq!(key.expression, "#pk = :pk");
         assert!(!key.names.contains_key("#sk"));
+        assert_placeholders_match(&key);
+    }
+
+    /// `ListQuery`'s bounds are exclusive, and a caller who gives both must
+    /// get the same items they would get from two one-sided queries —
+    /// `BETWEEN` would quietly include the endpoints instead.
+    #[test]
+    fn both_bounds_stay_exclusive() {
+        let key = KeyCondition::new("gsi1pk", "gsi1sk", "INBOX#x#MSG", Some("a"), Some("b"));
+        assert_eq!(
+            key.expression,
+            "#pk = :pk AND #sk > :after AND #sk < :before"
+        );
+        assert!(!key.expression.contains("BETWEEN"));
         assert_placeholders_match(&key);
     }
 
