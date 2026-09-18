@@ -10,16 +10,15 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Mutex;
 
+use aws_messaging_webhook::mail::flows;
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, WriteOp};
 use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
     EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
-use aws_messaging_webhook::mail::thread::{ThreadState, apply_message, new_thread};
-use aws_messaging_webhook::mail::txn::{
-    CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases,
-};
+use aws_messaging_webhook::mail::thread::ThreadState;
+use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use aws_messaging_webhook::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 use serde_dynamo::{AttributeValue, Item};
 
@@ -38,27 +37,18 @@ pub enum Injected {
     Throttle,
 }
 
-/// A transaction attempt's outcome once condition evaluation has run.
-enum Commit {
-    /// Every condition held; the writes were applied.
-    Applied,
-    /// At least one condition failed.
-    Cancelled(TxnDecision),
-}
-
 #[derive(Default)]
 struct Inner {
     items: HashMap<(String, String), Item>,
     injected: VecDeque<Injected>,
 }
 
-/// `Retry`/`VersionConflict` loops at most this many times before giving
-/// up with `MailStoreError::Conflict`.
-const MAX_RETRIES: u32 = 3;
-
 #[derive(Default)]
 pub struct MailMemoryStore {
     inner: Mutex<Inner>,
+    /// How many transactions have been attempted, so a test can tell a flow
+    /// that gave up immediately from one that burned its retries.
+    attempts: std::sync::atomic::AtomicUsize,
 }
 
 /// A minimal inbound message, for tests that need one in the store without
@@ -109,6 +99,12 @@ impl MailMemoryStore {
 
     fn key(pk: &str, sk: &str) -> (String, String) {
         (pk.to_owned(), sk.to_owned())
+    }
+
+    /// How many transactions have been attempted against this store.
+    #[must_use]
+    pub fn txn_attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The raw item at `pk`/`sk`, for tests asserting on an item the
@@ -227,7 +223,9 @@ impl MailMemoryStore {
     /// currently committed state, and either applies every write (all
     /// conditions held) or applies none (mirroring `TransactWriteItems`'
     /// all-or-nothing semantics).
-    fn attempt(&self, ops: &[PlannedOp]) -> Result<Commit, MailStoreError> {
+    fn attempt(&self, ops: &[PlannedOp]) -> Result<flows::TxnOutcome, MailStoreError> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[expect(
             clippy::unwrap_used,
             reason = "test double: a poisoned lock is a test bug"
@@ -240,7 +238,7 @@ impl MailMemoryStore {
                     "injected transient failure"
                 ))),
                 Injected::Conflict | Injected::Throttle => {
-                    Ok(Commit::Cancelled(TxnDecision::Retry))
+                    Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry))
                 }
             };
         }
@@ -269,13 +267,15 @@ impl MailMemoryStore {
         }
 
         if !all_ok {
-            return Ok(Commit::Cancelled(decode_cancellation(ops, &reasons)));
+            return Ok(flows::TxnOutcome::Cancelled(decode_cancellation(
+                ops, &reasons,
+            )));
         }
 
         for planned in ops {
             Self::apply_op(&mut guard.items, &planned.op);
         }
-        Ok(Commit::Applied)
+        Ok(flows::TxnOutcome::Committed)
     }
 
     /// One page of an index partition, mirroring the real store's query: the
@@ -367,6 +367,37 @@ impl MailMemoryStore {
             .items
             .get(&Self::key(pk, sk))
             .cloned()
+    }
+}
+
+impl flows::TxnStore for MailMemoryStore {
+    fn read_item<T: serde::de::DeserializeOwned + Send>(
+        &self,
+        pk: &str,
+        sk: &str,
+    ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
+        let result = self
+            .get_item(pk, sk)
+            .map(|item| {
+                serde_dynamo::from_item(item).map_err(|e| {
+                    MailStoreError::Permanent(anyhow::anyhow!("deserializing item: {e}"))
+                })
+            })
+            .transpose();
+        std::future::ready(result)
+    }
+
+    fn run_txn(
+        &self,
+        ops: &[PlannedOp],
+    ) -> impl Future<Output = Result<flows::TxnOutcome, MailStoreError>> + Send {
+        std::future::ready(self.attempt(ops))
+    }
+
+    /// Nothing to wait for: this store's "conflicts" are scripted, so a real
+    /// backoff would only make the tests slower.
+    fn pause(&self, _attempt: u32) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
     }
 }
 
@@ -479,48 +510,7 @@ impl MailStore for MailMemoryStore {
         &self,
         msg: &MailMessage,
     ) -> impl Future<Output = Result<InsertOutcome, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        use aws_messaging_webhook::mail::plan::plan_insert;
-
-        let result = (|| {
-            let mut taken = Vec::new();
-            for _attempt in 0..=MAX_RETRIES {
-                let thread_before: Option<ThreadState> = self
-                    .get_item(
-                        &keys::inbox_pk(msg.inbox_id.as_str()),
-                        &keys::thread_sk(&msg.thread_id),
-                    )
-                    .map(|item| {
-                        serde_dynamo::from_item(item).map_err(|e| {
-                            MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
-                        })
-                    })
-                    .transpose()?;
-                let thread_after = match &thread_before {
-                    Some(before) => apply_message(before, msg),
-                    None => new_thread(msg),
-                };
-
-                let mut ops = plan_insert(msg, thread_before.as_ref(), &thread_after)?;
-                drop_taken_aliases(&mut ops, &taken);
-                match self.attempt(&ops)? {
-                    Commit::Applied => return Ok(InsertOutcome::Fresh),
-                    Commit::Cancelled(TxnDecision::Duplicate) => {
-                        return Ok(InsertOutcome::Duplicate);
-                    }
-                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
-                    Commit::Cancelled(TxnDecision::Permanent | TxnDecision::KeyExists) => {
-                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                            "ingest transaction for message {} was cancelled",
-                            msg.message_id
-                        )));
-                    }
-                }
-            }
-            Err(MailStoreError::Conflict)
-        })();
-        std::future::ready(result)
+        flows::insert_message(self, msg)
     }
 
     fn get_send_key(
@@ -546,58 +536,7 @@ impl MailStore for MailMemoryStore {
         key: Option<&SendKey>,
         now_epoch: u64,
     ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        use aws_messaging_webhook::mail::plan::plan_enqueue;
-
-        let result = (|| {
-            let mut taken = Vec::new();
-            for _attempt in 0..=MAX_RETRIES {
-                let thread_before: Option<ThreadState> = self
-                    .get_item(
-                        &keys::inbox_pk(msg.inbox_id.as_str()),
-                        &keys::thread_sk(&msg.thread_id),
-                    )
-                    .map(|item| {
-                        serde_dynamo::from_item(item).map_err(|e| {
-                            MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
-                        })
-                    })
-                    .transpose()?;
-                let thread_after = match &thread_before {
-                    Some(before) => apply_message(before, msg),
-                    None => new_thread(msg),
-                };
-
-                let mut ops = plan_enqueue(
-                    msg,
-                    state,
-                    key,
-                    thread_before.as_ref(),
-                    &thread_after,
-                    now_epoch,
-                )?;
-                drop_taken_aliases(&mut ops, &taken);
-                match self.attempt(&ops)? {
-                    Commit::Applied => return Ok(EnqueueOutcome::Committed),
-                    Commit::Cancelled(TxnDecision::KeyExists) => {
-                        return Ok(EnqueueOutcome::KeyExists);
-                    }
-                    Commit::Cancelled(TxnDecision::Duplicate) => {
-                        return Ok(EnqueueOutcome::AlreadyQueued);
-                    }
-                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
-                    Commit::Cancelled(TxnDecision::Permanent) => {
-                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                            "enqueue transaction for message {} was cancelled",
-                            msg.message_id
-                        )));
-                    }
-                }
-            }
-            Err(MailStoreError::Conflict)
-        })();
-        std::future::ready(result)
+        flows::enqueue_send(self, msg, state, key, now_epoch)
     }
 
     fn resolve_ses_message(
@@ -661,33 +600,7 @@ impl MailStore for MailMemoryStore {
         message_id: &str,
         now: &str,
     ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        use aws_messaging_webhook::mail::plan::plan_claim;
-
-        let result = (|| {
-            for _attempt in 0..=MAX_RETRIES {
-                let Some(item) = self.get_item(&keys::outbox_pk(message_id), keys::outbox_sk())
-                else {
-                    return Ok(None);
-                };
-                let before: SendState = serde_dynamo::from_item(item).map_err(|e| {
-                    MailStoreError::Permanent(anyhow::anyhow!("deserializing send state: {e}"))
-                })?;
-                if before.send_status != SendStatus::Queued {
-                    return Ok(None);
-                }
-
-                let after = before.claimed(now);
-                let ops = plan_claim(&before, &after)?;
-                match self.attempt(&ops)? {
-                    Commit::Applied => return Ok(Some(after)),
-                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(_) => return Ok(None),
-                }
-            }
-            Err(MailStoreError::Conflict)
-        })();
-        std::future::ready(result)
+        flows::claim_send(self, message_id, now)
     }
 
     fn note_ses_call(
@@ -695,21 +608,7 @@ impl MailStore for MailMemoryStore {
         claimed: &SendState,
         now: &str,
     ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::plan::plan_ses_call;
-
-        let result = (|| {
-            let after = claimed.calling_ses(now);
-            let ops = plan_ses_call(claimed, &after)?;
-            for _attempt in 0..=MAX_RETRIES {
-                match self.attempt(&ops)? {
-                    Commit::Applied => return Ok(Some(after)),
-                    Commit::Cancelled(TxnDecision::Retry) => {}
-                    Commit::Cancelled(_) => return Ok(None),
-                }
-            }
-            Err(MailStoreError::Conflict)
-        })();
-        std::future::ready(result)
+        flows::note_ses_call(self, claimed, now)
     }
 
     fn mark_send(
@@ -718,91 +617,7 @@ impl MailStore for MailMemoryStore {
         outcome: MarkOutcome<'_>,
         now: &str,
     ) -> impl Future<Output = Result<(), MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        use aws_messaging_webhook::mail::plan::plan_mark;
-        use aws_messaging_webhook::mail::send::mark_transition;
-
-        let result = (|| {
-            let mut taken = Vec::new();
-            for _attempt in 0..=MAX_RETRIES {
-                let Some(item) = self.get_item(
-                    &keys::inbox_pk(state.inbox_id.as_str()),
-                    &keys::message_sk(&state.message_id),
-                ) else {
-                    return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                        "send state {} has no message",
-                        state.message_id
-                    )));
-                };
-                let msg: MailMessage = serde_dynamo::from_item(item).map_err(|e| {
-                    MailStoreError::Permanent(anyhow::anyhow!("deserializing message: {e}"))
-                })?;
-
-                let (after, labels, ses) = mark_transition(state, &msg, outcome, now);
-                let (added, removed) =
-                    aws_messaging_webhook::mail::send::label_changes(&msg.labels, &labels);
-                let thread = if added.is_empty() && removed.is_empty() {
-                    None
-                } else {
-                    let Some(thread_item) = self.get_item(
-                        &keys::inbox_pk(msg.inbox_id.as_str()),
-                        &keys::thread_sk(&msg.thread_id),
-                    ) else {
-                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                            "message {} refers to a thread that does not exist",
-                            msg.message_id
-                        )));
-                    };
-                    let before: ThreadState =
-                        serde_dynamo::from_item(thread_item).map_err(|e| {
-                            MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
-                        })?;
-                    let after = aws_messaging_webhook::mail::thread::apply_label_patch(
-                        &before, &added, &removed, now,
-                    );
-                    Some((before, after))
-                };
-                let mut ops = plan_mark(
-                    state,
-                    &after,
-                    &msg,
-                    &labels,
-                    thread.as_ref().map(|(before, after)| (before, after)),
-                    ses,
-                    now,
-                )?;
-                drop_taken_aliases(&mut ops, &taken);
-                match self.attempt(&ops)? {
-                    Commit::Applied => return Ok(()),
-                    Commit::Cancelled(TxnDecision::Retry) => {}
-                    Commit::Cancelled(TxnDecision::VersionConflict) => {
-                        // Mirrors the real store: a send state another writer
-                        // moved on is a lost claim, not something to retry.
-                        let current: Option<SendState> = self
-                            .get_item(&keys::outbox_pk(&state.message_id), keys::outbox_sk())
-                            .map(serde_dynamo::from_item)
-                            .transpose()
-                            .map_err(|e| {
-                                MailStoreError::Permanent(anyhow::anyhow!(
-                                    "deserializing send state: {e}"
-                                ))
-                            })?;
-                        if current.is_none_or(|current| current.version != state.version) {
-                            return Err(MailStoreError::Conflict);
-                        }
-                    }
-                    Commit::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
-                    Commit::Cancelled(_) => {
-                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                            "marking send {} was cancelled",
-                            state.message_id
-                        )));
-                    }
-                }
-            }
-            Err(MailStoreError::Conflict)
-        })();
-        std::future::ready(result)
+        flows::mark_send(self, state, outcome, now)
     }
 
     fn update_labels(
@@ -813,75 +628,7 @@ impl MailStore for MailMemoryStore {
         remove: &[String],
         now: &str,
     ) -> impl Future<Output = Result<Option<Vec<String>>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        use aws_messaging_webhook::mail::plan::plan_patch;
-        use aws_messaging_webhook::mail::thread::apply_label_patch;
-
-        let result = (|| {
-            for _attempt in 0..=MAX_RETRIES {
-                let Some(item) = self.get_item(
-                    &keys::inbox_pk(inbox.as_str()),
-                    &keys::message_sk(message_id),
-                ) else {
-                    return Ok(None);
-                };
-                let msg: MailMessage = serde_dynamo::from_item(item).map_err(|e| {
-                    MailStoreError::Permanent(anyhow::anyhow!("deserializing message: {e}"))
-                })?;
-                let Some(thread_item) = self.get_item(
-                    &keys::inbox_pk(inbox.as_str()),
-                    &keys::thread_sk(&msg.thread_id),
-                ) else {
-                    return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                        "message {message_id} refers to a thread that does not exist"
-                    )));
-                };
-                let thread_before: ThreadState =
-                    serde_dynamo::from_item(thread_item).map_err(|e| {
-                        MailStoreError::Permanent(anyhow::anyhow!("deserializing thread: {e}"))
-                    })?;
-
-                let mut new_labels = msg.labels.clone();
-                let mut added = Vec::new();
-                for label in add {
-                    if !new_labels.iter().any(|existing| existing == label) {
-                        new_labels.push(label.clone());
-                        added.push(label.clone());
-                    }
-                }
-                let mut removed = Vec::new();
-                for label in remove {
-                    if new_labels.iter().any(|existing| existing == label) {
-                        new_labels.retain(|existing| existing != label);
-                        removed.push(label.clone());
-                    }
-                }
-                new_labels.sort();
-
-                if added.is_empty() && removed.is_empty() {
-                    return Ok(Some(new_labels));
-                }
-
-                let thread_after = apply_label_patch(&thread_before, &added, &removed, now);
-                let ops = plan_patch(&msg, &new_labels, &thread_before, &thread_after, now)?;
-                match self.attempt(&ops)? {
-                    Commit::Applied => return Ok(Some(new_labels)),
-                    Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(
-                        TxnDecision::Permanent
-                        | TxnDecision::KeyExists
-                        | TxnDecision::Duplicate
-                        | TxnDecision::AliasTaken(_),
-                    ) => {
-                        return Err(MailStoreError::Permanent(anyhow::anyhow!(
-                            "label patch for message {message_id} was cancelled"
-                        )));
-                    }
-                }
-            }
-            Err(MailStoreError::Conflict)
-        })();
-        std::future::ready(result)
+        flows::update_labels(self, inbox, message_id, add, remove, now)
     }
 
     fn get_message(
@@ -1054,10 +801,99 @@ mod tests {
         assert!(matches!(err, MailStoreError::Transient(_)));
     }
 
+    /// A queued outbound message and its send state, committed the way the
+    /// send API commits them.
+    async fn queued_send(store: &MailMemoryStore) -> SendState {
+        use aws_messaging_webhook::mail::send::Envelope;
+
+        let mut msg = message("mid-1", "mid-1");
+        msg.labels = vec!["queued".to_owned()];
+        let state = SendState::queued(
+            msg.inbox_id.clone(),
+            msg.message_id.clone(),
+            msg.thread_id.clone(),
+            Envelope {
+                to: vec!["recipient@example.com".to_owned()],
+                ..Envelope::default()
+            },
+            None,
+            "2026-01-01T00:00:00.000Z",
+        );
+        store
+            .enqueue_send(&msg, &state, None, 1_800_000_000)
+            .await
+            .unwrap();
+        state
+    }
+
+    /// Marking a send with a state another writer has already moved past is
+    /// a lost claim, not something to retry: the caller's state can never
+    /// satisfy the version condition again, and retrying it would race the
+    /// writer that took over.
+    #[tokio::test]
+    async fn marking_a_send_someone_else_moved_on_reports_a_conflict() {
+        let store = MailMemoryStore::default();
+        let stale = queued_send(&store).await;
+
+        // Another sender claims it, moving the version on.
+        store
+            .claim_send("mid-1", "2026-01-01T00:00:01.000Z")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let attempts_before = store.txn_attempts();
+        let error = store
+            .mark_send(
+                &stale,
+                MarkOutcome::Sent(aws_messaging_webhook::mail::store::SesSent {
+                    message_id: "ses-1",
+                    region: "us-east-1",
+                }),
+                "2026-01-01T00:00:02.000Z",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MailStoreError::Conflict), "{error:?}");
+        // One attempt, then the re-read settles it: retrying a claim someone
+        // else holds can never succeed, so the budget must not be spent on it.
+        assert_eq!(store.txn_attempts() - attempts_before, 1);
+    }
+
+    /// A patch that adds a label the message already has, or removes one it
+    /// doesn't, writes nothing: it returns the current labels without
+    /// spending a transaction or bumping the message's version.
+    #[tokio::test]
+    async fn a_patch_that_changes_nothing_leaves_the_version_alone() {
+        let store = MailMemoryStore::default();
+        let mut msg = message("mid-1", "mid-1");
+        msg.labels = vec!["received".to_owned(), "unread".to_owned()];
+        let inbox = msg.inbox_id.clone();
+        store.insert_message(&msg).await.unwrap();
+        let before = store.get_message(&inbox, "mid-1").await.unwrap().unwrap();
+
+        let labels = store
+            .update_labels(
+                &inbox,
+                "mid-1",
+                &["unread".to_owned()],
+                &["spam".to_owned()],
+                "2026-01-01T00:00:05.000Z",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(labels, before.labels);
+        let after = store.get_message(&inbox, "mid-1").await.unwrap().unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
     #[tokio::test]
     async fn insert_message_gives_up_after_max_retries_on_persistent_throttling() {
         let store = MailMemoryStore::default();
-        for _ in 0..=MAX_RETRIES {
+        for _ in 0..=flows::MAX_TXN_RETRIES {
             store.inject(Injected::Throttle);
         }
         let msg = message("mid-1", "mid-1");
