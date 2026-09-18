@@ -11,14 +11,14 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use aws_messaging_webhook::mail::keys::PageKey;
-use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, TxnKind, WriteOp};
+use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, WriteOp};
 use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
     EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
 use aws_messaging_webhook::mail::thread::{ThreadState, apply_message, new_thread};
 use aws_messaging_webhook::mail::txn::{
-    CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases, taken_aliases,
+    CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases,
 };
 use aws_messaging_webhook::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 use serde_dynamo::{AttributeValue, Item};
@@ -44,8 +44,6 @@ enum Commit {
     Applied,
     /// At least one condition failed.
     Cancelled(TxnDecision),
-    /// Only these alias keys' checks failed; retry without them.
-    AliasTaken(Vec<String>),
 }
 
 #[derive(Default)]
@@ -161,18 +159,10 @@ impl MailMemoryStore {
         check: &aws_messaging_webhook::mail::plan::Check,
     ) -> bool {
         use aws_messaging_webhook::mail::plan::Check;
-        match check {
-            Check::Exists(name) => existing.is_some_and(|item| item.inner().contains_key(*name)),
-            Check::NotExists(name) => {
-                !existing.is_some_and(|item| item.inner().contains_key(*name))
-            }
-            Check::Eq(name, expected) => existing
-                .and_then(|item| item.inner().get(*name))
-                .is_some_and(|actual| actual == expected),
-            Check::In(name, expected) => existing
-                .and_then(|item| item.inner().get(*name))
-                .is_some_and(|actual| expected.contains(actual)),
-        }
+        let Check::Eq(name, expected) = check;
+        existing
+            .and_then(|item| item.inner().get(*name))
+            .is_some_and(|actual| actual == expected)
     }
 
     fn op_key(op: &WriteOp) -> Option<(String, String)> {
@@ -181,9 +171,9 @@ impl MailMemoryStore {
                 Self::string_attr(item, "pk")?,
                 Self::string_attr(item, "sk")?,
             )),
-            WriteOp::Update { pk, sk, .. }
-            | WriteOp::Delete { pk, sk }
-            | WriteOp::AliasFirstWriter { pk, sk, .. } => Some((pk.clone(), sk.clone())),
+            WriteOp::Update { pk, sk, .. } | WriteOp::AliasFirstWriter { pk, sk, .. } => {
+                Some((pk.clone(), sk.clone()))
+            }
         }
     }
 
@@ -209,9 +199,6 @@ impl MailMemoryStore {
                 for name in remove {
                     entry.inner_mut().remove(name);
                 }
-            }
-            WriteOp::Delete { pk, sk } => {
-                items.remove(&Self::key(pk, sk));
             }
             WriteOp::AliasFirstWriter {
                 pk,
@@ -261,7 +248,6 @@ impl MailMemoryStore {
         let cond_of = |op: &WriteOp| -> Cond {
             match op {
                 WriteOp::Put { cond, .. } | WriteOp::Update { cond, .. } => cond.clone(),
-                WriteOp::Delete { .. } => Cond::None,
                 WriteOp::AliasFirstWriter { .. } => Cond::NotExists,
             }
         };
@@ -283,10 +269,7 @@ impl MailMemoryStore {
         }
 
         if !all_ok {
-            return Ok(match decode_cancellation(TxnKind::Insert, ops, &reasons) {
-                TxnDecision::AliasTaken => Commit::AliasTaken(taken_aliases(ops, &reasons)),
-                decision => Commit::Cancelled(decision),
-            });
+            return Ok(Commit::Cancelled(decode_cancellation(ops, &reasons)));
         }
 
         for planned in ops {
@@ -526,10 +509,8 @@ impl MailStore for MailMemoryStore {
                         return Ok(InsertOutcome::Duplicate);
                     }
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::AliasTaken(keys) => taken.extend(keys),
-                    Commit::Cancelled(
-                        TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::AliasTaken,
-                    ) => {
+                    Commit::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
+                    Commit::Cancelled(TxnDecision::Permanent | TxnDecision::KeyExists) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "ingest transaction for message {} was cancelled",
                             msg.message_id
@@ -605,8 +586,8 @@ impl MailStore for MailMemoryStore {
                         return Ok(EnqueueOutcome::AlreadyQueued);
                     }
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::AliasTaken(keys) => taken.extend(keys),
-                    Commit::Cancelled(TxnDecision::Permanent | TxnDecision::AliasTaken) => {
+                    Commit::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
+                    Commit::Cancelled(TxnDecision::Permanent) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "enqueue transaction for message {} was cancelled",
                             msg.message_id
@@ -701,7 +682,7 @@ impl MailStore for MailMemoryStore {
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(Some(after)),
                     Commit::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {}
-                    Commit::Cancelled(_) | Commit::AliasTaken(_) => return Ok(None),
+                    Commit::Cancelled(_) => return Ok(None),
                 }
             }
             Err(MailStoreError::Conflict)
@@ -723,7 +704,7 @@ impl MailStore for MailMemoryStore {
                 match self.attempt(&ops)? {
                     Commit::Applied => return Ok(Some(after)),
                     Commit::Cancelled(TxnDecision::Retry) => {}
-                    Commit::Cancelled(_) | Commit::AliasTaken(_) => return Ok(None),
+                    Commit::Cancelled(_) => return Ok(None),
                 }
             }
             Err(MailStoreError::Conflict)
@@ -810,7 +791,7 @@ impl MailStore for MailMemoryStore {
                             return Err(MailStoreError::Conflict);
                         }
                     }
-                    Commit::AliasTaken(keys) => taken.extend(keys),
+                    Commit::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
                     Commit::Cancelled(_) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "marking send {} was cancelled",
@@ -890,9 +871,8 @@ impl MailStore for MailMemoryStore {
                         TxnDecision::Permanent
                         | TxnDecision::KeyExists
                         | TxnDecision::Duplicate
-                        | TxnDecision::AliasTaken,
-                    )
-                    | Commit::AliasTaken(_) => {
+                        | TxnDecision::AliasTaken(_),
+                    ) => {
                         return Err(MailStoreError::Permanent(anyhow::anyhow!(
                             "label patch for message {message_id} was cancelled"
                         )));

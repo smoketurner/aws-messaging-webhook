@@ -30,30 +30,11 @@ pub enum OpRole {
     SesRef,
 }
 
-/// Which flow this transaction belongs to; `decode_cancellation`
-/// branches on it (e.g. only `Enqueue` produces `TxnDecision::KeyExists`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxnKind {
-    Insert,
-    Enqueue,
-    Patch,
-    Delivery,
-    MarkSent,
-    MarkFailed,
-    MarkUnknown,
-    ResendUnknown,
-    RepointPromotion,
-    ExpireOutbox,
-}
-
-/// One equality/existence check, rendered into a `ConditionExpression`
-/// clause by the op's executor.
+/// One equality check on an existing item's attribute, rendered into a
+/// `ConditionExpression` clause by the op's executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
     Eq(&'static str, AttributeValue),
-    In(&'static str, Vec<AttributeValue>),
-    Exists(&'static str),
-    NotExists(&'static str),
 }
 
 /// A write's condition.
@@ -82,10 +63,6 @@ pub enum WriteOp {
         set: Vec<(String, AttributeValue)>,
         remove: Vec<String>,
         cond: Cond,
-    },
-    Delete {
-        pk: String,
-        sk: String,
     },
     /// The RFC-alias first-writer-wins put: unconditioned by version,
     /// just `NotExists` on the alias key.

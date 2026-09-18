@@ -3,12 +3,14 @@
 //! flow that runs a transaction shares one retry/conflict policy instead of
 //! re-deriving it from raw DynamoDB error codes.
 
-use crate::mail::plan::{Cond, OpRole, PlannedOp, TxnKind, WriteOp};
+use crate::mail::plan::{Cond, OpRole, PlannedOp, WriteOp};
 
 /// The outcome `decode_cancellation` resolves a transaction cancellation to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnDecision {
-    /// `TxnKind::Enqueue` only: the idempotency key already exists.
+    /// The idempotency key already exists, so this send was already
+    /// committed. Only an enqueue plans a key op, so only an enqueue can
+    /// see this.
     KeyExists,
     /// A `NotExists`-conditioned `Message`/`SendState` op lost its check —
     /// a redelivery (`Insert`) or this request's own earlier commit
@@ -20,10 +22,10 @@ pub enum TxnDecision {
     /// A version- or status-conditioned check lost: the caller re-reads and
     /// decides.
     VersionConflict,
-    /// Only `Message-ID` alias writes lost their check: those aliases already
-    /// belong to an earlier message. The first writer keeps an alias, so the
-    /// caller drops the ones [`taken_aliases`] names and commits the rest.
-    AliasTaken,
+    /// Only `Message-ID` alias writes lost their check: these aliases
+    /// already belong to an earlier message. The first writer keeps an
+    /// alias, so the caller drops these and commits the rest.
+    AliasTaken(Vec<String>),
     /// Anything else: log and surface as a permanent failure.
     Permanent,
 }
@@ -69,8 +71,8 @@ fn is_not_exists_conditioned(op: &WriteOp) -> bool {
     )
 }
 
-/// Whether `op` carries a version- or status-conditioned check (
-/// `Message`, `SendState` or `Thread`).
+/// Whether `op` carries a version- or status-conditioned check
+/// (`Message`, `SendState` or `Thread`).
 fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
     match op {
         WriteOp::Put { cond, .. } => {
@@ -85,7 +87,7 @@ fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
                 Cond::VersionEquals(_) | Cond::All(_) | Cond::NotExistsOrExpired { .. }
             )
         }
-        WriteOp::Delete { .. } | WriteOp::AliasFirstWriter { .. } => false,
+        WriteOp::AliasFirstWriter { .. } => false,
     }
 }
 
@@ -93,21 +95,16 @@ fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
 /// precedence documented above. `ops` and `reasons` are parallel: one
 /// cancellation reason per planned transaction item.
 #[must_use]
-pub fn decode_cancellation(
-    kind: TxnKind,
-    ops: &[PlannedOp],
-    reasons: &[CancellationReason],
-) -> TxnDecision {
+pub fn decode_cancellation(ops: &[PlannedOp], reasons: &[CancellationReason]) -> TxnDecision {
     debug_assert_eq!(ops.len(), reasons.len(), "ops and reasons must be parallel");
 
-    // Step 1: Enqueue's idempotency-key conflict.
-    if kind == TxnKind::Enqueue {
-        for (op, reason) in ops.iter().zip(reasons) {
-            if op.role == OpRole::IdempotencyKey
-                && *reason == CancellationReason::ConditionalCheckFailed
-            {
-                return TxnDecision::KeyExists;
-            }
+    // Step 1: the idempotency key lost its check. Only an enqueue plans one,
+    // so the op's role is enough to recognize the case.
+    for (op, reason) in ops.iter().zip(reasons) {
+        if op.role == OpRole::IdempotencyKey
+            && *reason == CancellationReason::ConditionalCheckFailed
+        {
+            return TxnDecision::KeyExists;
         }
     }
 
@@ -142,13 +139,14 @@ pub fn decode_cancellation(
     }
 
     // Step 5: the only failed checks are alias writes.
-    if !taken_aliases(ops, reasons).is_empty()
+    let taken = taken_aliases(ops, reasons);
+    if !taken.is_empty()
         && ops.iter().zip(reasons).all(|(op, reason)| {
             *reason != CancellationReason::ConditionalCheckFailed
                 || matches!(op.op, WriteOp::AliasFirstWriter { .. })
         })
     {
-        return TxnDecision::AliasTaken;
+        return TxnDecision::AliasTaken(taken);
     }
 
     // Step 6: anything else, including a failed check on an unconditioned op
@@ -158,8 +156,7 @@ pub fn decode_cancellation(
 
 /// The alias keys (`pk`) whose first-writer check failed in a cancelled
 /// transaction.
-#[must_use]
-pub fn taken_aliases(ops: &[PlannedOp], reasons: &[CancellationReason]) -> Vec<String> {
+fn taken_aliases(ops: &[PlannedOp], reasons: &[CancellationReason]) -> Vec<String> {
     let mut taken = Vec::new();
     for (op, reason) in ops.iter().zip(reasons) {
         if *reason == CancellationReason::ConditionalCheckFailed
@@ -175,7 +172,7 @@ pub fn taken_aliases(ops: &[PlannedOp], reasons: &[CancellationReason]) -> Vec<S
 pub fn drop_taken_aliases(ops: &mut Vec<PlannedOp>, taken: &[String]) {
     ops.retain(|op| match &op.op {
         WriteOp::AliasFirstWriter { pk, .. } => !taken.contains(pk),
-        WriteOp::Put { .. } | WriteOp::Update { .. } | WriteOp::Delete { .. } => true,
+        WriteOp::Put { .. } | WriteOp::Update { .. } => true,
     });
 }
 
@@ -247,11 +244,9 @@ mod tests {
             CancellationReason::ConditionalCheckFailed,
             CancellationReason::None,
         ];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::AliasTaken
-        );
-        let taken = taken_aliases(&ops, &reasons);
+        let TxnDecision::AliasTaken(taken) = decode_cancellation(&ops, &reasons) else {
+            panic!("only the alias check failed");
+        };
         assert_eq!(taken, vec!["RFC#support#taken@example.com"]);
 
         drop_taken_aliases(&mut ops, &taken);
@@ -273,7 +268,7 @@ mod tests {
             CancellationReason::ConditionalCheckFailed,
         ];
         assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
+            decode_cancellation(&ops, &reasons),
             TxnDecision::VersionConflict
         );
 
@@ -283,34 +278,27 @@ mod tests {
             not_exists_put(OpRole::Message),
             alias("RFC#support#taken@example.com"),
         ];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::Duplicate
-        );
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Duplicate);
     }
 
+    /// Only an enqueue plans an idempotency-key op, so a failed check on
+    /// one is what "this send was already committed" looks like. A
+    /// transaction without that op can never decode to `KeyExists`.
     #[test]
-    fn key_exists_only_for_enqueue() {
-        let ops = vec![not_exists_put(OpRole::IdempotencyKey)];
+    fn key_exists_comes_from_the_idempotency_key_op() {
         let reasons = vec![CancellationReason::ConditionalCheckFailed];
-        assert_eq!(
-            decode_cancellation(TxnKind::Enqueue, &ops, &reasons),
-            TxnDecision::KeyExists
-        );
-        assert_ne!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::KeyExists
-        );
+        let ops = vec![not_exists_put(OpRole::IdempotencyKey)];
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::KeyExists);
+
+        let ops = vec![not_exists_put(OpRole::Message)];
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Duplicate);
     }
 
     #[test]
     fn duplicate_from_not_exists_message_check() {
         let ops = vec![not_exists_put(OpRole::Message)];
         let reasons = vec![CancellationReason::ConditionalCheckFailed];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::Duplicate
-        );
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Duplicate);
     }
 
     #[test]
@@ -320,10 +308,7 @@ mod tests {
             CancellationReason::TransactionConflict,
             CancellationReason::None,
         ];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::Retry
-        );
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Retry);
     }
 
     #[test]
@@ -335,10 +320,7 @@ mod tests {
             CancellationReason::ConditionalCheckFailed,
             CancellationReason::TransactionConflict,
         ];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::Duplicate
-        );
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Duplicate);
     }
 
     #[test]
@@ -346,7 +328,7 @@ mod tests {
         let ops = vec![version_put(OpRole::Thread, 3)];
         let reasons = vec![CancellationReason::ConditionalCheckFailed];
         assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
+            decode_cancellation(&ops, &reasons),
             TxnDecision::VersionConflict
         );
     }
@@ -355,35 +337,27 @@ mod tests {
     fn permanent_for_validation_error() {
         let ops = vec![none_put(OpRole::SesRef)];
         let reasons = vec![CancellationReason::ValidationError];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::Permanent
-        );
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Permanent);
     }
 
     #[test]
     fn permanent_when_nothing_matches() {
         let ops = vec![none_put(OpRole::SesRef)];
         let reasons = vec![CancellationReason::None];
-        assert_eq!(
-            decode_cancellation(TxnKind::Insert, &ops, &reasons),
-            TxnDecision::Permanent
-        );
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Permanent);
     }
 
     proptest! {
-        /// Over random role layouts (with and without a SENDKEY op) and
-        /// random reason vectors: KeyExists only for Enqueue, Duplicate only
-        /// from a NotExists-conditioned op, a definite outcome always beats
-        /// Retry, and everything else falls through to Permanent.
+        /// Over random role layouts (with and without an idempotency-key op)
+        /// and random reason vectors: KeyExists only from a failed key check,
+        /// Duplicate only from a NotExists-conditioned op, a definite outcome
+        /// always beats Retry, and everything else falls through to Permanent.
         #[test]
         fn decode_cancellation_precedence_holds(
-            kind_is_enqueue in any::<bool>(),
             has_send_key in any::<bool>(),
             role_seed in proptest::collection::vec(0u8..5, 1..8),
             reason_seed in proptest::collection::vec(0u8..9, 1..8),
         ) {
-            let kind = if kind_is_enqueue { TxnKind::Enqueue } else { TxnKind::Insert };
             let roles = [
                 OpRole::Message,
                 OpRole::SendState,
@@ -417,10 +391,11 @@ mod tests {
                 ops[0] = not_exists_put(OpRole::IdempotencyKey);
             }
 
-            let decision = decode_cancellation(kind, &ops, &reasons);
+            let decision = decode_cancellation(&ops, &reasons);
 
             if decision == TxnDecision::KeyExists {
-                prop_assert_eq!(kind, TxnKind::Enqueue);
+                prop_assert!(has_send_key);
+                prop_assert_eq!(reasons[0], CancellationReason::ConditionalCheckFailed);
             }
             if decision == TxnDecision::Duplicate {
                 let has_not_exists_failure = ops.iter().zip(&reasons).any(|(op, reason)| {
@@ -431,8 +406,9 @@ mod tests {
                 prop_assert!(has_not_exists_failure);
             }
             if decision != TxnDecision::Retry && decision != TxnDecision::Permanent {
-                // A definite outcome (KeyExists/Duplicate/VersionConflict) was
-                // reached without falling into the catch-all.
+                // A definite outcome was reached without falling into the
+                // catch-all. No alias ops are planned here, so AliasTaken
+                // cannot come up.
                 prop_assert!(decision == TxnDecision::KeyExists
                     || decision == TxnDecision::Duplicate
                     || decision == TxnDecision::VersionConflict);
