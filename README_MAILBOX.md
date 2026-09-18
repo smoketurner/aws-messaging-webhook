@@ -66,11 +66,12 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
 
 1. **Publish DNS** (skip if you set `pHostedZoneId`). `output DnsRecords` lists the records:
    - the domain's MX to `inbound-smtp.<region>.amazonaws.com`;
-   - three DKIM CNAMEs;
+   - three DomainKeys Identified Mail (DKIM) CNAMEs;
    - the MAIL FROM domain `bounce.<domain>`, with an MX to `feedback-smtp.<region>.amazonses.com`
-     and `v=spf1 include:amazonses.com ~all`;
-   - the domain's SPF record `v=spf1 include:amazonses.com -all`;
-   - `_dmarc.<domain>`.
+     and a Sender Policy Framework (SPF) record, `v=spf1 include:amazonses.com ~all`;
+   - the domain's SPF record, `v=spf1 include:amazonses.com -all`;
+   - `_dmarc.<domain>`, the Domain-based Message Authentication, Reporting and Conformance
+     (DMARC) policy.
 2. **Wait for DKIM `SUCCESS`** before sending mail from the identity:
 
    ```bash
@@ -82,14 +83,16 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    deactivates any other. If one is already active, redeploy with `pExistingReceiptRuleSetName`
    set to its name and the stack adds only its rule.
 
-   Inbound mail stops silently whenever the stack's rule set is not the active one, including
-   after a deploy that replaces it. Check with `aws ses describe-active-receipt-rule-set`.
+   Inbound mail stops whenever the stack's rule set is not the active one, including after a
+   deploy that replaces it, and nothing reports it: SES never calls the function. Check with
+   `aws ses describe-active-receipt-rule-set`.
 
    ```bash
    aws ses set-active-receipt-rule-set --rule-set-name "$(output ReceiptRuleSetName)"
    ```
 
-4. **Create the API key parameter.** CloudFormation cannot create a SecureString parameter.
+4. **Create the API key parameter.** CloudFormation cannot create a Systems Manager (SSM)
+   SecureString parameter.
    Name it exactly `pApiKeysParameterName`, starting with `/`. The value holds SHA-256 hashes,
    never the keys:
 
@@ -101,7 +104,7 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    echo "$key"   # hand this to the client; it isn't stored anywhere
    ```
 
-   Add `--key-id <pApiKeysKmsKeyArn>` for a customer-managed key. Rotate by writing both
+   Add `--key-id <pApiKeysKmsKeyArn>` for a customer-managed Key Management Service (KMS) key. Rotate by writing both
    entries, moving clients to the new key, then removing the old entry.
 
 The API is served under the `ApiBaseUrl` output. `InboxAddress` is the inbox's address and its
@@ -171,7 +174,7 @@ List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (defau
 exactly one of `content` (base64) or `url`.
 
 A send or reply body may reach 6 MiB, the Function URL's limit; every other route takes 1 MiB.
-Base64 inflates inline content by about a third, so send larger attachments by `url`.
+Base64 inflates inline content by 33%, so send attachments over 4.5 MiB by `url`.
 
 **It queues; it does not send.** The response means the message is durably recorded, not that
 SES took it. A separate sender consumes the mail table's stream and makes the SES call. SESv2
@@ -182,8 +185,8 @@ Send an `Idempotency-Key` to make a retry safe:
 
 - The same key with the same request returns the original ids.
 - The same key with any difference — a field, an attachment's content or metadata, a different
-  route or original message — is a `409`. Sending something the caller didn't ask for is worse
-  than refusing.
+  route or original message — is a `409`. The alternative is sending mail the caller did not
+  ask for.
 - Keys are remembered for 24 hours. Without one, a retry after a lost response queues the
   message twice.
 
@@ -221,9 +224,9 @@ it. The sweep takes claims older than fifteen minutes:
 - a sender that recorded it was about to call SES moves to `unknown`, since the message may
   already have gone out.
 
-Fifteen minutes sits well beyond the sender's own timeout. Taking a send from a sender still
-working on it is how mail gets delivered twice. `unknown` sends are counted and left for an
-operator.
+Fifteen minutes is 7.5 times the sender's own 120-second timeout. Taking a send from a sender
+still working on it is how mail gets delivered twice. `unknown` sends are counted and left for
+an operator.
 
 SES events on the configuration set then label the message `delivered`, `bounced`,
 `complained`, `rejected` or `opened`. Labels are added, never removed: these events arrive out
@@ -252,8 +255,9 @@ configuration set.
 
 ## Mail metrics
 
-Ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as EMF
-in the stack-name namespace, each with a `function` dimension. The stack defines no alarms.
+Ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as
+CloudWatch Embedded Metrics Format (EMF) in the stack-name namespace, each with a `function`
+dimension. The stack defines no alarms.
 Build them on these metrics and on the `rAsyncInvokeDlq` and `rPublishDlq` queue depths.
 
 ## Disabling the mailbox
@@ -273,12 +277,12 @@ needs the retained bucket deleted first.
 ## Operator runbook
 
 Three situations need a person. The first two invoke the sender directly rather than going
-through the API: they are rare, destructive and account-scoped, so `lambda:InvokeFunction` is a
-better gate than a bearer key.
+through the API. Each one resends or closes a message that SES may already hold, so
+`lambda:InvokeFunction` gates them instead of a bearer key.
 
 **A send whose outcome is `unknown`.** SES was called and gave no usable answer, or the sender
-died after calling it, so SES may or may not hold the message. Nothing automatic touches it,
-because resending risks delivering twice. Find them in the sweep's `sends_outcome_unknown` log
+died after calling it. SES may or may not hold the message. Nothing automatic touches it:
+resending risks delivering twice. Find them in the sweep's `sends_outcome_unknown` log
 line or by querying `ByStatus`, then decide:
 
 ```bash
@@ -317,9 +321,8 @@ aws sqs delete-message --queue-url "$queue" \
 ```
 
 Ingest is idempotent: the message id comes from the SES message id and receipt timestamp, so a
-replay of a partly-successful attempt resolves to the same ids. The signature is re-verified on
-replay, which holds as long as the signing certificate is valid — comfortably within the queue's
-14-day retention.
+replay of a partial attempt resolves to the same ids. The replay re-verifies the signature, so
+it works while SES still serves the signing certificate. The queue holds the message 14 days.
 
 **A send stuck in `queued`.** `rMailSenderDlq` gets a record when the sender exhausts its
 retries. Its messages carry the stream position (`DDBStreamBatchInfo`), not the send, so they
@@ -340,8 +343,8 @@ The sender reacts to `requeued_at` appearing, so a send that already carries one
 
 ## Mail table
 
-A mailbox stack creates a second table, `MailTableName`. It is a separate partition space from
-the events table, keyed by inbox and message rather than by SNS message id:
+A mailbox stack creates a second table, `MailTableName`. It is a separate partition space from the events table, keyed by
+inbox and message rather than by SNS message id:
 
 | Item | `pk` | `sk` | Holds |
 |---|---|---|---|
@@ -351,8 +354,8 @@ the events table, keyed by inbox and message rather than by SNS message id:
 | RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps an inbound or outbound `Message-ID` to the message/thread it belongs to, for reply threading |
 
 Labels live on the message and thread items, not in per-label index rows. A label-filtered list
-reads the time-ordered index and filters the page. Ingest stays at three writes per message, and
-a rare label costs reading past non-matching ones.
+reads the time-ordered index and filters the page. Ingest stays at three writes per message. The
+cost is reading past non-matching messages, which grows as a label gets less common.
 
 Two indexes serve the reads:
 

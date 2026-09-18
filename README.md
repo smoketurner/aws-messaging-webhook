@@ -4,8 +4,8 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.98.0-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
 
-One Rust Lambda receives AWS messaging events over SNS: End User Messaging two-way SMS and
-delivery receipts, SES sending events, and SES inbound mail. Topics reach it over HTTPS to a
+One Rust Lambda receives AWS messaging events over SNS: End User Messaging (EUM) two-way SMS
+and delivery receipts, SES sending events, and SES inbound mail. Topics reach it over HTTPS to a
 Lambda Function URL, or by invoking it directly. Every event then:
 
 1. **Verifies.** The SNS signature (`SignatureVersion` 1 and 2) and a topic allowlist. These
@@ -47,7 +47,7 @@ behind it.
 
 Each payload's shape decides its event family, so there is no routing to configure. Wire each
 topic to its matching path anyway: a mismatch logs `family_mismatch` and still processes the
-event correctly. Direct SNS → Lambda subscriptions carry no path and need none.
+event. Direct SNS → Lambda subscriptions carry no path and need none.
 
 | Path | Subscribe this topic |
 |---|---|
@@ -110,7 +110,7 @@ aws sns subscribe --topic-arn <topic-arn> --protocol https \
 ```
 
 `PendingConfirmation` flips to `false` within seconds. If it stays pending, read the function
-logs: the topic is usually not allowlisted, or raw message delivery is on.
+logs. Two causes account for it: the topic is not allowlisted, or raw message delivery is on.
 
 ### Direct SNS → Lambda (optional)
 
@@ -129,11 +129,17 @@ aws sns subscribe --topic-arn <topic-arn> --protocol lambda \
   --notification-endpoint "${function_arn}"
 ```
 
-Retries differ between the pathways. Lambda's async-invoke queue retries a direct delivery
-**twice**; the HTTPS delivery policy retries far longer. Anything past those two retries lands
-in `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl` output) with the original event, so nothing is lost.
-Alarm on its depth and replay from it — see [Operations](#operations). Do not add your own
-on-failure destination: a function has one, and a second replaces the stack's.
+Retries differ between the pathways, and the direct one retries more, not less:
+
+| | SNS retries delivery | Then, on a function error |
+|---|---|---|
+| HTTPS | 3 times, 20 s apart, under SNS's default policy (configurable to 100 retries over 3,600 s) | The 5xx is the retry signal; SNS's policy governs |
+| Direct invoke | 100,015 times over 23 days, the AWS-managed endpoint policy | Lambda's async queue retries twice |
+
+Anything past those two async retries lands in `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl`) with the
+original event, so nothing is lost. Alarm on its depth and replay from it — see
+[Operations](#operations). Do not add your own on-failure destination: a function has one, and
+a second replaces the stack's.
 
 ### Parameters
 
@@ -263,7 +269,8 @@ bus. See [README_MAILBOX.md](README_MAILBOX.md#mailbox-events).
 One DynamoDB table (`TableName` output):
 
 - **Event items** — `pk = MSG#<messageId>`, `sk = EVT#<timestamp>#<snsMessageId>`: the exact
-  raw body received, parse metadata, TTL via `expires_at` (`pRawEventRetentionDays`, default 30).
+  raw body received, parse metadata, and a time to live (TTL) in `expires_at`
+  (`pRawEventRetentionDays`, default 30).
   The insert of each event item is what the stream relay turns into an EventBridge publish.
 - **Aggregate item** — same `pk`, `sk = AGG`: `current_status`, `first/last_event_at`,
   `open_count`, `last_opened_at`, `click_count`, `last_clicked_at`, `bot_open_count`,
@@ -298,7 +305,8 @@ only — no writes, no `Scan`, no indexes. Assume the role, then:
 - **Logs.** Structured JSON, one INFO line per message. The request path logs an `outcome`
   (`persisted|duplicate|confirmed|resubscribed`) and an `action`; the relay logs
   `outcome=published` per event.
-- **Metrics.** EMF, in the stack-name namespace, each with a `function` dimension:
+- **Metrics.** CloudWatch Embedded Metrics Format (EMF), in the stack-name namespace, each
+  with a `function` dimension:
   `MessagesReceived` (persisted + duplicate), `SignatureRejections`, `AllowlistRejections`,
   `UnclassifiedPayloads`, `Duplicates`, `EventsPublished`, `PublishFailures`, `InternalErrors`,
   `ActionFailures`, `Resubscribes`, `SubscriptionsLost`, `ColdStart`, and `Latency` (a
@@ -310,9 +318,9 @@ only — no writes, no `Scan`, no indexes. Assume the role, then:
 - **Durability.** The request path and the relay fail independently. A transient failure while
   persisting or acting returns 5xx, SNS redelivers, the conditional write dedupes it, and only
   the idempotent actions re-run. Publishing is decoupled: the event item is the outbox entry,
-  and the stream mapping retries, bisects poison batches, reports per-record failures and routes
-  the rest to the DLQ. Delivery is at-least-once end to end, so consumers tolerate rare
-  duplicates.
+  and the stream mapping retries, bisects poison batches and reports per-record failures. The
+  rest go to the dead-letter queue (DLQ). Delivery is at-least-once end to end, so consumers
+  tolerate duplicates.
 - **End-to-end probe.** Send through the SES mailbox simulator, then confirm three things: a
   `ses.bounce` event on the bus, an event item under `pk = MSG#<messageId>`, and the simulator
   address on the SES account suppression list.
@@ -331,7 +339,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 prek run                               # fmt, clippy, deny, actionlint, zizmor
 ```
 
-The handler tests drive the real router with properly signed SNS envelopes. The verifier
+The handler tests drive the real router with signed SNS envelopes. The verifier
 crate's `test-fixtures` feature generates throwaway keys and certificates, so development needs
 no AWS account. For a deployed check, see the probe under [Operations](#operations).
 
