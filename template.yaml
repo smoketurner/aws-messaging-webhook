@@ -1253,34 +1253,6 @@ Resources:
       InvocationEndpoint: !Ref pMailWebhookUrl
       HttpMethod: POST
 
-  # An event that exhausts its retries, or that the endpoint rejects with a
-  # 4xx EventBridge doesn't retry, lands here with the error attached.
-  rMailWebhookDlq:
-    Type: AWS::SQS::Queue
-    Condition: cHasMailWebhook
-    Properties:
-      MessageRetentionPeriod: 1209600 # 14 days
-      SqsManagedSseEnabled: true
-
-  rMailWebhookDlqPolicy:
-    Type: AWS::SQS::QueuePolicy
-    Condition: cHasMailWebhook
-    Properties:
-      Queues:
-        - !Ref rMailWebhookDlq
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: MailWebhookRuleDeadLetters
-            Effect: Allow
-            Principal:
-              Service: events.amazonaws.com
-            Action: sqs:SendMessage
-            Resource: !GetAtt rMailWebhookDlq.Arn
-            Condition:
-              ArnEquals:
-                aws:SourceArn: !GetAtt rMailWebhookRule.Arn
-
   rMailWebhookRole:
     Type: AWS::IAM::Role
     Condition: cHasMailWebhook
@@ -1331,11 +1303,12 @@ Resources:
             # deduplicates on.
             HeaderParameters:
               webhook-id: $.detail.event_id
+          # No dead-letter queue: nothing would watch it. An event that
+          # outlasts these retries, or gets a 4xx EventBridge doesn't retry,
+          # is dropped.
           RetryPolicy:
             MaximumRetryAttempts: 185
             MaximumEventAgeInSeconds: 86400
-          DeadLetterConfig:
-            Arn: !GetAtt rMailWebhookDlq.Arn
 
 Outputs:
   WebhookUrl:
@@ -1439,7 +1412,3 @@ Outputs:
         - !Sub 'bounce.${pMailDomain} TXT "v=spf1 include:amazonses.com ~all"'
         - !Sub '${pMailDomain} TXT "v=spf1 include:amazonses.com -all"'
         - !Sub '_dmarc.${pMailDomain} TXT "v=DMARC1; p=${pDmarcPolicy}"'
-  MailWebhookDlqUrl:
-    Condition: cHasMailWebhook
-    Description: SQS DLQ for mailbox events the webhook endpoint never accepted.
-    Value: !Ref rMailWebhookDlq

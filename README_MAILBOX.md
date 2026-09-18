@@ -508,9 +508,10 @@ Every request carries these headers:
 
 The receiver has 5 seconds to answer, so it should acknowledge first and do the work after.
 EventBridge retries `401`, `407`, `409`, `429`, `5xx` and timeouts for up to 24 hours and 185
-attempts. It doesn't retry any other `4xx`. An event that runs out of retries, or gets a `4xx`
-that isn't retried, goes to the `MailWebhookDlqUrl` queue with the error code attached. Delivery
-is at least once and unordered.
+attempts. It doesn't retry any other `4xx`. There is no dead-letter queue, so an event that runs
+out of retries, or gets a `4xx` that isn't retried, is dropped. A wrong secret should therefore
+get a `401`, which is retried, rather than a `403`, which drops the event. Delivery is at least
+once and unordered.
 
 To rotate the secret, overwrite the SSM parameter (`put-parameter --overwrite`) and run the same
 deploy again. The changed parameter value updates the connection. During the switch-over, have the receiver accept both the old and the new value.
