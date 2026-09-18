@@ -39,9 +39,6 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
     pub bytes: Vec<u8>,
-    /// The server's `Content-Type`, used only when the request did not name
-    /// one.
-    pub content_type: Option<String>,
 }
 
 /// Why a fetch did not produce bytes.
@@ -289,12 +286,6 @@ impl AttachmentFetcher for HttpAttachmentFetcher {
                 return Err(FetchError::TooLarge);
             }
 
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned);
-
             // And again while reading, because the header can lie.
             let mut bytes = Vec::new();
             let mut response = response;
@@ -309,10 +300,7 @@ impl AttachmentFetcher for HttpAttachmentFetcher {
                 bytes.extend_from_slice(&chunk);
             }
 
-            return Ok(Fetched {
-                bytes,
-                content_type,
-            });
+            return Ok(Fetched { bytes });
         }
 
         Err(FetchError::TooManyRedirects)
@@ -369,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plain_response_is_returned_with_its_content_type() {
+    async fn a_plain_response_is_returned() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/a.pdf"))
@@ -387,7 +375,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(fetched.bytes, b"hello");
-        assert_eq!(fetched.content_type.as_deref(), Some("application/pdf"));
     }
 
     #[tokio::test]

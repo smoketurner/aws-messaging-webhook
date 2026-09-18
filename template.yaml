@@ -406,7 +406,7 @@ Resources:
   # then GetItem the AGG item or Query pk = MSG#<messageId> to fetch a record
   # whose EventBridge payload was omitted for size, or a message's full
   # timeline. Base-table reads only — no write, no Scan, and no access to the
-  # internal ReconcileIndex (scoped to the table ARN, not index ARNs).
+  # index (scoped to the table ARN, not index ARNs).
   # Unnamed on purpose: a RoleName makes the stack need CAPABILITY_NAMED_IAM,
   # which turns setting pConsumerAccountIds into a failed deploy. Consumers
   # take the ARN from the ConsumerReadRoleArn output.
@@ -692,7 +692,7 @@ Resources:
             ProjectionType: ALL
       StreamSpecification:
         StreamViewType: NEW_AND_OLD_IMAGES
-      # Set only on idempotency-key and SES-call marker items.
+      # Set on message, thread and send-state items, and on idempotency keys.
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true

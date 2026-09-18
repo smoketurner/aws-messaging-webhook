@@ -64,16 +64,6 @@ impl SendStatus {
             Self::Sent | Self::Failed => false,
         }
     }
-
-    /// The coarse status mirrored onto the message item, if any. `sending` is
-    /// deliberately invisible there.
-    #[must_use]
-    pub fn mirrored(self) -> Option<Self> {
-        match self {
-            Self::Sending => None,
-            other => Some(other),
-        }
-    }
 }
 
 /// The real recipient lists, as given.
@@ -180,19 +170,15 @@ pub struct SendState {
     /// stops rather than looping forever.
     #[serde(default)]
     pub transient_failures: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_fetch_failure_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_ses_unavailable_at: Option<String>,
-    /// When the outbox objects for this message may be cleaned up.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub promote_at: Option<String>,
+    /// When an operator resent this message by hand, as a breadcrumb on the
+    /// item: nothing reads it, but a duplicate delivery is exactly the sort
+    /// of thing someone later has to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_resend_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<SendFailure>,
-    /// The `SENDKEY#` partition this send was committed under, so marking it
-    /// done can refresh that key's expiry.
+    /// The `SENDKEY#` partition this send was committed under, recorded so
+    /// an operator can trace a send back to the request that made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key_pk: Option<String>,
     pub created_at: String,
@@ -224,9 +210,6 @@ impl SendState {
             ses_call_at: None,
             requeued_at: None,
             transient_failures: 0,
-            last_fetch_failure_at: None,
-            last_ses_unavailable_at: None,
-            promote_at: None,
             operator_resend_at: None,
             failure: None,
             idempotency_key_pk,
@@ -361,9 +344,6 @@ impl SendState {
             send_status: SendStatus::Sent,
             version: self.version + 1,
             sending_at: None,
-            // The outbox objects can be cleaned up once nothing needs to
-            // rebuild the message.
-            promote_at: Some(now.to_owned()),
             updated_at: now.to_owned(),
             ..self.clone()
         }
@@ -377,7 +357,6 @@ impl SendState {
             version: self.version + 1,
             sending_at: None,
             failure: Some(failure),
-            promote_at: Some(now.to_owned()),
             updated_at: now.to_owned(),
             ..self.clone()
         }
@@ -515,12 +494,6 @@ pub fn mark_transition<'a>(
     }
 }
 
-/// The outbox key prefix for one message.
-#[must_use]
-pub fn outbox_prefix(message_id: &str) -> String {
-    format!("outbox/{message_id}")
-}
-
 /// Where the spec for `message_id` lives.
 #[must_use]
 pub fn spec_key(message_id: &str) -> String {
@@ -533,27 +506,9 @@ pub fn part_key(message_id: &str, attachment_id: &str) -> String {
     format!("outbox/{message_id}/parts/{attachment_id}")
 }
 
-/// Where the assembled MIME is cached, so a retried send reuses the exact
-/// bytes rather than rebuilding them.
-#[must_use]
-pub fn raw_key(message_id: &str) -> String {
-    format!("outbox/{message_id}/raw.eml")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sending_is_never_mirrored_onto_the_message() {
-        // The message item's status drives the relay, so a status that
-        // changes on every attempt must not reach it.
-        assert_eq!(SendStatus::Sending.mirrored(), None);
-        assert_eq!(SendStatus::Queued.mirrored(), Some(SendStatus::Queued));
-        assert_eq!(SendStatus::Sent.mirrored(), Some(SendStatus::Sent));
-        assert_eq!(SendStatus::Failed.mirrored(), Some(SendStatus::Failed));
-        assert_eq!(SendStatus::Unknown.mirrored(), Some(SendStatus::Unknown));
-    }
 
     #[test]
     fn statuses_serialize_as_the_stored_strings() {
@@ -627,12 +582,10 @@ mod tests {
     fn outbox_keys_all_sit_under_one_prefix() {
         // Retention and cleanup both work by prefix, so every object for a
         // message must be under it.
-        let prefix = outbox_prefix("mid-1");
-        assert!(spec_key("mid-1").starts_with(&prefix));
-        assert!(part_key("mid-1", "att_1").starts_with(&prefix));
-        assert!(raw_key("mid-1").starts_with(&prefix));
+        let prefix = "outbox/mid-1/";
+        assert!(spec_key("mid-1").starts_with(prefix));
+        assert!(part_key("mid-1", "att_1").starts_with(prefix));
         assert_eq!(spec_key("mid-1"), "outbox/mid-1/spec.json");
         assert_eq!(part_key("mid-1", "att_1"), "outbox/mid-1/parts/att_1");
-        assert_eq!(raw_key("mid-1"), "outbox/mid-1/raw.eml");
     }
 }

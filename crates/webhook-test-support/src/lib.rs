@@ -124,10 +124,7 @@ impl AttachmentFetcher for FakeServices {
         let result = match self.fetchable.lock().unwrap().get(url.as_str()).cloned() {
             None => Err(FetchError::Rejected { status: 404 }),
             Some(body) if body.len() as u64 > max_bytes => Err(FetchError::TooLarge),
-            Some(body) => Ok(Fetched {
-                bytes: body,
-                content_type: None,
-            }),
+            Some(body) => Ok(Fetched { bytes: body }),
         };
         std::future::ready(result)
     }
@@ -574,8 +571,6 @@ pub fn test_mail_config() -> MailConfig {
         api_keys_parameter: "/example/api-keys".to_owned(),
         attachment_url_ttl: std::time::Duration::from_secs(3600),
         region: "us-east-1".to_owned(),
-        send_rate: 1,
-        unknown_outbox_retention_days: 30,
         retention_days: 365,
     }
 }

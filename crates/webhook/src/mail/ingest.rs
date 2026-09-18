@@ -2,7 +2,6 @@
 //! per-inbox thread resolution and insert, all bounded by the invocation
 //! deadline.
 
-use std::future::Future;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -35,16 +34,7 @@ const DEADLINE_MARGIN: Duration = Duration::from_secs(10);
 /// object, a size or label cap violation, or throttling that outlasts the
 /// transaction retry budget; those are logged and counted, and the inbound
 /// event still publishes.
-pub fn ingest_inbound<T: Services>(
-    state: &AppState<T>,
-    event: &SesInboundNotification,
-    deadline: tokio::time::Instant,
-    envelope_ts_ms: Option<u64>,
-) -> impl Future<Output = Result<&'static str, ActionError>> {
-    run(state, event, deadline, envelope_ts_ms)
-}
-
-async fn run<T: Services>(
+pub async fn ingest_inbound<T: Services>(
     state: &AppState<T>,
     event: &SesInboundNotification,
     deadline: tokio::time::Instant,

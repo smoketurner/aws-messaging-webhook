@@ -99,17 +99,6 @@ pub fn send_key_sk() -> &'static str {
     "KEY"
 }
 
-/// The SES-call marker's `pk`.
-#[must_use]
-pub fn ses_call_pk(message_id: &str) -> String {
-    format!("SESCALL#{message_id}")
-}
-
-#[must_use]
-pub fn ses_call_sk() -> &'static str {
-    "CALL"
-}
-
 /// A decoded page-token key: where in an index to resume.
 ///
 /// Both halves are needed. A `Query` against a secondary index takes an
@@ -211,7 +200,6 @@ mod tests {
         assert_eq!(rfc_alias_pk("support", "abc@x"), "RFC#support#abc@x");
         assert_eq!(ses_ref_pk("ses-1"), "SESMSG#ses-1");
         assert_eq!(send_key_pk("deadbeef"), "SENDKEY#deadbeef");
-        assert_eq!(ses_call_pk("mid-1"), "SESCALL#mid-1");
     }
 
     #[test]
