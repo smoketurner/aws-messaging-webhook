@@ -113,7 +113,7 @@ pub fn send_key_sk() -> &'static str {
 /// the same item, because the index's key is not unique on its own. Carrying
 /// the table key here keeps it exact rather than re-derived from the sort
 /// value, whose shape differs per index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageKey {
     /// The index partition the token was issued for, re-validated against the
     /// request that presents it.
@@ -132,10 +132,10 @@ pub struct PageKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PageTokenPayload {
     scope: String,
-    partition: String,
-    sort: String,
-    table_pk: String,
-    table_sk: String,
+    /// Flattened, so the token's JSON keeps the shape it has always had
+    /// while the key's fields are declared once, on [`PageKey`].
+    #[serde(flatten)]
+    key: PageKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -154,10 +154,7 @@ pub struct PageTokenError;
 pub fn encode_page_token(key: &PageKey, scope: &str) -> String {
     let payload = PageTokenPayload {
         scope: scope.to_owned(),
-        partition: key.partition.clone(),
-        sort: key.sort.clone(),
-        table_pk: key.table_pk.clone(),
-        table_sk: key.table_sk.clone(),
+        key: key.clone(),
     };
     // Infallible: `PageTokenPayload` is plain owned strings.
     #[expect(
@@ -182,15 +179,10 @@ pub fn decode_page_token(
 ) -> Result<PageKey, PageTokenError> {
     let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| PageTokenError)?;
     let payload: PageTokenPayload = serde_json::from_slice(&bytes).map_err(|_| PageTokenError)?;
-    if payload.partition != expected_partition || payload.scope != expected_scope {
+    if payload.key.partition != expected_partition || payload.scope != expected_scope {
         return Err(PageTokenError);
     }
-    Ok(PageKey {
-        partition: payload.partition,
-        sort: payload.sort,
-        table_pk: payload.table_pk,
-        table_sk: payload.table_sk,
-    })
+    Ok(payload.key)
 }
 
 #[cfg(test)]
@@ -207,6 +199,26 @@ mod tests {
         assert_eq!(rfc_alias_pk("support", "abc@x"), "RFC#support#abc@x");
         assert_eq!(ses_ref_pk("ses-1"), "SESMSG#ses-1");
         assert_eq!(send_key_pk("deadbeef"), "SENDKEY#deadbeef");
+    }
+
+    /// Tokens are handed to callers, so their JSON is a wire format: the
+    /// key's fields sit beside `scope`, not nested under it.
+    #[test]
+    fn a_page_token_keeps_its_flat_json_shape() {
+        let key = PageKey {
+            partition: "INBOX#support#MSG".to_owned(),
+            sort: "mid-1".to_owned(),
+            table_pk: "INBOX#support".to_owned(),
+            table_sk: "MSG#mid-1".to_owned(),
+        };
+        let token = encode_page_token(&key, "asc=false;before=;after=");
+        let json = URL_SAFE_NO_PAD.decode(token).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["scope"], "asc=false;before=;after=");
+        assert_eq!(value["partition"], "INBOX#support#MSG");
+        assert_eq!(value["sort"], "mid-1");
+        assert_eq!(value["table_pk"], "INBOX#support");
+        assert_eq!(value["table_sk"], "MSG#mid-1");
     }
 
     #[test]
