@@ -11,10 +11,11 @@ parallel = true
 lint = true
 
 [default.deploy.parameters]
-profile = "plock-admin"
-s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-nwao0jggejqu"
-stack_name = "aws-messaging-webhook-dev"
+profile = "shared-admin"
+resolve_s3 = true
+#s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-nwao0jggejqu"
+stack_name = "smoketurner-inbox-prod"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 disable_rollback = true
-parameter_overrides = "pStage=dev pHostedZoneId=Z16D1PNQBSPVGS pMailDomain=mail.bigkong.com pMailInbox=hello pApiKeysParameterName=/messaging-webhook/dev/api-keys"
+parameter_overrides = "pStage=prod pHostedZoneId=Z09504702V4HQRPZLSGQ pMailDomain=inbox.smoketurner.com pMailInbox=hello pApiKeysParameterName=/messaging-webhook/prod/api-keys pMailTrackingDomain=click.inbox.smoketurner.com"

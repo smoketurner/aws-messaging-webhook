@@ -113,27 +113,21 @@ Parameters:
     Description: >-
       Custom subdomain SES wraps open and click tracking links in, e.g.
       click.mail.example.com. Empty (the default) leaves them on SES's own
-      awstrack.me domain; opens and clicks are reported either way. A
-      subdomain of pMailDomain needs no verification of its own; any other
-      domain must already be a verified SES identity.
+      awstrack.me domain; opens and clicks are reported either way. Setting it
+      creates a CloudFront distribution serving the subdomain over HTTPS, with
+      its certificate and DNS records, so it needs pHostedZoneId and a stack
+      in us-east-1 (CloudFront only takes certificates from there). A
+      subdomain of pMailDomain needs no SES verification of its own; any
+      other domain must already be a verified SES identity.
   pMailTrackingHttpsPolicy:
     Type: String
-    Default: OPTIONAL
+    Default: REQUIRE
     AllowedValues: [OPTIONAL, REQUIRE, REQUIRE_OPEN_ONLY]
     Description: >-
-      Scheme SES wraps the tracking links in. OPTIONAL, the default, is what a
-      bare CNAME to SES can serve: the open pixel over HTTP and each click link
-      on the scheme it already had. REQUIRE and REQUIRE_OPEN_ONLY need the
-      subdomain fronted by a CDN holding a certificate for it — see
-      pMailTrackingCnameTarget.
-  pMailTrackingCnameTarget:
-    Type: String
-    Default: ""
-    AllowedPattern: ^$|^([a-z0-9-]+\.)+[a-z]{2,}$
-    Description: >-
-      Host pMailTrackingDomain's CNAME points at. Empty (the default) uses
-      SES's regional tracking domain, r.<region>.awstrack.me. Set it to your
-      CDN's hostname when serving the subdomain over HTTPS.
+      Scheme SES wraps the tracking links in. REQUIRE, the default, wraps the
+      open pixel and every click link in HTTPS. OPTIONAL wraps the pixel in
+      HTTP and keeps each click link's own scheme; REQUIRE_OPEN_ONLY wraps
+      only the pixel in HTTPS. CloudFront redirects any HTTP request to HTTPS.
   pReceiptTlsPolicy:
     Type: String
     Default: Optional
@@ -185,10 +179,15 @@ Rules:
   MailTrackingOptionsNeedTrackingDomain:
     RuleCondition: !Equals [!Ref pMailTrackingDomain, ""]
     Assertions:
-      - Assert: !Equals [!Ref pMailTrackingHttpsPolicy, OPTIONAL]
+      - Assert: !Equals [!Ref pMailTrackingHttpsPolicy, REQUIRE]
         AssertDescription: pMailTrackingHttpsPolicy needs pMailTrackingDomain.
-      - Assert: !Equals [!Ref pMailTrackingCnameTarget, ""]
-        AssertDescription: pMailTrackingCnameTarget needs pMailTrackingDomain.
+  # The certificate validates through the hosted zone, and the distribution
+  # is reached through alias records in it.
+  MailTrackingNeedsHostedZone:
+    RuleCondition: !Not [!Equals [!Ref pMailTrackingDomain, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref pHostedZoneId, ""]]
+        AssertDescription: pMailTrackingDomain needs pHostedZoneId.
 
 Conditions:
   cIsProd: !Equals [!Ref pStage, prod]
@@ -199,8 +198,6 @@ Conditions:
   cHasHostedZone: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pHostedZoneId, ""]]]
   cNoHostedZone: !And [!Condition cHasMailDomain, !Equals [!Ref pHostedZoneId, ""]]
   cHasTrackingDomain: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pMailTrackingDomain, ""]]]
-  cHasTrackingCnameTarget: !Not [!Equals [!Ref pMailTrackingCnameTarget, ""]]
-  cTrackingRecordUnpublished: !And [!Condition cHasTrackingDomain, !Equals [!Ref pHostedZoneId, ""]]
   cCreateReceiptRuleSet: !And [!Condition cHasMailDomain, !Equals [!Ref pExistingReceiptRuleSetName, ""]]
   cHasMailBucketName: !Not [!Equals [!Ref pMailBucketName, ""]]
   cHasApiKeys: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pApiKeysParameterName, ""]]]
@@ -487,7 +484,7 @@ Resources:
 
   # Without pMailTrackingDomain, SES wraps the open pixel and click links in
   # its own awstrack.me domain. The custom subdomain puts them on a domain the
-  # recipient recognizes; SES still serves them, through the CNAME below.
+  # recipient recognizes; SES still serves them, through rMailTrackingDistribution.
   rMailConfigurationSet:
     Type: AWS::SES::ConfigurationSet
     Condition: cHasMailDomain
@@ -512,6 +509,29 @@ Resources:
       # events flow even if a caller omits it.
       ConfigurationSetAttributes:
         ConfigurationSetName: !Ref rMailConfigurationSet
+      # rMailEventDestination already publishes bounces and complaints. With
+      # no Return-Path set, forwarding would mail each one to the From address
+      # (the inbox), where it would arrive again as inbound mail.
+      FeedbackAttributes:
+        EmailForwardingEnabled: false
+
+  # The inbox address as an identity of its own. SES applies the settings of
+  # the most specific verified identity, so this one repeats the domain's
+  # rather than inheriting them. Creating it mails a verification link to the
+  # inbox, which is why it waits for the receipt rule.
+  rMailInboxIdentity:
+    Type: AWS::SES::EmailIdentity
+    Condition: cHasMailDomain
+    DependsOn: rMailReceiptRule
+    Properties:
+      EmailIdentity: !Sub "${pMailInbox}@${pMailDomain}"
+      MailFromAttributes:
+        MailFromDomain: !Sub "bounce.${pMailDomain}"
+        BehaviorOnMxFailure: USE_DEFAULT_VALUE
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref rMailConfigurationSet
+      FeedbackAttributes:
+        EmailForwardingEnabled: false
 
   rMailEventsTopic:
     Type: AWS::SNS::Topic
@@ -931,14 +951,16 @@ Resources:
               Effect: Allow
               Action: s3:ListBucket
               Resource: !GetAtt rMailBucket.Arn
-            # Scoped to this domain's identity and this stack's configuration
-            # set: the sender cannot send as another domain. The sender sends
+            # Scoped to this domain's identities (the domain and the inbox
+            # address) and this stack's configuration set: the sender cannot
+            # send as another domain. The sender sends
             # raw MIME, which SESv2 SendEmail authorizes as ses:SendRawEmail.
             - Sid: SendMail
               Effect: Allow
               Action: ses:SendRawEmail
               Resource:
                 - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${pMailDomain}"
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${pMailInbox}@${pMailDomain}"
                 - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${rMailConfigurationSet}"
             # rMailSenderStreamMapping is a standalone resource, so SAM grants
             # none of the stream or on-failure permissions it needs.
@@ -1089,17 +1111,83 @@ Resources:
           TTL: "300"
           ResourceRecords:
             - !Sub '"v=DMARC1; p=${pDmarcPolicy}"'
-        - !If
-          - cHasTrackingDomain
-          - Name: !Ref pMailTrackingDomain
-            Type: CNAME
-            TTL: "300"
-            ResourceRecords:
-              - !If
-                - cHasTrackingCnameTarget
-                - !Ref pMailTrackingCnameTarget
-                - !Sub "r.${AWS::Region}.awstrack.me"
-          - !Ref AWS::NoValue
+
+  # Open and click tracking over HTTPS on pMailTrackingDomain, per
+  # https://docs.aws.amazon.com/ses/latest/dg/configure-custom-open-click-domains.html:
+  # CloudFront in front of SES's tracking host for this region, passing the
+  # viewer's Host header through (AllViewer), which that guide requires.
+  # Nothing is cached: every request has to reach SES to be counted.
+  rMailTrackingCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: cHasTrackingDomain
+    Properties:
+      DomainName: !Ref pMailTrackingDomain
+      DomainValidationOptions:
+        - DomainName: !Ref pMailTrackingDomain
+          HostedZoneId: !Ref pHostedZoneId
+      ValidationMethod: DNS
+
+  rMailTrackingDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: cHasTrackingDomain
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref pMailTrackingDomain
+        Comment: !Sub "${AWS::StackName} email tracking"
+        DefaultCacheBehavior:
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # CachingDisabled
+          Compress: true
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # AllViewer
+          TargetOriginId: track
+          ViewerProtocolPolicy: redirect-to-https
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1
+            DomainName: !Sub "r.${AWS::Region}.awstrack.me"
+            Id: track
+        ViewerCertificate:
+          AcmCertificateArn: !Ref rMailTrackingCertificate
+          MinimumProtocolVersion: TLSv1
+          SslSupportMethod: sni-only
+      Tags:
+        - Key: "aws-cloudformation:stack-name"
+          Value: !Ref AWS::StackName
+        - Key: "aws-cloudformation:stack-id"
+          Value: !Ref AWS::StackId
+        - Key: "aws-cloudformation:logical-id"
+          Value: rMailTrackingDistribution
+        - Key: Name
+          Value: !Ref pMailTrackingDomain
+
+  # Z2FDTNDATAQYW2 is the fixed hosted zone id for every CloudFront alias
+  # target.
+  rMailTrackingDnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: cHasTrackingDomain
+    Properties:
+      HostedZoneId: !Ref pHostedZoneId
+      RecordSets:
+        - AliasTarget:
+            DNSName: !GetAtt rMailTrackingDistribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2
+          Name: !Ref pMailTrackingDomain
+          Type: A
+        - AliasTarget:
+            DNSName: !GetAtt rMailTrackingDistribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2
+          Name: !Ref pMailTrackingDomain
+          Type: AAAA
+        - AliasTarget:
+            DNSName: !GetAtt rMailTrackingDistribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2
+          Name: !Ref pMailTrackingDomain
+          Type: HTTPS
 
 Outputs:
   WebhookUrl:
@@ -1163,6 +1251,10 @@ Outputs:
     Condition: cHasTrackingDomain
     Description: Custom domain SES wraps open and click tracking links in.
     Value: !Ref pMailTrackingDomain
+  MailTrackingDistributionId:
+    Condition: cHasTrackingDomain
+    Description: CloudFront distribution serving the tracking domain over HTTPS.
+    Value: !Ref rMailTrackingDistribution
   InboxAddress:
     Condition: cHasMailDomain
     Value: !Sub "${pMailInbox}@${pMailDomain}"
@@ -1199,12 +1291,3 @@ Outputs:
         - !Sub 'bounce.${pMailDomain} TXT "v=spf1 include:amazonses.com ~all"'
         - !Sub '${pMailDomain} TXT "v=spf1 include:amazonses.com -all"'
         - !Sub '_dmarc.${pMailDomain} TXT "v=DMARC1; p=${pDmarcPolicy}"'
-  # Its own output rather than a line in DnsRecords: the tracking subdomain is
-  # optional, and where it points depends on whether a CDN fronts it.
-  TrackingDnsRecord:
-    Condition: cTrackingRecordUnpublished
-    Description: Tracking-domain DNS record to publish (no pHostedZoneId given).
-    Value: !If
-      - cHasTrackingCnameTarget
-      - !Sub "${pMailTrackingDomain} CNAME ${pMailTrackingCnameTarget}"
-      - !Sub "${pMailTrackingDomain} CNAME r.${AWS::Region}.awstrack.me"

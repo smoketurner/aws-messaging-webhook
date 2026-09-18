@@ -49,9 +49,8 @@ sam deploy --parameter-overrides \
 | `pMailRetentionDays` | `365` | How long a message is kept: S3 expiration for raw MIME, attachments and message content, and the TTL on its mail table items |
 | `pHostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
 | `pDmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
-| `pMailTrackingDomain` | *(empty)* | Subdomain SES wraps open and click tracking links in, e.g. `click.mail.example.com`. Empty leaves them on SES's `awstrack.me`; opens and clicks are reported either way. See [Open and click tracking](#open-and-click-tracking) |
-| `pMailTrackingHttpsPolicy` | `OPTIONAL` | `OPTIONAL`, `REQUIRE` or `REQUIRE_OPEN_ONLY`. The two HTTPS values need a CDN in front of the subdomain |
-| `pMailTrackingCnameTarget` | *(empty)* | Host the tracking subdomain's CNAME points at. Empty uses `r.<region>.awstrack.me`; set it to your CDN's hostname |
+| `pMailTrackingDomain` | *(empty)* | Subdomain SES wraps open and click tracking links in, e.g. `click.mail.example.com`. Empty leaves them on SES's `awstrack.me`; opens and clicks are reported either way. Needs `pHostedZoneId` and a stack in us-east-1. See [Open and click tracking](#open-and-click-tracking) |
+| `pMailTrackingHttpsPolicy` | `REQUIRE` | `REQUIRE`, `REQUIRE_OPEN_ONLY` or `OPTIONAL`: which tracking links SES wraps in HTTPS |
 | `pReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
 | `pExistingReceiptRuleSetName` | *(empty)* | Empty creates a rule set. Set it to add the rule to a rule set that is already active in the region |
 | `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Required when `pMailDomain` is set. Must start with `/`, and not with `/aws` or `/ssm`, which SSM reserves |
@@ -60,7 +59,7 @@ sam deploy --parameter-overrides \
 
 ## After the first deploy
 
-CloudFormation cannot do these four. Run them once, using this helper:
+CloudFormation cannot do these five. Run them once, using this helper:
 
 ```bash
 stack=aws-messaging-webhook-dev
@@ -76,10 +75,6 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    - the domain's SPF record, `v=spf1 include:amazonses.com -all`;
    - `_dmarc.<domain>`, the Domain-based Message Authentication, Reporting and Conformance
      (DMARC) policy.
-
-   With `pMailTrackingDomain` set, `output TrackingDnsRecord` gives one more: the tracking
-   subdomain's CNAME. It is a separate output because where it points depends on whether a CDN
-   fronts the subdomain.
 2. **Wait for DKIM `SUCCESS`** before sending mail from the identity:
 
    ```bash
@@ -114,6 +109,19 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
 
    Add `--key-id <pApiKeysKmsKeyArn>` for a customer-managed Key Management Service (KMS) key. Rotate by writing both
    entries, moving clients to the new key, then removing the old entry.
+
+5. **Confirm the inbox address.** The stack verifies the inbox address as an SES identity of its
+   own, so it can carry the domain's MAIL FROM, configuration set and feedback settings; SES
+   applies the most specific verified identity's settings. Creating it mails a verification
+   link to the inbox. On a first deploy that mail arrives before step 3 activates the rule set
+   and is lost, so send it again once inbound mail works:
+
+   ```bash
+   aws ses verify-email-identity --email-address "$(output InboxAddress)"
+   ```
+
+   Open the link in the message from `no-reply-aws@amazon.com` — `GET /v0/inboxes/<address>/messages`
+   lists it. Until the address is verified, sends from it fail.
 
 The API is served under the `ApiBaseUrl` output. `InboxAddress` is the inbox's address and its
 `inbox_id`, for example `/v0/inboxes/hello@mail.example.com/messages`.
@@ -258,20 +266,23 @@ yours instead:
 sam deploy --parameter-overrides "… pMailTrackingDomain=click.mail.example.com"
 ```
 
-The subdomain is a CNAME to SES's regional tracking host, `r.<region>.awstrack.me` — SES still
-serves the redirects, under your name. The stack publishes the record when `pHostedZoneId` is
-set, and prints it as `TrackingDnsRecord` when it isn't. A subdomain of `pMailDomain` is covered
-by that domain's identity and needs no verification of its own; any other domain must already be
-a verified SES identity. A dedicated subdomain per sending region is what SES recommends.
+SES still serves the redirects, under your name, through a CloudFront distribution the stack
+creates for the subdomain, following [SES's HTTPS setup](https://docs.aws.amazon.com/ses/latest/dg/configure-custom-open-click-domains.html).
+Its origin is SES's regional tracking host, `r.<region>.awstrack.me`; it forwards the viewer's
+`Host` header, caches nothing, redirects HTTP to HTTPS and serves IPv6. The stack also issues the
+subdomain's ACM certificate, validated through `pHostedZoneId`, and publishes A, AAAA and HTTPS
+alias records to the distribution. That is why the parameter needs `pHostedZoneId` and a stack
+in us-east-1, the only region CloudFront takes certificates from. A subdomain of `pMailDomain`
+is covered by that domain's SES identity and needs no verification of its own; any other domain
+must already be a verified SES identity. A dedicated subdomain per sending region is what SES
+recommends.
 
-`pMailTrackingHttpsPolicy` is `OPTIONAL` by default: the pixel loads over HTTP and each click
-link keeps the scheme the original link had. `REQUIRE` and `REQUIRE_OPEN_ONLY` wrap links in
-HTTPS, which a bare CNAME cannot serve — a certificate for your subdomain has to exist
-somewhere. Put a CDN holding one in front, with `r.<region>.awstrack.me` as its origin and the
-`Host` header forwarded, and set `pMailTrackingCnameTarget` to the CDN's hostname so the record
-points there instead. Check it with
-`curl --head https://click.mail.example.com/favicon.ico`: the response carries
-`x-amz-ses-region` and `x-amz-ses-request-protocol`.
+`pMailTrackingHttpsPolicy` is `REQUIRE` by default, wrapping the pixel and every click link in
+HTTPS. `REQUIRE_OPEN_ONLY` wraps only the pixel; `OPTIONAL` loads the pixel over HTTP and keeps
+each click link's own scheme, and CloudFront then answers every HTTP request with a redirect to
+HTTPS. Check the path with `curl --head https://click.mail.example.com/favicon.ico`: the response
+carries `x-amz-ses-region`, which should be the stack's region, and
+`x-amz-ses-request-protocol`, which should be `https`.
 
 Two markers in the HTML steer tracking per message. SES acts on both and removes them before
 the message goes out:
