@@ -30,6 +30,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::api::error::{ApiError, FieldError};
 use crate::api::json::ApiJson;
+use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
 use crate::mail::send::{
     self as send_mod, Envelope, SendKey, SendSpec, SendState, SendStatus, SpecAttachment,
@@ -1098,7 +1099,7 @@ fn queued_message(
     now: &str,
 ) -> MailMessage {
     let mut labels = send.labels.clone();
-    labels.push("queued".to_owned());
+    labels.push(SystemLabel::Queued.to_label());
     labels.sort();
     labels.dedup();
 

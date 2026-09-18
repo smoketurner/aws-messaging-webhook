@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::mail::InboxId;
+use crate::mail::labels::SystemLabel;
 
 /// Where a send has got to.
 ///
@@ -452,15 +453,15 @@ pub fn mark_transition<'a>(
 ) {
     use crate::mail::store::MarkOutcome;
 
-    let relabel = |remove: &str, add: &str| {
+    let relabel = |remove: SystemLabel, add: SystemLabel| {
         let mut labels: Vec<String> = msg
             .labels
             .iter()
-            .filter(|label| label.as_str() != remove)
+            .filter(|label| label.as_str() != remove.as_str())
             .cloned()
             .collect();
-        if !labels.iter().any(|label| label == add) {
-            labels.push(add.to_owned());
+        if !crate::mail::labels::has(&labels, add) {
+            labels.push(add.to_label());
         }
         labels.sort();
         labels
@@ -475,12 +476,12 @@ pub fn mark_transition<'a>(
     match outcome {
         MarkOutcome::Sent(sent) => (
             settled(state.sent(now)),
-            relabel("queued", "sent"),
+            relabel(SystemLabel::Queued, SystemLabel::Sent),
             Some(sent),
         ),
         MarkOutcome::Failed(failure) => (
             settled(state.failed(failure, now)),
-            relabel("queued", "rejected"),
+            relabel(SystemLabel::Queued, SystemLabel::Rejected),
             None,
         ),
         // Neither sent nor known to have failed, so the labels do not move:
@@ -489,7 +490,11 @@ pub fn mark_transition<'a>(
         MarkOutcome::Released => (state.released(now), msg.labels.clone(), None),
         // The operator is asserting the outcome SES never gave us, so the
         // message is labelled as if it had.
-        MarkOutcome::ClosedSent => (settled(state.sent(now)), relabel("queued", "sent"), None),
+        MarkOutcome::ClosedSent => (
+            settled(state.sent(now)),
+            relabel(SystemLabel::Queued, SystemLabel::Sent),
+            None,
+        ),
         MarkOutcome::Resumed => (state.resumed(now), msg.labels.clone(), None),
     }
 }

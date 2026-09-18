@@ -11,7 +11,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::mail::content::MessageContent;
-use crate::mail::{MailMessage, ids, time, wire};
+use crate::mail::labels::SystemLabel;
+use crate::mail::{MailMessage, ids, labels, time, wire};
 use crate::publish::{PUT_EVENTS_ENTRY_CAP_BYTES, SCHEMA_VERSION, detail_bytes};
 
 /// One mail-table stream record's outbound EventBridge event, before size
@@ -36,9 +37,9 @@ fn to_json<T: Serialize>(value: &T) -> Value {
 /// co-exist with the `received` system label rather than
 /// replacing it, so the event type is chosen from the label set.
 fn received_event_type(labels: &[String]) -> &'static str {
-    if labels.iter().any(|label| label == "spam") {
+    if labels::has(labels, SystemLabel::Spam) {
         "message.received.spam"
-    } else if labels.iter().any(|label| label == "unauthenticated") {
+    } else if labels::has(labels, SystemLabel::Unauthenticated) {
         "message.received.unauthenticated"
     } else {
         "message.received"
@@ -52,14 +53,20 @@ fn received_event_type(labels: &[String]) -> &'static str {
 /// nothing), and the rest are mailbox state a consumer reads from the item
 /// rather than lifecycle transitions.
 fn label_event_type(label: &str) -> Option<&'static str> {
-    match label {
-        "sent" => Some("message.sent"),
-        "delivered" => Some("message.delivered"),
-        "bounced" => Some("message.bounced"),
-        "complained" => Some("message.complained"),
-        "rejected" => Some("message.rejected"),
-        "opened" => Some("message.opened"),
-        _ => None,
+    match SystemLabel::parse(label)? {
+        SystemLabel::Sent => Some("message.sent"),
+        SystemLabel::Delivered => Some("message.delivered"),
+        SystemLabel::Bounced => Some("message.bounced"),
+        SystemLabel::Complained => Some("message.complained"),
+        SystemLabel::Rejected => Some("message.rejected"),
+        SystemLabel::Opened => Some("message.opened"),
+        // Mailbox state and the labels an INSERT already carries.
+        SystemLabel::Received
+        | SystemLabel::Queued
+        | SystemLabel::Unread
+        | SystemLabel::Spam
+        | SystemLabel::Trash
+        | SystemLabel::Unauthenticated => None,
     }
 }
 
@@ -86,7 +93,7 @@ pub fn build_received_event(
     content: &MessageContent,
     event_source: &str,
 ) -> Option<MailEvent> {
-    if !msg.labels.iter().any(|label| label == "received") {
+    if !labels::has(&msg.labels, SystemLabel::Received) {
         return None;
     }
     let event_type = received_event_type(&msg.labels);

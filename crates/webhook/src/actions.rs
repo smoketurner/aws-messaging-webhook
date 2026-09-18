@@ -6,6 +6,7 @@
 
 use std::future::Future;
 
+use crate::mail::labels::SystemLabel;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
@@ -189,13 +190,13 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
 /// `Send` is deliberately absent: the sender already marks the message sent,
 /// and a `Send` event arriving afterwards would say nothing new. `Click` has
 /// no mailbox label in the vocabulary this service uses.
-fn delivery_label(kind: &str) -> Option<&'static str> {
+fn delivery_label(kind: &str) -> Option<SystemLabel> {
     match kind {
-        "Delivery" => Some("delivered"),
-        "Bounce" => Some("bounced"),
-        "Complaint" => Some("complained"),
-        "Reject" => Some("rejected"),
-        "Open" => Some("opened"),
+        "Delivery" => Some(SystemLabel::Delivered),
+        "Bounce" => Some(SystemLabel::Bounced),
+        "Complaint" => Some(SystemLabel::Complained),
+        "Reject" => Some(SystemLabel::Rejected),
+        "Open" => Some(SystemLabel::Opened),
         _ => None,
     }
 }
@@ -232,14 +233,14 @@ async fn apply_delivery_label<T: Services>(
     let now = crate::mail::time::format(crate::mail::time::now_ms());
     state
         .services
-        .update_labels(&inbox, &message_id, &[label.to_owned()], &[], &now)
+        .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
         .await
         .map_err(mail_store_error)?;
 
     tracing::info!(
         message_id,
         inbox_id = %inbox.as_str(),
-        label,
+        label = label.as_str(),
         event = "delivery_label_applied",
         "labelled a sent message from its SES event"
     );

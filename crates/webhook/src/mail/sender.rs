@@ -109,7 +109,7 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<S
     if crate::stream::image_str(new_image, "sk")? != "STATE" {
         return None;
     }
-    if crate::stream::image_str(new_image, "send_status")? != "queued" {
+    if crate::stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
         return None;
     }
 

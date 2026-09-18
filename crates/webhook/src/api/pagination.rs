@@ -10,6 +10,7 @@
 //! by `<timestamp>#<thread_id>`. Each gets its own boundary encoding.
 
 use crate::api::error::{ApiError, FieldError};
+use crate::mail::labels::SystemLabel;
 use crate::mail::store::{DEFAULT_LIMIT, MAX_LIMIT};
 use crate::mail::thread::ThreadState;
 use crate::mail::{MailMessage, ids, time};
@@ -21,10 +22,13 @@ use crate::mail::{MailMessage, ids, time};
 /// the flag is honored so a client that sets it behaves the same here as
 /// against the reference implementation.
 const INCLUDE_FLAGS: [(&str, &str); 4] = [
-    ("include_spam", "spam"),
+    ("include_spam", SystemLabel::Spam.as_str()),
     ("include_blocked", "blocked"),
-    ("include_unauthenticated", "unauthenticated"),
-    ("include_trash", "trash"),
+    (
+        "include_unauthenticated",
+        SystemLabel::Unauthenticated.as_str(),
+    ),
+    ("include_trash", SystemLabel::Trash.as_str()),
 ];
 
 /// A parsed, validated list request.
