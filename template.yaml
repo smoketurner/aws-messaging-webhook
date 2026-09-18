@@ -189,8 +189,8 @@ Parameters:
     AllowedPattern: ^$|^[!-~]+$
     Description: >-
       Value sent in the x-webhook-secret header of every webhook POST. Pass it
-      from its SecureString SSM parameter at deploy time; never commit it to
-      samconfig.toml. Later deploys that omit it keep the previous value.
+      from its SecureString SSM parameter at deploy time rather than storing
+      it in samconfig.toml. Later deploys that omit it keep the previous value.
 
 Rules:
   MailParametersRequired:

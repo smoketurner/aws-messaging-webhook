@@ -72,9 +72,13 @@ AWS SAM CLI.
 git clone https://github.com/smoketurner/aws-messaging-webhook
 cd aws-messaging-webhook
 sam build
-sam deploy --parameter-overrides \
-  "pAllowedTopics=<your-account-id> pOptOutListName=<your-opt-out-list>"
+sam deploy --guided
 ```
+
+The guided deploy asks for the stack name, region and parameters, for example
+`pAllowedTopics=<your-account-id>` and `pOptOutListName=<your-opt-out-list>`. It needs
+`CAPABILITY_IAM`. It saves your answers to `samconfig.toml`, so later deploys are plain
+`sam deploy`. That file holds your account's settings and is gitignored.
 
 > [!IMPORTANT]
 > **`pAllowedTopics` is security, not configuration.** A valid signature proves a message came
