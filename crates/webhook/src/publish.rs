@@ -34,6 +34,12 @@ const MAX_DETAIL_BYTES: usize = 250_000;
 /// [1]: https://docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutEventsRequestEntry.html
 pub(crate) const PUT_EVENTS_ENTRY_CAP_BYTES: usize = 262_144;
 
+/// The `meta` fields a reduced detail keeps: enough to find the record this
+/// event stands for, and nothing whose length this service does not control.
+/// `messageId` and `snsMessageId` address the DynamoDB record, `webhookPath`
+/// is a `&'static str`, and `s3` names the object holding the raw message.
+const META_KEPT_WHEN_OVERSIZED: [&str; 4] = ["messageId", "snsMessageId", "webhookPath", "s3"];
+
 /// One event ready for `PutEvents`.
 #[derive(Debug, Clone)]
 pub struct OutboundEvent {
@@ -143,31 +149,40 @@ pub fn build_outbound(
     }
 
     // Step 3: hard-cap safety net. Step 2 buys headroom by replacing `event`
-    // with a pointer, but `meta.inbound.headers` (parsed `commonHeaders`) is
-    // copied verbatim and never reduced — an attacker-controlled ~261 KiB
-    // `subject` alone can keep the detail over the `PutEvents` 256 KiB cap
-    // even after the payload is dropped. Drop the inbound summary so the bus
-    // event stays publishable; `detail_type` still signals any quarantine
-    // routing, `meta.s3` still locates the raw MIME, and the full record
-    // (headers + verdicts) remains in DynamoDB. A published event without
-    // routing metadata is strictly better than a poison record that reaches
-    // no consumer, and this path only fires on the oversized edge case.
+    // with a pointer, but `meta` is copied from the payload and holds fields
+    // this service does not bound: `inbound.headers` carries SES's parsed
+    // `commonHeaders`, where an attacker-controlled ~261 KiB `subject` alone
+    // keeps the detail over the cap, and `previousMessageId` is an SMS field
+    // of any length. Removing them one at a time leaves the next such field
+    // to be found in production, so this keeps what a consumer needs to find
+    // the record and drops the rest.
+    //
+    // Every kept field is bounded — two ids, a `&'static str` path, and an S3
+    // bucket and key — so a detail that reaches here always fits. `meta.s3`
+    // is kept for the same reason the content strip preserves it: without the
+    // pointer, a consumer cannot `GetObject` the message it names.
     //
     // `PutEvents` counts the whole entry — `Detail` + `DetailType` + `Source`
     // — toward the 256 KiB cap, not `Detail` alone. Compare `detail` against
     // the cap *minus the actual envelope* (`detail_type` + the configured
     // `source`), or a `detail` in the just-under-the-cap window yields an
-    // entry just over it that AWS rejects (the bug fixed here). `saturating_sub`
-    // keeps an absurdly large `source` from underflowing into a huge threshold.
+    // entry just over it that AWS rejects. `saturating_sub` keeps an absurdly
+    // large `source` from underflowing into a huge threshold.
     let envelope = record.detail_type.len() + event_source.len();
     if detail_bytes(&detail) > PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(envelope)
         && let Some(meta) = detail.get_mut("meta").and_then(Value::as_object_mut)
     {
-        meta.remove("inbound");
+        let dropped: Vec<String> = meta
+            .keys()
+            .filter(|key| !META_KEPT_WHEN_OVERSIZED.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        meta.retain(|key, _| META_KEPT_WHEN_OVERSIZED.contains(&key.as_str()));
         tracing::warn!(
             sns_message_id = record.sns_message_id,
-            event = "inbound_meta_dropped",
-            "dropped meta.inbound to keep the EventBridge entry under the PutEvents cap"
+            dropped = dropped.join(","),
+            event = "meta_reduced",
+            "reduced meta to keep the EventBridge entry under the PutEvents cap"
         );
     }
 
@@ -342,6 +357,78 @@ mod tests {
             entry_bytes(&out.detail, &out.detail_type, DEFAULT_EVENT_SOURCE)
                 <= PUT_EVENTS_ENTRY_CAP_BYTES
         );
+    }
+
+    /// An SMS reply carries `previousPublishedMessageId`, which this service
+    /// lifts into `meta` and does not bound. At the SNS `Message` cap it made
+    /// a 262,351-byte entry — 207 over the `PutEvents` limit — which AWS
+    /// rejects per entry, so the relay retried it to exhaustion and DLQ'd it.
+    /// That is the poison record `build_outbound` exists to prevent.
+    #[test]
+    fn an_oversized_previous_message_id_still_fits_the_entry_cap() {
+        let mut notification = json!({
+            "originationNumber": "+14255550182",
+            "destinationNumber": "+12125550101",
+            "messageKeyword": "REPLY",
+            "messageBody": "Got it",
+            "inboundMessageId": "cae173d2-66b9-564c-8309-21f858e9fb84",
+            "previousPublishedMessageId": ""
+        });
+        let overhead = notification.to_string().len();
+        notification["previousPublishedMessageId"] =
+            json!("x".repeat(PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(overhead)));
+        let message = notification.to_string();
+        assert_eq!(
+            message.len(),
+            PUT_EVENTS_ENTRY_CAP_BYTES,
+            "the notification is exactly the SNS Message cap, so SNS delivers it"
+        );
+
+        let event = DomainEvent::classify(&message);
+        assert_eq!(event.detail_type(), "sms.inbound");
+        let out = build_outbound(
+            &record(Some(Source::SmsInbound), "sms.inbound"),
+            &event,
+            DEFAULT_EVENT_SOURCE,
+        );
+
+        let entry = entry_bytes(&out.detail, &out.detail_type, DEFAULT_EVENT_SOURCE);
+        assert!(
+            entry <= PUT_EVENTS_ENTRY_CAP_BYTES,
+            "published entry is {entry} bytes, over the cap"
+        );
+        // The id a consumer needs to fetch the record survives the reduction;
+        // the unbounded field does not.
+        assert_eq!(out.detail["meta"]["messageId"], json!("agg-1"));
+        assert!(out.detail["meta"]["previousMessageId"].is_null());
+    }
+
+    /// Step 3 keeps only fields whose length this service controls, so a new
+    /// unbounded `meta` field cannot reopen this hole. Anything else is
+    /// dropped, including the ones a reduced detail has no room for.
+    #[test]
+    fn a_reduced_meta_keeps_only_the_fields_that_locate_the_record() {
+        let mut notification = json!({
+            "originationNumber": "+14255550182",
+            "destinationNumber": "+12125550101",
+            "messageBody": "Got it",
+            "inboundMessageId": "cae173d2-66b9-564c-8309-21f858e9fb84",
+            "previousPublishedMessageId": ""
+        });
+        let overhead = notification.to_string().len();
+        notification["previousPublishedMessageId"] =
+            json!("x".repeat(PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(overhead)));
+        let event = DomainEvent::classify(&notification.to_string());
+        let out = build_outbound(
+            &record(Some(Source::SmsInbound), "sms.inbound"),
+            &event,
+            DEFAULT_EVENT_SOURCE,
+        );
+
+        let meta = out.detail["meta"].as_object().expect("meta is an object");
+        let mut kept: Vec<&str> = meta.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec!["messageId", "snsMessageId", "webhookPath"]);
     }
 
     #[test]
@@ -640,7 +727,8 @@ mod tests {
         // Build the window notification and run `build_outbound` with the fix.
         let message = notice("x".repeat(target_subject_len));
         let event = DomainEvent::classify(&message);
-        let out = build_outbound(&realistic_inbound_record(), &event, DEFAULT_EVENT_SOURCE);
+        let rec = realistic_inbound_record();
+        let out = build_outbound(&rec, &event, DEFAULT_EVENT_SOURCE);
 
         // Reachable from a valid SNS notification under the 262,144-byte cap.
         assert!(
@@ -654,12 +742,15 @@ mod tests {
             "Step 2 fired"
         );
 
-        // Reconstruct the pre-Step-3 detail the buggy code measured, with the
-        // actual (huge-subject) inbound summary still in place.
+        // Reconstruct the pre-Step-3 detail the buggy code measured: the
+        // published one with every field Step 3 removed put back, including
+        // the actual (huge-subject) inbound summary.
         let mut pre_step3 = out.detail.clone();
         pre_step3["meta"]["inbound"] = event
             .inbound_meta()
             .expect("ses.inbound carries meta.inbound");
+        pre_step3["meta"]["topicArn"] = json!(rec.topic_arn);
+        pre_step3["meta"]["receivedAt"] = json!(rec.received_at);
         let pre_detail = detail_bytes(&pre_step3);
         let pre_entry = entry_bytes(&pre_step3, &out.detail_type, DEFAULT_EVENT_SOURCE);
 
@@ -697,6 +788,38 @@ mod tests {
     }
 
     proptest! {
+        /// The same guarantee for the other unbounded field a payload can
+        /// carry into `meta`: an SMS reply's `previousPublishedMessageId`.
+        /// The subject property above never exercised this path, which is how
+        /// a 262,351-byte entry reached production.
+        #[test]
+        fn an_sms_reply_never_exceeds_putevents_entry_cap(
+            previous_len in 0usize..270_000,
+            source_extra in 0usize..200,
+        ) {
+            let source = format!("{DEFAULT_EVENT_SOURCE}{}", "s".repeat(source_extra));
+            let message = json!({
+                "originationNumber": "+14255550182",
+                "destinationNumber": "+12125550101",
+                "messageBody": "Got it",
+                "inboundMessageId": "cae173d2-66b9-564c-8309-21f858e9fb84",
+                "previousPublishedMessageId": "x".repeat(previous_len),
+            })
+            .to_string();
+            let event = DomainEvent::classify(&message);
+            prop_assert_eq!(event.detail_type(), "sms.inbound");
+            let out = build_outbound(&record(Some(Source::SmsInbound), "sms.inbound"), &event, &source);
+            let entry = entry_bytes(&out.detail, &out.detail_type, &source);
+            prop_assert!(
+                entry <= PUT_EVENTS_ENTRY_CAP_BYTES,
+                "entry {} exceeds the cap for a {}-byte previous id",
+                entry,
+                previous_len
+            );
+            // Whatever was reduced, the record stays findable.
+            prop_assert_eq!(&out.detail["meta"]["messageId"], &json!("agg-1"));
+        }
+
         /// For any attacker-controlled subject length (including beyond the SNS
         /// cap) and any configured `EVENT_SOURCE` up to ~200 bytes longer than
         /// the default, `build_outbound` must keep the EventBridge *entry*
