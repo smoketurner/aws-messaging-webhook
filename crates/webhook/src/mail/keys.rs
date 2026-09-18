@@ -36,6 +36,13 @@ pub fn threads_partition(inbox_id: &str) -> String {
     format!("INBOX#{inbox_id}#THR")
 }
 
+/// The `ByThread` partition listing one thread's messages, sorted by
+/// message id.
+#[must_use]
+pub fn thread_messages_partition(inbox_id: &str, thread_id: &str) -> String {
+    format!("THREAD#{inbox_id}#{thread_id}")
+}
+
 /// A thread's `ByTime` sort key: last activity, then id, so a thread list
 /// orders by most recent activity.
 #[must_use]

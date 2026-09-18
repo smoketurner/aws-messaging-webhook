@@ -703,7 +703,7 @@ impl MailStore for MailMemoryStore {
             }
         };
         let messages = self.query_page(
-            &format!("THREAD#{}#{}", inbox.as_str(), thread_id),
+            &keys::thread_messages_partition(inbox.as_str(), thread_id),
             "gsi2pk",
             "gsi2sk",
             &ListQuery {

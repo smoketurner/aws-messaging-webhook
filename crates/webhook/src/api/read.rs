@@ -17,7 +17,7 @@ use axum::extract::{Path, RawQuery, State};
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
 use crate::mail::keys::{self, PageKey, decode_page_token, encode_page_token};
-use crate::mail::objects::{self, ObjectError};
+use crate::mail::objects;
 use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
@@ -107,7 +107,7 @@ fn cursor(
 /// # Errors
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
-/// for another request; a store failure mapped by [`store_failure`].
+/// for another request; a store failure mapped onto the API's retry contract.
 pub async fn list_inboxes<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     RawQuery(query): RawQuery,
@@ -119,7 +119,7 @@ pub async fn list_inboxes<T: Services>(
         .services
         .list_inboxes(request.limit, start)
         .await
-        .map_err(store_failure)?;
+        .map_err(ApiError::from)?;
 
     let inboxes: Vec<wire::Inbox> = page.items.iter().map(wire::Inbox::from).collect();
     Ok(Json(wire::InboxList {
@@ -138,7 +138,7 @@ pub async fn list_inboxes<T: Services>(
 /// # Errors
 ///
 /// [`ApiError::NotFound`] when no such inbox exists; a store failure mapped
-/// by [`store_failure`].
+/// onto the API's retry contract.
 pub async fn get_inbox<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path(inbox_id): Path<String>,
@@ -147,7 +147,7 @@ pub async fn get_inbox<T: Services>(
         .services
         .get_inbox(&InboxId(inbox_id))
         .await
-        .map_err(store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(wire::Inbox::from(&inbox)))
 }
@@ -157,7 +157,7 @@ pub async fn get_inbox<T: Services>(
 /// # Errors
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
-/// for another inbox; a store failure mapped by [`store_failure`].
+/// for another inbox; a store failure mapped onto the API's retry contract.
 pub async fn list_messages<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path(inbox_id): Path<String>,
@@ -191,7 +191,7 @@ pub async fn list_messages<T: Services>(
         |round| async move { services.list_messages(&round).await },
     )
     .await
-    .map_err(store_failure)?;
+    .map_err(ApiError::from)?;
 
     let messages: Vec<wire::MessageItem> = messages.iter().map(wire::MessageItem::from).collect();
     Ok(Json(wire::MessageList {
@@ -207,8 +207,8 @@ pub async fn list_messages<T: Services>(
 /// # Errors
 ///
 /// [`ApiError::NotFound`] when the inbox holds no such message; a store
-/// failure mapped by [`store_failure`], or a content document read failure
-/// mapped by [`object_failure`].
+/// failure or a content document read failure, mapped onto the API's retry
+/// contract.
 pub async fn get_message<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path((inbox_id, message_id)): Path<(String, String)>,
@@ -217,11 +217,11 @@ pub async fn get_message<T: Services>(
         .services
         .get_message(&InboxId(inbox_id), &message_id)
         .await
-        .map_err(store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     let content = content::load(&state.services, &message)
         .await
-        .map_err(object_failure)?;
+        .map_err(ApiError::from)?;
     Ok(Json(wire::Message::new(&message, &content)))
 }
 
@@ -243,7 +243,7 @@ pub async fn get_raw<T: Services>(
         .services
         .get_message(&InboxId(inbox_id), &message_id)
         .await
-        .map_err(store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     let key = message.raw_s3_key.as_deref().ok_or(ApiError::NotFound)?;
 
@@ -252,7 +252,7 @@ pub async fn get_raw<T: Services>(
         .services
         .presign_get(key, Some(&disposition), Some("message/rfc822"))
         .await
-        .map_err(object_failure)?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(wire::Download {
         download_url: url,
@@ -281,7 +281,7 @@ pub async fn get_attachment<T: Services>(
         .services
         .get_message(&InboxId(inbox_id), &message_id)
         .await
-        .map_err(store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
 
     let attachment = message
@@ -298,7 +298,7 @@ pub async fn get_attachment<T: Services>(
         .services
         .presign_get(key, Some(&disposition), Some(&attachment.content_type))
         .await
-        .map_err(object_failure)?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(wire::Download {
         download_url: url,
@@ -322,24 +322,12 @@ fn expires_at() -> String {
     time::format(time::now_ms().saturating_add(ttl_ms))
 }
 
-/// Maps an object-store failure the same way [`store_failure`] maps a table
-/// failure: a missing object is a 404, a transient one is a retryable 502.
-fn object_failure(error: ObjectError) -> ApiError {
-    match error {
-        ObjectError::NotFound => ApiError::NotFound,
-        ObjectError::Transient(source) => ApiError::BadGateway(source),
-        ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
-            ApiError::Internal(anyhow::Error::new(error))
-        }
-    }
-}
-
 /// `GET /v0/inboxes/{inbox_id}/threads`
 ///
 /// # Errors
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
-/// for another inbox; a store failure mapped by [`store_failure`].
+/// for another inbox; a store failure mapped onto the API's retry contract.
 pub async fn list_threads<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path(inbox_id): Path<String>,
@@ -373,7 +361,7 @@ pub async fn list_threads<T: Services>(
         |round| async move { services.list_threads(&round).await },
     )
     .await
-    .map_err(store_failure)?;
+    .map_err(ApiError::from)?;
 
     let threads: Vec<wire::ThreadItem> = threads.iter().map(wire::ThreadItem::from).collect();
     Ok(Json(wire::ThreadList {
@@ -394,7 +382,7 @@ pub async fn list_threads<T: Services>(
 ///
 /// [`ApiError::Validation`] for a bad query parameter or page token;
 /// [`ApiError::NotFound`] when the inbox holds no such thread; a store
-/// failure mapped by [`store_failure`].
+/// failure mapped onto the API's retry contract.
 pub async fn get_thread<T: Services>(
     State(state): State<Arc<AppState<T>>>,
     Path((inbox_id, thread_id)): Path<(String, String)>,
@@ -402,14 +390,14 @@ pub async fn get_thread<T: Services>(
 ) -> Result<Json<wire::Thread>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let inbox = InboxId(inbox_id);
-    let partition = format!("THREAD#{}#{}", inbox.as_str(), thread_id);
+    let partition = keys::thread_messages_partition(inbox.as_str(), &thread_id);
     let start = cursor(&request, &partition, UNSCOPED)?;
 
     let view = state
         .services
         .get_thread(&inbox, &thread_id, request.limit, start)
         .await
-        .map_err(store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
 
     // One document read per message on the page; a page is bounded by the
@@ -418,7 +406,7 @@ pub async fn get_thread<T: Services>(
     for message in &view.messages.items {
         let content = content::load(&state.services, message)
             .await
-            .map_err(object_failure)?;
+            .map_err(ApiError::from)?;
         messages.push(wire::Message::new(message, &content));
     }
     Ok(Json(wire::Thread::new(
@@ -430,24 +418,6 @@ pub async fn get_thread<T: Services>(
             .as_ref()
             .map(|key| encode_page_token(key, UNSCOPED)),
     )))
-}
-
-/// Maps a store failure onto the API's retry contract: a label cap the
-/// request would exceed is a 400 the client must change, a throttled or
-/// unreachable table is a 502 the client may retry, and anything else is a
-/// 500 that does not leak the underlying error.
-pub(crate) fn store_failure(error: MailStoreError) -> ApiError {
-    match error {
-        MailStoreError::NotFound => ApiError::NotFound,
-        MailStoreError::InvalidPageToken => {
-            ApiError::field("page_token", "not a valid token for this request")
-        }
-        MailStoreError::LabelLimit(message) => ApiError::field("labels", message),
-        MailStoreError::Transient(source) => ApiError::BadGateway(source),
-        MailStoreError::Conflict | MailStoreError::Permanent(_) => {
-            ApiError::Internal(anyhow::Error::new(error))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -529,36 +499,6 @@ mod tests {
             (0..ITEMS)
                 .filter(|item| item.is_multiple_of(2))
                 .collect::<Vec<_>>()
-        );
-    }
-
-    /// The 500 body hides the cause, so the log is the only place it
-    /// survives: the conversion must keep the SDK error as a source.
-    #[test]
-    fn a_permanent_store_failure_keeps_its_cause() {
-        let error = store_failure(MailStoreError::Permanent(anyhow::anyhow!(
-            "Query(ByTime): AccessDeniedException"
-        )));
-        let ApiError::Internal(source) = error else {
-            panic!("expected an internal error, got {error:?}");
-        };
-        assert!(
-            format!("{source:?}").contains("AccessDeniedException"),
-            "cause missing from {source:?}"
-        );
-    }
-
-    #[test]
-    fn a_permanent_object_failure_keeps_its_cause() {
-        let error = object_failure(ObjectError::Permanent(anyhow::anyhow!(
-            "GetObject: AccessDenied"
-        )));
-        let ApiError::Internal(source) = error else {
-            panic!("expected an internal error, got {error:?}");
-        };
-        assert!(
-            format!("{source:?}").contains("AccessDenied"),
-            "cause missing from {source:?}"
         );
     }
 }

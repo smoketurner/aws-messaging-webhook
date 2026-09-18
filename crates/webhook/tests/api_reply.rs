@@ -284,6 +284,30 @@ async fn replying_to_an_unknown_message_is_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// `seeded` writes the message item without a content document, which is
+/// what a message whose body has aged out of S3 looks like. The reply still
+/// goes out and still joins the thread: the body is what's missing, not the
+/// message.
+#[tokio::test]
+async fn a_reply_survives_a_missing_content_document() {
+    let (h, original_id) = seeded(|_| {}).await;
+
+    let (status, response) = post(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &body(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["thread_id"], "thread-1");
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
+    // The original's References came from its content document, so the chain
+    // starts from what the item itself carries.
+    assert_eq!(spec.references, vec!["<original@example.net>"]);
+}
+
 #[tokio::test]
 async fn a_reply_without_a_body_is_rejected() {
     let (h, original_id) = seeded(|_| {}).await;

@@ -968,7 +968,7 @@ impl MailStore for AwsServices {
 
         // Messages of one thread, oldest first: ByThread is keyed by the
         // message id, which orders by time.
-        let partition = format!("THREAD#{}#{}", inbox.as_str(), thread_id);
+        let partition = keys::thread_messages_partition(inbox.as_str(), thread_id);
         let messages = self
             .query_page(
                 PageQuery {
