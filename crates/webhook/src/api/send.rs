@@ -26,7 +26,7 @@ use axum::http::HeaderMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mail_parser::parsers::MessageStream;
-use mail_parser::{Addr as MailAddr, Address as MailAddress, HeaderValue};
+use mail_parser::{Address as MailAddress, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -282,35 +282,40 @@ fn contains_newline(value: &str) -> bool {
 /// quoted names containing commas or angle brackets, `=?utf-8?B?…?=` encoded
 /// words and comments all parse rather than confusing a hand-rolled split.
 ///
-/// `Err` names what is wrong for the caller's error list: an entry that
-/// carries no address at all, or one that names more than one (a list, or a
-/// `Group: a@x, b@y;`), which the envelope cannot express as one recipient.
+/// `Err` names what is wrong for the caller's error list. An entry names one
+/// recipient: one that carries no address, or that names several — a list, or
+/// a group — is refused rather than resolved to one of them.
 fn envelope_address(value: &str) -> Result<String, &'static str> {
     // `parse_address` reads a header body, which ends at a newline.
     let mut header = value.as_bytes().to_vec();
     header.push(b'\n');
 
     let parsed = MessageStream::new(&header).parse_address();
-    let addrs: Vec<&MailAddr<'_>> = match &parsed {
-        HeaderValue::Address(MailAddress::List(list)) => list.iter().collect(),
-        HeaderValue::Address(MailAddress::Group(groups)) => groups
-            .iter()
-            .flat_map(|group| group.addresses.iter())
-            .collect(),
-        _ => Vec::new(),
+    let addrs = match &parsed {
+        // A bare address and a `Name <addr>` both parse as a one-entry list.
+        HeaderValue::Address(MailAddress::List(list)) => list.as_slice(),
+        // `Team: ada@example.com, grace@example.com;` — RFC 5322 group
+        // syntax. A group names a list even when it holds one member, and an
+        // entry here is one recipient.
+        HeaderValue::Address(MailAddress::Group(_)) => {
+            return Err("names a group, not one address");
+        }
+        _ => return Err("is not an email address"),
     };
 
-    match addrs.as_slice() {
-        [] => Err("is not an email address"),
-        [addr] => addr
-            .address
-            .as_deref()
-            .map(str::trim)
-            .filter(|address| !address.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or("is not an email address"),
-        _ => Err("must name exactly one address"),
-    }
+    let [addr] = addrs else {
+        return Err(if addrs.is_empty() {
+            "is not an email address"
+        } else {
+            "names more than one address"
+        });
+    };
+    addr.address
+        .as_deref()
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or("is not an email address")
 }
 
 fn addresses(
@@ -1288,11 +1293,17 @@ mod tests {
 
     /// The envelope names one recipient per entry, so a list or a group in
     /// one entry is the caller's error rather than a silent expansion.
+    /// An entry is one recipient. A list is refused rather than resolved to
+    /// one of its addresses, and a group is refused even holding a single
+    /// member — `Team: ada@example.com;` names a list of one, and reading it
+    /// as that one address would be this service deciding what the caller
+    /// meant.
     #[test]
     fn an_entry_naming_more_than_one_address_is_rejected() {
         for input in [
             "ada@example.com, grace@example.com",
             "Team: ada@example.com, grace@example.com;",
+            "Team: ada@example.com;",
         ] {
             let mut request = minimal();
             request.to = Some(Addresses::One(input.to_owned()));
