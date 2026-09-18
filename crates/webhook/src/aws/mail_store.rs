@@ -23,19 +23,16 @@ use aws_sdk_dynamodb::types::{
 use aws_smithy_types::error::display::DisplayErrorContext;
 
 use crate::aws::{self, AwsServices};
+use crate::mail::flows;
 use crate::mail::keys::{self, PageKey};
 use crate::mail::plan::{Check, Cond, PlannedOp, WriteOp};
-use crate::mail::send::{SendKey, SendState, SendStatus, mark_transition};
+use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::{
     EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
-use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
-use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases};
+use crate::mail::thread::ThreadState;
+use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
-
-/// `Retry`/`VersionConflict` loops at most this many times before giving
-/// up with `MailStoreError::Conflict`.
-const MAX_TXN_RETRIES: u32 = 3;
 
 /// Waits before retrying a cancelled transaction: exponential from 25 ms,
 /// with jitter so writers that collided do not collide again in step.
@@ -123,32 +120,6 @@ impl AwsServices {
         self.mail_config()
             .map(|config| config.table_name.as_str())
             .ok_or_else(|| MailStoreError::Permanent(anyhow!("mail is not configured")))
-    }
-
-    /// Reads the thread's current state, consistently ("read the thread
-    /// consistently, compute its new state in Rust").
-    async fn get_thread_state(
-        &self,
-        inbox: &InboxId,
-        thread_id: &str,
-    ) -> Result<Option<ThreadState>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
-            .key("sk", DynamoAv::S(keys::thread_sk(thread_id)))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(thread)", &e))?;
-        match output.item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item)
-                .map(Some)
-                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}"))),
-        }
     }
 }
 
@@ -499,16 +470,11 @@ fn alias_transact_item(
     Ok(TransactWriteItem::builder().put(put).build())
 }
 
-/// A `TransactWriteItems` attempt's outcome once the SDK call has returned.
-enum Attempt {
-    /// Every condition held; the writes were applied.
-    Committed,
-    /// The transaction was cancelled or is in progress.
-    Decision(TxnDecision),
-}
-
 impl AwsServices {
-    async fn attempt_transaction(&self, ops: &[PlannedOp]) -> Result<Attempt, MailStoreError> {
+    async fn attempt_transaction(
+        &self,
+        ops: &[PlannedOp],
+    ) -> Result<flows::TxnOutcome, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let mut builder = self.dynamo.transact_write_items();
         for planned in ops {
@@ -516,7 +482,7 @@ impl AwsServices {
         }
 
         match builder.send().await {
-            Ok(_) => Ok(Attempt::Committed),
+            Ok(_) => Ok(flows::TxnOutcome::Committed),
             Err(error) => {
                 if let SdkError::ServiceError(ctx) = &error {
                     match ctx.err() {
@@ -526,10 +492,12 @@ impl AwsServices {
                                 .iter()
                                 .map(|reason| map_cancellation_reason(reason.code()))
                                 .collect();
-                            return Ok(Attempt::Decision(decode_cancellation(ops, &reasons)));
+                            return Ok(flows::TxnOutcome::Cancelled(decode_cancellation(
+                                ops, &reasons,
+                            )));
                         }
                         TransactWriteItemsError::TransactionInProgressException(_) => {
-                            return Ok(Attempt::Decision(TxnDecision::Retry));
+                            return Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry));
                         }
                         TransactWriteItemsError::IdempotentParameterMismatchException(_) => {
                             return Err(MailStoreError::Permanent(anyhow!(
@@ -549,6 +517,42 @@ fn item_attribute_string(item: &HashMap<String, DynamoAv>, name: &str) -> Option
     match item.get(name) {
         Some(DynamoAv::S(value)) => Some(value.clone()),
         _ => None,
+    }
+}
+
+impl flows::TxnStore for AwsServices {
+    async fn read_item<T: serde::de::DeserializeOwned + Send>(
+        &self,
+        pk: &str,
+        sk: &str,
+    ) -> Result<Option<T>, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let output = self
+            .dynamo
+            .get_item()
+            .table_name(table_name)
+            .key("pk", DynamoAv::S(pk.to_owned()))
+            .key("sk", DynamoAv::S(sk.to_owned()))
+            // Consistent: what is read here conditions the next write.
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| store_error_from_sdk("GetItem", &e))?;
+        output
+            .item
+            .map(|item| {
+                serde_dynamo::from_item(item)
+                    .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing item: {e}")))
+            })
+            .transpose()
+    }
+
+    async fn run_txn(&self, ops: &[PlannedOp]) -> Result<flows::TxnOutcome, MailStoreError> {
+        self.attempt_transaction(ops).await
+    }
+
+    async fn pause(&self, attempt: u32) {
+        backoff(attempt).await;
     }
 }
 
@@ -736,39 +740,7 @@ impl MailStore for AwsServices {
     }
 
     async fn insert_message(&self, msg: &MailMessage) -> Result<InsertOutcome, MailStoreError> {
-        let mut taken = Vec::new();
-        for attempt in 0..=MAX_TXN_RETRIES {
-            // Read the thread consistently, compute its new state in
-            // Rust, then plan the whole transaction fresh — re-read on every
-            // retry, since a concurrent writer may have moved the thread's
-            // version.
-            let thread_before: Option<ThreadState> =
-                self.get_thread_state(&msg.inbox_id, &msg.thread_id).await?;
-            let thread_after = match &thread_before {
-                Some(before) => apply_message(before, msg),
-                None => new_thread(msg),
-            };
-
-            let mut ops =
-                crate::mail::plan::plan_insert(msg, thread_before.as_ref(), &thread_after)?;
-            drop_taken_aliases(&mut ops, &taken);
-
-            match self.attempt_transaction(&ops).await? {
-                Attempt::Committed => return Ok(InsertOutcome::Fresh),
-                Attempt::Decision(TxnDecision::Duplicate) => return Ok(InsertOutcome::Duplicate),
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
-                    backoff(attempt).await;
-                }
-                Attempt::Decision(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
-                Attempt::Decision(TxnDecision::Permanent | TxnDecision::KeyExists) => {
-                    return Err(MailStoreError::Permanent(anyhow!(
-                        "ingest transaction for message {} was cancelled",
-                        msg.message_id
-                    )));
-                }
-            }
-        }
-        Err(MailStoreError::Conflict)
+        flows::insert_message(self, msg).await
     }
 
     async fn get_message(
@@ -823,45 +795,7 @@ impl MailStore for AwsServices {
         key: Option<&SendKey>,
         now_epoch: u64,
     ) -> Result<EnqueueOutcome, MailStoreError> {
-        let mut taken = Vec::new();
-        for attempt in 0..=MAX_TXN_RETRIES {
-            // The thread is re-read on every attempt: a concurrent send into
-            // the same thread moves its version.
-            let thread_before = self.get_thread_state(&msg.inbox_id, &msg.thread_id).await?;
-            let thread_after = match &thread_before {
-                Some(before) => apply_message(before, msg),
-                None => new_thread(msg),
-            };
-
-            let mut ops = crate::mail::plan::plan_enqueue(
-                msg,
-                state,
-                key,
-                thread_before.as_ref(),
-                &thread_after,
-                now_epoch,
-            )?;
-            drop_taken_aliases(&mut ops, &taken);
-
-            match self.attempt_transaction(&ops).await? {
-                Attempt::Committed => return Ok(EnqueueOutcome::Committed),
-                Attempt::Decision(TxnDecision::KeyExists) => return Ok(EnqueueOutcome::KeyExists),
-                Attempt::Decision(TxnDecision::Duplicate) => {
-                    return Ok(EnqueueOutcome::AlreadyQueued);
-                }
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
-                    backoff(attempt).await;
-                }
-                Attempt::Decision(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
-                Attempt::Decision(TxnDecision::Permanent) => {
-                    return Err(MailStoreError::Permanent(anyhow!(
-                        "enqueue transaction for message {} was cancelled",
-                        msg.message_id
-                    )));
-                }
-            }
-        }
-        Err(MailStoreError::Conflict)
+        flows::enqueue_send(self, msg, state, key, now_epoch).await
     }
 
     async fn resolve_ses_message(
@@ -939,29 +873,7 @@ impl MailStore for AwsServices {
         message_id: &str,
         now: &str,
     ) -> Result<Option<SendState>, MailStoreError> {
-        for attempt in 0..=MAX_TXN_RETRIES {
-            let Some(before) = self.get_send_state(message_id).await? else {
-                return Ok(None);
-            };
-            // Anything but `queued` means this record is not ours to take:
-            // another sender holds it, or it has already finished.
-            if before.send_status != SendStatus::Queued {
-                return Ok(None);
-            }
-
-            let after = before.claimed(now);
-            let ops = crate::mail::plan::plan_claim(&before, &after)?;
-            match self.attempt_transaction(&ops).await? {
-                Attempt::Committed => return Ok(Some(after)),
-                // Lost the race: re-read, and the status check above settles
-                // it.
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
-                    backoff(attempt).await;
-                }
-                Attempt::Decision(_) => return Ok(None),
-            }
-        }
-        Err(MailStoreError::Conflict)
+        flows::claim_send(self, message_id, now).await
     }
 
     async fn note_ses_call(
@@ -969,19 +881,7 @@ impl MailStore for AwsServices {
         claimed: &SendState,
         now: &str,
     ) -> Result<Option<SendState>, MailStoreError> {
-        let after = claimed.calling_ses(now);
-        let ops = crate::mail::plan::plan_ses_call(claimed, &after)?;
-        for attempt in 0..=MAX_TXN_RETRIES {
-            match self.attempt_transaction(&ops).await? {
-                Attempt::Committed => return Ok(Some(after)),
-                // Throttled or conflicting with another transaction: the same
-                // write is still the right one.
-                Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
-                // The state moved on under this sender: the claim is gone.
-                Attempt::Decision(_) => return Ok(None),
-            }
-        }
-        Err(MailStoreError::Conflict)
+        flows::note_ses_call(self, claimed, now).await
     }
 
     async fn mark_send(
@@ -990,65 +890,7 @@ impl MailStore for AwsServices {
         outcome: MarkOutcome<'_>,
         now: &str,
     ) -> Result<(), MailStoreError> {
-        let mut taken = Vec::new();
-        for attempt in 0..=MAX_TXN_RETRIES {
-            let Some(msg) = self.get_message(&state.inbox_id, &state.message_id).await? else {
-                return Err(MailStoreError::Permanent(anyhow!(
-                    "send state {} has no message",
-                    state.message_id
-                )));
-            };
-            let (after, labels, ses) = mark_transition(state, &msg, outcome, now);
-            let (added, removed) = crate::mail::send::label_changes(&msg.labels, &labels);
-            let thread = if added.is_empty() && removed.is_empty() {
-                None
-            } else {
-                let Some(before) = self.get_thread_state(&msg.inbox_id, &msg.thread_id).await?
-                else {
-                    return Err(MailStoreError::Permanent(anyhow!(
-                        "message {} refers to thread {}, which does not exist",
-                        msg.message_id,
-                        msg.thread_id
-                    )));
-                };
-                let after = apply_label_patch(&before, &added, &removed, now);
-                Some((before, after))
-            };
-            let mut ops = crate::mail::plan::plan_mark(
-                state,
-                &after,
-                &msg,
-                &labels,
-                thread.as_ref().map(|(before, after)| (before, after)),
-                ses,
-                now,
-            )?;
-            drop_taken_aliases(&mut ops, &taken);
-
-            match self.attempt_transaction(&ops).await? {
-                Attempt::Committed => return Ok(()),
-                Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
-                Attempt::Decision(TxnDecision::VersionConflict) => {
-                    // A conflict on the send state itself means another writer
-                    // moved this send on — retrying with the state the caller
-                    // holds can never succeed, so the claim is reported lost.
-                    // A conflict on the message or thread is retried.
-                    let current = self.get_send_state(&state.message_id).await?;
-                    if current.is_none_or(|current| current.version != state.version) {
-                        return Err(MailStoreError::Conflict);
-                    }
-                    backoff(attempt).await;
-                }
-                Attempt::Decision(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
-                Attempt::Decision(_) => {
-                    return Err(MailStoreError::Permanent(anyhow!(
-                        "marking send {} was cancelled",
-                        state.message_id
-                    )));
-                }
-            }
-        }
-        Err(MailStoreError::Conflict)
+        flows::mark_send(self, state, outcome, now).await
     }
 
     async fn update_labels(
@@ -1059,70 +901,7 @@ impl MailStore for AwsServices {
         remove: &[String],
         now: &str,
     ) -> Result<Option<Vec<String>>, MailStoreError> {
-        for attempt in 0..=MAX_TXN_RETRIES {
-            // Re-read both items on every attempt: a retry means someone
-            // else moved a version, so the previous computation is stale.
-            let Some(msg) = self.get_message(inbox, message_id).await? else {
-                return Ok(None);
-            };
-            let Some(thread_before) = self.get_thread_state(inbox, &msg.thread_id).await? else {
-                return Err(MailStoreError::Permanent(anyhow!(
-                    "message {message_id} refers to thread {}, which does not exist",
-                    msg.thread_id
-                )));
-            };
-
-            let mut new_labels = msg.labels.clone();
-            let mut actually_added = Vec::new();
-            for label in add {
-                if !new_labels.iter().any(|existing| existing == label) {
-                    new_labels.push(label.clone());
-                    actually_added.push(label.clone());
-                }
-            }
-            let mut actually_removed = Vec::new();
-            for label in remove {
-                if new_labels.iter().any(|existing| existing == label) {
-                    new_labels.retain(|existing| existing != label);
-                    actually_removed.push(label.clone());
-                }
-            }
-            new_labels.sort();
-
-            // Nothing to do: report the current labels rather than spending a
-            // transaction and a version bump on a no-op.
-            if actually_added.is_empty() && actually_removed.is_empty() {
-                return Ok(Some(new_labels));
-            }
-
-            let thread_after =
-                apply_label_patch(&thread_before, &actually_added, &actually_removed, now);
-            let ops = crate::mail::plan::plan_patch(
-                &msg,
-                &new_labels,
-                &thread_before,
-                &thread_after,
-                now,
-            )?;
-
-            match self.attempt_transaction(&ops).await? {
-                Attempt::Committed => return Ok(Some(new_labels)),
-                Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
-                    backoff(attempt).await;
-                }
-                Attempt::Decision(
-                    TxnDecision::Permanent
-                    | TxnDecision::KeyExists
-                    | TxnDecision::Duplicate
-                    | TxnDecision::AliasTaken(_),
-                ) => {
-                    return Err(MailStoreError::Permanent(anyhow!(
-                        "label patch for message {message_id} was cancelled"
-                    )));
-                }
-            }
-        }
-        Err(MailStoreError::Conflict)
+        flows::update_labels(self, inbox, message_id, add, remove, now).await
     }
 
     async fn list_inboxes(

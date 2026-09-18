@@ -25,6 +25,7 @@ pub mod build;
 pub mod content;
 pub mod events;
 pub mod fetch;
+pub mod flows;
 pub mod ingest;
 pub mod labels;
 pub mod mime;
