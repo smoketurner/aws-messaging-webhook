@@ -27,6 +27,5 @@ lcov.info
 *.profraw
 *.profdata
 
-# Codegraph
-.codegraph/
 .local/
+*.bak
