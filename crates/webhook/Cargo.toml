@@ -57,6 +57,7 @@ base64 = { workspace = true, features = ["std"] }
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
 mail-builder.workspace = true
 mail-parser.workspace = true
+mime.workspace = true
 metrics.workspace = true
 metrics_cloudwatch_embedded = { workspace = true, features = ["lambda"] }
 reqwest = { workspace = true, features = ["rustls"] }

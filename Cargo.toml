@@ -13,126 +13,72 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/smoketurner/aws-messaging-webhook"
 
 [workspace.dependencies]
-aws-messaging-webhook = { path = "crates/webhook" }
-sns-message-verifier = { path = "crates/sns-message-verifier" }
-webhook-test-support = { path = "crates/webhook-test-support" }
-
-# Exact version pins only, with default features disabled on everything;
-# each member crate opts into exactly the features it uses.
-
-# Runtime
-lambda_http = { version = "=1.3.0", default-features = false }
-axum = { version = "=0.8.9", default-features = false }
-tokio = { version = "=1.53.1", default-features = false }
-tower = { version = "=0.5.3", default-features = false }
-tower-http = { version = "=0.6.11", default-features = false }
-
-# AWS SDK — defaults off also drops the legacy rustls 0.21 connector
-# (RUSTSEC-2026-0098/0099/0104); crates enable default-https-client (hyper 1).
+anyhow = { version = "=1.0.104", default-features = false }
 aws-config = { version = "=1.10.1", default-features = false }
+aws-messaging-webhook = { path = "crates/webhook" }
 aws-sdk-dynamodb = { version = "=1.120.0", default-features = false }
 aws-sdk-eventbridge = { version = "=1.112.0", default-features = false }
 aws-sdk-pinpointsmsvoicev2 = { version = "=1.116.0", default-features = false }
-aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
-# aws-sdk-s3 =1.147.0 needs aws-smithy-types ^1.7, but the workspace pins
-# =1.6.2 (see below); =1.141.0 is the newest release that still resolves
-# against it (verified via `cargo tree`/`cargo deny`).
 aws-sdk-s3 = { version = "=1.141.0", default-features = false }
-# Same constraint as aws-sdk-s3: newer ssm releases want aws-smithy-types
-# ^1.7. =1.119.0 is the newest that resolves against the =1.6.2 pin.
+aws-sdk-sesv2 = { version = "=1.128.0", default-features = false }
 aws-sdk-ssm = { version = "=1.119.0", default-features = false }
 aws-smithy-types = { version = "=1.6.2", default-features = false }
-
-# Serialization
-serde = { version = "=1.0.229", default-features = false }
-serde_json = { version = "=1.0.151", default-features = false }
-# Typed DynamoDB Streams event shapes for the stream relay consumer. The
-# `dynamodb` feature (enabled by the webhook crate) pulls serde_dynamo (typed
-# AttributeValue de/serialization, incl. base64 for binary) and chrono, so the
-# consumer doesn't hand-parse the stream image. serde_dynamo is also a direct
-# dep to name AttributeValue.
 aws_lambda_events = { version = "=1.2.0", default-features = false }
-serde_dynamo = { version = "=4.3.0", default-features = false }
-
-# Crypto for SNS signature verification. sha1/sha2 stay on the 0.10.x line and
-# x509-cert on 0.2.x: rsa 0.9 speaks digest 0.10 / spki 0.7, and the newer
-# 0.11 / 0.3 releases are trait-incompatible with it.
-rsa = { version = "=0.9.10", default-features = false }
-sha1 = { version = "=0.10.7", default-features = false }
-sha2 = { version = "=0.10.9", default-features = false }
-x509-cert = { version = "=0.2.5", default-features = false }
-# Constant-time comparison of presented API-key hashes.
-subtle = { version = "=2.6.1", default-features = false }
+axum = { version = "=0.8.9", default-features = false }
 base64 = { version = "=0.22.1", default-features = false }
-url = { version = "=2.5.8", default-features = false }
-reqwest = { version = "=0.13.4", default-features = false }
-
-# Mail inbox. uuid =1.26.1 unifies with the transitive uuid pulled in by
-# other dependencies (verified via `cargo tree`).
-mail-parser = { version = "=0.11.9", default-features = false }
-# Outbound MIME. Generating multipart boundaries, transfer encodings and
-# header folding by hand is the kind of thing that fails subtly and only for
-# some recipients, so it is left to the same authors as `mail-parser` above.
-# Its one feature, `gethostname`, is off: `Message-ID` is minted from the
-# message id, never from the host.
+lambda_http = { version = "=1.3.0", default-features = false }
 mail-builder = { version = "=1.0.0", default-features = false }
-uuid = { version = "=1.26.1", default-features = false }
-
-# Observability
+mail-parser = { version = "=0.11.9", default-features = false }
 metrics = { version = "=0.24.6", default-features = false }
 metrics_cloudwatch_embedded = { version = "=0.10.0", default-features = false }
-
-# Errors and logging
-thiserror = { version = "=2.0.20", default-features = false }
-anyhow = { version = "=1.0.104", default-features = false }
-tracing = { version = "=0.1.44", default-features = false }
-
-# Dev
+mime = { version = "=0.3.17", default-features = false }
 proptest = { version = "=1.11.0", default-features = false }
-wiremock = { version = "=0.6.5", default-features = false }
-# rand 0.8 is the last line implementing the rand_core 0.6 traits rsa 0.9 needs
 rand = { version = "=0.8.7", default-features = false }
+reqwest = { version = "=0.13.4", default-features = false }
+rsa = { version = "=0.9.10", default-features = false }
+serde = { version = "=1.0.229", default-features = false }
+serde_dynamo = { version = "=4.3.0", default-features = false }
+serde_json = { version = "=1.0.151", default-features = false }
+sha1 = { version = "=0.10.7", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
+sns-message-verifier = { path = "crates/sns-message-verifier" }
+subtle = { version = "=2.6.1", default-features = false }
+thiserror = { version = "=2.0.20", default-features = false }
+tokio = { version = "=1.53.1", default-features = false }
+tower = { version = "=0.5.3", default-features = false }
+tower-http = { version = "=0.6.11", default-features = false }
+tracing = { version = "=0.1.44", default-features = false }
+url = { version = "=2.5.8", default-features = false }
+uuid = { version = "=1.26.1", default-features = false }
+webhook-test-support = { path = "crates/webhook-test-support" }
+wiremock = { version = "=0.6.5", default-features = false }
+x509-cert = { version = "=0.2.5", default-features = false }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# Panic prevention
 unwrap_used = "deny"
 expect_used = "warn"
 panic = "deny"
 panic_in_result_fn = "deny"
 unimplemented = "deny"
-# No cheating
 allow_attributes = "deny"
-# Code hygiene
 dbg_macro = "deny"
 todo = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
-# Safety
 await_holding_lock = "deny"
 large_futures = "deny"
 exit = "deny"
 mem_forget = "deny"
-# Pedantic relaxations (too noisy)
 module_name_repetitions = "allow"
 similar_names = "allow"
 
-# Test harnesses sign SNS envelopes with a freshly generated 2048-bit RSA key,
-# and unoptimized key generation takes seconds per harness. Optimizing just the
-# two crates that do the math takes the test suite from minutes to seconds
-# without slowing the rest of a debug build.
 [profile.dev.package.rsa]
 opt-level = 3
 
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
 
-# Smaller deploy artifact and marginally faster cold start; slower `sam build`.
-# Deliberately NOT set: `panic = "abort"` — lambda_runtime catches handler
-# panics via unwinding, turning them into a 502 (SNS retries) while keeping the
-# sandbox warm; abort would torch the execution environment on every panic.
-# `opt-level = "z"` — per-message RSA verification and JSON parsing are billed
-# CPU time; size-over-speed is the wrong trade for this workload.
 [profile.release]
 lto = true
 codegen-units = 1
