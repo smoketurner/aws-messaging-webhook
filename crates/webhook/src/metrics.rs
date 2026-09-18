@@ -1,9 +1,9 @@
 //! `CloudWatch` Embedded Metrics Format (EMF) integration.
 //!
-//! Replaces the previous approach of log metric filters in the SAM template
-//! with inline EMF emission via the [`metrics`] facade. `CloudWatch` extracts
-//! metric datapoints directly from the structured JSON log line — no filter
-//! pattern matching required, and dimensions/values are available immediately.
+//! Metrics are emitted inline through the [`metrics`] facade: `CloudWatch`
+//! extracts the datapoints from the structured JSON log line, so dimensions
+//! and values are available immediately and the stack defines no metric
+//! filters.
 //!
 //! The [`metrics_cloudwatch_embedded`] backend handles batching and the EMF
 //! JSON schema. Per-invocation metrics are flushed to stdout at the end of
@@ -38,9 +38,7 @@ pub mod names {
     pub const INGEST_FAILURES: &str = "IngestFailures";
     pub const INGEST_SKIPPED: &str = "IngestSkipped";
     pub const INGEST_TIMEOUTS: &str = "IngestTimeouts";
-    pub const API_REQUESTS: &str = "ApiRequests";
     pub const API_AUTH_FAILURES: &str = "ApiAuthFailures";
-    pub const MESSAGES_QUEUED: &str = "MessagesQueued";
     pub const MESSAGES_SENT: &str = "MessagesSent";
     pub const SEND_FAILURES: &str = "SendFailures";
     pub const SEND_OUTCOME_UNKNOWN: &str = "SendOutcomeUnknown";

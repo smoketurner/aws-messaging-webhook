@@ -3,8 +3,9 @@
 //! Three groups. Ingest (`get_inbox`, `ensure_inbox`, `message_exists`,
 //! `resolve_rfc_ids`, `insert_message`, `get_message`), the read API
 //! (`list_inboxes`, `list_messages`, `list_threads`, `get_thread`,
-//! `update_labels`), and sending (`enqueue_send`, `claim_send`, `mark_send`
-//! and the queries the sweep uses).
+//! `update_labels`), and sending (`enqueue_send`, `get_send_key`,
+//! `claim_send`, `note_ses_call`, `mark_send`, `get_send_state`,
+//! `resolve_ses_message`, and `list_by_status` for the sweep).
 //!
 //! The list queries read the time-ordered index rather than per-label
 //! partitions: one inbox's volume doesn't justify the write amplification of

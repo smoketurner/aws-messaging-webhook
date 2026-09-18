@@ -50,8 +50,6 @@ fn test_mail_config() -> MailConfig {
         api_keys_parameter: "/example/api-keys".to_owned(),
         attachment_url_ttl: Duration::from_secs(3600),
         region: "us-east-1".to_owned(),
-        send_rate: 1,
-        unknown_outbox_retention_days: 30,
         retention_days: 365,
     }
 }

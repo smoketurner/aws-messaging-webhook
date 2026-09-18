@@ -94,9 +94,10 @@ transition and delivery event, and copied into both list indexes; DynamoDB bills
 writes on the whole item. Keeping the content out keeps the item to a few KB whatever the mail
 looks like, and a body of any size is stored whole rather than truncated to fit.
 
-The document is written before the item's transaction, so an item never exists without it; an
-orphaned document from a transaction that failed is overwritten by the retry, since inbound ids
-are deterministic. Three readers need it: `GET` for one message or one thread, a reply (for the
+The document is written before the item's transaction, so an item never exists without it. The
+write is conditional (`if-none-match: *`), so a retry of a failed transaction finds its own
+document already there and keeps it — inbound ids are deterministic, so the content is the
+same either way, and an orphan expires with the bucket's lifecycle rule. Three readers need it: `GET` for one message or one thread, a reply (for the
 original's `References` and `Reply-To`), and the stream relay (for the `message.received` event
 body). List endpoints read only items.
 

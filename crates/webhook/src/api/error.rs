@@ -65,9 +65,6 @@ pub enum ApiError {
     #[error("unauthorized")]
     Unauthorized,
 
-    #[error("forbidden: {0}")]
-    Forbidden(String),
-
     #[error("not found")]
     NotFound,
 
@@ -77,9 +74,6 @@ pub enum ApiError {
 
     #[error("payload too large")]
     TooLarge,
-
-    #[error("too many requests")]
-    Throttled,
 
     /// A route the API contract defines but this service does not implement.
     #[error("not implemented")]
@@ -113,11 +107,9 @@ impl ApiError {
         match self {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -131,11 +123,9 @@ impl ApiError {
         match self {
             Self::Validation(_) => "ValidationError",
             Self::Unauthorized => "UnauthorizedError",
-            Self::Forbidden(_) => "ForbiddenError",
             Self::NotFound => "NotFoundError",
             Self::Conflict(_) => "ConflictError",
             Self::TooLarge => "PayloadTooLargeError",
-            Self::Throttled => "RateLimitError",
             Self::NotImplemented => "NotImplementedError",
             Self::Unavailable => "ServiceUnavailableError",
             Self::BadGateway(_) | Self::Internal(_) => "InternalServerError",
@@ -148,10 +138,9 @@ impl ApiError {
         match self {
             Self::Validation(_) => "Request validation failed.".to_owned(),
             Self::Unauthorized => "Missing or invalid API key.".to_owned(),
-            Self::Forbidden(detail) | Self::Conflict(detail) => detail.clone(),
+            Self::Conflict(detail) => detail.clone(),
             Self::NotFound => "Resource not found.".to_owned(),
             Self::TooLarge => "Request body is too large.".to_owned(),
-            Self::Throttled => "Too many requests.".to_owned(),
             Self::NotImplemented => "This endpoint is not implemented.".to_owned(),
             Self::Unavailable => "API keys are temporarily unavailable; retry shortly.".to_owned(),
             Self::BadGateway(_) | Self::Internal(_) => "Internal server error.".to_owned(),

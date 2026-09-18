@@ -29,7 +29,7 @@ deny: ## Check dependencies (advisories, licenses, bans)
 
 lint: fmt-check clippy deny ## Full lint suite (fmt + clippy + deny)
 
-check: lint test ## Everything CI runs (lint + test)
+check: lint test validate ## Everything CI runs (lint, test, template)
 
 watch: ## Start local Lambda runtime (cargo-lambda)
 	cargo lambda watch

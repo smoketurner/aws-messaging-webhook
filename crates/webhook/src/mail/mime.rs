@@ -1,4 +1,4 @@
-//! Inbound MIME parsing. Outbound MIME building is not implemented yet.
+//! Inbound MIME parsing. Outbound MIME is built in `mail::build`.
 
 use std::collections::BTreeMap;
 

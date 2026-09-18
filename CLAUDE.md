@@ -65,7 +65,8 @@ Two workspace crates:
    whether the aggregate was applied (idempotent actions run regardless).
 6. `actions/` runs inline lifecycle calls (delivery feedback, STOP/START opt-outs, bounce and
    complaint suppression). AWS-native lists are the source of truth.
-7. `stream.rs` is the **sole publisher**: a DynamoDB Streams consumer (same binary) rebuilds each
+7. `stream.rs` is the **sole publisher of event details**: a DynamoDB Streams consumer (same
+   binary) rebuilds each
    newly-persisted event via `publish.rs::build_outbound` and emits it to EventBridge, capping
    detail size so an oversized payload can't become a poison record. The event-source mapping's
    retries + on-failure DLQ make delivery durable independently of the request path.
@@ -84,7 +85,8 @@ Two workspace crates:
   aliases the Lambda-shape `SigningCertUrl`/`UnsubscribeUrl` casing) so signed values stay
   verbatim. The request path persists (the outbox entry) before running idempotent actions; a
   5xx redelivery re-runs only the repeat-safe actions, so action APIs must stay repeat-safe.
-  Publishing is decoupled — the stream relay is the sole publisher, with its own retries + DLQ.
+  Publishing is decoupled — the stream relay publishes every event detail, with its own
+  retries + DLQ (the request path publishes only `subscription.changed`).
   `ActionErrorKind` splits transient (5xx, retry) from permanent (log + metric, still persist) —
   a misconfigured opt-out list must not become a retry storm.
 - **No verification bypass in release builds.** `SNS_CERT_HOST_OVERRIDE` (for

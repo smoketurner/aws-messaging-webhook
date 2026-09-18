@@ -42,8 +42,10 @@ SES receipt rule ─────► SNS ─┘  (lambda protocol) ────�
 
 The request path is a durable outbox writer: it verifies, persists the event item (the outbox
 entry), and runs inline lifecycle actions. A DynamoDB Streams consumer in the same function is
-the **sole publisher** — it reads each newly-persisted event and emits it to EventBridge, with
-the stream event-source mapping's retries and on-failure DLQ guaranteeing delivery.
+the **sole publisher of event details** — it reads each newly-persisted event and emits it to
+EventBridge, with the stream event-source mapping's retries and on-failure DLQ guaranteeing
+delivery. (The request path publishes one event of its own, `subscription.changed`, which has
+no event item behind it.)
 
 The event family is classified from each payload's shape, so no routing configuration exists.
 Wire each SNS topic to its matching path anyway — a topic delivering a different family than
@@ -153,7 +155,7 @@ one, and configuring a second replaces the stack's.
 | `pEventSource` | `aws-messaging-webhook` | `source` field on published EventBridge events |
 | `pRawEventRetentionDays` | `30` | DynamoDB TTL for raw event items |
 | `pAggregateRetentionDays` | `365` | DynamoDB TTL for the per-message aggregate item; kept longer than raw events so current state outlives them |
-| `pLogLevel` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR` (no `TRACE`; see [Upgrading from `pLogLevel=TRACE`](#upgrading-from-plogleveltrace)) |
+| `pLogLevel` | `INFO` | `DEBUG`/`INFO`/`WARN`/`ERROR`; `TRACE` is refused, since the runtime and the AWS SDK log raw payloads at that level |
 | `pLogRetentionDays` | `30` | CloudWatch log retention |
 | `pConsumerAccountIds` | *(empty)* | Comma-separated 12-digit account ids allowed to assume the read-only consumer role (see [Consumer read access](#consumer-read-access)); empty grants none |
 
@@ -170,17 +172,6 @@ one, and configuring a second replaces the stack's.
 - SNS topics and subscriptions deliberately live *outside* this stack, next to your EUM/SES
   configuration; the wiring commands above bridge the two after deploy. The exception is the
   two mail topics a mailbox stack owns (see [Mailbox](#mailbox)).
-
-### Upgrading from `pLogLevel=TRACE`
-
-`TRACE` is no longer an allowed `pLogLevel`: at that level the Lambda runtime logs raw
-invocation payloads and the AWS SDK logs full requests and responses, which leaks secrets.
-CloudFormation reuses a stack's previous parameter values on update, so a stack deployed with
-`pLogLevel=TRACE` fails parameter validation on its next deploy. Pass a new level once:
-
-```bash
-sam deploy --parameter-overrides "pLogLevel=DEBUG"
-```
 
 ## Mailbox
 
@@ -273,9 +264,9 @@ also its `inbox_id` (for example `/v0/inboxes/hello@mail.example.com/messages`).
 
 ### Mailbox API
 
-Every `/v0` route needs `Authorization: Bearer <key>`. Reads, label changes and sends are
-implemented; the remaining routes answer `501`. Every error, including a malformed JSON body, a
-missing content type and an oversized request, has a JSON body with a `name` and `message`.
+Every `/v0` route needs `Authorization: Bearer <key>`. The routes below are the API; anything
+else under `/v0` answers `501`. Every error, including a malformed JSON body, a missing content
+type and an oversized request, has a JSON body with a `name` and `message`.
 
 | Route | Returns |
 |---|---|
@@ -690,10 +681,9 @@ Two indexes serve the reads. `ByTime` (`gsi1pk`/`gsi1sk`) holds three partition 
 messages. Message ids are UUIDv7s, so sorting by id *is* sorting by time, which is what lets a
 `before`/`after` window become a plain key range.
 
-This release populates only the Inbox, Message and Thread items from inbound ingest.
-The send-state, send-key and SES-reference items the send path adds live on the same table
-under their own `pk`s (`OUTBOX#<messageId>`, `SENDKEY#<sha256>`, `SESMSG#<sesMessageId>`,
-`SESCALL#<messageId>`) and are not written by this release. `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from
+Inbound ingest writes the Inbox, Message and Thread items; the send path adds its own on the
+same table under their own `pk`s (`OUTBOX#<messageId>`, `SENDKEY#<sha256>`,
+`SESMSG#<sesMessageId>`). `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from
 the SES message id and receipt timestamp), so a redelivered SES notification always resolves to
 the same message rather than creating a duplicate. A message's raw MIME and attachments live in
 the mail bucket, not the table; the message item's `raw_s3_key`/attachment `object_key`s point at
@@ -758,7 +748,7 @@ prek run                               # fmt, clippy, deny, actionlint, zizmor
 The handler tests drive the real router end to end with properly signed SNS envelopes (the
 verifier crate's `test-fixtures` feature generates throwaway keys and certificates), so no AWS
 account is needed for development. For a deployed end-to-end check see the SES-simulator probe
-under Observability.
+under [Operations](#operations).
 
 > [!NOTE]
 > Debug builds honor `SNS_CERT_HOST_OVERRIDE` for running against a local fake SNS under

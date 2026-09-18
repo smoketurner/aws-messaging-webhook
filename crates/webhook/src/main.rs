@@ -10,14 +10,12 @@ use sns_message_verifier::SnsVerifier;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_http::Error> {
-    lambda_http::tracing::init_default_subscriber();
+    aws_messaging_webhook::logging::init();
 
     let (config, allowlist) = Config::from_env()?;
 
-    // Initialize EMF metrics collector. The namespace matches the CloudWatch
-    // metric namespace previously populated by log metric filters (the stack
-    // name). Falls back to the event_source when STACK_NAME is unset (local
-    // dev).
+    // The EMF collector's namespace is the stack name, falling back to the
+    // event source when STACK_NAME is unset (local dev).
     let namespace = std::env::var("STACK_NAME").unwrap_or_else(|_| config.event_source.clone());
     let collector = aws_messaging_webhook::metrics::init(namespace)
         .map_err(|e| format!("failed to initialize metrics collector: {e}"))?;

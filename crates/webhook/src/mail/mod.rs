@@ -47,8 +47,6 @@ pub const ADDRESS_MAX_BYTES: usize = 320;
 pub const INBOUND_ADDRESS_LIST_MAX: usize = 100;
 pub const OUTBOUND_RECIPIENTS_MAX: usize = 50;
 pub const REFERENCES_MAX: usize = 50;
-/// Aliases skip ids over 900 bytes.
-pub const RFC_ID_MAX_BYTES: usize = 998;
 pub const HEADER_NAME_MAX: usize = 128;
 pub const HEADER_VALUE_MAX: usize = 998;
 pub const HEADERS_BUDGET: usize = 32_000;
@@ -59,9 +57,7 @@ pub const PREVIEW_CHARS: usize = 256;
 pub const MAX_INBOUND_RAW_BYTES: u64 = 45_000_000;
 pub const MAX_OUTBOUND_DECODED_BYTES: u64 = 28_000_000;
 pub const MAX_OUTBOUND_RAW_BYTES: u64 = 39_500_000;
-pub const RESPONSE_BUDGET_BYTES: usize = 5_000_000;
 pub const THREAD_ATTACHMENT_SUMMARIES: usize = 20;
-pub const THREAD_ATTACHMENT_ROUTE_MAX_KEYS: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Core storage types
