@@ -4,22 +4,21 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.98.0-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](#license)
 
-One Rust Lambda function that receives AWS messaging events delivered over SNS — End User
-Messaging two-way SMS and delivery receipts, SES sending events, and SES inbound email
-notifications — over either pathway: HTTPS to a Lambda Function URL (Axum), or direct
-SNS → Lambda invocation. Then it:
+One Rust Lambda receives AWS messaging events over SNS: End User Messaging two-way SMS and
+delivery receipts, SES sending events, and SES inbound mail. Topics reach it over HTTPS to a
+Lambda Function URL, or by invoking it directly. Every event then:
 
-1. **Verifies** the SNS message signature (`SignatureVersion` 1 and 2) and enforces a topic
-   allowlist. Together these are the security boundary for the public URL.
-2. **Auto-confirms** SNS subscriptions from allowlisted topics, and auto-re-subscribes if an
-   unauthenticated `UnsubscribeURL` is abused (`AUTO_RESUBSCRIBE=false` disables).
-3. **Persists** every event to DynamoDB as an event-sourced store: one item per event keyed by
-   the originating message, plus a per-message aggregate (delivery status, open/click counts).
-   The conditional write doubles as idempotency — SNS redeliveries never double-process.
-4. **Acts** on lifecycle events inline: delivery receipts → `PutMessageFeedback`; STOP/START
-   keywords → `PutOptedOutNumber`/`DeleteOptedOutNumber`; hard bounces and complaints →
+1. **Verifies.** The SNS signature (`SignatureVersion` 1 and 2) and a topic allowlist. These
+   two are the security boundary for the public URL.
+2. **Confirms.** Subscriptions from allowlisted topics confirm themselves, and re-subscribe if
+   an unauthenticated `UnsubscribeURL` is abused (`pAutoResubscribe=false` disables this).
+3. **Persists.** One DynamoDB item per event, keyed by the originating message, plus a
+   per-message aggregate holding delivery status and open/click counts. The conditional write
+   is the idempotency: an SNS redelivery never double-processes.
+4. **Acts.** Delivery receipts call `PutMessageFeedback`. STOP/START keywords call
+   `PutOptedOutNumber`/`DeleteOptedOutNumber`. Hard bounces and complaints call
    `PutSuppressedDestination`. AWS-native lists stay the source of truth.
-5. **Re-publishes** normalized events to a custom EventBridge bus for downstream applications.
+5. **Publishes.** Normalized events go to a custom EventBridge bus.
 
 - [Architecture](#architecture)
 - [Deploy](#deploy)
@@ -40,17 +39,15 @@ SES receipt rule ─────► SNS ─┘  (lambda protocol) ────�
                                 verify → persist → act     └─► lifecycle actions (EUM/SES APIs)
 ```
 
-The request path is a durable outbox writer: it verifies, persists the event item (the outbox
-entry), and runs inline lifecycle actions. A DynamoDB Streams consumer in the same function is
-the **sole publisher of event details** — it reads each newly-persisted event and emits it to
-EventBridge, with the stream event-source mapping's retries and on-failure DLQ guaranteeing
-delivery. (The request path publishes one event of its own, `subscription.changed`, which has
-no event item behind it.)
+The request path is a durable outbox writer: verify, persist the event item, run the inline
+lifecycle actions. A DynamoDB Streams consumer in the same function publishes every event
+detail, and the stream mapping's retries and on-failure DLQ make that delivery durable. The
+request path publishes one event of its own, `subscription.changed`, which has no event item
+behind it.
 
-The event family is classified from each payload's shape, so no routing configuration exists.
-Wire each SNS topic to its matching path anyway — a topic delivering a different family than
-its path logs a `family_mismatch` warning (the event still processes correctly). Direct
-SNS → Lambda subscriptions carry no path and need no substitute for one:
+Each payload's shape decides its event family, so there is no routing to configure. Wire each
+topic to its matching path anyway: a mismatch logs `family_mismatch` and still processes the
+event correctly. Direct SNS → Lambda subscriptions carry no path and need none.
 
 | Path | Subscribe this topic |
 |---|---|
@@ -80,10 +77,10 @@ sam deploy --parameter-overrides \
 ```
 
 > [!IMPORTANT]
-> **`pAllowedTopics` is load-bearing security.** Signature verification proves a message came
-> from SNS — from *any* AWS account. The allowlist (12-digit account ids and/or TopicArn globs,
-> comma-separated) is what stops strangers from subscribing your public endpoint to their
-> topics. Empty = accept everything = development only.
+> **`pAllowedTopics` is security, not configuration.** A valid signature proves a message came
+> from SNS in *some* AWS account. The allowlist — comma-separated 12-digit account ids and/or
+> TopicArn globs — is what stops a stranger subscribing your public endpoint to their topic.
+> Empty accepts everything, which is for development only.
 
 > [!WARNING]
 > **Raw message delivery must stay disabled** on subscriptions (the default). Raw delivery
@@ -114,18 +111,15 @@ aws sns subscribe --topic-arn <topic-arn> --protocol https \
   --notification-endpoint "$endpoint"
 ```
 
-The function auto-confirms the subscription: `PendingConfirmation` on the new subscription
-flips to `false` within seconds. If it stays pending, check the function logs — is the topic
-allowlisted? Is raw message delivery disabled? `SignatureVersion` 2 (SHA256) is recommended;
-version 1, the SNS default, also verifies.
+`PendingConfirmation` flips to `false` within seconds. If it stays pending, read the function
+logs: the topic is usually not allowlisted, or raw message delivery is on.
 
 ### Direct SNS → Lambda (optional)
 
-Topics can also invoke the function directly instead of POSTing to the Function URL. The same
-signature verification and allowlist apply; there is no confirmation handshake (Lambda
-subscriptions confirm via IAM) and no routing to configure — the event family comes from the
-payload shape. Grant the topic permission to invoke the function (keep the `--source-arn`
-scope: it is the per-topic gate on this pathway), then subscribe:
+A topic can invoke the function directly instead of POSTing to the Function URL. Signature
+verification and the allowlist apply the same way. There is no confirmation handshake, since
+Lambda subscriptions confirm through IAM. Grant the topic permission to invoke the function,
+then subscribe. Keep `--source-arn` scoped: it is the per-topic gate on this pathway.
 
 ```bash
 function_arn=$(aws cloudformation describe-stacks --stack-name aws-messaging-webhook-dev \
@@ -137,12 +131,11 @@ aws sns subscribe --topic-arn <topic-arn> --protocol lambda \
   --notification-endpoint "${function_arn}"
 ```
 
-The retry behavior differs: SNS hands direct deliveries to Lambda's async-invoke queue, which
-retries a failed invocation **twice**, while the HTTPS delivery policy retries far longer.
-Anything past those two retries lands in the stack's `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl`
-output) carrying the original event, so nothing is dropped; alarm on its depth and replay from
-it (see [Operations](#operations)). Don't add your own on-failure destination — a function has
-one, and configuring a second replaces the stack's.
+Retries differ between the pathways. Lambda's async-invoke queue retries a direct delivery
+**twice**; the HTTPS delivery policy retries far longer. Anything past those two retries lands
+in `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl` output) with the original event, so nothing is lost.
+Alarm on its depth and replay from it — see [Operations](#operations). Do not add your own
+on-failure destination: a function has one, and a second replaces the stack's.
 
 ### Parameters
 
@@ -161,34 +154,30 @@ one, and configuring a second replaces the stack's.
 
 ### Deployment contract
 
-- **`SignatureVersion: 2`** (SHA256) is recommended per topic (the wiring commands above set
-  it). Version 1 (the SNS default) is also supported.
-- **SES inbound email**: use the receipt rule **S3 action** to store message content, with the
-  SNS notification carrying the pointer. Full content over SNS is size-limited and discouraged;
-  oversized inbound payloads have their embedded content stripped from the EventBridge event
-  (the DynamoDB raw record keeps whatever SNS delivered).
-- **SMS opt-out handling** fires only with self-managed opt-outs enabled on your numbers
-  (AWS-managed opt-outs intercept STOP before SNS ever sees it) and requires `pOptOutListName`.
-- SNS topics and subscriptions deliberately live *outside* this stack, next to your EUM/SES
-  configuration; the wiring commands above bridge the two after deploy. The exception is the
-  two mail topics a mailbox stack owns (see [Mailbox](#mailbox)).
+- **Signatures.** `SignatureVersion: 2` (SHA256) per topic, which the commands above set.
+  Version 1, the SNS default, also verifies.
+- **SES inbound.** Use the receipt rule's S3 action and let the SNS notification carry the
+  pointer. Content delivered over SNS is size-limited; an oversized payload loses its embedded
+  content in the EventBridge event, though DynamoDB keeps whatever SNS delivered.
+- **SMS opt-outs.** STOP/START handling needs self-managed opt-outs on your numbers and
+  `pOptOutListName`. AWS-managed opt-outs intercept STOP before SNS sees it.
+- **Topics live outside this stack**, next to your EUM/SES configuration. The exception is the
+  two topics a mailbox stack owns (see [Mailbox](#mailbox)).
 
 ## Mailbox
 
-Setting `pMailDomain` also makes the stack a mailbox on SES. The stack
-creates the SES identity and configuration set, a receipt rule that stores inbound mail in S3,
-the mail bucket and mail table, two SNS topics subscribed to the function, and (with
-`pHostedZoneId`) the DNS records.
+Set `pMailDomain` and the stack becomes a mailbox on SES. It creates the SES identity and
+configuration set, a receipt rule storing inbound mail in S3, the mail bucket and mail table,
+two SNS topics subscribed to the function, and the DNS records when `pHostedZoneId` is set.
 
-With `pMailDomain` empty (the default), none of those resources exist, and the function keeps
-its 10 s timeout, 256 MB of memory and its current environment. A mailbox stack runs the
-function with a 90 s timeout and 512 MB, so one invocation can parse a 40 MB message.
+Empty `pMailDomain` (the default) creates none of it, and the function keeps its 10 s timeout
+and 256 MB. A mailbox stack runs it with a 90 s timeout and 512 MB, enough to parse a 40 MB
+message in one invocation.
 
 > [!IMPORTANT]
-> **Region.** SES email receiving is offered only in some regions. Deploy a mailbox stack in a
-> region that has an email receiving endpoint in the
-> [SES endpoints list](https://docs.aws.amazon.com/general/latest/gr/ses.html); elsewhere the
-> receipt rule set can't be created.
+> **Region.** SES receives email in some regions only. Deploy a mailbox stack where the
+> [SES endpoints list](https://docs.aws.amazon.com/general/latest/gr/ses.html) shows an email
+> receiving endpoint. Elsewhere the receipt rule set cannot be created.
 
 ```bash
 sam deploy --parameter-overrides \
@@ -214,7 +203,7 @@ sam deploy --parameter-overrides \
 
 ### After the first deploy
 
-CloudFormation can't do the steps below, so run them once. They use this helper:
+CloudFormation cannot do these four. Run them once, using this helper:
 
 ```bash
 stack=aws-messaging-webhook-dev
@@ -236,16 +225,19 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
      --query '{dkim: DkimAttributes.Status, mailFrom: MailFromAttributes.MailFromDomainStatus}'
    ```
 
-3. **Activate the receipt rule set.** A region has exactly one active rule set, so activating
-   this one deactivates any other. If a rule set is already active, redeploy with
-   `pExistingReceiptRuleSetName` set to its name instead; the stack then only adds its rule.
+3. **Activate the receipt rule set.** A region has one active rule set, so activating this one
+   deactivates any other. If one is already active, redeploy with `pExistingReceiptRuleSetName`
+   set to its name and the stack adds only its rule.
+
+   Inbound mail stops silently whenever the stack's rule set is not the active one, including
+   after a deploy that replaces it. Check with `aws ses describe-active-receipt-rule-set`.
 
    ```bash
    aws ses set-active-receipt-rule-set --rule-set-name "$(output ReceiptRuleSetName)"
    ```
 
-4. **Create the API key parameter.** CloudFormation can't create a SecureString parameter. Its
-   name must start with `/` and equal `pApiKeysParameterName`. The value holds SHA-256 hashes,
+4. **Create the API key parameter.** CloudFormation cannot create a SecureString parameter.
+   Name it exactly `pApiKeysParameterName`, starting with `/`. The value holds SHA-256 hashes,
    never the keys:
 
    ```bash
@@ -256,17 +248,17 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    echo "$key"   # hand this to the client; it isn't stored anywhere
    ```
 
-   Add `--key-id <pApiKeysKmsKeyArn>` when you use a customer-managed key. To rotate, overwrite
-   the parameter with both entries, move clients to the new key, then remove the old entry.
+   Add `--key-id <pApiKeysKmsKeyArn>` for a customer-managed key. Rotate by writing both
+   entries, moving clients to the new key, then removing the old entry.
 
-The API is served under the `ApiBaseUrl` output; `InboxAddress` is the inbox's address, which is
-also its `inbox_id` (for example `/v0/inboxes/hello@mail.example.com/messages`).
+The API is served under the `ApiBaseUrl` output. `InboxAddress` is the inbox's address and its
+`inbox_id`, for example `/v0/inboxes/hello@mail.example.com/messages`.
 
 ### Mailbox API
 
-Every `/v0` route needs `Authorization: Bearer <key>`. The routes below are the API; anything
-else under `/v0` answers `501`. Every error, including a malformed JSON body, a missing content
-type and an oversized request, has a JSON body with a `name` and `message`.
+Every `/v0` route needs `Authorization: Bearer <key>`. Anything under `/v0` that isn't listed
+below answers `501`. Every error carries a JSON body with a `name` and `message`, including a
+malformed body, a missing content type and an oversized request.
 
 | Route | Returns |
 |---|---|
@@ -282,22 +274,22 @@ type and an oversized request, has a JSON body with a `name` and `message`.
 | `POST /v0/inboxes/{inbox_id}/messages/send` | `{message_id, thread_id}` once the send is durably queued |
 | `POST …/messages/{message_id}/reply` | the same, joining the original's thread |
 
-Downloads are presigned S3 URLs, valid for 15 minutes, rather than bytes streamed through the
-function. The URL carries its own authorization — the API key is not needed to follow it, and
-anyone holding the URL can fetch the object until it expires. A message whose raw object or
-attachment has passed `pMailRetentionDays`, and an attachment that was dropped for size, answer
-`404`, since there is nothing stored to hand back.
+Downloads are presigned S3 URLs valid for 15 minutes, not bytes streamed through the function.
+The URL carries its own authorization: following it needs no API key, and anyone holding it can
+fetch the object until it expires. A raw message or attachment past `pMailRetentionDays`, and an
+attachment dropped for size, answer `404`.
 
-`PATCH` takes `{"add_labels": …, "remove_labels": …}`, each either one label or a list. Labels
-are lowercased, trimmed and deduplicated. There is no "mark as read" endpoint: removing the
-`unread` label is how a client marks mail read. The labels the service sets itself — everything
-except `unread`, `spam`, `trash` and your own — are rejected with a `400`, as is a label given in
-both fields. A message's thread keeps a label until the last message carrying it gives it up, and
-relabelling does not count as thread activity, so it doesn't reorder a thread list.
+`PATCH` takes `{"add_labels": …, "remove_labels": …}`, each one label or a list. Labels are
+lowercased, trimmed and deduplicated. Removing the `unread` label is how a client marks mail
+read; there is no separate endpoint for it.
 
-A message may carry at most 20 labels of your own, and a thread at most 20 across its messages;
-the service's own labels don't count toward either. A change that would exceed either cap is a
-`400` on `labels`, as is a request naming more than 20 labels.
+- A message carries at most 20 of your labels, a thread at most 20 across its messages. The
+  service's own labels don't count. Exceeding either cap is a `400` on `labels`, as is naming
+  more than 20 labels in one request.
+- The service's own labels — everything but `unread`, `spam`, `trash` and yours — are a `400`,
+  as is the same label in both fields.
+- A thread keeps a label until its last message carrying it gives it up. Relabelling is not
+  thread activity, so it does not reorder a thread list.
 
 List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (default false),
 `before`, `after`, `labels`, `from`, `to`, `subject`, and the four `include_*` flags
@@ -311,13 +303,13 @@ List parameters: `limit` (default 20, max 100), `page_token`, `ascending` (defau
   as a substring.
 - The `include_*` flags default to false and drop items carrying that label. Naming a label
   explicitly overrides the flag that would hide it, so `?labels=trash` returns trashed mail.
-- `page_token` is opaque and bound to the inbox, sort order and time window it was issued for:
-  presenting one to a different inbox, or with a different `ascending`, `before` or `after`, is
-  a `400`. The label and address filters may change between pages.
-- A filtered list can come back with fewer than `limit` items and a `next_page_token`; follow the
-  token to continue.
-- `GET /v0/inboxes` and the messages embedded in `GET …/threads/{thread_id}` take only `limit`
-  and `page_token`. A thread view includes every message in the thread, whatever its labels.
+- `page_token` is opaque and bound to the inbox, sort order and time window that issued it.
+  Presenting one with a different inbox, `ascending`, `before` or `after` is a `400`. Label and
+  address filters may change between pages.
+- A filtered list can return fewer than `limit` items *and* a `next_page_token`. Follow the
+  token.
+- `GET /v0/inboxes` and the messages inside `GET …/threads/{thread_id}` take only `limit` and
+  `page_token`. A thread view includes every message in the thread, whatever its labels.
 
 ### Sending
 
@@ -328,114 +320,105 @@ Function URL's own limit (every other route takes 1 MiB); base64 makes inline co
 third larger than the file, so send larger attachments by `url`.
 
 **It queues; it does not send.** The response means the message is durably recorded, not that
-SES has accepted it. A separate sender function consumes the mail table's stream and makes the
-SES call. This exists because SESv2 `SendEmail` has no idempotency token and the AWS SDKs retry
-5xx on their own, so a synchronous send could deliver the same mail more than once.
+SES took it. A separate sender consumes the mail table's stream and makes the SES call. SESv2
+`SendEmail` has no idempotency token and the AWS SDKs retry 5xx themselves, so a synchronous
+send could deliver the same mail twice.
 
-Send `Idempotency-Key` to make a retry safe. The same key with the same request returns the
-original ids; the same key with a *different* request — any field, any attachment's content or
-metadata, or the same key used on a different route or original message — is a `409`, since
-silently sending something the caller didn't ask for is worse than refusing. Keys are remembered for 24 hours.
-Without a key, a retry after a lost response can queue the message twice.
+Send an `Idempotency-Key` to make a retry safe:
 
-Headers the service controls — `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`,
-`Date`, `Message-ID`, `In-Reply-To`, `References`, `Return-Path`, `MIME-Version` and every
-`Content-*` — are rejected rather than ignored, so a caller cannot send as another inbox. Any CR
-or LF in an address, header name or header value is refused: all three end up in a MIME document
-where a newline would start a new header.
+- The same key with the same request returns the original ids.
+- The same key with any difference — a field, an attachment's content or metadata, a different
+  route or original message — is a `409`. Sending something the caller didn't ask for is worse
+  than refusing.
+- Keys are remembered for 24 hours. Without one, a retry after a lost response queues the
+  message twice.
 
-`…/reply` takes the same body plus `reply_all`, and fills in what you leave out from the message
-being answered: the thread, `In-Reply-To`, the `References` chain, a `Re:` subject (not doubled
-if one is already there), and the recipient — the original's `Reply-To` if it set one, otherwise
-its sender. With `reply_all`, the original's other recipients are copied, minus this inbox, so a
-reply never arrives back where it came from. Naming `to`, `cc` or `bcc` yourself overrides the
-derived recipients but keeps the threading.
+Headers the service controls are refused rather than ignored, so a caller cannot send as
+another inbox: `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`, `Date`,
+`Message-ID`, `In-Reply-To`, `References`, `Return-Path`, `MIME-Version` and every `Content-*`.
+A CR or LF anywhere in an address, header name or header value is also refused — all three end
+up in a MIME document, where a newline starts a new header.
 
-An attachment `url` must be `https`, on the default port, with no embedded credentials, and must
-not resolve to a private or link-local address. That is checked when the request is accepted and
-again when the sender fetches it — on the URL itself and on every redirect `Location`, at most
-five hops. The sender is the only HTTP client in this service that follows redirects at all, and
-it does so by hand for exactly that reason: the first check says nothing about where a redirect
-leads. The host is resolved once and the connection pinned to the addresses that passed, so the
-name cannot resolve to something else between the check and the connect. A compressed response
-is refused rather than stored as-is, since nothing here decompresses.
+`…/reply` takes the same body plus `reply_all`, and derives what you leave out from the message
+it answers: the thread, `In-Reply-To`, the `References` chain, a `Re:` subject (never doubled),
+and the recipient — the original's `Reply-To`, or its sender. `reply_all` copies the original's
+other recipients, minus this inbox, so a reply never arrives back where it came from. Naming
+`to`, `cc` or `bcc` overrides the derived recipients and keeps the threading.
 
-Fetched bytes are stored in the outbox under the attachment's id, so a retried send reuses them
-instead of re-fetching a URL whose content may have changed in the meantime.
+An attachment `url` must be `https`, on the default port, without embedded credentials, and
+must not resolve to a private or link-local address. The API checks that when it accepts the
+request, and the sender checks it again on the URL and on every redirect `Location`, at most
+five hops. The sender is the only HTTP client here that follows redirects, and it does so by
+hand because the first check says nothing about where a redirect leads. The host resolves once
+and the connection pins to the addresses that passed, so the name cannot change underneath it.
+A compressed response is refused, since nothing here decompresses.
 
-A scheduled sweep runs every ten minutes. A sender killed between claiming a send and recording
-its outcome leaves the send `sending` with nobody working on it and no stream record to
-re-trigger it. The sweep looks at claims older than fifteen minutes: one whose sender never got
-as far as calling SES is released to be attempted again, and one whose sender recorded that it
-was about to call SES moves to `unknown`, since the message may already have gone out.
-That threshold is deliberately well beyond the sender's own timeout: taking a send away from a
-sender still working on it is how the same message gets delivered twice. Sends whose outcome is
-`unknown` are counted and left alone — SES may hold those, so only an operator can decide.
+Fetched bytes go to the outbox under the attachment's id, so a retried send reuses them instead
+of re-fetching a URL whose content may have changed.
 
-Once a message is sent, SES events on the configuration set label it: `delivered`, `bounced`,
-`complained`, `rejected` and `opened`. Labels are added and never removed, because these events
-arrive out of order under at-least-once delivery and a message that both bounced and was opened
-should say both. An event for mail this service did not send resolves to nothing and is ignored,
-which is the ordinary case on a shared configuration set.
+A sweep runs every ten minutes. A sender killed between claiming a send and recording its
+outcome leaves that send `sending`, with nobody working on it and no stream record to re-trigger
+it. The sweep takes claims older than fifteen minutes: one whose sender never reached SES is
+released for another attempt, and one whose sender recorded that it was about to call SES moves
+to `unknown`, since the message may already have gone out. Fifteen minutes sits well beyond the
+sender's own timeout — taking a send from a sender still working on it is how mail gets
+delivered twice. `unknown` sends are counted and left for an operator.
 
-Because labels live on the items rather than in per-label index rows, a filtered list reads a
-page and filters it, re-reading up to five times to fill the page. A response can therefore come
-back with fewer than `limit` items *and* a `next_page_token`; that is a normal result, and the
-client follows the token.
+SES events on the configuration set then label the message `delivered`, `bounced`,
+`complained`, `rejected` or `opened`. Labels are added, never removed: these events arrive out
+of order, and a message that both bounced and was opened should say both. An event for mail
+this service did not send resolves to nothing, which is the ordinary case on a shared
+configuration set.
 
 ### How the mailbox is wired
 
-- **Topology.** The stack owns two SNS topics, `MailInboundTopicArn` (receipt notifications)
-  and `MailEventsTopicArn` (configuration-set events for sent mail). Both are subscribed to the
-  function over the direct (lambda) pathway with per-topic invoke permissions, so there's no
-  wiring step. Every other topic stays outside the stack. When `pAllowedTopics` is non-empty,
-  the two mail topic ARNs are appended to the function's allowlist automatically.
-- **Retries.** Lambda's async queue retries a failed mail delivery twice, then sends it to
-  `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl` output). That on-failure destination applies to every
-  asynchronous invocation of the function, including direct SNS subscriptions you wired by hand.
-- **Mail table stream.** The mail table's stream has at most two readers, the stream relay and
-  the mail sender, which is DynamoDB's recommended ceiling. A third consumer needs Kinesis Data
-  Streams for DynamoDB.
-- **Storage layout.** SES writes raw MIME under `inbound/raw/`. Each message's bodies, headers,
-  `References`, `Reply-To` and verdicts are stored as `messages/<inbox>/<message_id>.json`; the
-  mail table item holds only what lists, threads, labels and send status need.
+- **Topics.** The stack owns `MailInboundTopicArn` (receipt notifications) and
+  `MailEventsTopicArn` (configuration-set events for sent mail), both subscribed to the function
+  over the direct pathway with per-topic invoke permissions. No wiring step. A non-empty
+  `pAllowedTopics` gains both ARNs automatically.
+- **Retries.** Lambda's async queue retries a failed mail delivery twice, then writes it to
+  `rAsyncInvokeDlq` (`AsyncInvokeDlqUrl`). That destination covers every asynchronous
+  invocation, including direct SNS subscriptions you wired by hand.
+- **Stream readers.** The mail table's stream has two: the relay and the sender. That is
+  DynamoDB's recommended ceiling; a third needs Kinesis Data Streams for DynamoDB.
+- **Storage.** SES writes raw MIME under `inbound/raw/`. Bodies, headers, `References`,
+  `Reply-To` and verdicts go to `messages/<inbox>/<message_id>.json`. The table item holds only
+  what lists, threads, labels and send status need.
 - **Retention.** Objects under `inbound/`, `attachments/`, `messages/` and `sent/` expire after
-  `pMailRetentionDays`, and the message's mail table items carry a TTL of the same length, so a
-  message ages out whole. DynamoDB removes expired items within a few days of their TTL.
-  Nothing under `outbox/` expires.
-- The mail bucket and mail table are retained when the stack or the mailbox is deleted.
+  `pMailRetentionDays`, and the message's items carry the same TTL, so a message ages out whole.
+  DynamoDB removes expired items within a few days. Nothing under `outbox/` expires.
+- **Deletion.** The mail bucket and mail table survive deleting the stack or the mailbox.
 
 ### Mail metrics
 
-Mail ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as
-CloudWatch Embedded Metrics Format (EMF) in the stack-name namespace, each carrying a `function`
-dimension. The stack defines no alarms; build your own alarms or dashboards on these metrics and
-on the `rAsyncInvokeDlq` and `rPublishDlq` queue depths.
+Ingest emits `MessagesIngested`, `IngestFailures`, `IngestSkipped` and `IngestTimeouts` as EMF
+in the stack-name namespace, each with a `function` dimension. The stack defines no alarms.
+Build them on these metrics and on the `rAsyncInvokeDlq` and `rPublishDlq` queue depths.
 
 ### Disabling the mailbox
 
-SES refuses to delete the active rule set, so clearing `pMailDomain` on a stack whose created
-rule set is active fails the update. Deactivate it first:
+SES refuses to delete the active rule set, so clearing `pMailDomain` fails while the stack's
+rule set is active. Deactivate it first:
 
 ```bash
 aws ses set-active-receipt-rule-set   # no name: deactivates the active rule set
 ```
 
-With `pExistingReceiptRuleSetName`, only the stack's rule is removed and no deactivation is
-needed, but mail to the mailbox addresses then matches no rule. The mail bucket and mail table
-are retained, so delete them by hand if you don't need them. If you re-enable the mailbox with
-the same explicit `pMailBucketName`, delete the retained bucket first.
+With `pExistingReceiptRuleSetName`, only the stack's rule goes and no deactivation is needed,
+but mail to the mailbox then matches no rule. The bucket and table are retained; delete them by
+hand if you don't want them. Re-enabling the mailbox with the same explicit `pMailBucketName`
+needs the retained bucket deleted first.
 
 ### Operator runbook
 
-Two situations need a person. Both are driven by invoking the sender function directly rather
-than through the API: they are rare, destructive and account-scoped, so `lambda:InvokeFunction`
-is a better gate than a bearer key.
+Three situations need a person. The first two invoke the sender directly rather than going
+through the API: they are rare, destructive and account-scoped, so `lambda:InvokeFunction` is a
+better gate than a bearer key.
 
-**A send whose outcome is `unknown`.** SES was called and no usable answer came back, or the
-sender died after calling it, so SES may or may not hold the message. Nothing automatic will touch it — resending risks delivering twice.
-Find them in the sweep's log line (`sends_outcome_unknown`) or by querying `ByStatus`, then
-decide:
+**A send whose outcome is `unknown`.** SES was called and gave no usable answer, or the sender
+died after calling it, so SES may or may not hold the message. Nothing automatic touches it,
+because resending risks delivering twice. Find them in the sweep's `sends_outcome_unknown` log
+line or by querying `ByStatus`, then decide:
 
 ```bash
 sender=$(output MailSenderFunctionName)
@@ -451,13 +434,13 @@ aws lambda invoke --function-name "$sender" --payload \
   '{"command":"close_failed","message_id":"<id>"}' /dev/stdout
 ```
 
-Only a send in `unknown` can be resolved; anything else is refused, because resolving a send
-still in flight would race the sender holding it and resolving a finished one would rewrite a
-settled outcome. Closing as sent labels the message `sent` without an SES id; closing as failed
-labels it `rejected` with reason `closed_by_operator`.
+Only an `unknown` send resolves this way. Anything else is refused: resolving a send in flight
+races the sender holding it, and resolving a finished one rewrites a settled outcome. Closing as
+sent labels the message `sent` with no SES id. Closing as failed labels it `rejected` with
+reason `closed_by_operator`.
 
-**Mail that failed to ingest.** Deliveries that exhausted their retries land in `rAsyncInvokeDlq`
-carrying the original event, so replaying one is re-invoking the webhook function with it:
+**Mail that failed to ingest.** A delivery that exhausted its retries lands in
+`rAsyncInvokeDlq` with the original event. Replaying it means re-invoking the function:
 
 ```bash
 queue=$(output AsyncInvokeDlqUrl)
@@ -472,17 +455,16 @@ aws sqs delete-message --queue-url "$queue" \
   --receipt-handle "$(echo "$msg" | jq -r '.Messages[0].ReceiptHandle')"
 ```
 
-Ingest is idempotent — the message id is derived from the SES message id and receipt timestamp,
-so a replay that partly succeeded before resolves to the same ids rather than duplicating. The
-signature is re-verified on replay, which works as long as the signing certificate is still
-valid; that holds comfortably within the queue's 14-day retention.
+Ingest is idempotent: the message id comes from the SES message id and receipt timestamp, so a
+replay of a partly-successful attempt resolves to the same ids. The signature is re-verified on
+replay, which holds as long as the signing certificate is valid — comfortably within the queue's
+14-day retention.
 
-**A send stuck in `queued`.** `rMailSenderDlq` receives a record when the sender exhausts its
-retries on a queued send. The queue is fed by the mail table's stream, so its messages carry only
-the stream position (`DDBStreamBatchInfo`), not the send, and can't be replayed. The send state
-in the table is the source of truth: once the cause is fixed, re-trigger the sender by stamping
-`requeued_at` on the send, which is the change the sender acts on. The condition leaves a send
-that has moved on untouched.
+**A send stuck in `queued`.** `rMailSenderDlq` gets a record when the sender exhausts its
+retries. Its messages carry the stream position (`DDBStreamBatchInfo`), not the send, so they
+cannot be replayed. The send state in the table is the source of truth: fix the cause, then
+re-trigger the sender by stamping `requeued_at`, which is the change it acts on. The condition
+below leaves a send that has moved on untouched.
 
 ```bash
 aws dynamodb update-item --table-name "$(output MailTableName)" \
@@ -492,26 +474,28 @@ aws dynamodb update-item --table-name "$(output MailTableName)" \
   --expression-attribute-values "{\":now\":{\"S\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"},\":queued\":{\"S\":\"queued\"}}"
 ```
 
-The sender only reacts to `requeued_at` appearing, so for a send that already carries one, run a
+The sender reacts to `requeued_at` appearing, so a send that already carries one needs a
 `REMOVE requeued_at` update first. Then delete the DLQ message.
 
 ## EventBridge contract
 
-Events publish to the `<stack-name>-events` bus with `source` = `pEventSource` parameter
-(default `aws-messaging-webhook`) and these detail-types:
+Events publish to the `<stack-name>-events` bus with `source` = `pEventSource` (default
+`aws-messaging-webhook`).
 
-`sms.inbound`, `sms.delivery`, `mms.delivery`, `voice.delivery`, `ses.bounce`, `ses.complaint`, `ses.delivery`, `ses.send`,
-`ses.reject`, `ses.open`, `ses.click`, `ses.rendering-failure`, `ses.delivery-delay`,
-`ses.subscription`, `ses.inbound`, `ses.inbound.quarantined` (spam/virus verdict FAIL —
-classification only, nothing dropped), `ses.unknown` (a valid SES event of a kind this version
-doesn't map yet), `message.status.changed` (the per-message aggregate's `current_status`
-transitioned), `subscription.changed` (auto-re-subscribe fired), `unknown` (unparseable
-payload, forwarded verbatim).
+| Detail-type | Fires on |
+|---|---|
+| `sms.inbound`, `sms.delivery`, `mms.delivery`, `voice.delivery` | End User Messaging |
+| `ses.send`, `ses.delivery`, `ses.bounce`, `ses.complaint`, `ses.reject`, `ses.open`, `ses.click`, `ses.rendering-failure`, `ses.delivery-delay`, `ses.subscription` | SES sending events |
+| `ses.inbound` | An inbound receipt |
+| `ses.inbound.quarantined` | The same, spam or virus verdict `FAIL`. Classification only — nothing is dropped |
+| `ses.unknown` | A valid SES event this version doesn't map yet |
+| `message.status.changed` | A per-message aggregate's `current_status` transitioned |
+| `subscription.changed` | Auto-re-subscribe fired |
+| `unknown` | An unparseable payload, forwarded verbatim |
 
-An event whose payload exceeds the EventBridge 256 KB entry limit is published with its `event`
-replaced by `{ "payloadOmitted": true, ... }`; `meta.messageId` is always preserved, so
-consumers fetch the full record from DynamoDB. (SES inbound raw MIME is dropped first; this
-pointer form is the fallback.)
+An event over EventBridge's 256 KB entry limit publishes with its `event` replaced by
+`{ "payloadOmitted": true, … }`. `meta.messageId` always survives, so consumers fetch the full
+record from DynamoDB. SES inbound raw MIME drops first; the pointer form is the fallback.
 
 Detail shape:
 
@@ -537,30 +521,24 @@ Detail shape:
 }
 ```
 
-`previousMessageId` is present only on `sms.inbound` events where the inbound message is a
-reply to a previously sent outbound message (i.e. the EUM payload carries a
-`previousPublishedMessageId`). Consumers can use it to correlate a reply with the sent message
-that triggered it without parsing the event payload. It is absent (not null) on unsolicited
-inbound contacts and on all other event families.
+Three `meta` fields are conditional, and absent rather than null when they don't apply:
 
-`meta.s3` and `meta.inbound` appear only on `ses.inbound` (and `ses.inbound.quarantined`)
-events. `meta.s3` `{ bucket, key }` is the pointer to the stored raw MIME, present when the
-receipt rule used the S3 action and SES populated both the bucket and the object key — the
-recommended SES → S3 receipt path. It **survives the oversized-payload content-strip**: when an
-inbound message is too large and its embedded `content` is dropped, the pointer stays, so a
-consumer can still `GetObject` the message from S3. `meta.inbound` carries a summary lifted out
-of the receipt so consumers can route without fetching from S3: `headers` (the SES-parsed
-`commonHeaders` — `from`/`to`/`subject`/`date`/`messageId`) and `auth` (the `spf`/`dkim`/`dmarc`/
-`spam`/`virus` verdict statuses plus `dmarcPolicy`). Every sub-field is omitted (not null) when
-SES did not supply it, and the whole `inbound` block is absent when the receipt carried neither
-headers nor verdicts. All three additions are meta-only and additive, so `schemaVersion` stays 1.
+- **`previousMessageId`** appears on an `sms.inbound` event whose payload carries a
+  `previousPublishedMessageId` — a reply to a message you sent. It correlates the two without
+  parsing the payload.
+- **`s3`** `{bucket, key}` appears on `ses.inbound` and `ses.inbound.quarantined` when the
+  receipt rule used the S3 action. It survives the oversized-payload strip, so a consumer can
+  still `GetObject` the message when `content` is gone.
+- **`inbound`** appears on the same two, carrying what the receipt already knew so consumers can
+  route without fetching from S3: `headers` (SES's parsed `commonHeaders`) and `auth` (the
+  `spf`/`dkim`/`dmarc`/`spam`/`virus` statuses and `dmarcPolicy`). The block is absent when the
+  receipt carried neither.
 
-`schemaVersion` is present on every published detail, including the `subscription.changed`
-event, so consumers have a stable field to switch on as the contract evolves.
+`schemaVersion` is on every detail, including `subscription.changed`, so consumers have one
+field to switch on as the contract evolves. These three additions are meta-only, so it stays 1.
 
-The stream relay also emits `message.status.changed` when a message's aggregate `current_status`
-transitions (e.g. `sent` → `delivered` → `bounced`) — not on count-only bumps like opens/clicks —
-so consumers can track the authoritative rolled-up status without re-deriving precedence:
+The relay also emits `message.status.changed` when an aggregate's `current_status` transitions
+(`sent` → `delivered` → `bounced`), but not on count-only bumps like opens and clicks:
 
 ```json
 {
@@ -576,24 +554,21 @@ so consumers can track the authoritative rolled-up status without re-deriving pr
 }
 ```
 
-Open and click counts are split by SES's `isBotEvent` signal: an interaction SES
-flags `Likely` bot-generated (Apple Mail Privacy Protection prefetch, security
-scanners) accrues to `botOpenCount` / `botClickCount`, and everything else —
-including events that predate the feature and carry no `isBotEvent` — accrues to
-the human `openCount` / `clickCount`. Consumers wanting the raw signal per event
-read `detail.event.open.isBotEvent` (or `.click.isBotEvent`) off the `ses.open` /
-`ses.click` detail, which is forwarded verbatim.
+SES's `isBotEvent` signal splits the counts. An interaction flagged `Likely` — Apple Mail
+Privacy Protection prefetch, security scanners — accrues to `botOpenCount`/`botClickCount`.
+Everything else, including older events carrying no `isBotEvent`, accrues to
+`openCount`/`clickCount`. The raw per-event signal is on the forwarded `ses.open`/`ses.click`
+detail at `detail.event.open.isBotEvent`.
 
 ### Mailbox events
 
-A mailbox stack's mail table stream additionally publishes mailbox detail-types on the same
-bus, `source` and `schemaVersion` contract as above.
+A mailbox stack publishes mailbox detail-types from the mail table's stream, on the same bus,
+`source` and `schemaVersion` contract.
 
-`message.received`, `message.received.spam` (spam/virus verdict `FAIL`) or
-`message.received.unauthenticated` (SPF/DKIM/DMARC `FAIL`, spam/virus clean) fires once per
-inbox a newly-ingested message lands in — a message to two inboxes publishes two events, one per
-inbox. Precedence is spam over unauthenticated over plain; nothing is ever dropped, only
-classified. Shape:
+`message.received`, `message.received.spam` (spam or virus verdict `FAIL`) or
+`message.received.unauthenticated` (SPF/DKIM/DMARC `FAIL`, spam and virus clean) fires once per
+inbox a new message lands in. Spam beats unauthenticated beats plain. Nothing is dropped, only
+classified.
 
 ```json
 {
@@ -617,28 +592,25 @@ classified. Shape:
 }
 ```
 
-`message` is the same `Message` object the `/v0` read API returns.
-`thread` is the compact snapshot taken as of this message's arrival (`thread_id`, `subject`,
-`message_count`, `recipients`), not a full thread fetch — a consumer wanting the thread's current
-state re-reads it, since the snapshot is only ever as fresh as the message that carries it. An
-oversized detail is reduced the same way the SMS/SES pipeline's details are: `message.html`,
-`.text` and `.headers` drop first, then `thread` shrinks to `{thread_id}`, then `message` falls
-back to `{payloadOmitted, ids}`; `meta` is never dropped.
+`message` is the `Message` object the `/v0` read API returns. `thread` is the snapshot taken as
+this message arrived — `thread_id`, `subject`, `message_count`, `recipients` — not a fresh
+fetch, so a consumer wanting current thread state re-reads it. An oversized detail reduces the
+way the SMS/SES details do: `message.html`, `.text` and `.headers` first, then `thread` to
+`{thread_id}`, then `message` to `{payloadOmitted, ids}`. `meta` never drops.
 
-`message.sent` fires when the sender relabels a queued message `sent`, and `message.delivered`,
-`message.bounced`, `message.complained`, `message.rejected` and `message.opened` fire when the
-SES event for a sent message adds that label. Each carries the same `schemaVersion`, `meta`,
-`type`, `event_type` and `event_id` fields as above, with `message` in its list form — the
-identifiers, labels, addresses, subject and preview, without the body, which the consumer
-already has from the message's own event or the read API. Delivery labels are added, never
-removed, so a message that both bounced and was opened publishes both; a label arriving twice
-(an SES event redelivered, a stream record replayed) rebuilds the same `event_id`, which is
-what a consumer deduplicates on.
+`message.sent` fires when the sender relabels a queued message `sent`. `message.delivered`,
+`message.bounced`, `message.complained`, `message.rejected` and `message.opened` fire when an
+SES event adds that label. Each carries the same `schemaVersion`, `meta`, `type`, `event_type`
+and `event_id`, with `message` in its list form: identifiers, labels, addresses, subject and
+preview, no body — the consumer has that from the message's own event or the read API.
 
-A payload matching no known family, mail-table writes on anything but a message item (send
-state, marker, key and RFC-alias items, and thread housekeeping writes), and a message write
-that adds no system label (a read receipt, a user's own label, a metadata write) publish
-nothing from the mail table stream.
+Delivery labels are added, never removed, so a message that bounced and was opened publishes
+both. A label arriving twice — an SES event redelivered, a stream record replayed — rebuilds the
+same `event_id`, which is what a consumer deduplicates on.
+
+The mail stream publishes nothing for an unrecognized payload, for writes to anything but a
+message item (send state, markers, keys, RFC aliases, thread housekeeping), or for a message
+write adding no system label (a read receipt, your own label, a metadata write).
 
 ## Data model
 
@@ -669,35 +641,33 @@ events table above, keyed by inbox and message rather than by SNS message id:
 | Thread | `INBOX#<inbox>` | `THR#<threadId>` | rolled-up subject/preview/senders/recipients/labels, message count, size, newest attachments |
 | RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | maps an inbound or outbound `Message-ID` to the message/thread it belongs to, for reply threading |
 
-Labels live in the message and thread items themselves, not in per-label index rows: a list
-filtered by label is served by reading the time-ordered index and filtering the page. That keeps
-ingest to a fixed three writes per message, at the cost of reading past non-matching messages
-when a label is rare.
+Labels live on the message and thread items, not in per-label index rows. A label-filtered list
+reads the time-ordered index and filters the page. Ingest stays at three writes per message, and
+a rare label costs reading past non-matching ones.
 
-Two indexes serve the reads. `ByTime` (`gsi1pk`/`gsi1sk`) holds three partition shapes:
-`INBOX#<inbox>#MSG` sorted by message id, `INBOX#<inbox>#THR` sorted by
-`<timestamp>#<threadId>`, and `INBOXES` sorted by inbox id. `ByThread`
-(`gsi2pk`/`gsi2sk`) holds `THREAD#<inbox>#<threadId>` sorted by message id, for a thread's own
-messages. Message ids are UUIDv7s, so sorting by id *is* sorting by time, which is what lets a
-`before`/`after` window become a plain key range.
+Two indexes serve the reads:
 
-Inbound ingest writes the Inbox, Message and Thread items; the send path adds its own on the
-same table under their own `pk`s (`OUTBOX#<messageId>`, `SENDKEY#<sha256>`,
-`SESMSG#<sesMessageId>`). `message_id` and `thread_id` are UUIDv7s: inbound ids are deterministic (derived from
-the SES message id and receipt timestamp), so a redelivered SES notification always resolves to
-the same message rather than creating a duplicate. A message's raw MIME and attachments live in
-the mail bucket, not the table; the message item's `raw_s3_key`/attachment `object_key`s point at
-them.
+- **`ByTime`** (`gsi1pk`/`gsi1sk`) — `INBOX#<inbox>#MSG` by message id, `INBOX#<inbox>#THR` by
+  `<timestamp>#<threadId>`, and `INBOXES` by inbox id.
+- **`ByThread`** (`gsi2pk`/`gsi2sk`) — `THREAD#<inbox>#<threadId>` by message id, for one
+  thread's messages.
+
+Message ids are UUIDv7s, so sorting by id sorts by time, which turns a `before`/`after` window
+into a plain key range. Inbound ids are deterministic, derived from the SES message id and
+receipt timestamp, so a redelivered notification resolves to the same message instead of a
+duplicate.
+
+Ingest writes the Inbox, Message and Thread items. The send path adds its own under
+`OUTBOX#<messageId>`, `SENDKEY#<sha256>` and `SESMSG#<sesMessageId>`. Raw MIME and attachments
+live in the mail bucket; `raw_s3_key` and each attachment's `object_key` point at them.
 
 ### Consumer read access
 
-When an EventBridge detail is published with `payloadOmitted` (over the 256 KB entry limit),
-or a consumer wants a message's full timeline, it fetches directly from DynamoDB. Cross-account
-consumers get read access through a role, not raw table grants: set `pConsumerAccountIds` to the
-12-digit account ids at deploy time and the stack creates a role those accounts may assume,
-whose ARN is the `ConsumerReadRoleArn` output. It allows `GetItem` /
-`BatchGetItem` / `Query` on the table only — no writes, no `Scan`, and no access to internal
-indexes. A consumer assumes the role, then:
+A consumer reads DynamoDB directly when a detail arrives with `payloadOmitted`, or when it
+wants a message's full timeline. Cross-account consumers get a role rather than table grants:
+set `pConsumerAccountIds` to the 12-digit account ids and the stack creates a role for them,
+published as `ConsumerReadRoleArn`. It allows `GetItem`, `BatchGetItem` and `Query` on the table
+only — no writes, no `Scan`, no indexes. Assume the role, then:
 
 - current state: `GetItem` on `pk = MSG#<messageId>`, `sk = AGG`
 - full timeline: `Query` on `pk = MSG#<messageId>`
@@ -707,35 +677,33 @@ indexes. A consumer assumes the role, then:
 
 ## Operations
 
-- Structured JSON logs; one INFO line per message. The request path logs an `outcome`
-  (`persisted|duplicate|confirmed|resubscribed`) and `action`; the stream relay logs
-  `outcome=published` per event emitted to EventBridge.
-- CloudWatch metrics (namespace = stack name) emitted inline via CloudWatch Embedded Metrics
-  Format (EMF): `MessagesReceived` (request-path deliveries: persisted + duplicate),
-  `SignatureRejections`, `AllowlistRejections`, `UnclassifiedPayloads` (events forwarded as
-  `unknown` — a sustained rate means a new AWS event shape or junk on a topic), `Duplicates`,
-  `EventsPublished` (from the stream relay), `PublishFailures` (a relay publish that will be
-  retried), `InternalErrors`, `ActionFailures`, `Resubscribes`, `SubscriptionsLost` (alarm on
-  this — a subscription was cancelled and, with `pAutoResubscribe=false`, not re-attached),
-  `ColdStart` (Count = 1 on the first invocation of a new execution environment), and
-  `Latency` (histogram, milliseconds per invocation — CloudWatch derives p50/p90/p99). All
-  metrics carry a `function` dimension (the Lambda function name). Also alarm on the native
-  Lambda stream `IteratorAge` and the `rPublishDlq` queue depth (`PublishDlqUrl` output): a
-  non-empty DLQ means events exhausted their publish retries.
-- The request path and the stream relay have independent durability. A transient failure in the
-  request path (persist or a lifecycle action) returns 5xx so SNS redelivers; the conditional
-  write dedupes the redelivery and re-runs only the idempotent actions. Publishing is decoupled:
-  the event item is the outbox entry, and the stream event-source mapping retries the publish
-  (bisecting poison batches, reporting per-record failures) and routes anything past the retry
-  limit to the DLQ — so a publish can never be silently lost. Consumers must tolerate rare
-  duplicate bus events (at-least-once end to end).
-- End-to-end check on a deployed stack: send a probe through the SES mailbox simulator —
-  `aws sesv2 send-email --from-email-address <verified-sender> --destination
-  ToAddresses=bounce@simulator.amazonses.com --content
-  "Simple={Subject={Data=probe},Body={Text={Data=probe}}}"` — then confirm a `ses.bounce`
-  event arrives on the bus (temporary rule → SQS, or CloudWatch), an event item is written to
-  DynamoDB under `pk = MSG#<messageId>`, and the simulator address lands on the SES account
-  suppression list.
+- **Logs.** Structured JSON, one INFO line per message. The request path logs an `outcome`
+  (`persisted|duplicate|confirmed|resubscribed`) and an `action`; the relay logs
+  `outcome=published` per event.
+- **Metrics.** EMF, in the stack-name namespace, each with a `function` dimension:
+  `MessagesReceived` (persisted + duplicate), `SignatureRejections`, `AllowlistRejections`,
+  `UnclassifiedPayloads`, `Duplicates`, `EventsPublished`, `PublishFailures`, `InternalErrors`,
+  `ActionFailures`, `Resubscribes`, `SubscriptionsLost`, `ColdStart`, and `Latency` (a
+  histogram in milliseconds, so CloudWatch derives p50/p90/p99).
+- **What to alarm on.** `SubscriptionsLost` means a subscription was cancelled and, with
+  `pAutoResubscribe=false`, not re-attached. A non-empty `rPublishDlq` (`PublishDlqUrl`) means
+  events exhausted their publish retries. A sustained `UnclassifiedPayloads` rate means a new
+  AWS event shape or junk on a topic. Also watch the native Lambda stream `IteratorAge`.
+- **Durability.** The request path and the relay fail independently. A transient failure while
+  persisting or acting returns 5xx, SNS redelivers, the conditional write dedupes it, and only
+  the idempotent actions re-run. Publishing is decoupled: the event item is the outbox entry,
+  and the stream mapping retries, bisects poison batches, reports per-record failures and routes
+  the rest to the DLQ. Delivery is at-least-once end to end, so consumers tolerate rare
+  duplicates.
+- **End-to-end probe.** Send through the SES mailbox simulator, then confirm three things: a
+  `ses.bounce` event on the bus, an event item under `pk = MSG#<messageId>`, and the simulator
+  address on the SES account suppression list.
+
+  ```bash
+  aws sesv2 send-email --from-email-address <verified-sender> \
+    --destination ToAddresses=bounce@simulator.amazonses.com \
+    --content "Simple={Subject={Data=probe},Body={Text={Data=probe}}}"
+  ```
 
 ## Development
 
@@ -745,14 +713,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 prek run                               # fmt, clippy, deny, actionlint, zizmor
 ```
 
-The handler tests drive the real router end to end with properly signed SNS envelopes (the
-verifier crate's `test-fixtures` feature generates throwaway keys and certificates), so no AWS
-account is needed for development. For a deployed end-to-end check see the SES-simulator probe
-under [Operations](#operations).
+The handler tests drive the real router with properly signed SNS envelopes — the verifier
+crate's `test-fixtures` feature generates throwaway keys and certificates — so development needs
+no AWS account. For a deployed check, see the probe under [Operations](#operations).
 
 > [!NOTE]
-> Debug builds honor `SNS_CERT_HOST_OVERRIDE` for running against a local fake SNS under
-> `cargo lambda watch`; release builds have no bypass.
+> Debug builds honor `SNS_CERT_HOST_OVERRIDE`, for running against a local fake SNS under
+> `cargo lambda watch`. Release builds have no bypass.
 
 ## License
 
