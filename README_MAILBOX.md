@@ -56,6 +56,8 @@ sam deploy --parameter-overrides \
 | `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Required when `pMailDomain` is set. Must start with `/`, and not with `/aws` or `/ssm`, which SSM reserves |
 | `pApiKeysKmsKeyArn` | *(empty)* | Customer-managed KMS key that encrypts that parameter; empty means `aws/ssm` |
 | `pAttachmentUrlTtlSeconds` | `900` | Lifetime of presigned download URLs, 60–3600 |
+| `pMailWebhookUrl` | *(empty)* | HTTPS endpoint that receives the mailbox events as webhook POSTs. Empty creates no delivery. Needs `pMailWebhookSecret`. See [Delivering to a webhook](#delivering-to-a-webhook) |
+| `pMailWebhookSecret` | *(empty)* | `NoEcho`. Value sent in the `x-webhook-secret` header. Pass it from its SecureString parameter at deploy time and keep it out of `samconfig.toml` |
 
 ## After the first deploy
 
@@ -450,10 +452,8 @@ live in the mail bucket; `raw_s3_key` and each attachment's `object_key` point a
 A mailbox stack publishes mailbox events on the same bus and `source` as the SMS and SES events.
 Each event's detail-type is its `event_type`, and its detail is the reference mailbox API's
 webhook payload exactly: `type` (always `"event"`), `event_type`, `event_id` and one
-event-specific object. There is no `schemaVersion` or `meta`. To deliver the events to an HTTP
-webhook, point an EventBridge API destination at it with `InputPath: $.detail`, and match the
-detail-types below by name. Don't match on a `message.` prefix, because that also catches the
-SES pipeline's `message.status.changed`.
+event-specific object. There is no `schemaVersion` or `meta`. To have the stack deliver them to
+an HTTP endpoint, see [Delivering to a webhook](#delivering-to-a-webhook).
 
 | Event | Fires | Object |
 |---|---|---|
@@ -468,6 +468,52 @@ SES pipeline's `message.status.changed`.
 `tests/fixtures/mailbox-events/schemas.json` holds the published schema for each of these, and
 `tests/mailbox_event_schemas.rs` checks every event the relay builds against it. The check
 rejects any field the schema doesn't define.
+
+### Delivering to a webhook
+
+Set `pMailWebhookUrl` and the stack delivers every event in the table above to it through an
+EventBridge API destination. Each event arrives as a `POST` whose body is the event's detail,
+exactly the payload shown below.
+
+Keep the secret in a SecureString SSM parameter, next to the API keys:
+
+```bash
+aws ssm put-parameter --name /messaging-webhook/dev/mail-webhook-secret --type SecureString \
+  --value "$(openssl rand -hex 32)"
+```
+
+CloudFormation can't read a SecureString into an EventBridge connection: its `ssm-secure`
+dynamic reference works only on a fixed list of resource properties, and connections aren't on
+it. So the deploy reads the parameter and passes the value as the `NoEcho` parameter
+`pMailWebhookSecret`, which CloudFormation masks in its console and API output:
+
+```bash
+sam deploy --parameter-overrides \
+  pMailWebhookUrl=https://… \
+  pMailWebhookSecret="$(aws ssm get-parameter --name /messaging-webhook/dev/mail-webhook-secret \
+    --with-decryption --query Parameter.Value --output text)"
+```
+
+`--parameter-overrides` on the command line replaces the list in `samconfig.toml`. On an existing
+stack that's harmless: SAM sends every parameter you don't pass as "use the previous value", so
+the rest of the stack's settings, and later the secret itself, carry over. `pMailWebhookUrl` can
+live in `samconfig.toml`. The secret must not.
+
+Every request carries these headers:
+
+- `x-webhook-secret`: the secret's value. EventBridge can't sign requests, so the receiver
+  authenticates each one by comparing this header in constant time.
+- `webhook-id`: the event's `event_id`. It stays the same across retries and redeliveries, so
+  the receiver deduplicates on it.
+
+The receiver has 5 seconds to answer, so it should acknowledge first and do the work after.
+EventBridge retries `401`, `407`, `409`, `429`, `5xx` and timeouts for up to 24 hours and 185
+attempts. It doesn't retry any other `4xx`. An event that runs out of retries, or gets a `4xx`
+that isn't retried, goes to the `MailWebhookDlqUrl` queue with the error code attached. Delivery
+is at least once and unordered.
+
+To rotate the secret, overwrite the SSM parameter (`put-parameter --overwrite`) and run the same
+deploy again. The changed parameter value updates the connection. During the switch-over, have the receiver accept both the old and the new value.
 
 ### Received mail
 

@@ -6,6 +6,17 @@ Description: >-
   performs lifecycle actions, and re-publishes to an EventBridge bus.
   Optionally hosts a mailbox on SES (pMailDomain).
 
+Metadata:
+  cfn-lint:
+    config:
+      # W1030 checks a parameter's default against every property it feeds.
+      # pMailWebhookSecret defaults to empty and feeds the connection's API key,
+      # which must be non-empty, but that connection only exists when
+      # pMailWebhookUrl is set, and MailWebhookNeedsMailDomain then rejects an
+      # empty secret. The warning is reported on the parameter, where no
+      # resource-level ignore reaches.
+      ignore_checks: [W1030]
+
 Parameters:
   pStage:
     Type: String
@@ -159,6 +170,27 @@ Parameters:
     MinValue: 60
     MaxValue: 3600
     Description: Lifetime of presigned attachment and raw-message download URLs.
+  pMailWebhookUrl:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^https://[^\s]+$
+    Description: >-
+      HTTPS endpoint that receives the mailbox's message.* events as webhook
+      POSTs (the event detail as the body) through an EventBridge API
+      destination. Empty (the default) creates no destination.
+  # Read from the SecureString parameter at deploy time rather than through a
+  # dynamic reference: ssm-secure resolves only in a fixed list of resource
+  # properties, and AWS::Events::Connection is not among them.
+  pMailWebhookSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    # A header value: printable ASCII, no spaces.
+    AllowedPattern: ^$|^[!-~]+$
+    Description: >-
+      Value sent in the x-webhook-secret header of every webhook POST. Pass it
+      from its SecureString SSM parameter at deploy time; never commit it to
+      samconfig.toml. Later deploys that omit it keep the previous value.
 
 Rules:
   MailParametersRequired:
@@ -189,6 +221,15 @@ Rules:
       - Assert: !Not [!Equals [!Ref pHostedZoneId, ""]]
         AssertDescription: pMailTrackingDomain needs pHostedZoneId.
 
+  # The events it delivers only exist on a mailbox stack.
+  MailWebhookNeedsMailDomain:
+    RuleCondition: !Not [!Equals [!Ref pMailWebhookUrl, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref pMailDomain, ""]]
+        AssertDescription: pMailWebhookUrl needs pMailDomain.
+      - Assert: !Not [!Equals [!Ref pMailWebhookSecret, ""]]
+        AssertDescription: pMailWebhookUrl needs pMailWebhookSecret.
+
 Conditions:
   cIsProd: !Equals [!Ref pStage, prod]
   cHasOptOutList: !Not [!Equals [!Ref pOptOutListName, ""]]
@@ -204,6 +245,7 @@ Conditions:
   cHasApiKeysKmsKey: !And [!Condition cHasApiKeys, !Not [!Equals [!Ref pApiKeysKmsKeyArn, ""]]]
   cHasAllowedTopics: !Not [!Equals [!Ref pAllowedTopics, ""]]
   cAllowlistMailTopics: !And [!Condition cHasMailDomain, !Condition cHasAllowedTopics]
+  cHasMailWebhook: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pMailWebhookUrl, ""]]]
 
 # Both functions are the same Rust binary on the same runtime; only their
 # FUNCTION_MODE, sizing and permissions differ.
@@ -1189,6 +1231,112 @@ Resources:
           Name: !Ref pMailTrackingDomain
           Type: HTTPS
 
+  # Delivers the mailbox events to pMailWebhookUrl. The body is the event's
+  # detail, which is the reference mailbox API's webhook payload, so the
+  # receiver parses it unchanged. EventBridge can't sign a request, so the
+  # receiver authenticates it by the secret header instead.
+  rMailWebhookConnection:
+    Type: AWS::Events::Connection
+    Condition: cHasMailWebhook
+    Properties:
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: x-webhook-secret
+          ApiKeyValue: !Ref pMailWebhookSecret
+
+  rMailWebhookDestination:
+    Type: AWS::Events::ApiDestination
+    Condition: cHasMailWebhook
+    Properties:
+      ConnectionArn: !GetAtt rMailWebhookConnection.Arn
+      InvocationEndpoint: !Ref pMailWebhookUrl
+      HttpMethod: POST
+
+  # An event that exhausts its retries, or that the endpoint rejects with a
+  # 4xx EventBridge doesn't retry, lands here with the error attached.
+  rMailWebhookDlq:
+    Type: AWS::SQS::Queue
+    Condition: cHasMailWebhook
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+      SqsManagedSseEnabled: true
+
+  rMailWebhookDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: cHasMailWebhook
+    Properties:
+      Queues:
+        - !Ref rMailWebhookDlq
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: MailWebhookRuleDeadLetters
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt rMailWebhookDlq.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt rMailWebhookRule.Arn
+
+  rMailWebhookRole:
+    Type: AWS::IAM::Role
+    Condition: cHasMailWebhook
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeMailWebhook
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:InvokeApiDestination
+                Resource: !GetAtt rMailWebhookDestination.Arn
+
+  # Matched by name, not by a `message.` prefix, which would also catch the
+  # SES pipeline's message.status.changed.
+  rMailWebhookRule:
+    Type: AWS::Events::Rule
+    Condition: cHasMailWebhook
+    Properties:
+      EventBusName: !Ref rEventBus
+      EventPattern:
+        source:
+          - !Ref pEventSource
+        detail-type:
+          - message.received
+          - message.received.spam
+          - message.received.unauthenticated
+          - message.sent
+          - message.delivered
+          - message.bounced
+          - message.complained
+          - message.rejected
+          - message.opened
+      Targets:
+        - Id: mail-webhook
+          Arn: !GetAtt rMailWebhookDestination.Arn
+          RoleArn: !GetAtt rMailWebhookRole.Arn
+          InputPath: $.detail
+          HttpParameters:
+            # Stable across retries and redeliveries: what the receiver
+            # deduplicates on.
+            HeaderParameters:
+              webhook-id: $.detail.event_id
+          RetryPolicy:
+            MaximumRetryAttempts: 185
+            MaximumEventAgeInSeconds: 86400
+          DeadLetterConfig:
+            Arn: !GetAtt rMailWebhookDlq.Arn
+
 Outputs:
   WebhookUrl:
     Description: Base Function URL (trailing slash included).
@@ -1291,3 +1439,7 @@ Outputs:
         - !Sub 'bounce.${pMailDomain} TXT "v=spf1 include:amazonses.com ~all"'
         - !Sub '${pMailDomain} TXT "v=spf1 include:amazonses.com -all"'
         - !Sub '_dmarc.${pMailDomain} TXT "v=DMARC1; p=${pDmarcPolicy}"'
+  MailWebhookDlqUrl:
+    Condition: cHasMailWebhook
+    Description: SQS DLQ for mailbox events the webhook endpoint never accepted.
+    Value: !Ref rMailWebhookDlq
