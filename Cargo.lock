@@ -167,6 +167,7 @@ dependencies = [
  "mail-parser",
  "metrics",
  "metrics_cloudwatch_embedded",
+ "mime",
  "proptest",
  "reqwest",
  "serde",

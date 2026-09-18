@@ -69,6 +69,7 @@ reqwest = { version = "=0.13.4", default-features = false }
 
 # Mail inbox. uuid =1.26.1 unifies with the transitive uuid pulled in by
 # other dependencies (verified via `cargo tree`).
+mime = { version = "=0.3.17", default-features = false }
 mail-parser = { version = "=0.11.9", default-features = false }
 # Outbound MIME. Generating multipart boundaries, transfer encodings and
 # header folding by hand is the kind of thing that fails subtly and only for

@@ -25,6 +25,8 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use mail_parser::parsers::MessageStream;
+use mail_parser::{Addr as MailAddr, Address as MailAddress, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -265,23 +267,50 @@ fn contains_newline(value: &str) -> bool {
     value.contains('\r') || value.contains('\n')
 }
 
-/// The address out of `Name <addr>`, or the value itself when it is already
-/// bare.
+/// The address the envelope carries for one recipient entry: the address
+/// itself, with any display name, comment or encoded word around it removed.
 ///
-/// `None` when the angle brackets are unbalanced or hold another pair: SES
-/// refuses those with `BadRequestException: Missing '<'`, which reaches the
-/// caller as a queued message that can never be sent rather than as a 400 on
-/// the request that caused it.
-fn addr_spec(value: &str) -> Option<String> {
-    let Some((_name, rest)) = value.split_once('<') else {
-        return (!value.contains('>')).then(|| value.to_owned());
+/// A caller may write `Ada Lovelace <ada@example.com>`, and a reply derives
+/// its recipients from the stored `From` of the message it answers, which is
+/// kept in that form for the read API to show. What goes into the envelope
+/// has to be the address by itself, because that is the list SES delivers
+/// to; a display form reaches it as `BadRequestException: Missing '<'`,
+/// after the message is already queued.
+///
+/// Parsed by `mail-parser`, the same RFC 5322 parser that reads the header
+/// on the way in, so a value this service wrote is a value it can read back:
+/// quoted names containing commas or angle brackets, `=?utf-8?B?…?=` encoded
+/// words and comments all parse rather than confusing a hand-rolled split.
+///
+/// `Err` names what is wrong for the caller's error list: an entry that
+/// carries no address at all, or one that names more than one (a list, or a
+/// `Group: a@x, b@y;`), which the envelope cannot express as one recipient.
+fn envelope_address(value: &str) -> Result<String, &'static str> {
+    // `parse_address` reads a header body, which ends at a newline.
+    let mut header = value.as_bytes().to_vec();
+    header.push(b'\n');
+
+    let parsed = MessageStream::new(&header).parse_address();
+    let addrs: Vec<&MailAddr<'_>> = match &parsed {
+        HeaderValue::Address(MailAddress::List(list)) => list.iter().collect(),
+        HeaderValue::Address(MailAddress::Group(groups)) => groups
+            .iter()
+            .flat_map(|group| group.addresses.iter())
+            .collect(),
+        _ => Vec::new(),
     };
-    let inner = rest.strip_suffix('>')?;
-    let inner = inner.trim();
-    if inner.is_empty() || inner.contains('<') || inner.contains('>') {
-        return None;
+
+    match addrs.as_slice() {
+        [] => Err("is not an email address"),
+        [addr] => addr
+            .address
+            .as_deref()
+            .map(str::trim)
+            .filter(|address| !address.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or("is not an email address"),
+        _ => Err("must name exactly one address"),
     }
-    Some(inner.to_owned())
 }
 
 fn addresses(
@@ -307,14 +336,12 @@ fn addresses(
             errors.push(field(path, "an address must not contain a line break"));
             continue;
         }
-        // A caller may write `Name <addr>`, and a reply derives its
-        // recipients from the stored `From` of the message it answers, which
-        // is kept in that form. The envelope holds addresses SES delivers to,
-        // so the address is taken out of it here; the display name is not
-        // carried into the header.
-        let Some(address) = addr_spec(&address) else {
-            errors.push(field(path, format!("`{address}` is not an email address")));
-            continue;
+        let address = match envelope_address(&address) {
+            Ok(address) => address,
+            Err(problem) => {
+                errors.push(field(path, format!("`{address}` {problem}")));
+                continue;
+            }
         };
         // Not a full RFC 5322 parse: SES is the authority on deliverability.
         // This only rejects what cannot be an address at all.
@@ -394,37 +421,22 @@ fn headers(
     out
 }
 
-/// A content type is `token/token`, optionally with one `; charset=token`.
+/// Whether `value` is a media type, parsed by the `mime` crate rather than
+/// by hand: the RFC 2045 grammar allows several parameters and quoted-string
+/// values (`application/pdf; name="report.pdf"`), which a check written here
+/// would keep getting wrong in one direction or the other.
+///
+/// The length and newline checks stay: this value becomes a header, and the
+/// parser has no opinion about how long a header may be.
 fn is_content_type(value: &str) -> bool {
     if value.len() > CONTENT_TYPE_MAX_BYTES || contains_newline(value) {
         return false;
     }
-    let (essence, parameters) = match value.split_once(';') {
-        Some((essence, parameters)) => (essence, Some(parameters)),
-        None => (value, None),
-    };
-    let Some((kind, subtype)) = essence.trim().split_once('/') else {
-        return false;
-    };
-    let is_token = |token: &str| {
-        !token.is_empty()
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'))
-    };
-    if !is_token(kind.trim()) || !is_token(subtype.trim()) {
-        return false;
-    }
-    match parameters {
-        None => true,
-        Some(parameters) => match parameters.trim().split_once('=') {
-            Some((name, value)) => {
-                name.trim().eq_ignore_ascii_case("charset")
-                    && is_token(value.trim().trim_matches('"'))
-            }
-            None => false,
-        },
-    }
+    // `mime` parses `text/` as type `text` with an empty subtype; a media
+    // type needs both halves.
+    value
+        .parse::<mime::Mime>()
+        .is_ok_and(|media| !media.subtype().as_str().is_empty())
 }
 
 /// Resolves the one source an attachment is allowed to have.
@@ -1249,21 +1261,56 @@ mod tests {
         assert_eq!(send.to, vec!["ada@example.com"]);
     }
 
+    /// The forms a hand-rolled split on `<` gets wrong, and the parser
+    /// doesn't: a quoted display name holding a comma or a bracket, an
+    /// encoded word, and a comment.
     #[test]
-    fn unbalanced_or_nested_angle_brackets_are_rejected() {
-        for value in [
-            "Ada Lovelace <ada@example.com",
-            "ada@example.com>",
-            "A <b <c@example.com>>",
-            "Nobody <>",
+    fn quoted_names_encoded_words_and_comments_parse() {
+        for (input, expected) in [
+            ("\"Lovelace, Ada\" <ada@example.com>", "ada@example.com"),
+            (
+                "\"Ada <not-an-address>\" <ada@example.com>",
+                "ada@example.com",
+            ),
+            (
+                "=?utf-8?B?QWRhIExvdmVsYWNl?= <ada@example.com>",
+                "ada@example.com",
+            ),
+            ("ada@example.com (Ada Lovelace)", "ada@example.com"),
+            ("<ada@example.com>", "ada@example.com"),
         ] {
             let mut request = minimal();
-            request.to = Some(Addresses::One(value.to_owned()));
-            // Two errors: the address itself, and the request then having no
-            // recipient at all.
+            request.to = Some(Addresses::One(input.to_owned()));
+            let send = validate(request).unwrap_or_else(|e| panic!("{input}: {e:?}"));
+            assert_eq!(send.to, vec![expected.to_owned()], "{input}");
+        }
+    }
+
+    /// The envelope names one recipient per entry, so a list or a group in
+    /// one entry is the caller's error rather than a silent expansion.
+    #[test]
+    fn an_entry_naming_more_than_one_address_is_rejected() {
+        for input in [
+            "ada@example.com, grace@example.com",
+            "Team: ada@example.com, grace@example.com;",
+        ] {
+            let mut request = minimal();
+            request.to = Some(Addresses::One(input.to_owned()));
             assert!(
                 paths(request).iter().all(|path| path == "to"),
-                "{value} should be refused as a `to` problem"
+                "{input} should be refused as a `to` problem"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_with_no_address_is_rejected() {
+        for input in ["Ada Lovelace <>", "Ada Lovelace", "<>"] {
+            let mut request = minimal();
+            request.to = Some(Addresses::One(input.to_owned()));
+            assert!(
+                paths(request).iter().all(|path| path == "to"),
+                "{input} should be refused as a `to` problem"
             );
         }
     }
@@ -1452,7 +1499,14 @@ mod tests {
         assert!(!is_content_type("text/"));
         assert!(!is_content_type("/plain"));
         assert!(!is_content_type("text/plain\r\nX-Evil: yes"));
-        assert!(!is_content_type("text/plain; boundary=x"));
+        // Parameters other than charset, and more than one of them, are part
+        // of the grammar; the hand-written check refused both.
+        assert!(is_content_type("application/pdf; name=\"report.pdf\""));
+        assert!(is_content_type(
+            "multipart/mixed; boundary=abc; charset=utf-8"
+        ));
+        assert!(!is_content_type("text/plain; ="));
+        assert!(!is_content_type("text/plain; charset"));
         assert!(!is_content_type(&format!(
             "text/{}",
             "x".repeat(CONTENT_TYPE_MAX_BYTES)
