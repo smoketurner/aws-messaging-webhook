@@ -265,6 +265,25 @@ fn contains_newline(value: &str) -> bool {
     value.contains('\r') || value.contains('\n')
 }
 
+/// The address out of `Name <addr>`, or the value itself when it is already
+/// bare.
+///
+/// `None` when the angle brackets are unbalanced or hold another pair: SES
+/// refuses those with `BadRequestException: Missing '<'`, which reaches the
+/// caller as a queued message that can never be sent rather than as a 400 on
+/// the request that caused it.
+fn addr_spec(value: &str) -> Option<String> {
+    let Some((_name, rest)) = value.split_once('<') else {
+        return (!value.contains('>')).then(|| value.to_owned());
+    };
+    let inner = rest.strip_suffix('>')?;
+    let inner = inner.trim();
+    if inner.is_empty() || inner.contains('<') || inner.contains('>') {
+        return None;
+    }
+    Some(inner.to_owned())
+}
+
 fn addresses(
     input: Option<Addresses>,
     path: &'static str,
@@ -288,6 +307,15 @@ fn addresses(
             errors.push(field(path, "an address must not contain a line break"));
             continue;
         }
+        // A caller may write `Name <addr>`, and a reply derives its
+        // recipients from the stored `From` of the message it answers, which
+        // is kept in that form. The envelope holds addresses SES delivers to,
+        // so the address is taken out of it here; the display name is not
+        // carried into the header.
+        let Some(address) = addr_spec(&address) else {
+            errors.push(field(path, format!("`{address}` is not an email address")));
+            continue;
+        };
         // Not a full RFC 5322 parse: SES is the authority on deliverability.
         // This only rejects what cannot be an address at all.
         if !address.contains('@') {
@@ -1187,6 +1215,57 @@ mod tests {
         request.to = Some(Addresses::Many(many));
         request.cc = Some(Addresses::One("one-too-many@example.com".to_owned()));
         assert_eq!(paths(request), vec!["to"]);
+    }
+
+    /// SES delivers to the envelope, not the header, so a recipient written
+    /// as `Name <addr>` — which is how a reply gets its recipients, since the
+    /// stored `From` keeps its display name — has to reach the envelope as
+    /// the address alone. It reached SES verbatim before, which refused the
+    /// whole message with `Missing '<'` once it was already queued.
+    #[test]
+    fn a_display_name_is_reduced_to_the_address() {
+        let mut request = minimal();
+        request.to = Some(Addresses::Many(vec![
+            "Ada Lovelace <ada@example.com>".to_owned(),
+            "  Spaced Out  <spaced@example.com>  ".to_owned(),
+            "bare@example.com".to_owned(),
+        ]));
+        let send = validate(request).unwrap();
+        assert_eq!(
+            send.to,
+            vec!["ada@example.com", "spaced@example.com", "bare@example.com"]
+        );
+    }
+
+    /// The same address written both ways is one recipient, not two.
+    #[test]
+    fn a_display_name_and_its_bare_address_collapse() {
+        let mut request = minimal();
+        request.to = Some(Addresses::Many(vec![
+            "Ada Lovelace <ada@example.com>".to_owned(),
+            "ada@example.com".to_owned(),
+        ]));
+        let send = validate(request).unwrap();
+        assert_eq!(send.to, vec!["ada@example.com"]);
+    }
+
+    #[test]
+    fn unbalanced_or_nested_angle_brackets_are_rejected() {
+        for value in [
+            "Ada Lovelace <ada@example.com",
+            "ada@example.com>",
+            "A <b <c@example.com>>",
+            "Nobody <>",
+        ] {
+            let mut request = minimal();
+            request.to = Some(Addresses::One(value.to_owned()));
+            // Two errors: the address itself, and the request then having no
+            // recipient at all.
+            assert!(
+                paths(request).iter().all(|path| path == "to"),
+                "{value} should be refused as a `to` problem"
+            );
+        }
     }
 
     #[test]
