@@ -8,6 +8,7 @@ none of these resources exist. [README.md](README.md) covers what runs either wa
 - [After the first deploy](#after-the-first-deploy)
 - [Mailbox API](#mailbox-api)
 - [Sending](#sending)
+- [Open and click tracking](#open-and-click-tracking)
 - [How the mailbox is wired](#how-the-mailbox-is-wired)
 - [Mail metrics](#mail-metrics)
 - [Disabling the mailbox](#disabling-the-mailbox)
@@ -48,6 +49,9 @@ sam deploy --parameter-overrides \
 | `pMailRetentionDays` | `365` | How long a message is kept: S3 expiration for raw MIME, attachments and message content, and the TTL on its mail table items |
 | `pHostedZoneId` | *(empty)* | Route 53 zone for the domain. Set it and the stack publishes the DNS records; leave it empty and the `DnsRecords` output lists them |
 | `pDmarcPolicy` | `quarantine` | `none`, `quarantine` or `reject` in the `_dmarc` record |
+| `pMailTrackingDomain` | *(empty)* | Subdomain SES wraps open and click tracking links in, e.g. `click.mail.example.com`. Empty leaves them on SES's `awstrack.me`; opens and clicks are reported either way. See [Open and click tracking](#open-and-click-tracking) |
+| `pMailTrackingHttpsPolicy` | `OPTIONAL` | `OPTIONAL`, `REQUIRE` or `REQUIRE_OPEN_ONLY`. The two HTTPS values need a CDN in front of the subdomain |
+| `pMailTrackingCnameTarget` | *(empty)* | Host the tracking subdomain's CNAME points at. Empty uses `r.<region>.awstrack.me`; set it to your CDN's hostname |
 | `pReceiptTlsPolicy` | `Optional` | `Require` rejects inbound mail that wasn't delivered over TLS |
 | `pExistingReceiptRuleSetName` | *(empty)* | Empty creates a rule set. Set it to add the rule to a rule set that is already active in the region |
 | `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Required when `pMailDomain` is set. Must start with `/`, and not with `/aws` or `/ssm`, which SSM reserves |
@@ -72,6 +76,10 @@ output() { aws cloudformation describe-stacks --stack-name "$stack" \
    - the domain's SPF record, `v=spf1 include:amazonses.com -all`;
    - `_dmarc.<domain>`, the Domain-based Message Authentication, Reporting and Conformance
      (DMARC) policy.
+
+   With `pMailTrackingDomain` set, `output TrackingDnsRecord` gives one more: the tracking
+   subdomain's CNAME. It is a separate output because where it points depends on whether a CDN
+   fronts the subdomain.
 2. **Wait for DKIM `SUCCESS`** before sending mail from the identity:
 
    ```bash
@@ -233,6 +241,59 @@ SES events on the configuration set then label the message `delivered`, `bounced
 of order, and a message that both bounced and was opened should say both. An event for mail
 this service did not send resolves to nothing, which is the ordinary case on a shared
 configuration set.
+
+## Open and click tracking
+
+Both are on, unconditionally: the configuration set matches every event type SES defines, and
+every send names it. SES appends a 1×1 transparent pixel to the `html` body — fetching it is an
+`Open` — and rewrites each link into a redirect it counts as a `Click`. A text-only message is
+tracked for neither: both work by changing the HTML.
+
+What `pMailTrackingDomain` changes is whose domain those links wear, not whether they are
+reported. Out of the box they are served from SES's own `awstrack.me`, visible to the recipient
+in the status bar of every link they hover. Set the parameter and they wear a subdomain of
+yours instead:
+
+```bash
+sam deploy --parameter-overrides "… pMailTrackingDomain=click.mail.example.com"
+```
+
+The subdomain is a CNAME to SES's regional tracking host, `r.<region>.awstrack.me` — SES still
+serves the redirects, under your name. The stack publishes the record when `pHostedZoneId` is
+set, and prints it as `TrackingDnsRecord` when it isn't. A subdomain of `pMailDomain` is covered
+by that domain's identity and needs no verification of its own; any other domain must already be
+a verified SES identity. A dedicated subdomain per sending region is what SES recommends.
+
+`pMailTrackingHttpsPolicy` is `OPTIONAL` by default: the pixel loads over HTTP and each click
+link keeps the scheme the original link had. `REQUIRE` and `REQUIRE_OPEN_ONLY` wrap links in
+HTTPS, which a bare CNAME cannot serve — a certificate for your subdomain has to exist
+somewhere. Put a CDN holding one in front, with `r.<region>.awstrack.me` as its origin and the
+`Host` header forwarded, and set `pMailTrackingCnameTarget` to the CDN's hostname so the record
+points there instead. Check it with
+`curl --head https://click.mail.example.com/favicon.ico`: the response carries
+`x-amz-ses-region` and `x-amz-ses-request-protocol`.
+
+Two markers in the HTML steer tracking per message. SES acts on both and removes them before
+the message goes out:
+
+- `{{ses:openTracker}}` anywhere in the `html` body puts the pixel there instead of at the end,
+  where a client that clips long messages may never load it. One per message — a second is a
+  `400` from SES, which the sender records as a failed send.
+- `<a ses:no-track href="…">` leaves that one link alone. SES rewrites at most 250 links in a
+  message and skips any URL that isn't RFC 3986-encoded.
+
+Opens and clicks reach the webhook over `MailEventsTopicArn` like every other sending event, and
+land on the bus as `ses.open` and `ses.click`. They accrue to `open_count` and `click_count` on
+the message's aggregate, or to `bot_open_count`/`bot_click_count` when SES flags the interaction
+`isBotEvent=Likely` — Apple Mail Privacy Protection prefetches and scanners. An `Open` also
+labels the mailbox message `opened`; a click adds no label.
+
+The event destination matches all ten SES event types: `send`, `reject`, `bounce`, `complaint`,
+`delivery`, `open`, `click`, `renderingFailure`, `deliveryDelay` and `subscription`. A type left
+out here is the one way an event is lost outright, so none is. The last three carry no aggregate
+status rule and no mailbox label — they are persisted and forwarded as `ses.rendering-failure`,
+`ses.delivery-delay` and `ses.subscription`, which is the pass-through the pipeline is built to
+degrade to.
 
 ## How the mailbox is wired
 

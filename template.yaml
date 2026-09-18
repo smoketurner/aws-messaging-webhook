@@ -106,6 +106,34 @@ Parameters:
     Type: String
     Default: quarantine
     AllowedValues: [none, quarantine, reject]
+  pMailTrackingDomain:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^([a-z0-9-]+\.)+[a-z]{2,}$
+    Description: >-
+      Custom subdomain SES wraps open and click tracking links in, e.g.
+      click.mail.example.com. Empty (the default) leaves them on SES's own
+      awstrack.me domain; opens and clicks are reported either way. A
+      subdomain of pMailDomain needs no verification of its own; any other
+      domain must already be a verified SES identity.
+  pMailTrackingHttpsPolicy:
+    Type: String
+    Default: OPTIONAL
+    AllowedValues: [OPTIONAL, REQUIRE, REQUIRE_OPEN_ONLY]
+    Description: >-
+      Scheme SES wraps the tracking links in. OPTIONAL, the default, is what a
+      bare CNAME to SES can serve: the open pixel over HTTP and each click link
+      on the scheme it already had. REQUIRE and REQUIRE_OPEN_ONLY need the
+      subdomain fronted by a CDN holding a certificate for it — see
+      pMailTrackingCnameTarget.
+  pMailTrackingCnameTarget:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^([a-z0-9-]+\.)+[a-z]{2,}$
+    Description: >-
+      Host pMailTrackingDomain's CNAME points at. Empty (the default) uses
+      SES's regional tracking domain, r.<region>.awstrack.me. Set it to your
+      CDN's hostname when serving the subdomain over HTTPS.
   pReceiptTlsPolicy:
     Type: String
     Default: Optional
@@ -147,6 +175,20 @@ Rules:
       # Both functions refuse to start without it.
       - Assert: !Not [!Equals [!Ref pApiKeysParameterName, ""]]
         AssertDescription: pApiKeysParameterName is required when pMailDomain is set.
+  # Tracking options live on the mailbox configuration set, so without a
+  # mailbox they would be accepted and then quietly do nothing.
+  MailTrackingNeedsMailDomain:
+    RuleCondition: !Equals [!Ref pMailDomain, ""]
+    Assertions:
+      - Assert: !Equals [!Ref pMailTrackingDomain, ""]
+        AssertDescription: pMailTrackingDomain needs pMailDomain.
+  MailTrackingOptionsNeedTrackingDomain:
+    RuleCondition: !Equals [!Ref pMailTrackingDomain, ""]
+    Assertions:
+      - Assert: !Equals [!Ref pMailTrackingHttpsPolicy, OPTIONAL]
+        AssertDescription: pMailTrackingHttpsPolicy needs pMailTrackingDomain.
+      - Assert: !Equals [!Ref pMailTrackingCnameTarget, ""]
+        AssertDescription: pMailTrackingCnameTarget needs pMailTrackingDomain.
 
 Conditions:
   cIsProd: !Equals [!Ref pStage, prod]
@@ -156,6 +198,9 @@ Conditions:
   cHasMailDomain: !Not [!Equals [!Ref pMailDomain, ""]]
   cHasHostedZone: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pHostedZoneId, ""]]]
   cNoHostedZone: !And [!Condition cHasMailDomain, !Equals [!Ref pHostedZoneId, ""]]
+  cHasTrackingDomain: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pMailTrackingDomain, ""]]]
+  cHasTrackingCnameTarget: !Not [!Equals [!Ref pMailTrackingCnameTarget, ""]]
+  cTrackingRecordUnpublished: !And [!Condition cHasTrackingDomain, !Equals [!Ref pHostedZoneId, ""]]
   cCreateReceiptRuleSet: !And [!Condition cHasMailDomain, !Equals [!Ref pExistingReceiptRuleSetName, ""]]
   cHasMailBucketName: !Not [!Equals [!Ref pMailBucketName, ""]]
   cHasApiKeys: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pApiKeysParameterName, ""]]]
@@ -440,9 +485,18 @@ Resources:
   # stack owns: a receipt rule and an event destination must name their topic.
   # ---------------------------------------------------------------------------
 
+  # Without pMailTrackingDomain, SES wraps the open pixel and click links in
+  # its own awstrack.me domain. The custom subdomain puts them on a domain the
+  # recipient recognizes; SES still serves them, through the CNAME below.
   rMailConfigurationSet:
     Type: AWS::SES::ConfigurationSet
     Condition: cHasMailDomain
+    Properties:
+      TrackingOptions: !If
+        - cHasTrackingDomain
+        - CustomRedirectDomain: !Ref pMailTrackingDomain
+          HttpsPolicy: !Ref pMailTrackingHttpsPolicy
+        - !Ref AWS::NoValue
 
   rMailIdentity:
     Type: AWS::SES::EmailIdentity
@@ -494,7 +548,23 @@ Resources:
       EventDestination:
         Name: mail-events
         Enabled: true
-        MatchingEventTypes: [send, delivery, bounce, complaint, reject, open]
+        # Every event type SES defines, unconditionally. model/ maps all ten
+        # to a detail-type already, and one the aggregate has no status rule
+        # for is still persisted and forwarded — a missing type here is the
+        # only way an event is lost outright. pMailTrackingDomain changes the
+        # domain the open pixel and the rewritten links wear, never whether
+        # they are reported.
+        MatchingEventTypes:
+          - send
+          - reject
+          - bounce
+          - complaint
+          - delivery
+          - open
+          - click
+          - renderingFailure
+          - deliveryDelay
+          - subscription
         SnsDestination:
           TopicARN: !Ref rMailEventsTopic
 
@@ -1019,6 +1089,17 @@ Resources:
           TTL: "300"
           ResourceRecords:
             - !Sub '"v=DMARC1; p=${pDmarcPolicy}"'
+        - !If
+          - cHasTrackingDomain
+          - Name: !Ref pMailTrackingDomain
+            Type: CNAME
+            TTL: "300"
+            ResourceRecords:
+              - !If
+                - cHasTrackingCnameTarget
+                - !Ref pMailTrackingCnameTarget
+                - !Sub "r.${AWS::Region}.awstrack.me"
+          - !Ref AWS::NoValue
 
 Outputs:
   WebhookUrl:
@@ -1078,6 +1159,10 @@ Outputs:
   MailConfigurationSetName:
     Condition: cHasMailDomain
     Value: !Ref rMailConfigurationSet
+  MailTrackingDomain:
+    Condition: cHasTrackingDomain
+    Description: Custom domain SES wraps open and click tracking links in.
+    Value: !Ref pMailTrackingDomain
   InboxAddress:
     Condition: cHasMailDomain
     Value: !Sub "${pMailInbox}@${pMailDomain}"
@@ -1114,3 +1199,12 @@ Outputs:
         - !Sub 'bounce.${pMailDomain} TXT "v=spf1 include:amazonses.com ~all"'
         - !Sub '${pMailDomain} TXT "v=spf1 include:amazonses.com -all"'
         - !Sub '_dmarc.${pMailDomain} TXT "v=DMARC1; p=${pDmarcPolicy}"'
+  # Its own output rather than a line in DnsRecords: the tracking subdomain is
+  # optional, and where it points depends on whether a CDN fronts it.
+  TrackingDnsRecord:
+    Condition: cTrackingRecordUnpublished
+    Description: Tracking-domain DNS record to publish (no pHostedZoneId given).
+    Value: !If
+      - cHasTrackingCnameTarget
+      - !Sub "${pMailTrackingDomain} CNAME ${pMailTrackingCnameTarget}"
+      - !Sub "${pMailTrackingDomain} CNAME r.${AWS::Region}.awstrack.me"
