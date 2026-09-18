@@ -1,0 +1,1090 @@
+{
+  "components": {
+    "schemas": {
+      "attachments_Attachment": {
+        "type": "object",
+        "properties": {
+          "attachment_id": {
+            "$ref": "#/components/schemas/attachments_AttachmentId"
+          },
+          "filename": {
+            "$ref": "#/components/schemas/attachments_AttachmentFilename"
+          },
+          "size": {
+            "$ref": "#/components/schemas/attachments_AttachmentSize"
+          },
+          "content_type": {
+            "$ref": "#/components/schemas/attachments_AttachmentContentType"
+          },
+          "content_disposition": {
+            "$ref": "#/components/schemas/attachments_AttachmentContentDisposition"
+          },
+          "content_id": {
+            "$ref": "#/components/schemas/attachments_AttachmentContentId"
+          }
+        },
+        "required": [
+          "attachment_id",
+          "size"
+        ],
+        "title": "Attachment"
+      },
+      "attachments_AttachmentContentDisposition": {
+        "type": "string",
+        "enum": [
+          "inline",
+          "attachment"
+        ],
+        "description": "Content disposition of attachment.",
+        "title": "AttachmentContentDisposition"
+      },
+      "attachments_AttachmentContentId": {
+        "type": "string",
+        "description": "Content ID of attachment.",
+        "title": "AttachmentContentId"
+      },
+      "attachments_AttachmentContentType": {
+        "type": "string",
+        "description": "Content type of attachment.",
+        "title": "AttachmentContentType"
+      },
+      "attachments_AttachmentFilename": {
+        "type": "string",
+        "description": "Filename of attachment.",
+        "title": "AttachmentFilename"
+      },
+      "attachments_AttachmentId": {
+        "type": "string",
+        "description": "ID of attachment.",
+        "title": "AttachmentId"
+      },
+      "attachments_AttachmentSize": {
+        "type": "integer",
+        "description": "Size of attachment in bytes.",
+        "title": "AttachmentSize"
+      },
+      "domains_ClientId": {
+        "type": "string",
+        "description": "Client ID of domain.",
+        "title": "ClientId"
+      },
+      "domains_Domain": {
+        "type": "object",
+        "properties": {
+          "pod_id": {
+            "$ref": "#/components/schemas/pods_PodId"
+          },
+          "domain_id": {
+            "$ref": "#/components/schemas/domains_DomainId"
+          },
+          "domain": {
+            "$ref": "#/components/schemas/domains_DomainName"
+          },
+          "status": {
+            "$ref": "#/components/schemas/domains_Status"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the domain is not (yet) VERIFIED, when known. `dns_records_missing` / `dns_records_invalid` point at the DNS records. The `ses_*` values mean the records look right and sending-infrastructure validation has not converged: `ses_dkim_pending` / `ses_mail_from_pending` (still checking), `ses_dkim_temporary_failure` / `ses_mail_from_temporary_failure` (a transient error the infrastructure keeps retrying on its own — usually resolves without changes), `ses_dkim_failed` / `ses_mail_from_failed` (a terminal verdict; re-verify after fixing), `ses_dkim_not_started` / `ses_mail_from_not_started` (the attribute was never configured on the identity — re-verify to push it), and `ses_not_verified_for_sending`. Absent when VERIFIED."
+          },
+          "feedback_enabled": {
+            "$ref": "#/components/schemas/domains_FeedbackEnabled"
+          },
+          "subdomains_enabled": {
+            "$ref": "#/components/schemas/domains_SubdomainsEnabled"
+          },
+          "tracking_enabled": {
+            "$ref": "#/components/schemas/domains_TrackingEnabled"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/domains_VerificationRecord"
+            },
+            "description": "A list of DNS records required to verify the domain. Includes a\nwildcard MX record (`*.<domain>`) when `subdomains_enabled` is true."
+          },
+          "client_id": {
+            "$ref": "#/components/schemas/domains_ClientId"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time at which the domain was last updated."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time at which the domain was created."
+          }
+        },
+        "required": [
+          "domain_id",
+          "domain",
+          "status",
+          "feedback_enabled",
+          "subdomains_enabled",
+          "tracking_enabled",
+          "records",
+          "updated_at",
+          "created_at"
+        ],
+        "title": "Domain"
+      },
+      "domains_DomainId": {
+        "type": "string",
+        "description": "The ID of the domain.",
+        "title": "DomainId"
+      },
+      "domains_DomainName": {
+        "type": "string",
+        "description": "The name of the domain (e.g., `example.com`).",
+        "title": "DomainName"
+      },
+      "domains_FeedbackEnabled": {
+        "type": "boolean",
+        "description": "Bounce and complaint notifications are sent to your inboxes.",
+        "title": "FeedbackEnabled"
+      },
+      "domains_RecordStatus": {
+        "type": "string",
+        "enum": [
+          "MISSING",
+          "INVALID",
+          "VALID"
+        ],
+        "title": "RecordStatus"
+      },
+      "domains_RecordType": {
+        "type": "string",
+        "enum": [
+          "TXT",
+          "CNAME",
+          "MX"
+        ],
+        "title": "RecordType"
+      },
+      "domains_Status": {
+        "$ref": "#/components/schemas/domains_VerificationStatus",
+        "description": "The verification status of the domain.",
+        "title": "Status"
+      },
+      "domains_SubdomainsEnabled": {
+        "type": "boolean",
+        "description": "Allow inboxes on any subdomain of this domain. Adds a required wildcard MX\nrecord (`*.<domain>`) to `records`.",
+        "title": "SubdomainsEnabled"
+      },
+      "domains_TrackingEnabled": {
+        "type": "boolean",
+        "description": "Serve open tracking pixels from this domain. Adds a required `link.<domain>`\nCNAME record to `records`, which must be published and verified before\n`track_opens` can be used on a send.",
+        "title": "TrackingEnabled"
+      },
+      "domains_VerificationRecord": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/domains_RecordType",
+            "description": "The type of the DNS record."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name or host of the record."
+          },
+          "value": {
+            "type": "string",
+            "description": "The value of the record."
+          },
+          "status": {
+            "$ref": "#/components/schemas/domains_RecordStatus",
+            "description": "The verification status of this specific record."
+          },
+          "priority": {
+            "type": "integer",
+            "description": "The priority of the MX record."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the record is INVALID, when known. `duplicate_records` means the expected value is present but extra records coexist at the same name; `value_mismatch` means a record exists but does not match the expected value."
+          }
+        },
+        "required": [
+          "type",
+          "name",
+          "value",
+          "status"
+        ],
+        "title": "VerificationRecord"
+      },
+      "domains_VerificationStatus": {
+        "type": "string",
+        "enum": [
+          "NOT_STARTED",
+          "PENDING",
+          "INVALID",
+          "FAILED",
+          "VERIFYING",
+          "VERIFIED"
+        ],
+        "title": "VerificationStatus"
+      },
+      "events_Bounce": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/events_Timestamp"
+          },
+          "type": {
+            "type": "string",
+            "description": "Bounce type."
+          },
+          "sub_type": {
+            "type": "string",
+            "description": "Bounce sub-type."
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/events_Recipient"
+            },
+            "description": "Bounced recipients."
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "timestamp",
+          "type",
+          "sub_type",
+          "recipients"
+        ],
+        "title": "Bounce"
+      },
+      "events_Complaint": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/events_Timestamp"
+          },
+          "type": {
+            "type": "string",
+            "description": "Complaint type."
+          },
+          "sub_type": {
+            "type": "string",
+            "description": "Complaint sub-type."
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Complained recipients."
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "timestamp",
+          "type",
+          "sub_type",
+          "recipients"
+        ],
+        "title": "Complaint"
+      },
+      "events_Delivery": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/events_Timestamp"
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Delivered recipients."
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "timestamp",
+          "recipients"
+        ],
+        "title": "Delivery"
+      },
+      "events_DomainVerifiedEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "domain.verified"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "domain": {
+            "$ref": "#/components/schemas/domains_Domain"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "domain"
+        ],
+        "title": "DomainVerifiedEvent"
+      },
+      "events_EventId": {
+        "type": "string",
+        "description": "ID of event.",
+        "title": "EventId"
+      },
+      "events_MessageBouncedEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "message.bounced"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "bounce": {
+            "$ref": "#/components/schemas/events_Bounce"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "bounce"
+        ],
+        "title": "MessageBouncedEvent"
+      },
+      "events_MessageComplainedEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "message.complained"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "complaint": {
+            "$ref": "#/components/schemas/events_Complaint"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "complaint"
+        ],
+        "title": "MessageComplainedEvent"
+      },
+      "events_MessageDeliveredEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "message.delivered"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/events_Delivery"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "delivery"
+        ],
+        "title": "MessageDeliveredEvent"
+      },
+      "events_MessageOpenedEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "message.opened"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "open": {
+            "$ref": "#/components/schemas/events_Open"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "open"
+        ],
+        "description": "A tracked message was opened for the first time. Sent once per message: repeat opens do not\nresend it.",
+        "title": "MessageOpenedEvent"
+      },
+      "events_MessageReceivedEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "$ref": "#/components/schemas/events_MessageReceivedEventType"
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "message": {
+            "$ref": "#/components/schemas/messages_Message"
+          },
+          "thread": {
+            "$ref": "#/components/schemas/threads_ThreadItem"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "message",
+          "thread"
+        ],
+        "description": "A message was received. Spam, blocked, and unauthenticated received-message events use the same payload shape with different `event_type` values.",
+        "title": "MessageReceivedEvent"
+      },
+      "events_MessageReceivedEventType": {
+        "type": "string",
+        "enum": [
+          "message.received",
+          "message.received.spam",
+          "message.received.blocked",
+          "message.received.unauthenticated"
+        ],
+        "title": "MessageReceivedEventType"
+      },
+      "events_MessageRejectedEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "message.rejected"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "reject": {
+            "$ref": "#/components/schemas/events_Reject"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "reject"
+        ],
+        "title": "MessageRejectedEvent"
+      },
+      "events_MessageSentEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "event"
+            ]
+          },
+          "event_type": {
+            "type": "string",
+            "enum": [
+              "message.sent"
+            ]
+          },
+          "event_id": {
+            "$ref": "#/components/schemas/events_EventId"
+          },
+          "send": {
+            "$ref": "#/components/schemas/events_Send"
+          }
+        },
+        "required": [
+          "type",
+          "event_type",
+          "event_id",
+          "send"
+        ],
+        "title": "MessageSentEvent"
+      },
+      "events_Open": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/events_Timestamp"
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "timestamp"
+        ],
+        "title": "Open"
+      },
+      "events_Recipient": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Recipient address."
+          },
+          "status": {
+            "type": "string",
+            "description": "Recipient status."
+          }
+        },
+        "required": [
+          "address",
+          "status"
+        ],
+        "title": "Recipient"
+      },
+      "events_Reject": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/events_Timestamp"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Reject reason."
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "timestamp",
+          "reason"
+        ],
+        "title": "Reject"
+      },
+      "events_Send": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/events_Timestamp"
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Sent recipients."
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "timestamp",
+          "recipients"
+        ],
+        "title": "Send"
+      },
+      "events_Timestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Timestamp of event.",
+        "title": "Timestamp"
+      },
+      "inboxes_InboxId": {
+        "type": "string",
+        "description": "The ID of the inbox.",
+        "title": "InboxId"
+      },
+      "messages_Message": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/messages_MessageId"
+          },
+          "labels": {
+            "$ref": "#/components/schemas/messages_MessageLabels"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/messages_MessageTimestamp"
+          },
+          "from": {
+            "$ref": "#/components/schemas/messages_MessageFrom"
+          },
+          "reply_to": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Reply-to addresses. In format `username@domain.com` or `Display Name <username@domain.com>`."
+          },
+          "to": {
+            "$ref": "#/components/schemas/messages_MessageTo"
+          },
+          "cc": {
+            "$ref": "#/components/schemas/messages_MessageCc"
+          },
+          "bcc": {
+            "$ref": "#/components/schemas/messages_MessageBcc"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/messages_MessageSubject"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/messages_MessagePreview"
+          },
+          "text": {
+            "$ref": "#/components/schemas/messages_MessageText"
+          },
+          "html": {
+            "$ref": "#/components/schemas/messages_MessageHtml"
+          },
+          "extracted_text": {
+            "type": "string",
+            "description": "Extracted new text content."
+          },
+          "extracted_html": {
+            "type": "string",
+            "description": "Extracted new HTML content."
+          },
+          "attachments": {
+            "$ref": "#/components/schemas/messages_MessageAttachments"
+          },
+          "in_reply_to": {
+            "$ref": "#/components/schemas/messages_MessageInReplyTo"
+          },
+          "references": {
+            "$ref": "#/components/schemas/messages_MessageReferences"
+          },
+          "headers": {
+            "$ref": "#/components/schemas/messages_MessageHeaders"
+          },
+          "size": {
+            "$ref": "#/components/schemas/messages_MessageSize"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/messages_MessageUpdatedAt"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/messages_MessageCreatedAt"
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "message_id",
+          "labels",
+          "timestamp",
+          "from",
+          "to",
+          "size",
+          "updated_at",
+          "created_at"
+        ],
+        "title": "Message"
+      },
+      "messages_MessageAttachments": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/attachments_Attachment"
+        },
+        "description": "Attachments in message.",
+        "title": "MessageAttachments"
+      },
+      "messages_MessageBcc": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Addresses of BCC recipients. In format `username@domain.com` or `Display Name <username@domain.com>`.",
+        "title": "MessageBcc"
+      },
+      "messages_MessageCc": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Addresses of CC recipients. In format `username@domain.com` or `Display Name <username@domain.com>`.",
+        "title": "MessageCc"
+      },
+      "messages_MessageCreatedAt": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Time at which message was created.",
+        "title": "MessageCreatedAt"
+      },
+      "messages_MessageFrom": {
+        "type": "string",
+        "description": "Address of sender. In format `username@domain.com` or `Display Name <username@domain.com>`.",
+        "title": "MessageFrom"
+      },
+      "messages_MessageHeaders": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Headers in message.",
+        "title": "MessageHeaders"
+      },
+      "messages_MessageHtml": {
+        "type": "string",
+        "description": "HTML body of message.",
+        "title": "MessageHtml"
+      },
+      "messages_MessageId": {
+        "type": "string",
+        "description": "ID of message.",
+        "title": "MessageId"
+      },
+      "messages_MessageInReplyTo": {
+        "type": "string",
+        "description": "ID of message being replied to.",
+        "title": "MessageInReplyTo"
+      },
+      "messages_MessageLabels": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Labels of message.",
+        "title": "MessageLabels"
+      },
+      "messages_MessagePreview": {
+        "type": "string",
+        "description": "Text preview of message.",
+        "title": "MessagePreview"
+      },
+      "messages_MessageReferences": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "IDs of previous messages in thread.",
+        "title": "MessageReferences"
+      },
+      "messages_MessageSize": {
+        "type": "integer",
+        "description": "Size of message in bytes.",
+        "title": "MessageSize"
+      },
+      "messages_MessageSubject": {
+        "type": "string",
+        "description": "Subject of message.",
+        "title": "MessageSubject"
+      },
+      "messages_MessageText": {
+        "type": "string",
+        "description": "Plain text body of message.",
+        "title": "MessageText"
+      },
+      "messages_MessageTimestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Time at which message was sent or drafted.",
+        "title": "MessageTimestamp"
+      },
+      "messages_MessageTo": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Addresses of recipients. In format `username@domain.com` or `Display Name <username@domain.com>`.",
+        "title": "MessageTo"
+      },
+      "messages_MessageUpdatedAt": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Time at which message was last updated.",
+        "title": "MessageUpdatedAt"
+      },
+      "pods_PodId": {
+        "type": "string",
+        "description": "ID of pod.",
+        "title": "PodId"
+      },
+      "threads_ThreadAttachments": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/attachments_Attachment"
+        },
+        "description": "Attachments in thread.",
+        "title": "ThreadAttachments"
+      },
+      "threads_ThreadCreatedAt": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Time at which thread was created.",
+        "title": "ThreadCreatedAt"
+      },
+      "threads_ThreadId": {
+        "type": "string",
+        "description": "ID of thread.",
+        "title": "ThreadId"
+      },
+      "threads_ThreadItem": {
+        "type": "object",
+        "properties": {
+          "inbox_id": {
+            "$ref": "#/components/schemas/inboxes_InboxId"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/threads_ThreadId"
+          },
+          "labels": {
+            "$ref": "#/components/schemas/threads_ThreadLabels"
+          },
+          "timestamp": {
+            "$ref": "#/components/schemas/threads_ThreadTimestamp"
+          },
+          "received_timestamp": {
+            "$ref": "#/components/schemas/threads_ThreadReceivedTimestamp"
+          },
+          "sent_timestamp": {
+            "$ref": "#/components/schemas/threads_ThreadSentTimestamp"
+          },
+          "senders": {
+            "$ref": "#/components/schemas/threads_ThreadSenders"
+          },
+          "recipients": {
+            "$ref": "#/components/schemas/threads_ThreadRecipients"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/threads_ThreadSubject"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/threads_ThreadPreview"
+          },
+          "attachments": {
+            "$ref": "#/components/schemas/threads_ThreadAttachments"
+          },
+          "last_message_id": {
+            "$ref": "#/components/schemas/threads_ThreadLastMessageId"
+          },
+          "message_count": {
+            "$ref": "#/components/schemas/threads_ThreadMessageCount"
+          },
+          "size": {
+            "$ref": "#/components/schemas/threads_ThreadSize"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/threads_ThreadUpdatedAt"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/threads_ThreadCreatedAt"
+          }
+        },
+        "required": [
+          "inbox_id",
+          "thread_id",
+          "labels",
+          "timestamp",
+          "senders",
+          "recipients",
+          "last_message_id",
+          "message_count",
+          "size",
+          "updated_at",
+          "created_at"
+        ],
+        "title": "ThreadItem"
+      },
+      "threads_ThreadLabels": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Labels of thread.",
+        "title": "ThreadLabels"
+      },
+      "threads_ThreadLastMessageId": {
+        "type": "string",
+        "description": "ID of last message in thread.",
+        "title": "ThreadLastMessageId"
+      },
+      "threads_ThreadMessageCount": {
+        "type": "integer",
+        "description": "Number of messages in thread.",
+        "title": "ThreadMessageCount"
+      },
+      "threads_ThreadPreview": {
+        "type": "string",
+        "description": "Text preview of last message in thread.",
+        "title": "ThreadPreview"
+      },
+      "threads_ThreadReceivedTimestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Timestamp of last received message.",
+        "title": "ThreadReceivedTimestamp"
+      },
+      "threads_ThreadRecipients": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Recipients in thread. In format `username@domain.com` or `Display Name <username@domain.com>`.",
+        "title": "ThreadRecipients"
+      },
+      "threads_ThreadSenders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Senders in thread. In format `username@domain.com` or `Display Name <username@domain.com>`.",
+        "title": "ThreadSenders"
+      },
+      "threads_ThreadSentTimestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Timestamp of last sent message.",
+        "title": "ThreadSentTimestamp"
+      },
+      "threads_ThreadSize": {
+        "type": "integer",
+        "description": "Size of thread in bytes.",
+        "title": "ThreadSize"
+      },
+      "threads_ThreadSubject": {
+        "type": "string",
+        "description": "Subject of thread.",
+        "title": "ThreadSubject"
+      },
+      "threads_ThreadTimestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Timestamp of last sent or received message.",
+        "title": "ThreadTimestamp"
+      },
+      "threads_ThreadUpdatedAt": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Time at which thread was last updated.",
+        "title": "ThreadUpdatedAt"
+      }
+    }
+  }
+}

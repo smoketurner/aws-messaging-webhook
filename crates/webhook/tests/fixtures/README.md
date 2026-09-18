@@ -27,3 +27,13 @@ typos in the docs' examples were repaired to make them valid JSON:
 events reuse the `TEXT_*` event types with an RCS agent id as
 `originationPhoneNumber`. The docs show two RCS examples identical in shape;
 only the first is kept.
+
+## Mailbox event schemas
+
+`mailbox-events/schemas.json` holds the reference mailbox API's published webhook event schemas,
+retrieved 2026-09-18 from its OpenAPI 3.1 specification. It contains the eight webhook event
+payload schemas (`events_*Event`) and every schema they reference, in the spec's own
+`components.schemas` layout so each `$ref` resolves unchanged. Values are unmodified and
+whitespace is normalized to 2-space-indented JSON. `mailbox_event_schemas.rs` validates every
+mailbox event the relay publishes against them and fails if the file documents an event type
+the test doesn't account for, so a refreshed copy surfaces new types.

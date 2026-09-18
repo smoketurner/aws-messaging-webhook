@@ -1,7 +1,8 @@
 //! The mail table's DynamoDB Streams relay: `message.received*` on a `MSG#`
-//! INSERT, `message.<label>` on a MODIFY that adds a system label, nothing
+//! INSERT, `message.sent` on the MODIFY that relabels a send `sent`, nothing
 //! on any other mail-table item, and the existing events-table relay left
-//! unaffected.
+//! unaffected. The payloads' exact shape is pinned by
+//! `mailbox_event_schemas.rs`.
 //!
 //! Stream images are built with `serde_dynamo::to_item` on
 //! [`aws_messaging_webhook::mail::MailMessage`] — never hand-parsed
@@ -59,6 +60,11 @@ fn sample_message() -> MailMessage {
             timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
             created_at: "2026-01-15T09:30:00.000Z".to_owned(),
             updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+            last_message_id: "mid-1".to_owned(),
+            size: 1234,
+            received_timestamp: Some("2026-01-15T09:30:00.000Z".to_owned()),
+            sent_timestamp: None,
+            attachments: Vec::new(),
         }),
         delivery: BTreeMap::new(),
         send_status: None,
@@ -173,11 +179,8 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
             .as_str()
             .is_some_and(|id| id.starts_with("evt_"))
     );
-    assert_eq!(detail["schemaVersion"], 1);
-    assert_eq!(detail["meta"]["messageId"], "mid-1");
-    assert_eq!(detail["meta"]["inboxId"], "support@example.com");
-    assert_eq!(detail["meta"]["threadId"], "tid-1");
-    assert_eq!(detail["meta"]["sesMessageId"], "ses-1");
+    assert!(detail.get("schemaVersion").is_none());
+    assert!(detail.get("meta").is_none());
     assert_eq!(detail["message"]["message_id"], "mid-1");
     assert_eq!(detail["message"]["from"], "sender@example.com");
     assert_eq!(detail["message"]["text"], "Hello there");
@@ -211,6 +214,11 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
         timestamp: "2026-01-15T09:31:00.000Z".to_owned(),
         created_at: "2026-01-15T09:30:00.000Z".to_owned(),
         updated_at: "2026-01-15T09:31:00.000Z".to_owned(),
+        last_message_id: "mid-2".to_owned(),
+        size: 2468,
+        received_timestamp: Some("2026-01-15T09:31:00.000Z".to_owned()),
+        sent_timestamp: None,
+        attachments: Vec::new(),
     });
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-reply");
 
@@ -271,11 +279,11 @@ async fn spam_takes_precedence_over_unauthenticated_on_the_stream_path() {
     assert_eq!(published[0].detail_type, "message.received.spam");
 }
 
-/// The sender's `queued` → `sent` relabel, and each delivery label an SES
-/// event adds afterwards, publish their own lifecycle event carrying the
-/// message's identifiers and current labels.
+/// The sender's `queued` → `sent` relabel publishes the send. The delivery
+/// label an SES event adds afterwards publishes nothing here: that event
+/// publishes from the SES event itself, on the events-table relay.
 #[tokio::test]
-async fn modify_publishes_an_event_for_each_system_label_added() {
+async fn modify_publishes_the_send_but_not_a_delivery_label() {
     let h = harness().await;
     let mut queued = sample_message();
     queued.labels = vec!["queued".to_owned()];
@@ -304,12 +312,8 @@ async fn modify_publishes_an_event_for_each_system_label_added() {
         .iter()
         .map(|event| event.detail_type.as_str())
         .collect();
-    assert_eq!(types, vec!["message.sent", "message.delivered"]);
-    assert_eq!(published[1].detail["meta"]["messageId"], "mid-1");
-    assert_eq!(
-        published[1].detail["message"]["labels"],
-        json!(["sent", "delivered"])
-    );
+    assert_eq!(types, vec!["message.sent"]);
+    assert_eq!(published[0].detail["send"]["message_id"], "mid-1");
 }
 
 /// A MODIFY that adds no system label — a user's own label, a read receipt,
@@ -373,7 +377,7 @@ async fn a_batch_stops_at_its_first_failed_record() {
     let published = h.fake().published.lock().unwrap();
     let ids: Vec<&str> = published
         .iter()
-        .map(|event| event.detail["meta"]["messageId"].as_str().unwrap())
+        .map(|event| event.detail["message"]["message_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["mid-1"]);
 }
@@ -441,9 +445,8 @@ async fn oversized_html_is_dropped_before_falling_back() {
 
     let published = h.fake().published.lock().unwrap();
     assert_eq!(published.len(), 1);
-    assert_eq!(published[0].detail["message"]["html"], Value::Null);
+    assert!(published[0].detail["message"].get("html").is_none());
     assert_eq!(published[0].detail["message"]["text"], "Hello there");
-    assert_eq!(published[0].detail["meta"]["messageId"], "mid-1");
 }
 
 #[tokio::test]

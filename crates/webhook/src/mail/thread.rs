@@ -283,6 +283,11 @@ impl From<&ThreadState> for ThreadSnapshot {
             timestamp: thread.timestamp.clone(),
             created_at: thread.created_at.clone(),
             updated_at: thread.updated_at.clone(),
+            last_message_id: thread.last_message_id.clone(),
+            size: thread.size,
+            received_timestamp: thread.received_timestamp.clone(),
+            sent_timestamp: thread.sent_timestamp.clone(),
+            attachments: thread.attachments.clone(),
         }
     }
 }
@@ -474,6 +479,10 @@ mod tests {
         assert_eq!(snapshot.senders, after.senders);
         assert_eq!(snapshot.recipients, after.recipients);
         assert_eq!(snapshot.timestamp, after.timestamp);
+        assert_eq!(snapshot.last_message_id, "mid-2");
+        assert_eq!(snapshot.size, after.size);
+        assert_eq!(snapshot.received_timestamp, after.received_timestamp);
+        assert_eq!(snapshot.attachments.len(), after.attachments.len());
     }
 
     #[test]

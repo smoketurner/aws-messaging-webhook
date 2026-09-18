@@ -95,11 +95,32 @@ pub fn ses_rfc_ids(ses_message_id: &str, region: &str) -> [String; 2] {
 /// The EventBridge `event_id`: `evt_` followed by a deterministic
 /// simple-form `UUIDv7` seeded from `(inbox, message_id, event_type)`, so
 /// redelivery of the same underlying event produces the same `event_id`.
-/// `ts_ms` is the message timestamp for a received event, `sent_at` for
-/// sent, and the delivery timestamp for a delivery event.
+/// `ts_ms` is the message timestamp for a received event and `sent_at` for
+/// sent.
 #[must_use]
 pub fn event_id(inbox: &str, message_id: &str, event_type: &str, ts_ms: u64) -> String {
     let seed = deterministic_seed(&format!("{inbox}\n{message_id}\n{event_type}"));
+    let uuid = Builder::from_unix_timestamp_millis(ts_ms, &seed).into_uuid();
+    format!("evt_{uuid}")
+}
+
+/// The `event_id` of an event built from one SES event. A message can see
+/// several SES events of one type (a bounce per recipient batch, an open per
+/// open), so the SNS message id that carried this one joins the seed: a
+/// redelivery of the same notification rebuilds the same id, and a second
+/// notification of the same type gets its own. `ts_ms` is the notification's
+/// timestamp.
+#[must_use]
+pub fn ses_event_id(
+    inbox: &str,
+    message_id: &str,
+    event_type: &str,
+    sns_message_id: &str,
+    ts_ms: u64,
+) -> String {
+    let seed = deterministic_seed(&format!(
+        "{inbox}\n{message_id}\n{event_type}\n{sns_message_id}"
+    ));
     let uuid = Builder::from_unix_timestamp_millis(ts_ms, &seed).into_uuid();
     format!("evt_{uuid}")
 }
@@ -228,6 +249,25 @@ mod tests {
         let received = event_id("inbox-1", "mid-1", "received", 1_700_000_000_000);
         let sent = event_id("inbox-1", "mid-1", "sent", 1_700_000_000_000);
         assert_ne!(received, sent);
+    }
+
+    #[test]
+    fn ses_event_id_is_deterministic_and_distinct_per_notification() {
+        let ts = 1_700_000_000_000;
+        let a = ses_event_id("inbox-1", "mid-1", "message.bounced", "sns-1", ts);
+        assert_eq!(
+            a,
+            ses_event_id("inbox-1", "mid-1", "message.bounced", "sns-1", ts)
+        );
+        assert!(a.starts_with("evt_"));
+        assert_ne!(
+            a,
+            ses_event_id("inbox-1", "mid-1", "message.bounced", "sns-2", ts)
+        );
+        assert_ne!(
+            a,
+            ses_event_id("inbox-1", "mid-1", "message.opened", "sns-1", ts)
+        );
     }
 
     proptest! {
