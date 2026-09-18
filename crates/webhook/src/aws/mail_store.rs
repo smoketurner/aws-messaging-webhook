@@ -18,21 +18,19 @@ use anyhow::anyhow;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
-    AttributeValue as DynamoAv, Delete, KeysAndAttributes, Put, TransactWriteItem, Update,
+    AttributeValue as DynamoAv, KeysAndAttributes, Put, TransactWriteItem, Update,
 };
 use aws_smithy_types::error::display::DisplayErrorContext;
 
 use crate::aws::{self, AwsServices};
 use crate::mail::keys::{self, PageKey};
-use crate::mail::plan::{Check, Cond, PlannedOp, TxnKind, WriteOp};
+use crate::mail::plan::{Check, Cond, PlannedOp, WriteOp};
 use crate::mail::send::{SendKey, SendState, SendStatus, mark_transition};
 use crate::mail::store::{
     EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
 };
 use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
-use crate::mail::txn::{
-    CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases, taken_aliases,
-};
+use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation, drop_taken_aliases};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
 /// `Retry`/`VersionConflict` loops at most this many times before giving
@@ -360,39 +358,12 @@ fn render_cond(cond: &Cond) -> RenderedCond {
             let mut names = Vec::new();
             let mut values = Vec::new();
             for (index, check) in checks.iter().enumerate() {
-                match check {
-                    Check::Eq(name, value) => {
-                        let name_placeholder = format!("#c{index}");
-                        let value_placeholder = format!(":c{index}");
-                        names.push((name_placeholder.clone(), (*name).to_owned()));
-                        values.push((value_placeholder.clone(), value.clone().into()));
-                        clauses.push(format!("{name_placeholder} = {value_placeholder}"));
-                    }
-                    Check::In(name, options) => {
-                        let name_placeholder = format!("#c{index}");
-                        names.push((name_placeholder.clone(), (*name).to_owned()));
-                        let mut option_placeholders = Vec::with_capacity(options.len());
-                        for (option_index, option) in options.iter().enumerate() {
-                            let value_placeholder = format!(":c{index}_{option_index}");
-                            values.push((value_placeholder.clone(), option.clone().into()));
-                            option_placeholders.push(value_placeholder);
-                        }
-                        clauses.push(format!(
-                            "{name_placeholder} IN ({})",
-                            option_placeholders.join(", ")
-                        ));
-                    }
-                    Check::Exists(name) => {
-                        let name_placeholder = format!("#c{index}");
-                        names.push((name_placeholder.clone(), (*name).to_owned()));
-                        clauses.push(format!("attribute_exists({name_placeholder})"));
-                    }
-                    Check::NotExists(name) => {
-                        let name_placeholder = format!("#c{index}");
-                        names.push((name_placeholder.clone(), (*name).to_owned()));
-                        clauses.push(format!("attribute_not_exists({name_placeholder})"));
-                    }
-                }
+                let Check::Eq(name, value) = check;
+                let name_placeholder = format!("#c{index}");
+                let value_placeholder = format!(":c{index}");
+                names.push((name_placeholder.clone(), (*name).to_owned()));
+                values.push((value_placeholder.clone(), value.clone().into()));
+                clauses.push(format!("{name_placeholder} = {value_placeholder}"));
             }
             RenderedCond {
                 expression: Some(clauses.join(" AND ")),
@@ -414,7 +385,6 @@ fn to_transact_item(table_name: &str, op: &WriteOp) -> Result<TransactWriteItem,
             remove,
             cond,
         } => update_transact_item(table_name, pk, sk, set, remove, cond),
-        WriteOp::Delete { pk, sk } => delete_transact_item(table_name, pk, sk),
         WriteOp::AliasFirstWriter {
             pk,
             sk,
@@ -508,20 +478,6 @@ fn update_transact_item(
     Ok(TransactWriteItem::builder().update(update).build())
 }
 
-fn delete_transact_item(
-    table_name: &str,
-    pk: &str,
-    sk: &str,
-) -> Result<TransactWriteItem, MailStoreError> {
-    let delete = Delete::builder()
-        .table_name(table_name)
-        .key("pk", DynamoAv::S(pk.to_owned()))
-        .key("sk", DynamoAv::S(sk.to_owned()))
-        .build()
-        .map_err(|e| MailStoreError::Permanent(anyhow!("building Delete: {e}")))?;
-    Ok(TransactWriteItem::builder().delete(delete).build())
-}
-
 fn alias_transact_item(
     table_name: &str,
     pk: &str,
@@ -549,17 +505,10 @@ enum Attempt {
     Committed,
     /// The transaction was cancelled or is in progress.
     Decision(TxnDecision),
-    /// Cancelled only because these alias keys already belong to an earlier
-    /// message; retry without them.
-    AliasTaken(Vec<String>),
 }
 
 impl AwsServices {
-    async fn attempt_transaction(
-        &self,
-        kind: TxnKind,
-        ops: &[PlannedOp],
-    ) -> Result<Attempt, MailStoreError> {
+    async fn attempt_transaction(&self, ops: &[PlannedOp]) -> Result<Attempt, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let mut builder = self.dynamo.transact_write_items();
         for planned in ops {
@@ -577,12 +526,7 @@ impl AwsServices {
                                 .iter()
                                 .map(|reason| map_cancellation_reason(reason.code()))
                                 .collect();
-                            return Ok(match decode_cancellation(kind, ops, &reasons) {
-                                TxnDecision::AliasTaken => {
-                                    Attempt::AliasTaken(taken_aliases(ops, &reasons))
-                                }
-                                decision => Attempt::Decision(decision),
-                            });
+                            return Ok(Attempt::Decision(decode_cancellation(ops, &reasons)));
                         }
                         TransactWriteItemsError::TransactionInProgressException(_) => {
                             return Ok(Attempt::Decision(TxnDecision::Retry));
@@ -809,16 +753,14 @@ impl MailStore for AwsServices {
                 crate::mail::plan::plan_insert(msg, thread_before.as_ref(), &thread_after)?;
             drop_taken_aliases(&mut ops, &taken);
 
-            match self.attempt_transaction(TxnKind::Insert, &ops).await? {
+            match self.attempt_transaction(&ops).await? {
                 Attempt::Committed => return Ok(InsertOutcome::Fresh),
                 Attempt::Decision(TxnDecision::Duplicate) => return Ok(InsertOutcome::Duplicate),
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
                     backoff(attempt).await;
                 }
-                Attempt::AliasTaken(keys) => taken.extend(keys),
-                Attempt::Decision(
-                    TxnDecision::Permanent | TxnDecision::KeyExists | TxnDecision::AliasTaken,
-                ) => {
+                Attempt::Decision(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
+                Attempt::Decision(TxnDecision::Permanent | TxnDecision::KeyExists) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "ingest transaction for message {} was cancelled",
                         msg.message_id
@@ -901,7 +843,7 @@ impl MailStore for AwsServices {
             )?;
             drop_taken_aliases(&mut ops, &taken);
 
-            match self.attempt_transaction(TxnKind::Enqueue, &ops).await? {
+            match self.attempt_transaction(&ops).await? {
                 Attempt::Committed => return Ok(EnqueueOutcome::Committed),
                 Attempt::Decision(TxnDecision::KeyExists) => return Ok(EnqueueOutcome::KeyExists),
                 Attempt::Decision(TxnDecision::Duplicate) => {
@@ -910,8 +852,8 @@ impl MailStore for AwsServices {
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
                     backoff(attempt).await;
                 }
-                Attempt::AliasTaken(keys) => taken.extend(keys),
-                Attempt::Decision(TxnDecision::Permanent | TxnDecision::AliasTaken) => {
+                Attempt::Decision(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
+                Attempt::Decision(TxnDecision::Permanent) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "enqueue transaction for message {} was cancelled",
                         msg.message_id
@@ -1009,14 +951,14 @@ impl MailStore for AwsServices {
 
             let after = before.claimed(now);
             let ops = crate::mail::plan::plan_claim(&before, &after)?;
-            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+            match self.attempt_transaction(&ops).await? {
                 Attempt::Committed => return Ok(Some(after)),
                 // Lost the race: re-read, and the status check above settles
                 // it.
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
                     backoff(attempt).await;
                 }
-                Attempt::Decision(_) | Attempt::AliasTaken(_) => return Ok(None),
+                Attempt::Decision(_) => return Ok(None),
             }
         }
         Err(MailStoreError::Conflict)
@@ -1030,13 +972,13 @@ impl MailStore for AwsServices {
         let after = claimed.calling_ses(now);
         let ops = crate::mail::plan::plan_ses_call(claimed, &after)?;
         for attempt in 0..=MAX_TXN_RETRIES {
-            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+            match self.attempt_transaction(&ops).await? {
                 Attempt::Committed => return Ok(Some(after)),
                 // Throttled or conflicting with another transaction: the same
                 // write is still the right one.
                 Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
                 // The state moved on under this sender: the claim is gone.
-                Attempt::Decision(_) | Attempt::AliasTaken(_) => return Ok(None),
+                Attempt::Decision(_) => return Ok(None),
             }
         }
         Err(MailStoreError::Conflict)
@@ -1083,7 +1025,7 @@ impl MailStore for AwsServices {
             )?;
             drop_taken_aliases(&mut ops, &taken);
 
-            match self.attempt_transaction(TxnKind::MarkSent, &ops).await? {
+            match self.attempt_transaction(&ops).await? {
                 Attempt::Committed => return Ok(()),
                 Attempt::Decision(TxnDecision::Retry) => backoff(attempt).await,
                 Attempt::Decision(TxnDecision::VersionConflict) => {
@@ -1097,7 +1039,7 @@ impl MailStore for AwsServices {
                     }
                     backoff(attempt).await;
                 }
-                Attempt::AliasTaken(keys) => taken.extend(keys),
+                Attempt::Decision(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
                 Attempt::Decision(_) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "marking send {} was cancelled",
@@ -1163,7 +1105,7 @@ impl MailStore for AwsServices {
                 now,
             )?;
 
-            match self.attempt_transaction(TxnKind::Patch, &ops).await? {
+            match self.attempt_transaction(&ops).await? {
                 Attempt::Committed => return Ok(Some(new_labels)),
                 Attempt::Decision(TxnDecision::Retry | TxnDecision::VersionConflict) => {
                     backoff(attempt).await;
@@ -1172,9 +1114,8 @@ impl MailStore for AwsServices {
                     TxnDecision::Permanent
                     | TxnDecision::KeyExists
                     | TxnDecision::Duplicate
-                    | TxnDecision::AliasTaken,
-                )
-                | Attempt::AliasTaken(_) => {
+                    | TxnDecision::AliasTaken(_),
+                ) => {
                     return Err(MailStoreError::Permanent(anyhow!(
                         "label patch for message {message_id} was cancelled"
                     )));
