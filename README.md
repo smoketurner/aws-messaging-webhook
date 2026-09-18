@@ -175,7 +175,8 @@ S3, a `/v0` API reads and sends it, and mailbox events publish to the same bus. 
 default: no mail resources, and the function stays at a 10 s timeout and 256 MB.
 
 [README_MAILBOX.md](README_MAILBOX.md) has its parameters, post-deploy steps, API, sending
-contract, storage layout, runbook and events.
+contract, storage layout, runbook and events — including `pMailTrackingDomain`, which moves the
+open pixel and click links onto a subdomain of your own instead of SES's `awstrack.me`.
 
 ## EventBridge contract
 
