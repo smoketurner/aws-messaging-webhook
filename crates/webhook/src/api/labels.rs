@@ -44,41 +44,42 @@ pub struct UpdateRequest {
     remove_labels: Option<Labels>,
 }
 
-/// Normalizes and validates one side of the request.
+/// Normalizes and validates a list of caller-supplied labels.
 ///
 /// Labels are trimmed, lowercased and deduplicated so `Unread` and `unread`
 /// cannot both land on a message and so a removal matches what a list filter
-/// would match.
-fn clean(
-    labels_in: Option<Labels>,
+/// would match. Every problem is reported against `field`, and a label that
+/// has one is dropped rather than carried forward.
+///
+/// Shared with the send path, so a label the API accepts on a send is a
+/// label it accepts on a patch.
+pub(crate) fn normalize_labels(
+    labels_in: Vec<String>,
     field: &'static str,
     errors: &mut Vec<FieldError>,
 ) -> Vec<String> {
+    let problem = |message: String| FieldError {
+        path: field.to_owned(),
+        message,
+    };
     let mut cleaned: Vec<String> = Vec::new();
-    for label in labels_in.map(Labels::into_vec).unwrap_or_default() {
+    for label in labels_in {
         let label = label.trim().to_lowercase();
         if label.is_empty() {
-            errors.push(FieldError {
-                path: field.to_owned(),
-                message: "a label cannot be empty".to_owned(),
-            });
+            errors.push(problem("a label cannot be empty".to_owned()));
             continue;
         }
         if label.len() > LABEL_MAX_BYTES {
-            errors.push(FieldError {
-                path: field.to_owned(),
-                message: format!("`{label}` is longer than {LABEL_MAX_BYTES} bytes"),
-            });
+            errors.push(problem(format!(
+                "`{label}` is longer than {LABEL_MAX_BYTES} bytes"
+            )));
             continue;
         }
         if labels::is_reserved(&label) {
-            errors.push(FieldError {
-                path: field.to_owned(),
-                message: format!(
-                    "`{label}` is set by the service and cannot be changed; \
-                     only `unread`, `spam`, `trash` and your own labels can"
-                ),
-            });
+            errors.push(problem(format!(
+                "`{label}` is set by the service and cannot be changed; \
+                 only `unread`, `spam`, `trash` and your own labels can"
+            )));
             continue;
         }
         if !cleaned.contains(&label) {
@@ -89,10 +90,9 @@ fn clean(
     // result fits the message and thread caps is checked against what they
     // already hold.
     if cleaned.len() > MESSAGE_USER_LABEL_CAP {
-        errors.push(FieldError {
-            path: field.to_owned(),
-            message: format!("at most {MESSAGE_USER_LABEL_CAP} labels per request"),
-        });
+        errors.push(problem(format!(
+            "at most {MESSAGE_USER_LABEL_CAP} labels per request"
+        )));
     }
     cleaned.sort();
     cleaned
@@ -112,8 +112,19 @@ pub async fn update_labels<T: Services>(
     ApiJson(request): ApiJson<UpdateRequest>,
 ) -> Result<Json<wire::MessageLabels>, ApiError> {
     let mut errors = Vec::new();
-    let add = clean(request.add_labels, "add_labels", &mut errors);
-    let remove = clean(request.remove_labels, "remove_labels", &mut errors);
+    let add = normalize_labels(
+        request.add_labels.map(Labels::into_vec).unwrap_or_default(),
+        "add_labels",
+        &mut errors,
+    );
+    let remove = normalize_labels(
+        request
+            .remove_labels
+            .map(Labels::into_vec)
+            .unwrap_or_default(),
+        "remove_labels",
+        &mut errors,
+    );
 
     // Adding and removing the same label has no defensible outcome, so it is
     // rejected rather than silently resolved one way.
@@ -135,7 +146,7 @@ pub async fn update_labels<T: Services>(
         .services
         .update_labels(&InboxId(inbox_id), &message_id, &add, &remove, &now)
         .await
-        .map_err(crate::api::read::store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
 
     Ok(Json(wire::MessageLabels { message_id, labels }))
@@ -147,8 +158,8 @@ mod tests {
 
     fn clean_all(values: &[&str]) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
-        let labels = Labels::Many(values.iter().map(|v| (*v).to_owned()).collect());
-        let cleaned = clean(Some(labels), "add_labels", &mut errors);
+        let values: Vec<String> = values.iter().map(|v| (*v).to_owned()).collect();
+        let cleaned = normalize_labels(values, "add_labels", &mut errors);
         (
             cleaned,
             errors.into_iter().map(|error| error.message).collect(),
@@ -188,12 +199,10 @@ mod tests {
     #[test]
     fn a_single_label_and_a_list_of_one_are_the_same_request() {
         let mut errors = Vec::new();
-        let one = clean(Some(Labels::One("Urgent".to_owned())), "add", &mut errors);
-        let many = clean(
-            Some(Labels::Many(vec!["Urgent".to_owned()])),
-            "add",
-            &mut errors,
-        );
+        let one = Labels::One("Urgent".to_owned()).into_vec();
+        let many = Labels::Many(vec!["Urgent".to_owned()]).into_vec();
+        let one = normalize_labels(one, "add", &mut errors);
+        let many = normalize_labels(many, "add", &mut errors);
         assert_eq!(one, many);
         assert!(errors.is_empty());
     }
@@ -201,7 +210,9 @@ mod tests {
     #[test]
     fn an_absent_field_is_an_empty_list() {
         let mut errors = Vec::new();
-        assert!(clean(None, "add_labels", &mut errors).is_empty());
+        let absent: Option<Labels> = None;
+        let labels = absent.map(Labels::into_vec).unwrap_or_default();
+        assert!(normalize_labels(labels, "add_labels", &mut errors).is_empty());
         assert!(errors.is_empty());
     }
 
@@ -211,11 +222,22 @@ mod tests {
             serde_json::from_str(r#"{"add_labels":"read","remove_labels":["unread"]}"#).unwrap();
         let mut errors = Vec::new();
         assert_eq!(
-            clean(request.add_labels, "add_labels", &mut errors),
+            normalize_labels(
+                request.add_labels.map(Labels::into_vec).unwrap_or_default(),
+                "add_labels",
+                &mut errors
+            ),
             vec!["read"]
         );
         assert_eq!(
-            clean(request.remove_labels, "remove_labels", &mut errors),
+            normalize_labels(
+                request
+                    .remove_labels
+                    .map(Labels::into_vec)
+                    .unwrap_or_default(),
+                "remove_labels",
+                &mut errors
+            ),
             vec!["unread"]
         );
         assert!(errors.is_empty());

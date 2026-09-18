@@ -14,6 +14,8 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+use crate::mail::objects::ObjectError;
+use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 
 /// The standard error body. `code`, `fix` and `docs` are omitted rather than
@@ -101,7 +103,45 @@ impl ApiError {
             message: message.into(),
         }])
     }
+}
 
+/// Maps a store failure onto the API's retry contract: a label cap the
+/// request would exceed is a 400 the client must change, a throttled or
+/// unreachable table is a 502 the client may retry, and anything else is a
+/// 500 that does not leak the underlying error.
+impl From<MailStoreError> for ApiError {
+    fn from(error: MailStoreError) -> Self {
+        match error {
+            MailStoreError::NotFound => Self::NotFound,
+            MailStoreError::InvalidPageToken => {
+                Self::field("page_token", "not a valid token for this request")
+            }
+            MailStoreError::LabelLimit(message) => Self::field("labels", message),
+            MailStoreError::Transient(source) => Self::BadGateway(source),
+            MailStoreError::Conflict | MailStoreError::Permanent(_) => {
+                Self::Internal(anyhow::Error::new(error))
+            }
+        }
+    }
+}
+
+/// The same contract for the object store, where an object the caller asked
+/// for is missing rather than a row. A caller that reaches an object this
+/// service should have written itself maps `NotFound` on its own — that is
+/// an inconsistency, not a missing resource.
+impl From<ObjectError> for ApiError {
+    fn from(error: ObjectError) -> Self {
+        match error {
+            ObjectError::NotFound => Self::NotFound,
+            ObjectError::Transient(source) => Self::BadGateway(source),
+            ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
+                Self::Internal(anyhow::Error::new(error))
+            }
+        }
+    }
+}
+
+impl ApiError {
     #[must_use]
     pub fn status(&self) -> StatusCode {
         match self {
@@ -225,6 +265,55 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The 500 body hides the cause, so the log is the only place it
+    /// survives: the conversion must keep the underlying error as a source.
+    #[test]
+    fn a_permanent_store_failure_keeps_its_cause() {
+        let error = ApiError::from(MailStoreError::Permanent(anyhow::anyhow!(
+            "Query(ByTime): AccessDeniedException"
+        )));
+        let ApiError::Internal(source) = error else {
+            panic!("expected an internal error, got {error:?}");
+        };
+        assert!(
+            format!("{source:?}").contains("AccessDeniedException"),
+            "cause missing from {source:?}"
+        );
+    }
+
+    #[test]
+    fn a_permanent_object_failure_keeps_its_cause() {
+        let error = ApiError::from(ObjectError::Permanent(anyhow::anyhow!(
+            "GetObject: AccessDenied"
+        )));
+        let ApiError::Internal(source) = error else {
+            panic!("expected an internal error, got {error:?}");
+        };
+        assert!(
+            format!("{source:?}").contains("AccessDenied"),
+            "cause missing from {source:?}"
+        );
+    }
+
+    /// The two stores agree on what each failure means to a caller: a
+    /// missing row and a missing object are both 404s, and either store
+    /// being unreachable is a 502 the caller may retry.
+    #[test]
+    fn both_stores_map_onto_the_same_contract() {
+        assert_eq!(
+            ApiError::from(MailStoreError::NotFound).status(),
+            ApiError::from(ObjectError::NotFound).status()
+        );
+        assert_eq!(
+            ApiError::from(MailStoreError::Transient(anyhow::anyhow!("throttled"))).status(),
+            ApiError::from(ObjectError::Transient(anyhow::anyhow!("throttled"))).status()
+        );
+        assert_eq!(
+            ApiError::from(MailStoreError::NotFound).status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

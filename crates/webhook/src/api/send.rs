@@ -31,7 +31,6 @@ use sha2::{Digest as _, Sha256};
 use crate::api::error::{ApiError, FieldError};
 use crate::api::json::ApiJson;
 use crate::mail::labels::SystemLabel;
-use crate::mail::objects::ObjectError;
 use crate::mail::send::{
     self as send_mod, Envelope, SendKey, SendSpec, SendState, SendStatus, SpecAttachment,
 };
@@ -39,9 +38,9 @@ use crate::mail::store::EnqueueOutcome;
 use crate::mail::url_policy::{self, AttachmentUrl};
 use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, AttachmentMeta, Direction,
-    HEADER_NAME_MAX, HEADER_VALUE_MAX, HEADERS_BUDGET, InboxId, LABEL_MAX_BYTES,
-    MAX_OUTBOUND_DECODED_BYTES, MESSAGE_USER_LABEL_CAP, MailMessage, OUTBOUND_RECIPIENTS_MAX,
-    PREVIEW_CHARS, REFERENCES_MAX, SUBJECT_MAX_BYTES, content, ids, keys, labels, time,
+    HEADER_NAME_MAX, HEADER_VALUE_MAX, HEADERS_BUDGET, InboxId, MAX_OUTBOUND_DECODED_BYTES,
+    MailMessage, OUTBOUND_RECIPIENTS_MAX, PREVIEW_CHARS, REFERENCES_MAX, SUBJECT_MAX_BYTES,
+    content, ids, keys, time,
 };
 use crate::state::{AppState, Services};
 
@@ -224,7 +223,11 @@ pub fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> {
         errors.push(field("text", "at least one of text or html is required"));
     }
 
-    let labels = user_labels(request.labels, &mut errors);
+    let labels = crate::api::labels::normalize_labels(
+        request.labels.unwrap_or_default(),
+        "labels",
+        &mut errors,
+    );
     let headers = headers(request.headers, &mut errors);
     let attachments = attachments(request.attachments, &mut errors);
 
@@ -295,42 +298,6 @@ fn addresses(
             out.push(address);
         }
     }
-    out
-}
-
-fn user_labels(input: Option<Vec<String>>, errors: &mut Vec<FieldError>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for label in input.unwrap_or_default() {
-        let label = label.trim().to_lowercase();
-        if label.is_empty() {
-            errors.push(field("labels", "a label cannot be empty"));
-            continue;
-        }
-        if label.len() > LABEL_MAX_BYTES {
-            errors.push(field(
-                "labels",
-                format!("`{label}` is longer than {LABEL_MAX_BYTES} bytes"),
-            ));
-            continue;
-        }
-        if labels::is_reserved(&label) {
-            errors.push(field(
-                "labels",
-                format!("`{label}` is set by the service and cannot be applied"),
-            ));
-            continue;
-        }
-        if !out.contains(&label) {
-            out.push(label);
-        }
-    }
-    if out.len() > MESSAGE_USER_LABEL_CAP {
-        errors.push(field(
-            "labels",
-            format!("at most {MESSAGE_USER_LABEL_CAP} labels"),
-        ));
-    }
-    out.sort();
     out
 }
 
@@ -630,7 +597,7 @@ async fn enqueue<T: Services>(
         .services
         .get_inbox(&inbox)
         .await
-        .map_err(crate::api::read::store_failure)?
+        .map_err(ApiError::from)?
         .is_none()
     {
         return Err(ApiError::NotFound);
@@ -674,7 +641,7 @@ async fn enqueue<T: Services>(
     };
     content::store(&state.services, &inbox, &message_id, &message_content)
         .await
-        .map_err(object_failure)?;
+        .map_err(ApiError::from)?;
 
     let state_item = SendState::queued(
         inbox.clone(),
@@ -729,7 +696,7 @@ async fn enqueue<T: Services>(
         }
         Err(error) => {
             discard_uploads(&state.services, &inbox, &spec).await;
-            Err(crate::api::read::store_failure(error))
+            Err(ApiError::from(error))
         }
     }
 }
@@ -746,7 +713,7 @@ async fn replay_key<T: Services>(
         .services
         .get_send_key(key_hash)
         .await
-        .map_err(crate::api::read::store_failure)?
+        .map_err(ApiError::from)?
     else {
         return Ok(None);
     };
@@ -828,11 +795,14 @@ pub async fn reply<T: Services>(
         .services
         .get_message(&inbox, &message_id)
         .await
-        .map_err(crate::api::read::store_failure)?
+        .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
+    // A missing content document is not an error here: `content::load` logs
+    // it and returns empty content, so a reply to a message whose body is
+    // gone still goes out, without the original's references or reply-to.
     let original_content = content::load(&state.services, &original)
         .await
-        .map_err(object_failure)?;
+        .map_err(ApiError::from)?;
 
     let mut send = request.send;
     // Recipients default to whoever should receive a reply to the original,
@@ -1073,7 +1043,7 @@ async fn upload_spec<T: Services>(
                 &spec_attachment.content_type,
             )
             .await
-            .map_err(object_failure)?;
+            .map_err(ApiError::from)?;
     }
 
     let body = serde_json::to_vec(spec)
@@ -1085,7 +1055,7 @@ async fn upload_spec<T: Services>(
             "application/json",
         )
         .await
-        .map_err(object_failure)?;
+        .map_err(ApiError::from)?;
     Ok(())
 }
 
@@ -1153,15 +1123,6 @@ fn preview_of(send: &ValidatedSend) -> String {
         .chars()
         .take(PREVIEW_CHARS)
         .collect()
-}
-
-fn object_failure(error: ObjectError) -> ApiError {
-    match error {
-        ObjectError::Transient(source) => ApiError::BadGateway(source),
-        ObjectError::NotFound | ObjectError::TooLarge { .. } | ObjectError::Permanent(_) => {
-            ApiError::Internal(anyhow::Error::new(error))
-        }
-    }
 }
 
 #[cfg(test)]
