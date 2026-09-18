@@ -24,8 +24,10 @@
 //! message item; every other mail-table `sk` — `STATE`, `META`, `THR#…`,
 //! `MSGAT#…`, `THRAT#…`, `RFC`, `SESMSG#…`, `SENDKEY#…`, `SESCALL#…` — never
 //! publishes). A message item's INSERT publishes the arrival of received
-//! mail and its MODIFYs publish the system labels each write added, so a
-//! send and every SES delivery event reach the bus as they happen. A `MSG#`
+//! mail and the sender's `queued` → `sent` relabel publishes the send. The
+//! delivery, bounce, complaint, reject and open events of a sent message
+//! publish from the events-table branch instead, one per SES event, since
+//! only the SES event carries their details. A `MSG#`
 //! image deserializes straight into [`crate::mail::MailMessage`] via
 //! `serde_dynamo::from_item`, never by hand-parsing the attribute JSON, so
 //! [`crate::mail::events`] works from the same struct the store reads and
@@ -39,10 +41,14 @@ use sns_message_verifier::SnsEnvelope;
 
 use crate::mail::MailMessage;
 use crate::mail::content;
-use crate::mail::events::{MailEvent, build_label_events, build_received_event};
+use crate::mail::events::{
+    MailEvent, build_received_event, build_sent_event, build_ses_event, ses_event_type,
+};
 use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
+use crate::mail::store::MailStoreError;
 use crate::metrics::names;
+use crate::model::ses_notification::SesNotification;
 use crate::model::{DomainEvent, Source};
 use crate::publish::{OutboundEvent, SCHEMA_VERSION, build_outbound};
 use crate::state::{AppState, Services};
@@ -141,11 +147,11 @@ pub async fn handle_stream<T: Services>(
             publish_status_changed(state, new_image, &record.change.old_image).await
         } else if sk.starts_with("MSG#") {
             // Mail-table message item: an INSERT publishes the arrival of
-            // received mail, a MODIFY the system labels it just gained.
+            // received mail, a MODIFY the send when it is the sent relabel.
             if record.event_name == "INSERT" {
                 publish_mail_record(state, new_image).await
             } else {
-                publish_mail_labels(state, new_image, &record.change.old_image).await
+                publish_mail_sent(state, new_image, &record.change.old_image).await
             }
         } else {
             // Every other mail-table item (STATE, META, THR#…, MSGAT#…,
@@ -217,6 +223,35 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
         aggregate_expires_at: 0,
     };
 
+    // Resolved before anything publishes, so a transient lookup failure
+    // retries the record without having published half of it.
+    let mailbox_event = match &event {
+        DomainEvent::Ses { event: ses, .. } => {
+            match mailbox_ses_event(state, ses, &envelope).await {
+                Ok(mailbox_event) => mailbox_event,
+                Err(MailStoreError::Transient(error)) => {
+                    tracing::error!(
+                        ?error,
+                        sns_message_id = record.sns_message_id,
+                        event = "publish_failure",
+                        "failed to resolve the SES event's mailbox message; will retry"
+                    );
+                    return RelayOutcome::Retry;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        sns_message_id = record.sns_message_id,
+                        event = "stream_bad_mail_lookup",
+                        "could not resolve the SES event's mailbox message; publishing without it"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let outbound = build_outbound(&record, &event, &state.config.event_source);
     match state.services.publish(&outbound).await {
         Ok(()) => {
@@ -228,7 +263,6 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
                 outcome = "published",
                 "event published to EventBridge"
             );
-            RelayOutcome::Settled
         }
         Err(error) => {
             metrics::counter!(names::PUBLISH_FAILURES).increment(1);
@@ -238,9 +272,42 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
                 event = "publish_failure",
                 "failed to publish to EventBridge; will retry"
             );
-            RelayOutcome::Retry
+            return RelayOutcome::Retry;
         }
     }
+
+    match mailbox_event {
+        Some((msg, mailbox_event)) => publish_mail_events(state, &msg, vec![mailbox_event]).await,
+        None => RelayOutcome::Settled,
+    }
+}
+
+/// The mailbox lifecycle event an SES event publishes, with the message it
+/// belongs to, when it is for mail this mailbox sent. Most events on a
+/// shared configuration set are for other senders, so an unresolved id is
+/// `None`, not an error.
+async fn mailbox_ses_event<T: Services>(
+    state: &AppState<T>,
+    ses: &SesNotification,
+    envelope: &SnsEnvelope,
+) -> Result<Option<(MailMessage, MailEvent)>, MailStoreError> {
+    if state.config.mail.is_none() || ses_event_type(&ses.kind).is_none() {
+        return Ok(None);
+    }
+    let Some((inbox, message_id)) = state
+        .services
+        .resolve_ses_message(&ses.mail.message_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(msg) = state.services.get_message(&inbox, &message_id).await? else {
+        return Ok(None);
+    };
+    Ok(
+        build_ses_event(ses, &msg, &envelope.message_id, &envelope.timestamp)
+            .map(|mailbox_event| (msg, mailbox_event)),
+    )
 }
 
 /// Publishes the `message.received*` event for one `MSG#` mail-table INSERT
@@ -299,13 +366,11 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
     publish_mail_events(state, &msg, vec![event]).await
 }
 
-/// Publishes the `message.<label>` events for one `MSG#` MODIFY: the system
-/// labels the write added (the sender's `queued` → `sent` relabel, and the
-/// `delivered`/`bounced`/`complained`/`rejected`/`opened` labels SES events
-/// apply). A write that adds no such label — a user's own label, a read
-/// receipt, a promotion repoint, a metadata write — publishes nothing.
-/// Same retry contract as [`publish_mail_record`].
-async fn publish_mail_labels<T: Services>(
+/// Publishes the `message.sent` event for one `MSG#` MODIFY that is the
+/// sender's `queued` → `sent` relabel. Any other write — a delivery label, a
+/// user's own label, a read receipt, a promotion repoint, a metadata write —
+/// publishes nothing. Same retry contract as [`publish_mail_record`].
+async fn publish_mail_sent<T: Services>(
     state: &AppState<T>,
     new_image: &Item,
     old_image: &Item,
@@ -323,16 +388,15 @@ async fn publish_mail_labels<T: Services>(
     };
 
     // An old image without readable labels (a stream configured for new
-    // images only) would make every label look new, so it publishes nothing
-    // rather than re-announcing a message's whole label set on each write.
+    // images only) would make `sent` look new on every later write, so it
+    // publishes nothing rather than re-announcing the send each time.
     let Some(old_labels) = image_strings(old_image, "labels") else {
         return RelayOutcome::Settled;
     };
-    let events = build_label_events(&msg, &old_labels, &state.config.event_source);
-    if events.is_empty() {
+    let Some(event) = build_sent_event(&msg, &old_labels) else {
         return RelayOutcome::Settled;
-    }
-    publish_mail_events(state, &msg, events).await
+    };
+    publish_mail_events(state, &msg, vec![event]).await
 }
 
 /// Publishes already-built mail events, one `PutEvents` call each.

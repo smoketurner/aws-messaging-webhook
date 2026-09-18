@@ -5,6 +5,9 @@
 # Environment
 .env
 
+# Local SAM deploy settings: account, stack and domain specific
+samconfig.toml
+
 # Mutation testing
 mutants.out/
 mutants.out.old/
@@ -24,6 +27,5 @@ lcov.info
 *.profraw
 *.profdata
 
-# Codegraph
-.codegraph/
 .local/
+*.bak

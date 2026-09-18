@@ -56,6 +56,8 @@ sam deploy --parameter-overrides \
 | `pApiKeysParameterName` | *(empty)* | Name of the SecureString SSM parameter holding the API key hashes. Required when `pMailDomain` is set. Must start with `/`, and not with `/aws` or `/ssm`, which SSM reserves |
 | `pApiKeysKmsKeyArn` | *(empty)* | Customer-managed KMS key that encrypts that parameter; empty means `aws/ssm` |
 | `pAttachmentUrlTtlSeconds` | `900` | Lifetime of presigned download URLs, 60–3600 |
+| `pMailWebhookUrl` | *(empty)* | HTTPS endpoint that receives the mailbox events as webhook POSTs. Empty creates no delivery. Needs `pMailWebhookSecret`. See [Delivering to a webhook](#delivering-to-a-webhook) |
+| `pMailWebhookSecret` | *(empty)* | `NoEcho`. Value sent in the `x-webhook-secret` header. Pass it from its SecureString parameter at deploy time and keep it out of `samconfig.toml` |
 
 ## After the first deploy
 
@@ -447,21 +449,79 @@ live in the mail bucket; `raw_s3_key` and each attachment's `object_key` point a
 
 ## Mailbox events
 
-A mailbox stack publishes mailbox detail-types from the mail table's stream, on the same bus,
-`source` and `schemaVersion` contract.
+A mailbox stack publishes mailbox events on the same bus and `source` as the SMS and SES events.
+Each event's detail-type is its `event_type`, and its detail is the reference mailbox API's
+webhook payload exactly: `type` (always `"event"`), `event_type`, `event_id` and one
+event-specific object. To have the stack deliver them to an HTTP endpoint, see [Delivering to a webhook](#delivering-to-a-webhook).
 
-`message.received`, `message.received.spam` (spam or virus verdict `FAIL`) or
-`message.received.unauthenticated` (SPF/DKIM/DMARC `FAIL`, spam and virus clean) fires once per
-inbox a new message lands in. Spam beats unauthenticated beats plain. Nothing is dropped, only
-classified.
+| Event | Fires | Object |
+|---|---|---|
+| `message.received`, `.spam`, `.unauthenticated` | once per inbox a new message lands in | `message`, `thread` |
+| `message.sent` | the sender relabels a queued message `sent` | `send` |
+| `message.delivered` | an SES `Delivery` event for a sent message | `delivery` |
+| `message.bounced` | an SES `Bounce` event for a sent message | `bounce` |
+| `message.complained` | an SES `Complaint` event for a sent message | `complaint` |
+| `message.rejected` | an SES `Reject` event for a sent message | `reject` |
+| `message.opened` | an SES `Open` event for a sent message | `open` |
+
+`tests/fixtures/mailbox-events/schemas.json` holds the published schema for each of these, and
+`tests/mailbox_event_schemas.rs` checks every event the relay builds against it. The check
+rejects any field the schema doesn't define.
+
+### Delivering to a webhook
+
+Set `pMailWebhookUrl` and the stack delivers every event in the table above to it through an
+EventBridge API destination. Each event arrives as a `POST` whose body is the event's detail,
+exactly the payload shown below.
+
+Keep the secret in a SecureString SSM parameter, next to the API keys:
+
+```bash
+aws ssm put-parameter --name /messaging-webhook/dev/mail-webhook-secret --type SecureString \
+  --value "$(openssl rand -hex 32)"
+```
+
+The deploy reads the parameter and passes the value as the `NoEcho` parameter
+`pMailWebhookSecret`, which CloudFormation masks in its console and API output:
+
+```bash
+sam deploy --parameter-overrides \
+  pMailWebhookUrl=https://… \
+  pMailWebhookSecret="$(aws ssm get-parameter --name /messaging-webhook/dev/mail-webhook-secret \
+    --with-decryption --query Parameter.Value --output text)"
+```
+
+`--parameter-overrides` on the command line replaces the list in `samconfig.toml`. On an existing
+stack that's harmless: SAM sends every parameter you don't pass as "use the previous value", so
+the rest of the stack's settings, and later the secret itself, carry over. `pMailWebhookUrl` can
+live in `samconfig.toml`. The secret must not.
+
+Every request carries these headers:
+
+- `x-webhook-secret`: the secret's value. The receiver authenticates each request by comparing
+  this header in constant time.
+- `webhook-id`: the event's `event_id`. It stays the same across retries and redeliveries, so
+  the receiver deduplicates on it.
+
+The receiver has 5 seconds to answer, so it should acknowledge first and do the work after.
+EventBridge retries `401`, `407`, `409`, `429`, `5xx` and timeouts for up to 24 hours and 185
+attempts. It doesn't retry any other `4xx`. An event that runs out of retries, or gets a `4xx`
+that isn't retried, is dropped. A wrong secret should therefore
+get a `401`, which is retried, rather than a `403`, which drops the event. Delivery is at least
+once and unordered.
+
+To rotate the secret, overwrite the SSM parameter (`put-parameter --overwrite`) and run the same
+deploy again. The changed parameter value updates the connection. During the switch-over, have the receiver accept both the old and the new value.
+
+### Received mail
+
+`message.received.spam` means the spam or virus verdict was `FAIL`. `message.received.unauthenticated`
+means SPF, DKIM or DMARC was `FAIL` while spam and virus were clean. Spam beats unauthenticated,
+which beats plain. Nothing is dropped, only classified.
 
 ```json
 {
-  "schemaVersion": 1,
-  "meta": {
-    "messageId": "…", "inboxId": "…", "threadId": "…", "sesMessageId": "…"
-  },
-  "type": "message.received",
+  "type": "event",
   "event_type": "message.received",
   "event_id": "evt_…",
   "message": {
@@ -473,33 +533,67 @@ classified.
     "attachments": [{ "attachment_id": "…", "size": 1234, "filename": "…", "content_type": "…", "content_disposition": "attachment" }],
     "in_reply_to": "…", "references": ["…"], "headers": { "X-…": "…" }
   },
-  "thread": { "thread_id": "…", "subject": "…", "message_count": 1, "recipients": ["…"] }
+  "thread": {
+    "inbox_id": "…", "thread_id": "…", "labels": ["received", "unread"],
+    "timestamp": "…", "received_timestamp": "…",
+    "senders": ["…"], "recipients": ["…"], "subject": "…", "preview": "…",
+    "last_message_id": "…", "message_count": 1, "size": 1234,
+    "created_at": "…", "updated_at": "…"
+  }
 }
 ```
 
-`message` is the `Message` object the `/v0` read API returns. `thread` is the snapshot taken as
-this message arrived — `thread_id`, `subject`, `message_count`, `recipients` — not a fresh
-fetch, so a consumer wanting current thread state re-reads it. An oversized detail reduces the
-way the SMS/SES details do: `message.html`, `.text` and `.headers` first, then `thread` to
-`{thread_id}`, then `message` to `{payloadOmitted, ids}`. `meta` never drops.
+`message` is the `Message` object the `/v0` read API returns. `thread` is the thread as it stood
+when this message arrived, including this message, not a fresh fetch. A consumer that needs the
+current thread state re-reads it. `senders` and `recipients` hold at most 20 addresses, and
+`attachments` at most 20.
 
-`message.sent` fires when the sender relabels a queued message `sent`. `message.delivered`,
-`message.bounced`, `message.complained`, `message.rejected` and `message.opened` fire when an
-SES event adds that label.
+An event over EventBridge's 256 KB entry limit drops `message.html`, then `message.text`, then
+`message.headers`, stopping as soon as it fits. If it still doesn't fit, `message` and `thread`
+are cut down to their required fields, which always fits because the field caps bound them.
 
-Each carries the same `schemaVersion`, `meta`, `type`, `event_type` and `event_id`. `message` is
-in its list form: identifiers, labels, addresses, subject and preview, no body. The consumer has
-the body from the message's own event or the read API.
+### Sent mail
 
-Delivery labels are added, never removed, so a message that bounced and was opened publishes
-both. A label arriving twice — an SES event redelivered, a stream record replayed — rebuilds the
-same `event_id`, which is what a consumer deduplicates on.
+```json
+{
+  "type": "event",
+  "event_type": "message.bounced",
+  "event_id": "evt_…",
+  "bounce": {
+    "inbox_id": "…", "thread_id": "…", "message_id": "…", "timestamp": "…",
+    "type": "Permanent", "sub_type": "General",
+    "recipients": [{ "address": "…", "status": "5.1.1" }]
+  }
+}
+```
 
-The mail stream publishes nothing for:
+Every object carries `inbox_id`, `thread_id`, `message_id` and `timestamp`. The rest comes from
+the send or the SES event:
 
-- an unrecognized payload;
-- a write to anything but a message item — send state, markers, keys, RFC aliases, thread
+- `send.recipients`: the message's `to`, `cc` and `bcc` addresses. `timestamp` is `sent_at`.
+- `delivery.recipients`: SES's delivered recipients.
+- `bounce`: `type` and `sub_type` are SES's `bounceType` and `bounceSubType`, and each
+  recipient's `status` is its DSN status code. The code is empty when no MTA reported one.
+- `complaint`: `type` and `sub_type` are SES's `complaintFeedbackType` and `complaintSubType`,
+  or empty when absent. `recipients` are the complained addresses.
+- `reject.reason`: SES's reject reason. An SES reject carries no time of its own, so
+  `timestamp` is when SNS published the notification.
+- `open`: identifiers and the open's `timestamp` only.
+
+The SES-driven events come from the events-table relay, one per SES event. The relay resolves the
+SES message id to a mailbox message and skips events for mail this service didn't send, which is
+most events on a shared configuration set. A message bounced for two recipients in separate
+notifications publishes two `message.bounced` events, and every open publishes a
+`message.opened`. The mailbox labels (`delivered`, `bounced`, …) are still added once each and
+never removed.
+
+`event_id` is deterministic, so a redelivered SNS notification or a replayed stream record
+rebuilds the same id. Consumers deduplicate on it.
+
+The mailbox publishes nothing for:
+
+- an SES `Send`, `Click`, `DeliveryDelay`, `Rendering Failure` or `Subscription` event;
+- a write to anything but a message item: send state, markers, keys, RFC aliases, thread
   housekeeping;
-- a message write adding no system label, such as a read receipt, your own label or a metadata
-  write.
-
+- a message write other than the `sent` relabel, such as a delivery label, a read receipt, your
+  own label or a metadata write.

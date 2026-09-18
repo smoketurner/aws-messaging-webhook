@@ -310,19 +310,28 @@ counted and left alone.
 ## Events
 
 The mail table's stream is a second source for the existing relay, which remains the sole
-publisher. `detail-type` is the event type, and the `event_type`/`event_id`/`message` triple is
-the reference API's webhook payload, so a consumer wanting an HTTP webhook uses an EventBridge
-API destination selecting `$.detail` — no code — plus an additive `schemaVersion`/`meta` block.
+publisher. `detail-type` is the event type, and the detail is the reference API's webhook
+payload exactly: `type`, `event_type`, `event_id` and one event-specific object, with nothing
+added. A consumer that wants an HTTP webhook uses an EventBridge API destination selecting
+`$.detail`, with no code. `tests/mailbox_event_schemas.rs` checks every event against the
+reference API's published schemas.
 
-| Event | Emitted when |
-|---|---|
-| `message.received` / `.spam` / `.unauthenticated` | A message INSERT labelled `received` |
-| `message.sent` | The sender relabels a message `queued` → `sent` |
-| `message.delivered`, `.bounced`, `.complained`, `.rejected`, `.opened` | An SES event resolves to a mailbox message and adds its label |
+| Event | Emitted when | Object |
+|---|---|---|
+| `message.received` / `.spam` / `.unauthenticated` | A message INSERT labelled `received` | `message`, `thread` |
+| `message.sent` | The sender relabels a message `queued` → `sent` | `send` |
+| `message.delivered`, `.bounced`, `.complained`, `.rejected`, `.opened` | An SES event resolves to a mailbox message | `delivery`, `bounce`, `complaint`, `reject`, `open` |
 
-The received event carries the message with its body and its thread snapshot. The rest are
-label transitions on a message the consumer has already seen, so they carry the list view —
-identifiers, labels, addresses, subject and preview — and no body.
+The received event carries the message with its body, and the thread as it stood when the
+message arrived. That thread is stored on the message item at ingest, so the relay never reads
+the thread item.
+
+The five SES-driven events are built in the events-table relay from the SES event itself, one per
+event. The label an SES event adds says only that it happened, and only the first time.
+Recipients, bounce and complaint types, and the reject reason are in the SES event alone, and
+SES reports each recipient batch and each open separately. The relay resolves the SES message id
+through the `SESMSG#` reference before publishing anything, so a transient lookup failure
+retries the record instead of publishing half of it.
 
 Delivery labels are **added, never removed**. These events arrive out of order under
 at-least-once delivery, so a message that both bounced and was opened should say both rather
@@ -332,9 +341,10 @@ shared configuration set are for mail this service did not send.
 A client's own label edits through `PATCH` change the item but publish nothing — the reference
 API has no event for them.
 
-The 256 KB `PutEvents` cap is handled the way the existing pipeline handles inbound content:
-drop `html`, then `text`, then fall back to a payload-omitted marker with `meta` intact. The API
-is the fetch path.
+The 256 KB `PutEvents` cap is handled by dropping `html`, then `text`, then `headers`, and
+finally cutting `message` and `thread` down to their required fields. The field caps keep those
+well under the limit, so an oversized event is still a valid payload. The API is the fetch path
+for anything dropped.
 
 ## Observability
 

@@ -37,10 +37,21 @@ pub enum Injected {
     Throttle,
 }
 
+/// A scripted failure [`MailMemoryStore::fail_next_resolve`] queues for the
+/// next `resolve_ses_message` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFailure {
+    /// Maps to [`MailStoreError::Transient`]: worth a retry.
+    Transient,
+    /// Maps to [`MailStoreError::Permanent`]: a retry would fail the same way.
+    Permanent,
+}
+
 #[derive(Default)]
 struct Inner {
     items: HashMap<(String, String), Item>,
     injected: VecDeque<Injected>,
+    resolve_failure: Option<ReadFailure>,
 }
 
 #[derive(Default)]
@@ -95,6 +106,16 @@ impl MailMemoryStore {
             reason = "test double: a poisoned lock is a test bug"
         )]
         self.inner.lock().unwrap().injected.push_back(failure);
+    }
+
+    /// Fails the next `resolve_ses_message` call only.
+    pub fn fail_next_resolve(&self, failure: ReadFailure) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: a poisoned lock is a test bug"
+        )]
+        let mut inner = self.inner.lock().unwrap();
+        inner.resolve_failure = Some(failure);
     }
 
     fn key(pk: &str, sk: &str) -> (String, String) {
@@ -519,6 +540,24 @@ impl MailStore for MailMemoryStore {
         ses_message_id: &str,
     ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send {
         use aws_messaging_webhook::mail::keys;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: a poisoned lock is a test bug"
+        )]
+        let failure = self.inner.lock().unwrap().resolve_failure.take();
+        match failure {
+            Some(ReadFailure::Transient) => {
+                return std::future::ready(Err(MailStoreError::Transient(anyhow::anyhow!(
+                    "injected transient read failure"
+                ))));
+            }
+            Some(ReadFailure::Permanent) => {
+                return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
+                    "injected permanent read failure"
+                ))));
+            }
+            None => {}
+        }
         let resolved = self
             .get_item(&keys::ses_ref_pk(ses_message_id), keys::ses_ref_sk())
             .and_then(|item| {

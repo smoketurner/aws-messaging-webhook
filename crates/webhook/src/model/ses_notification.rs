@@ -17,6 +17,10 @@ pub struct SesNotification {
     pub bounce: Option<SesBounce>,
     #[serde(default)]
     pub complaint: Option<SesComplaint>,
+    #[serde(default)]
+    pub delivery: Option<SesDelivery>,
+    #[serde(default)]
+    pub reject: Option<SesReject>,
     /// Present only on `Open` events. Typed solely for its `isBotEvent`
     /// signal; the full object is still forwarded verbatim.
     #[serde(default)]
@@ -73,7 +77,11 @@ pub struct SesBounce {
     /// reserves the right to add values).
     pub bounce_type: String,
     #[serde(default)]
+    pub bounce_sub_type: Option<String>,
+    #[serde(default)]
     pub bounced_recipients: Vec<SesRecipient>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 impl SesBounce {
@@ -89,17 +97,47 @@ impl SesBounce {
 pub struct SesComplaint {
     #[serde(default)]
     pub complained_recipients: Vec<SesRecipient>,
+    /// The feedback report's type (`abuse`, `fraud`, …); absent when the
+    /// report carried none.
+    #[serde(default)]
+    pub complaint_feedback_type: Option<String>,
+    /// `OnAccountSuppressionList` when SES itself generated the complaint,
+    /// otherwise null.
+    #[serde(default)]
+    pub complaint_sub_type: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SesRecipient {
     pub email_address: String,
+    /// The DSN status code (e.g. `5.1.1`), present on a bounced recipient
+    /// when an MTA reported one.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
-/// The `open` / `click` engagement object. Only `isBotEvent` is typed — it is
-/// the one field the aggregate acts on; the rest of the object is forwarded
-/// verbatim.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SesDelivery {
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SesReject {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The `open` / `click` engagement object. `isBotEvent` is what the
+/// aggregate acts on and `timestamp` what a mailbox `message.opened` event
+/// reports; the rest of the object is forwarded verbatim.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SesEngagement {
@@ -109,6 +147,8 @@ pub struct SesEngagement {
     /// predate the feature.
     #[serde(default)]
     pub is_bot_event: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 impl SesEngagement {
@@ -168,9 +208,18 @@ mod tests {
         assert_eq!(event.mail.message_id, "EXAMPLE7c191be45");
         let bounce = event.bounce.unwrap();
         assert!(bounce.is_permanent());
+        assert_eq!(bounce.bounce_sub_type.as_deref(), Some("General"));
+        assert_eq!(
+            bounce.timestamp.as_deref(),
+            Some("2017-08-05T00:41:02.669Z")
+        );
         assert_eq!(
             bounce.bounced_recipients[0].email_address,
             "recipient@example.com"
+        );
+        assert_eq!(
+            bounce.bounced_recipients[0].status.as_deref(),
+            Some("5.1.1")
         );
     }
 
@@ -195,6 +244,48 @@ mod tests {
         assert_eq!(
             complaint.complained_recipients[0].email_address,
             "recipient1@example.com"
+        );
+        assert_eq!(complaint.complaint_feedback_type.as_deref(), Some("abuse"));
+        assert_eq!(complaint.complaint_sub_type, None);
+        assert_eq!(
+            complaint.timestamp.as_deref(),
+            Some("2012-05-25T14:59:38.623Z")
+        );
+    }
+
+    #[test]
+    fn parses_delivery_reject_and_open_details() {
+        let delivery: SesNotification = serde_json::from_str(
+            r#"{"eventType":"Delivery","mail":{"messageId":"m"},
+                "delivery":{"timestamp":"2016-10-19T23:21:04.133Z",
+                            "recipients":["recipient@example.com"],
+                            "smtpResponse":"250 2.6.0 Message received"}}"#,
+        )
+        .unwrap();
+        let delivery = delivery.delivery.unwrap();
+        assert_eq!(
+            delivery.timestamp.as_deref(),
+            Some("2016-10-19T23:21:04.133Z")
+        );
+        assert_eq!(delivery.recipients, vec!["recipient@example.com"]);
+
+        let reject: SesNotification = serde_json::from_str(
+            r#"{"eventType":"Reject","mail":{"messageId":"m"},"reject":{"reason":"Bad content"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reject.reject.unwrap().reason.as_deref(),
+            Some("Bad content")
+        );
+
+        let open: SesNotification = serde_json::from_str(
+            r#"{"eventType":"Open","mail":{"messageId":"m"},
+                "open":{"timestamp":"2017-08-09T22:00:19.652Z","ipAddress":"192.0.2.1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            open.open.unwrap().timestamp.as_deref(),
+            Some("2017-08-09T22:00:19.652Z")
         );
     }
 

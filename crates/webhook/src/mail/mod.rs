@@ -162,6 +162,17 @@ pub struct ThreadSnapshot {
     pub timestamp: String,
     pub created_at: String,
     pub updated_at: String,
+    // Defaulted so a snapshot stored before these fields existed still reads.
+    #[serde(default)]
+    pub last_message_id: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentMeta>,
 }
 
 /// The `Message` item: what lists, threads, labels and send status read and

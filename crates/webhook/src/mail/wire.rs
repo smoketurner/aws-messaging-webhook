@@ -60,7 +60,8 @@ pub struct Message {
     pub labels: Vec<String>,
     pub timestamp: String,
     pub from: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized, even empty: the contract makes `to` required.
+    #[serde(default)]
     pub to: Vec<String>,
     pub size: u64,
     pub updated_at: String,
@@ -261,6 +262,10 @@ pub struct ThreadItem {
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub received_timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
@@ -282,6 +287,8 @@ impl From<&crate::mail::thread::ThreadState> for ThreadItem {
             size: thread.size,
             created_at: thread.created_at.clone(),
             updated_at: thread.updated_at.clone(),
+            received_timestamp: thread.received_timestamp.clone(),
+            sent_timestamp: thread.sent_timestamp.clone(),
             subject: (!thread.subject.is_empty()).then(|| thread.subject.clone()),
             preview: (!thread.preview.is_empty()).then(|| thread.preview.clone()),
             attachments: thread.attachments.iter().map(Attachment::from).collect(),
