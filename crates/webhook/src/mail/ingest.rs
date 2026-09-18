@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::actions::ActionError;
 use crate::config::MailConfig;
+use crate::mail::labels::SystemLabel;
 use crate::mail::mime::{ParseError, ParsedAttachment, parse_inbound};
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
@@ -560,24 +561,17 @@ async fn insert_into_inbox<T: Services>(
         .map_err(map_store_error)
 }
 
-/// The labels an inbound message carries, sorted (matching `plan_insert`'s
-/// sorted-labels invariant).
+/// The labels an inbound message carries: `received` and `unread`, plus
+/// whatever the verdict adds, sorted (matching `plan_insert`'s sorted-labels
+/// invariant).
 fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<String> {
-    match verdict {
-        labels::InboundVerdict::Spam => {
-            vec![
-                "received".to_owned(),
-                "spam".to_owned(),
-                "unread".to_owned(),
-            ]
-        }
-        labels::InboundVerdict::Unauthenticated => vec![
-            "received".to_owned(),
-            "unauthenticated".to_owned(),
-            "unread".to_owned(),
-        ],
-        labels::InboundVerdict::Clean => vec!["received".to_owned(), "unread".to_owned()],
-    }
+    let mut labels: Vec<String> = [SystemLabel::Received, SystemLabel::Unread]
+        .into_iter()
+        .chain(verdict.label())
+        .map(SystemLabel::to_label)
+        .collect();
+    labels.sort_unstable();
+    labels
 }
 
 /// Whether SPF, DKIM or DMARC returned `FAIL`.

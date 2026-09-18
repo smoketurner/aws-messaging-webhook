@@ -40,6 +40,7 @@ use sns_message_verifier::SnsEnvelope;
 use crate::mail::MailMessage;
 use crate::mail::content;
 use crate::mail::events::{MailEvent, build_label_events, build_received_event};
+use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
 use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
@@ -264,7 +265,7 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
     // A queued send's INSERT publishes nothing (its lifecycle starts at the
     // `sent` relabel), and reading its content document first would be an S3
     // GET for an event that is never built.
-    if !msg.labels.iter().any(|label| label == "received") {
+    if !crate::mail::labels::has(&msg.labels, SystemLabel::Received) {
         return RelayOutcome::Settled;
     }
     let content = match content::load(&state.services, &msg).await {
