@@ -119,9 +119,8 @@ an advisory:
 - **The crypto stack is version-coupled.** rsa 0.9 speaks digest 0.10 / spki 0.7, so sha1 and
   sha2 stay on 0.10.x and x509-cert on 0.2.x — the 0.11 / 0.3 releases are trait-incompatible.
   rand stays on 0.8, the last line implementing the rand_core 0.6 traits rsa 0.9 needs.
-- **`aws-sdk-s3` and `aws-sdk-ssm` are held back by `aws-smithy-types =1.6.2`.** Newer releases
-  of either want ^1.7. `=1.141.0` and `=1.119.0` are the newest that resolve; check with
-  `cargo tree`/`cargo deny` before moving any of the three.
+- **`aws-sdk-s3`, `aws-sdk-ssm`, and `aws-smithy-types` move together.** Bump them as a set;
+  check with `cargo tree`/`cargo deny` before moving any of the three.
 - **Defaults off on the AWS SDKs** drops the legacy rustls 0.21 connector
   (RUSTSEC-2026-0098/0099/0104); crates enable `default-https-client` (hyper 1) instead.
 - **`mail-builder`'s `gethostname` feature stays off**: `Message-ID` is minted from the message
