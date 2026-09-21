@@ -26,7 +26,7 @@ jobs:
           # Dependencies compile the same whether or not deny/clippy/tests pass;
           # without this, a streak of red runs means every run builds cold.
           cache-on-failure: true
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-deny@0.20.2
       - run: cargo fmt --all -- --check
@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: zizmor@1.28.0
       # actionlint is a Go tool; install-action only carries Rust-ecosystem manifests.
