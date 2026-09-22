@@ -238,7 +238,9 @@ A sweep runs every ten minutes. A sender killed between claiming a send and reco
 outcome leaves that send `sending`, with nobody working on it and no stream record to re-trigger
 it. The sweep takes claims older than fifteen minutes:
 
-- a sender that never reached SES releases its claim for another attempt;
+- a sender that never reached SES releases its claim for another attempt; if that
+  keeps happening, the send fails as `sender_abandoned`, so the sweep does not
+  loop forever;
 - a sender that recorded it was about to call SES moves to `unknown`, since the message may
   already have gone out.
 
