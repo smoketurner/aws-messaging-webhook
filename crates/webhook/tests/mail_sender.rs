@@ -930,6 +930,85 @@ async fn a_sent_message_leaves_no_outbox_objects_behind() {
 }
 
 #[tokio::test]
+async fn a_failed_send_leaves_no_outbox_objects_behind() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
+        reason: "MessageRejected".to_owned(),
+    });
+    let handled = handle_send(&h.state, &message_id, deadline())
+        .await
+        .unwrap();
+    assert_eq!(handled, Handled::Failed);
+
+    assert!(
+        !h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "the spec should be gone once the message has failed permanently"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the attachment should be removed too: {deleted:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_abandoned_after_repeated_transient_failures_clears_its_outbox() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    let mut attempts = 0;
+    let mut handled = Handled::Skipped;
+    while handled != Handled::Failed && attempts < 8 {
+        attempts += 1;
+        *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+            reason: "Throttled".to_owned(),
+        });
+        handled = handle_send(&h.state, &message_id, deadline())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        handled,
+        Handled::Failed,
+        "it should give up rather than loop forever"
+    );
+
+    assert!(
+        !h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "the spec should be gone once the message has failed permanently"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the attachment should be removed too: {deleted:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
     // Clearing these would make an operator resend impossible.
     let h = seeded().await;

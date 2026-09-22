@@ -678,15 +678,17 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
     tokio::time::sleep_until((Instant::now() + delay).min(latest)).await;
 }
 
-/// Removes the outbox objects for a finished send.
+/// Removes the outbox objects for a send whose outcome has settled.
 ///
 /// Best effort, and deliberately after the outcome is recorded: the send has
 /// already happened, so a failure here must not undo it or make the record be
-/// retried. Anything left behind expires with the bucket's retention rule.
+/// retried. The `outbox/` prefix has no bucket lifecycle rule, so anything
+/// left behind would never expire — a settled send must clear its own
+/// objects, because nothing else reaps them.
 ///
-/// Only ever called for a send that is finished and will not be rebuilt. A
-/// send in `unknown` keeps its objects, because an operator may yet ask for it
-/// to go out again.
+/// Called for both a `Sent` send and a terminal `Failed` send: neither will
+/// be rebuilt, so neither needs its outbox. A send in `unknown` keeps its
+/// objects, because an operator may yet ask for it to go out again.
 async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     let message_id = &finished.message_id;
     let mut keys = vec![send::spec_key(message_id)];
@@ -710,7 +712,7 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
                 key,
                 error = ?error,
                 event = "outbox_cleanup_failed",
-                "could not remove an outbox object; it will expire with retention"
+                "could not remove an outbox object; the `outbox/` prefix has no retention rule, so it will need manual cleanup"
             );
         }
     }
@@ -949,6 +951,7 @@ async fn fail<T: Services>(
         .mark_send(claimed, MarkOutcome::Failed(failure), now)
         .await
         .map_err(store_error)?;
+    clear_outbox(state, claimed).await;
     metrics::counter!(names::SEND_FAILURES).increment(1);
     tracing::warn!(
         message_id = %claimed.message_id,
