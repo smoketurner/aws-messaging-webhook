@@ -4,8 +4,9 @@
 //!
 //! Objects are written once and never modified. The one deletion is
 //! [`ObjectStore::delete_object`], which the sender uses to clear an outbox
-//! entry after its message has gone out; everything else expires on the
-//! bucket's own schedule.
+//! entry once its send's outcome has settled; everything else expires on the
+//! bucket's own schedule. The `outbox/` prefix has no lifecycle rule, so a
+//! settled send clears its own objects — nothing else reaps them.
 
 use std::future::Future;
 use std::time::Duration;

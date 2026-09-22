@@ -203,6 +203,59 @@ async fn a_page_token_from_another_inbox_is_rejected() {
     assert_eq!(body["errors"][0]["path"], "page_token");
 }
 
+/// A page token's partition is built from the normalized inbox id, so a token
+/// issued for one casing is accepted when re-presented with any other casing
+/// of the same inbox (same partition), and still rejected for a genuinely
+/// different inbox.
+#[tokio::test]
+async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
+    let h = seeded().await;
+    for hour in 9..12 {
+        insert(
+            &h,
+            &format!("2026-01-01T{hour:02}:00:00.000Z"),
+            "t1",
+            |_| {},
+        )
+        .await;
+    }
+
+    // Issue a token from the lowercased path.
+    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?limit=1")).await;
+    let token = body["next_page_token"].as_str().unwrap().to_owned();
+
+    // Re-present it through a mixed-case path of the *same* inbox → 200, the
+    // next page is served (the normalized partitions match).
+    let (status, body) = get(
+        &h,
+        &format!("/v0/inboxes/Support@Example.com/messages?limit=1&page_token={token}"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "token should cross casing of the same inbox"
+    );
+    assert_eq!(body["count"], 1);
+
+    // The same token is still rejected for a genuinely different inbox.
+    h.state
+        .services
+        .ensure_inbox(
+            &InboxId("billing@example.com".to_owned()),
+            "2026-01-01T00:00:00.000Z",
+        )
+        .await
+        .unwrap();
+    let (status, body) = get(
+        &h,
+        &format!("/v0/inboxes/billing@example.com/messages?page_token={token}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["errors"][0]["path"], "page_token");
+}
+
 #[tokio::test]
 async fn spam_and_trash_are_hidden_unless_asked_for() {
     let h = seeded().await;

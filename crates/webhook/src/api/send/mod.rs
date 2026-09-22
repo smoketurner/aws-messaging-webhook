@@ -60,7 +60,15 @@ pub async fn send<T: Services>(
     headers: HeaderMap,
     ApiJson(request): ApiJson<SendRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    enqueue(&state, InboxId(inbox_id), request, &headers, None, "send").await
+    enqueue(
+        &state,
+        InboxId::from_path(&inbox_id),
+        request,
+        &headers,
+        None,
+        "send",
+    )
+    .await
 }
 
 /// Validates, uploads and commits one outbound message.
@@ -171,7 +179,7 @@ async fn enqueue<T: Services>(
         // and this commit: answer the way that request would be answered on a
         // replay, and drop what this one uploaded.
         Ok(EnqueueOutcome::KeyExists) => {
-            discard_uploads(&state.services, &inbox, &spec).await;
+            discard_uploads(&state.services, &spec).await;
             let hash = key
                 .as_ref()
                 .map(|key| key.key_hash.as_str())
@@ -185,7 +193,7 @@ async fn enqueue<T: Services>(
             }
         }
         Err(error) => {
-            discard_uploads(&state.services, &inbox, &spec).await;
+            discard_uploads(&state.services, &spec).await;
             Err(ApiError::from(error))
         }
     }

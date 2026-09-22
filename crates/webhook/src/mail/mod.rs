@@ -81,6 +81,20 @@ impl InboxId {
     pub fn domain(&self) -> &str {
         self.0.split_once('@').map_or("", |(_, domain)| domain)
     }
+
+    /// Builds an [`InboxId`] from a client-supplied path segment, applying the
+    /// same canonicalization the ingest path applies to envelope recipients
+    /// (`ingest::normalized_recipients`: `trim().to_ascii_lowercase()`).
+    ///
+    /// DynamoDB partition keys are case-sensitive strings, and ingest stores
+    /// every message under the lowercased recipient, so a `{inbox_id}` path
+    /// whose casing or surrounding whitespace differs from the stored id must
+    /// be normalized the same way before it is used as a key — otherwise the
+    /// read addresses a non-existent row.
+    #[must_use]
+    pub fn from_path(segment: &str) -> Self {
+        Self(segment.trim().to_ascii_lowercase())
+    }
 }
 
 impl std::fmt::Display for InboxId {
@@ -294,5 +308,28 @@ mod tests {
         assert!(!is_valid_local_part("has space"));
         assert!(!is_valid_local_part("has@at"));
         assert!(!is_valid_local_part(&"a".repeat(65)));
+    }
+
+    /// `from_path` must fold a mixed-case or padded path segment down to the
+    /// same id ingest stores under, mirroring `normalized_recipients`.
+    #[test]
+    fn from_path_trims_and_ascii_lowercases_like_ingest() {
+        assert_eq!(
+            InboxId::from_path("Support@Example.com"),
+            InboxId("support@example.com".to_owned())
+        );
+        assert_eq!(
+            InboxId::from_path("  Support@Example.com  "),
+            InboxId("support@example.com".to_owned())
+        );
+        assert_eq!(
+            InboxId::from_path("SUPPORT@EXAMPLE.COM"),
+            InboxId("support@example.com".to_owned())
+        );
+        // The already-canonical form is a fixed point.
+        assert_eq!(
+            InboxId::from_path("support@example.com"),
+            InboxId("support@example.com".to_owned())
+        );
     }
 }

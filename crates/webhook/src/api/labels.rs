@@ -144,7 +144,13 @@ pub async fn update_labels<T: Services>(
     let now = time::format(time::now_ms());
     let labels = state
         .services
-        .update_labels(&InboxId(inbox_id), &message_id, &add, &remove, &now)
+        .update_labels(
+            &InboxId::from_path(&inbox_id),
+            &message_id,
+            &add,
+            &remove,
+            &now,
+        )
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
