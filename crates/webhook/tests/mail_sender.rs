@@ -758,6 +758,98 @@ async fn the_sweep_releases_a_claim_whose_sender_died() {
 }
 
 #[tokio::test]
+async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
+    // Symmetric to an_object_store_that_stays_unavailable_eventually_fails_the_send,
+    // which proves the live hand_back path caps at MAX_TRANSIENT_FAILURES (5).
+    // A sender killed before note_ses_call leaves a stale claim the sweep
+    // releases; each release bumps transient_failures. After the cap is
+    // exceeded the sweep should fail the send, as hand_back does, so a poison
+    // message that OOMs each sender during load cannot churn forever.
+    const CAP: u32 = 5;
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+
+    let mut abandoned = 0;
+    for _ in 0..(CAP + 2) {
+        h.state
+            .services
+            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        let report = sweep(&h.state).await.unwrap();
+        abandoned += report.abandoned;
+    }
+
+    let state = state_of(&h, &message_id);
+    assert_ne!(
+        state.send_status,
+        SendStatus::Queued,
+        "once the cap is exceeded the sweep should stop requeuing; got {:?} with transient_failures={}",
+        state.send_status,
+        state.transient_failures
+    );
+    // It settles as a failure an operator can see, not as `unknown` (SES was
+    // never called here) and not left `sending`.
+    assert_eq!(state.send_status, SendStatus::Failed);
+    assert_eq!(
+        state.failure.map(SendFailure::as_str),
+        Some("sender_abandoned")
+    );
+    // A settled send ages out with its message; the looping send had none.
+    assert!(state.expires_at.is_some(), "an abandoned send must age out");
+    // Exactly one sweep transitioned it to Failed; the rest either released
+    // (under the cap) or did nothing (already failed, so not `sending`).
+    assert_eq!(abandoned, 1);
+
+    // Once failed it is no longer `sending`, so further sweeps leave it alone.
+    let report = sweep(&h.state).await.unwrap();
+    assert_eq!(report.abandoned, 0);
+    assert_eq!(report.released, 0);
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
+}
+
+#[tokio::test]
+async fn the_sweep_releases_until_the_cap_lets_it_fail() {
+    // The boundary: the first four releases (transient_failures 0..3) are
+    // Released, and the fifth attempt (transient_failures == 4) is Failed,
+    // matching hand_back's `transient_failures + 1 >= MAX_TRANSIENT_FAILURES`.
+    const CAP: u32 = 5;
+    let h = seeded().await;
+    let message_id = queued(&h, &body()).await;
+
+    for attempt in 0..(CAP - 1) {
+        h.state
+            .services
+            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        let report = sweep(&h.state).await.unwrap();
+        assert_eq!(report.released, 1, "attempt {attempt} should be released");
+        assert_eq!(
+            report.abandoned, 0,
+            "attempt {attempt} should not be failed"
+        );
+        let state = state_of(&h, &message_id);
+        assert_eq!(state.send_status, SendStatus::Queued);
+        assert_eq!(state.transient_failures, attempt + 1);
+    }
+
+    // The fifth claim trips the cap and is failed rather than requeued.
+    h.state
+        .services
+        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    let report = sweep(&h.state).await.unwrap();
+    assert_eq!(report.released, 0);
+    assert_eq!(report.abandoned, 1);
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Failed);
+    assert_eq!(state.failure, Some(SendFailure::SenderAbandoned));
+    assert!(state.expires_at.is_some());
+}
+
+#[tokio::test]
 async fn the_sweep_leaves_a_recent_claim_alone() {
     // Taking a send away from a sender still working on it is how the same
     // message gets sent twice.
@@ -1116,6 +1208,35 @@ async fn an_operator_resending_an_unknown_send_keeps_its_outbox() {
             .unwrap(),
         Handled::Sent
     );
+}
+
+#[tokio::test]
+async fn a_send_the_sweep_abandons_clears_its_outbox() {
+    // The sweep's own terminal failure settles the send without going through
+    // the sender's failure path, so it owes the same cleanup.
+    const CAP: u32 = 5;
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    for _ in 0..CAP {
+        h.state
+            .services
+            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        sweep(&h.state).await.unwrap();
+    }
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
+    assert_outbox_cleared(&h, &message_id);
 }
 
 #[tokio::test]

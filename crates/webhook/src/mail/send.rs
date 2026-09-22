@@ -119,6 +119,12 @@ pub enum SendFailure {
     SesUnavailable,
     /// An operator closed it by hand.
     ClosedByOperator,
+    /// The send was claimed and abandoned by its sender too many times in a
+    /// row; it never reached SES. A sender that is killed before it records
+    /// `ses_call_at` leaves a stale claim the sweep releases, and after the
+    /// transient-failure cap is exceeded that release would loop forever, so
+    /// the sweep fails the send instead.
+    SenderAbandoned,
 }
 
 impl SendFailure {
@@ -134,6 +140,7 @@ impl SendFailure {
             Self::Rejected => "rejected",
             Self::SesUnavailable => "ses_unavailable",
             Self::ClosedByOperator => "closed_by_operator",
+            Self::SenderAbandoned => "sender_abandoned",
         }
     }
 }
