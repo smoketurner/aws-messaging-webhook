@@ -356,18 +356,17 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
                 event = "send_claim_abandoned",
                 "a send has been abandoned past the failure cap; failing it"
             );
-            state
-                .services
-                .mark_send(
-                    &stuck,
-                    MarkOutcome::Failed(SendFailure::SenderAbandoned),
-                    &now,
-                )
-                .await
-                .map(|()| {
-                    report.abandoned += 1;
-                    metrics::counter!(names::SEND_FAILURES).increment(1);
-                })
+            record(
+                state,
+                &stuck,
+                MarkOutcome::Failed(SendFailure::SenderAbandoned),
+                &now,
+            )
+            .await
+            .map(|()| {
+                report.abandoned += 1;
+                metrics::counter!(names::SEND_FAILURES).increment(1);
+            })
         } else {
             tracing::warn!(
                 message_id = %stuck.message_id,
@@ -709,7 +708,8 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
 /// send that will never be assembled again, and `outbox/` has no lifecycle
 /// rule, so objects not cleared here are leaked for good. Routing every record
 /// through one place is what stops a new settling call site from leaking the
-/// way the terminal-failure and operator-close paths each did.
+/// way the terminal-failure and operator-close paths each did — and what the
+/// sweep's own abandon path gets for free.
 ///
 /// The one settling write that does not come through here is `Sent`: SES
 /// already has the message, so [`mark_sent`] retries that write, and

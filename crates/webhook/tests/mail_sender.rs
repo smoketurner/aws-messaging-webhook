@@ -1211,6 +1211,35 @@ async fn an_operator_resending_an_unknown_send_keeps_its_outbox() {
 }
 
 #[tokio::test]
+async fn a_send_the_sweep_abandons_clears_its_outbox() {
+    // The sweep's own terminal failure settles the send without going through
+    // the sender's failure path, so it owes the same cleanup.
+    const CAP: u32 = 5;
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    for _ in 0..CAP {
+        h.state
+            .services
+            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        sweep(&h.state).await.unwrap();
+    }
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
+    assert_outbox_cleared(&h, &message_id);
+}
+
+#[tokio::test]
 async fn a_send_the_sweep_releases_keeps_its_outbox() {
     // A release is not a settle: the send goes back in the queue and must
     // still have the spec and parts the next sender assembles it from.
