@@ -930,11 +930,250 @@ async fn a_sent_message_leaves_no_outbox_objects_behind() {
 }
 
 #[tokio::test]
+async fn a_failed_send_leaves_no_outbox_objects_behind() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
+        reason: "MessageRejected".to_owned(),
+    });
+    let handled = handle_send(&h.state, &message_id, deadline())
+        .await
+        .unwrap();
+    assert_eq!(handled, Handled::Failed);
+
+    assert!(
+        !h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "the spec should be gone once the message has failed permanently"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the attachment should be removed too: {deleted:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_abandoned_after_repeated_transient_failures_clears_its_outbox() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+
+    let mut attempts = 0;
+    let mut handled = Handled::Skipped;
+    while handled != Handled::Failed && attempts < 8 {
+        attempts += 1;
+        *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+            reason: "Throttled".to_owned(),
+        });
+        handled = handle_send(&h.state, &message_id, deadline())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        handled,
+        Handled::Failed,
+        "it should give up rather than loop forever"
+    );
+
+    assert!(
+        !h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "the spec should be gone once the message has failed permanently"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the attachment should be removed too: {deleted:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
     // Clearing these would make an operator resend impossible.
     let h = seeded().await;
     let message_id = stuck_unknown(&h).await;
 
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "an unresolved send must keep what it would be rebuilt from"
+    );
+}
+
+/// Drives a send that carries an attachment to `unknown`, so a resolution can
+/// be checked against both outbox objects a send leaves behind.
+async fn stuck_unknown_with_attachment(h: &Harness) -> String {
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+        reason: "connection reset".to_owned(),
+    });
+    handle_send(&h.state, &message_id, deadline())
+        .await
+        .unwrap();
+    assert_eq!(state_of(h, &message_id).send_status, SendStatus::Unknown);
+    message_id
+}
+
+/// Asserts the send's spec and its attachment part are both gone.
+fn assert_outbox_cleared(h: &Harness, message_id: &str) {
+    assert!(
+        !h.state
+            .services
+            .objects
+            .contains(&send::spec_key(message_id)),
+        "the spec should be gone once the send has settled"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the attachment should be removed too: {deleted:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_operator_closing_an_unknown_send_as_sent_clears_its_outbox() {
+    // `ClosedSent` settles the send exactly as `Sent` does — the record takes
+    // its message's TTL and nothing will assemble it again — so it owes the
+    // same cleanup. `outbox/` has no lifecycle rule to reap what it leaves.
+    let h = seeded().await;
+    let message_id = stuck_unknown_with_attachment(&h).await;
+
+    resolve_unknown(&h.state, &message_id, Resolution::CloseSent)
+        .await
+        .unwrap();
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
+    assert_outbox_cleared(&h, &message_id);
+}
+
+#[tokio::test]
+async fn an_operator_closing_an_unknown_send_as_failed_clears_its_outbox() {
+    // The same for the other terminal resolution: `CloseFailed` records a
+    // `Failed` outcome without going through the sender's own failure path.
+    let h = seeded().await;
+    let message_id = stuck_unknown_with_attachment(&h).await;
+
+    resolve_unknown(&h.state, &message_id, Resolution::CloseFailed)
+        .await
+        .unwrap();
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
+    assert_outbox_cleared(&h, &message_id);
+}
+
+#[tokio::test]
+async fn an_operator_resending_an_unknown_send_keeps_its_outbox() {
+    // The other side of the rule: a resumed send is not settled, and it is
+    // about to be assembled again, so clearing its outbox would break it.
+    let h = seeded().await;
+    let message_id = stuck_unknown_with_attachment(&h).await;
+
+    resolve_unknown(&h.state, &message_id, Resolution::Resend)
+        .await
+        .unwrap();
+
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "a resumed send must keep what it will be rebuilt from"
+    );
+    assert_eq!(
+        handle_send(&h.state, &message_id, deadline())
+            .await
+            .unwrap(),
+        Handled::Sent
+    );
+}
+
+#[tokio::test]
+async fn a_send_the_sweep_releases_keeps_its_outbox() {
+    // A release is not a settle: the send goes back in the queue and must
+    // still have the spec and parts the next sender assembles it from.
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+
+    h.state
+        .services
+        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    let report = sweep(&h.state).await.unwrap();
+
+    assert_eq!(report.released, 1);
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Queued);
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "a requeued send must keep what it will be rebuilt from"
+    );
+    assert!(
+        h.state.services.objects.delete_object_calls().is_empty(),
+        "a release must delete nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
+    // The sweep's other non-settling outcome: SES may hold the message, so an
+    // operator may yet resend it and the outbox must survive.
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+
+    let claimed = h
+        .state
+        .services
+        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap()
+        .expect("the send was queued, so the claim wins");
+    h.state
+        .services
+        .note_ses_call(&claimed, "2020-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    let report = sweep(&h.state).await.unwrap();
+
+    assert_eq!(report.marked_unknown, 1);
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
     assert!(
         h.state
             .services
