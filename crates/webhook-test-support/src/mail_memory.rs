@@ -35,6 +35,13 @@ pub enum Injected {
     /// A `ThrottlingError` cancellation reason on every planned op, also
     /// decoded to [`TxnDecision::Retry`].
     Throttle,
+    /// The idempotency-key condition check failed: another request won the
+    /// race and committed the same key. Decoded to
+    /// [`TxnDecision::KeyExists`], the outcome the send API's
+    /// `EnqueueOutcome::KeyExists` path (which runs `discard_uploads`) is
+    /// reached with. Lets a sequential test exercise a cleanup path that is
+    /// otherwise only reachable when two sends race for the same key.
+    KeyExists,
 }
 
 /// A scripted failure [`MailMemoryStore::fail_next_resolve`] queues for the
@@ -261,6 +268,7 @@ impl MailMemoryStore {
                 Injected::Conflict | Injected::Throttle => {
                     Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry))
                 }
+                Injected::KeyExists => Ok(flows::TxnOutcome::Cancelled(TxnDecision::KeyExists)),
             };
         }
 

@@ -360,7 +360,9 @@ Resources:
               Action: sqs:SendMessage
               Resource: !GetAtt rAsyncInvokeDlq.Arn
             # Mail statements. Transactions are authorized through the item
-            # actions. No ses:SendEmail (only the sender sends) and no S3 delete.
+            # actions. No ses:SendEmail (only the sender sends). The only S3
+            # delete this role needs is on outbox/, granted by
+            # OutboxObjectsDelete for the failed-commit cleanup.
             - !If
               - cHasMailDomain
               - Sid: MailTableReadWrite
@@ -408,6 +410,19 @@ Resources:
                   - !Sub "${rMailBucket.Arn}/attachments/*"
                   - !Sub "${rMailBucket.Arn}/messages/*"
                   - !Sub "${rMailBucket.Arn}/outbox/*"
+              - !Ref AWS::NoValue
+            # A failed send commit (a DDB transact failure or an
+            # Idempotency-Key collision) must remove what it uploaded under
+            # outbox/, which has no lifecycle rule. Scoped to outbox/ alone:
+            # messages/ is reclaimed by the expire-messages rule and a send
+            # never writes under attachments/ (outbound parts live under
+            # outbox/<message_id>/parts/), so neither needs a delete grant.
+            - !If
+              - cHasMailDomain
+              - Sid: OutboxObjectsDelete
+                Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub "${rMailBucket.Arn}/outbox/*"
               - !Ref AWS::NoValue
             # Without ListBucket, S3 answers GetObject/HeadObject on a missing
             # key with 403 instead of 404, and a missing object would look

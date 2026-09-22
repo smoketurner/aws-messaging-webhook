@@ -294,9 +294,11 @@ async fn renaming_an_attachment_is_a_different_request() {
 }
 
 #[tokio::test]
-async fn a_send_that_fails_to_commit_leaves_no_uploads_behind() {
-    // Nothing under outbox/ expires, so a failed commit must not strand its
-    // spec and parts there.
+async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
+    // Nothing under outbox/ expires, so a failed commit must remove the spec
+    // and parts it uploaded there. The content document lives under
+    // messages/, reclaimed by the bucket's expire-messages lifecycle rule, so
+    // discard_uploads leaves it and keeps its deletes scoped to outbox/.
     let h = seeded().await;
     h.state
         .services
@@ -315,9 +317,80 @@ async fn a_send_that_fails_to_commit_leaves_no_uploads_behind() {
     let objects = &h.state.services.objects;
     let uploaded = objects.put_object_calls();
     assert!(!uploaded.is_empty());
-    for key in &uploaded {
+
+    // Every outbox/ upload is gone: the cleanup is the only thing that reclaims
+    // this prefix, so stranding any of it would leak forever.
+    for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
         assert!(!objects.contains(key), "{key} was left behind");
     }
+    // The cleanup only ever reaches into outbox/: touching messages/ would
+    // widen the role's delete grant and dodge the lifecycle rule that
+    // already reclaims the content document.
+    let deleted = objects.delete_object_calls();
+    assert!(
+        deleted.iter().all(|k| k.starts_with("outbox/")),
+        "discard_uploads deleted outside outbox/: {deleted:?}"
+    );
+    // The content document stays for the expire-messages rule to reclaim.
+    let content_key = uploaded
+        .iter()
+        .find(|k| k.starts_with("messages/"))
+        .expect("a send stores a content document");
+    assert!(
+        objects.contains(content_key),
+        "{content_key} should be left for the expire-messages lifecycle rule"
+    );
+}
+
+#[tokio::test]
+async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
+    // When two sends race for one Idempotency-Key, the loser's commit is
+    // cancelled as KeyExists and discard_uploads must remove what it uploaded
+    // under outbox/ — that prefix has no lifecycle rule, so stranding it would
+    // leak. The content document under messages/ is left for the
+    // expire-messages rule, as on the commit-failure path.
+    //
+    // The KeyExists cancellation is normally only reachable when two requests
+    // overlap; the in-memory store can inject it so a sequential test can
+    // exercise the loser's cleanup path.
+    let h = seeded().await;
+    h.state
+        .services
+        .mail
+        .inject(webhook_test_support::mail_memory::Injected::KeyExists);
+    let mut request = body();
+    request["attachments"] = json!([{
+        "content": STANDARD.encode("file bytes"),
+        "filename": "notes.txt",
+        "content_type": "text/plain",
+    }]);
+
+    let (status, response) = send_it(&h, &request, Some("key-1")).await;
+
+    // No prior committed key to replay, so the loser answers with the
+    // "already in use" conflict.
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response["name"], "ConflictError");
+
+    let objects = &h.state.services.objects;
+    let uploaded = objects.put_object_calls();
+    assert!(!uploaded.is_empty());
+    for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
+        assert!(!objects.contains(key), "{key} was left behind");
+    }
+    let deleted = objects.delete_object_calls();
+    assert!(
+        deleted.iter().all(|k| k.starts_with("outbox/")),
+        "discard_uploads deleted outside outbox/: {deleted:?}"
+    );
+    let content_key = uploaded
+        .iter()
+        .find(|k| k.starts_with("messages/"))
+        .expect("a send stores a content document");
+    assert!(
+        objects.contains(content_key),
+        "{content_key} should be left for the expire-messages lifecycle rule"
+    );
 }
 
 /// Every failure a client can cause carries the JSON error body, including

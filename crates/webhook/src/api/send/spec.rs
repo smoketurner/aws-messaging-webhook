@@ -9,7 +9,7 @@ use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::labels::SystemLabel;
 use crate::mail::send::{self as send_mod, Envelope, SendSpec, SendStatus, SpecAttachment};
-use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, PREVIEW_CHARS, content, ids};
+use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, PREVIEW_CHARS, ids};
 use crate::state::Services;
 
 /// Builds the spec the sender will assemble the message from.
@@ -180,15 +180,16 @@ pub(super) fn preview_of(send: &ValidatedSend) -> String {
         .collect()
 }
 
-/// Removes what a send uploaded before its commit failed: the spec, inline
-/// parts and content document. Nothing under `outbox/` expires, so leaving
-/// them would keep them forever. Best effort: the request has already failed,
-/// and a leftover object is harmless.
-pub(super) async fn discard_uploads<T: Services>(services: &T, inbox: &InboxId, spec: &SendSpec) {
-    let mut keys = vec![
-        send_mod::spec_key(&spec.message_id),
-        content::content_key(inbox, &spec.message_id),
-    ];
+/// Removes what a send uploaded under `outbox/` before its commit failed: the
+/// spec and its inline parts. Nothing under `outbox/` expires, so leaving
+/// them would keep them forever; the outbox-only delete grant this role holds
+/// is exactly what makes these deletes succeed. The content document under
+/// `messages/` is deliberately not touched: that prefix is reclaimed by the
+/// bucket's `expire-messages` lifecycle rule, so deleting it here would only
+/// add a no-op call (and a noisy warning under a narrower grant). Best effort:
+/// the request has already failed, and a leftover object is harmless.
+pub(super) async fn discard_uploads<T: Services>(services: &T, spec: &SendSpec) {
+    let mut keys = vec![send_mod::spec_key(&spec.message_id)];
     keys.extend(
         spec.attachments
             .iter()
