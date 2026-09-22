@@ -52,7 +52,7 @@ pub async fn reply<T: Services>(
     headers: HeaderMap,
     ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    let inbox = InboxId(inbox_id);
+    let inbox = InboxId::from_path(&inbox_id);
     let original = state
         .services
         .get_message(&inbox, &message_id)

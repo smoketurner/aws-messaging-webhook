@@ -349,3 +349,26 @@ async fn a_reply_shows_up_in_the_original_thread() {
     assert_eq!(thread["count"], 2);
     assert_eq!(thread["message_count"], 2);
 }
+
+/// A reply addressed through a mixed-case `{inbox_id}` path still queues: the
+/// API normalizes the path, so the inbox the original message lives under
+/// resolves (was 404 before the fix).
+#[tokio::test]
+async fn a_reply_addressing_a_mixed_case_inbox_path_is_queued() {
+    let (h, original_id) = seeded(|_| {}).await;
+
+    let (status, response) = post(
+        &h,
+        &format!("/v0/inboxes/Support@Example.com/messages/{original_id}/reply"),
+        &body(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "mixed-case path should not 404");
+    assert_eq!(response["thread_id"], "thread-1");
+    assert!(
+        response["message_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+}

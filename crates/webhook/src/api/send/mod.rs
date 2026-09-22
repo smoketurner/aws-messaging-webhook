@@ -60,7 +60,15 @@ pub async fn send<T: Services>(
     headers: HeaderMap,
     ApiJson(request): ApiJson<SendRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    enqueue(&state, InboxId(inbox_id), request, &headers, None, "send").await
+    enqueue(
+        &state,
+        InboxId::from_path(&inbox_id),
+        request,
+        &headers,
+        None,
+        "send",
+    )
+    .await
 }
 
 /// Validates, uploads and commits one outbound message.
