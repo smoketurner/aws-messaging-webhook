@@ -956,17 +956,40 @@ impl MailStore for AwsServices {
         let thread = thread
             .map_err(|e| store_error_from_sdk("GetItem(thread)", &e))?
             .item;
-        let Some(thread) = thread else {
-            // The messages query may have run for nothing; a thread that
-            // doesn't exist is the rarer case than one that does.
-            return Ok(None);
-        };
-        let thread: ThreadState = serde_dynamo::from_item(thread)
-            .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}")))?;
-        let messages = messages?;
-
-        Ok(Some(ThreadView { thread, messages }))
+        assemble_thread_view(thread.map(serde_dynamo::Item::from), messages)
     }
+}
+
+/// Assembles a `ThreadView` from the two reads [`AwsServices::get_thread`] runs
+/// concurrently via `tokio::join!`: the base-table thread `GetItem` and the
+/// `ByThread` GSI `Query` for the thread's messages.
+///
+/// Extracted pure so the divergent-result decision — what to do when one read
+/// succeeded and the other failed — is unit-testable without an AWS client.
+/// The load-bearing rule: a `messages` failure coinciding with an absent thread
+/// is surfaced, not dropped. `tokio::join!` drives both reads to completion, so
+/// by the time the thread item is known to be absent the `messages` `Result` is
+/// already resolved; returning `Ok(None)` without applying `?` would mask a
+/// retry-exhausted `ByThread` failure as a definitive `404 NotFound` (the API
+/// handler maps `Ok(None)` to `NotFound`) instead of `MailStoreError::Transient`
+/// /`Permanent` (`502`/`500`), hiding it from the service's internal-error
+/// metrics.
+fn assemble_thread_view(
+    thread: Option<serde_dynamo::Item>,
+    messages: Result<Page<MailMessage>, MailStoreError>,
+) -> Result<Option<ThreadView>, MailStoreError> {
+    let Some(thread) = thread else {
+        // The messages query may have run for nothing; a thread that doesn't
+        // exist is the rarer case than one that does — but its result must be
+        // surfaced first so a `ByThread` failure coinciding with an absent
+        // thread is not masked as a definitive 404.
+        messages?;
+        return Ok(None);
+    };
+    let thread: ThreadState = serde_dynamo::from_item(thread)
+        .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}")))?;
+    let messages = messages?;
+    Ok(Some(ThreadView { thread, messages }))
 }
 
 #[cfg(test)]
@@ -1029,5 +1052,41 @@ mod tests {
             assert_eq!(key.names.get("#sk").map(String::as_str), Some("gsi1sk"));
             assert_placeholders_match(&key);
         }
+    }
+
+    // --- get_thread: assemble_thread_view ---------------------------------
+    //
+    // `get_thread` runs the base-table thread `GetItem` and the `ByThread` GSI
+    // `Query` concurrently via `tokio::join!`, so by the time the thread item
+    // is known to be absent the messages `Result` is already resolved. These
+    // tests pin the divergent-result contract the AWS client hands to
+    // `assemble_thread_view`: a dependency failure on the messages read must
+    // not be masked as a definitive `Ok(None)` (which the `get_thread` API
+    // handler maps to a non-retryable `404 NotFound`) just because the thread
+    // happened to be absent.
+
+    /// The regression: a retry-exhausted `ByThread` `Query` (throttle/5xx/transport)
+    /// that coincides with an absent thread surfaces as `Transient` (`502`),
+    /// not a dropped `Result` reported as `Ok(None)` → `404`.
+    #[test]
+    fn thread_absent_with_transient_messages_failure_surfaces_the_error() {
+        let messages: Result<Page<MailMessage>, MailStoreError> = Err(MailStoreError::Transient(
+            anyhow!("listing thread messages: throttled"),
+        ));
+        assert!(matches!(
+            assemble_thread_view(None, messages),
+            Err(MailStoreError::Transient(_))
+        ));
+    }
+
+    /// A healthy, empty `Query` alongside a genuinely-absent thread is still a
+    /// routine `404`: the fix surfaces errors only, it never invents a thread.
+    #[test]
+    fn thread_absent_with_healthy_empty_messages_returns_none() {
+        let empty: Page<MailMessage> = Page {
+            items: vec![],
+            next: None,
+        };
+        assert!(matches!(assemble_thread_view(None, Ok(empty)), Ok(None)));
     }
 }
