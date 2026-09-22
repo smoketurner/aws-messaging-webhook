@@ -84,6 +84,25 @@ pub enum MarkOutcome<'a> {
     Resumed,
 }
 
+impl MarkOutcome<'_> {
+    /// Whether this outcome settles the send: the record takes its message's
+    /// TTL and the message will never be assembled from its outbox again.
+    ///
+    /// Pairs one-to-one with the arms [`crate::mail::send::mark_transition`]
+    /// wraps in `settled(..)`, and is what the sender keys outbox cleanup off:
+    /// the `outbox/` prefix has no lifecycle rule, so a settled send that does
+    /// not clear its own objects leaks them forever.
+    #[must_use]
+    pub fn settles(&self) -> bool {
+        match self {
+            Self::Sent(_) | Self::Failed(_) | Self::ClosedSent => true,
+            // A send that is handed back, left for an operator, or resumed
+            // may yet be assembled again, so it keeps its outbox.
+            Self::Released | Self::Unknown | Self::Resumed => false,
+        }
+    }
+}
+
 /// What SES said about a message it accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SesSent<'a> {
@@ -274,4 +293,29 @@ pub enum MailStoreError {
     Transient(#[source] anyhow::Error),
     #[error("permanent mail store error")]
     Permanent(#[source] anyhow::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pairing this predicate exists for: the outcomes
+    /// [`crate::mail::send::mark_transition`] wraps in `settled(..)` are
+    /// exactly the ones whose outbox the sender clears. Adding an outcome
+    /// without deciding which side it falls on is how the terminal-failure,
+    /// sweep-abandon and operator-close paths each came to leak.
+    #[test]
+    fn only_the_outcomes_that_take_a_ttl_settle() {
+        let sent = SesSent {
+            message_id: "0100-ses",
+            region: "us-east-1",
+        };
+        assert!(MarkOutcome::Sent(sent).settles());
+        assert!(MarkOutcome::Failed(SendFailure::Rejected).settles());
+        assert!(MarkOutcome::ClosedSent.settles());
+
+        assert!(!MarkOutcome::Released.settles());
+        assert!(!MarkOutcome::Unknown.settles());
+        assert!(!MarkOutcome::Resumed.settles());
+    }
 }

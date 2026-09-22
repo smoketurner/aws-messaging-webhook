@@ -229,9 +229,7 @@ pub async fn resolve_unknown<T: Services>(
         Resolution::CloseSent => MarkOutcome::ClosedSent,
         Resolution::CloseFailed => MarkOutcome::Failed(SendFailure::ClosedByOperator),
     };
-    state
-        .services
-        .mark_send(&send, outcome, &now)
+    record(state, &send, outcome, &now)
         .await
         .map_err(store_error)?;
 
@@ -334,9 +332,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
                 event = "send_claim_stale_after_ses_call",
                 "a sender died after it was about to call SES; the message may have gone out"
             );
-            state
-                .services
-                .mark_send(&stuck, MarkOutcome::Unknown, &now)
+            record(state, &stuck, MarkOutcome::Unknown, &now)
                 .await
                 .map(|()| report.marked_unknown += 1)
         } else {
@@ -346,9 +342,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
                 event = "send_claim_released",
                 "releasing a claim whose sender appears to be gone"
             );
-            state
-                .services
-                .mark_send(&stuck, MarkOutcome::Released, &now)
+            record(state, &stuck, MarkOutcome::Released, &now)
                 .await
                 .map(|()| report.released += 1)
         };
@@ -572,9 +566,7 @@ async fn record_outcome<T: Services>(
                 event = "send_outcome_unknown",
                 "SES may or may not have accepted this message; not resending"
             );
-            state
-                .services
-                .mark_send(calling, MarkOutcome::Unknown, now)
+            record(state, calling, MarkOutcome::Unknown, now)
                 .await
                 .map_err(store_error)?;
             metrics::counter!(names::SEND_OUTCOME_UNKNOWN).increment(1);
@@ -661,9 +653,7 @@ async fn hand_back<T: Services>(
     }
     let delay = Duration::from_secs(1 << claimed.transient_failures.min(4));
     wait_before_retry(delay, deadline).await;
-    state
-        .services
-        .mark_send(claimed, MarkOutcome::Released, now)
+    record(state, claimed, MarkOutcome::Released, now)
         .await
         .map_err(store_error)?;
     Ok(Handled::Skipped)
@@ -678,6 +668,35 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
     tokio::time::sleep_until((Instant::now() + delay).min(latest)).await;
 }
 
+/// Records an outcome for a send and disposes of what that outcome makes
+/// dead.
+///
+/// The sender's one way to call [`Services::mark_send`], because the write and
+/// the cleanup belong together: any outcome [`MarkOutcome::settles`] leaves a
+/// send that will never be assembled again, and `outbox/` has no lifecycle
+/// rule, so objects not cleared here are leaked for good. Routing every record
+/// through one place is what stops a new settling call site from leaking the
+/// way the terminal-failure and operator-close paths each did.
+///
+/// The one settling write that does not come through here is `Sent`: SES
+/// already has the message, so [`mark_sent`] retries that write, and
+/// [`record_outcome`] pairs it with the same [`clear_outbox`] call.
+///
+/// Cleanup is best effort and never reported: only the store write can fail
+/// the caller.
+async fn record<T: Services>(
+    state: &AppState<T>,
+    send: &SendState,
+    outcome: MarkOutcome<'_>,
+    now: &str,
+) -> Result<(), MailStoreError> {
+    state.services.mark_send(send, outcome, now).await?;
+    if outcome.settles() {
+        clear_outbox(state, send).await;
+    }
+    Ok(())
+}
+
 /// Removes the outbox objects for a send whose outcome has settled.
 ///
 /// Best effort, and deliberately after the outcome is recorded: the send has
@@ -686,9 +705,11 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
 /// left behind would never expire — a settled send must clear its own
 /// objects, because nothing else reaps them.
 ///
-/// Called for both a `Sent` send and a terminal `Failed` send: neither will
-/// be rebuilt, so neither needs its outbox. A send in `unknown` keeps its
-/// objects, because an operator may yet ask for it to go out again.
+/// Called for every outcome [`MarkOutcome::settles`] reports: a `Sent` send, a
+/// terminal `Failed` one from any path, and a send an operator closes. None
+/// of them will be assembled again, so none of them needs its outbox. A send
+/// in `unknown`, released or resumed keeps its objects, because it may yet go
+/// out.
 async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     let message_id = &finished.message_id;
     let mut keys = vec![send::spec_key(message_id)];
@@ -946,12 +967,9 @@ async fn fail<T: Services>(
     failure: SendFailure,
     now: &str,
 ) -> Result<Handled, SenderError> {
-    state
-        .services
-        .mark_send(claimed, MarkOutcome::Failed(failure), now)
+    record(state, claimed, MarkOutcome::Failed(failure), now)
         .await
         .map_err(store_error)?;
-    clear_outbox(state, claimed).await;
     metrics::counter!(names::SEND_FAILURES).increment(1);
     tracing::warn!(
         message_id = %claimed.message_id,
