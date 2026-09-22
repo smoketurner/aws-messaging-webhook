@@ -145,7 +145,7 @@ pub async fn get_inbox<T: Services>(
 ) -> Result<Json<wire::Inbox>, ApiError> {
     let inbox = state
         .services
-        .get_inbox(&InboxId(inbox_id))
+        .get_inbox(&InboxId::from_path(&inbox_id))
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
@@ -164,7 +164,7 @@ pub async fn list_messages<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::MessageList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let inbox = InboxId(inbox_id);
+    let inbox = InboxId::from_path(&inbox_id);
     let partition = keys::messages_partition(inbox.as_str());
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
@@ -215,7 +215,7 @@ pub async fn get_message<T: Services>(
 ) -> Result<Json<wire::Message>, ApiError> {
     let message = state
         .services
-        .get_message(&InboxId(inbox_id), &message_id)
+        .get_message(&InboxId::from_path(&inbox_id), &message_id)
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
@@ -241,7 +241,7 @@ pub async fn get_raw<T: Services>(
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .services
-        .get_message(&InboxId(inbox_id), &message_id)
+        .get_message(&InboxId::from_path(&inbox_id), &message_id)
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
@@ -279,7 +279,7 @@ pub async fn get_attachment<T: Services>(
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .services
-        .get_message(&InboxId(inbox_id), &message_id)
+        .get_message(&InboxId::from_path(&inbox_id), &message_id)
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
@@ -334,7 +334,7 @@ pub async fn list_threads<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::ThreadList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let inbox = InboxId(inbox_id);
+    let inbox = InboxId::from_path(&inbox_id);
     let partition = keys::threads_partition(inbox.as_str());
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
@@ -389,7 +389,7 @@ pub async fn get_thread<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::Thread>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let inbox = InboxId(inbox_id);
+    let inbox = InboxId::from_path(&inbox_id);
     let partition = keys::thread_messages_partition(inbox.as_str(), &thread_id);
     let start = cursor(&request, &partition, UNSCOPED)?;
 

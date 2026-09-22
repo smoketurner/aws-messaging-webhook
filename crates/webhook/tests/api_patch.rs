@@ -295,3 +295,23 @@ async fn patching_requires_a_key() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A patch addressed through a mixed-case `{inbox_id}` path still reaches the
+/// message: the API normalizes the path, so the inbox the message lives under
+/// resolves (was 404 before the fix).
+#[tokio::test]
+async fn a_patch_addressing_a_mixed_case_inbox_path_updates_labels() {
+    let (h, ids) = seeded("t1", 1).await;
+
+    let (status, body) = send(
+        &h,
+        "PATCH",
+        &format!("/v0/inboxes/Support@Example.com/messages/{}", ids[0]),
+        Some(json!({"remove_labels": ["unread"]})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "mixed-case path should not 404");
+    assert_eq!(body["message_id"], ids[0]);
+    assert_eq!(body["labels"], json!(["received"]));
+}

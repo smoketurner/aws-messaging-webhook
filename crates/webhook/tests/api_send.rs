@@ -455,3 +455,34 @@ async fn a_queued_send_appears_in_the_inbox_listing() {
     assert_eq!(list["count"], 1);
     assert_eq!(list["messages"][0]["labels"], json!(["queued"]));
 }
+
+/// A client addressing a mixed-case `{inbox_id}` path still queues a send:
+/// the API normalizes the path the same way ingest normalizes the RCPT, so
+/// the inbox seeded under the lowercased id resolves (was 404 before the
+/// fix).
+#[tokio::test]
+async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
+    let h = seeded().await;
+
+    let (status, body) = post(
+        &h,
+        "/v0/inboxes/Support@Example.com/messages/send",
+        &body(),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "mixed-case path should not 404");
+    let message_id = body["message_id"].as_str().unwrap().to_owned();
+    assert!(!message_id.is_empty());
+
+    // The send lands on the inbox ingest/reads know — the lowercased id.
+    let message = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &message_id)
+        .await
+        .unwrap()
+        .expect("the queued send is stored under the lowercased id");
+    assert_eq!(message.inbox_id, InboxId(INBOX.to_owned()));
+}
