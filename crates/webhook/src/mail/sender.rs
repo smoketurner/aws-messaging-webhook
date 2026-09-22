@@ -274,8 +274,13 @@ const MARK_SENT_ATTEMPTS: u32 = 3;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
     /// Claims released because the sender holding them appears to be gone
-    /// before it called SES.
+    /// before it called SES, and the transient-failure cap was not yet
+    /// reached.
     pub released: usize,
+    /// Claims whose sender repeatedly vanished before it called SES, past
+    /// the transient-failure cap. Failed so they stop looping and age out,
+    /// as `hand_back` does for the live retry path.
+    pub abandoned: usize,
     /// Claims whose sender appears to be gone after it was about to call
     /// SES, moved to `unknown` because the message may have gone out.
     pub marked_unknown: usize,
@@ -296,7 +301,11 @@ pub struct SweepReport {
 /// A stale claim is released only when its sender never got as far as
 /// calling SES. One whose sender recorded that it was about to call SES may
 /// already have been delivered, so it becomes `unknown` for an operator:
-/// releasing it could send the message twice.
+/// releasing it could send the message twice. A release that never reaches
+/// SES bumps `transient_failures`, and once that would exceed
+/// [`MAX_TRANSIENT_FAILURES`] the send is failed instead of requeued — the
+/// same cap [`hand_back`] enforces on the live retry path — so a send whose
+/// sender is repeatedly killed during load cannot loop forever.
 ///
 /// Sends in `unknown` are counted and left alone. A stuck send that cannot be
 /// updated — its state moved on since the index was read, or the store is
@@ -339,6 +348,30 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
                 .mark_send(&stuck, MarkOutcome::Unknown, &now)
                 .await
                 .map(|()| report.marked_unknown += 1)
+        } else if stuck.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
+            // The sender vanished before it called SES, and this is not the
+            // first time: a release would requeue and the next sweep would
+            // release again, looping forever. `hand_back` enforces this same
+            // cap on the live retry path; the sweep must too, or a poison
+            // message that kills every sender during load churns indefinitely.
+            tracing::warn!(
+                message_id = %stuck.message_id,
+                transient_failures = stuck.transient_failures,
+                event = "send_claim_abandoned",
+                "a send has been abandoned past the failure cap; failing it"
+            );
+            state
+                .services
+                .mark_send(
+                    &stuck,
+                    MarkOutcome::Failed(SendFailure::SenderAbandoned),
+                    &now,
+                )
+                .await
+                .map(|()| {
+                    report.abandoned += 1;
+                    metrics::counter!(names::SEND_FAILURES).increment(1);
+                })
         } else {
             tracing::warn!(
                 message_id = %stuck.message_id,
