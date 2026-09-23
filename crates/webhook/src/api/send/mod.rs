@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
-use crate::mail::send::{Envelope, SendKey, SendState};
+use crate::mail::send::{Envelope, SendKey, SendSpec, SendState};
 use crate::mail::store::EnqueueOutcome;
 use crate::mail::{InboxId, MailMessage, content, ids, keys, time};
 use crate::state::{AppState, Services};
@@ -128,7 +128,12 @@ async fn enqueue<T: Services>(
         spec.in_reply_to = Some(original.rfc_message_id.clone());
         spec.references = threading_references(original, &original_content.references);
     }
-    upload_spec(&state.services, &spec, &validated).await?;
+    // Reclaim any `outbox/` uploads before the error escapes — a partial
+    // `upload_spec` would otherwise orphan them, and `outbox/` has no
+    // lifecycle rule.
+    if let Err(error) = upload_spec(&state.services, &spec, &validated).await {
+        return Err(discard_and_fail(&state.services, &spec, error).await);
+    }
     let message_content = content::MessageContent {
         text: validated.text.clone(),
         html: validated.html.clone(),
@@ -137,9 +142,12 @@ async fn enqueue<T: Services>(
         reply_to: validated.reply_to.clone(),
         verdicts: None,
     };
-    content::store(&state.services, &inbox, &message_id, &message_content)
-        .await
-        .map_err(ApiError::from)?;
+    // The spec and parts already landed under `outbox/`; reclaim them before
+    // the error escapes. (`messages/` reclaims itself via its lifecycle rule.)
+    if let Err(error) = content::store(&state.services, &inbox, &message_id, &message_content).await
+    {
+        return Err(discard_and_fail(&state.services, &spec, error).await);
+    }
 
     let state_item = SendState::queued(
         inbox.clone(),
@@ -192,9 +200,19 @@ async fn enqueue<T: Services>(
                 )),
             }
         }
-        Err(error) => {
-            discard_uploads(&state.services, &spec).await;
-            Err(ApiError::from(error))
-        }
+        Err(error) => Err(discard_and_fail(&state.services, &spec, error).await),
     }
+}
+
+/// Reclaims what a send uploaded under `outbox/` and wraps `error` as the API
+/// surfaces it, for any failure between `upload_spec` and a successful
+/// commit. `outbox/` has no bucket lifecycle rule, so stranding the uploads
+/// would leak them forever; [`discard_uploads`] is best effort (a leftover
+/// object is harmless, and `delete_object` treats a missing key as success).
+async fn discard_and_fail<T: Services, E>(services: &T, spec: &SendSpec, error: E) -> ApiError
+where
+    ApiError: From<E>,
+{
+    discard_uploads(services, spec).await;
+    ApiError::from(error)
 }

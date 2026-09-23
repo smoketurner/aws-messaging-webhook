@@ -51,6 +51,11 @@ pub struct FakeObjectStore {
     objects: Mutex<HashMap<String, StoredObject>>,
     failures: Mutex<HashMap<String, ObjectFailure>>,
     calls: Mutex<CallLog>,
+    /// A 1-based countdown that fails the Nth `put_object_if_absent` call with
+    /// `ObjectError::Transient`, regardless of key, then clears itself.
+    /// `outbound_message_id` is random, so the spec key is unknowable ahead of
+    /// time; only call-order counting can target a particular put.
+    nth_put_failure: Mutex<Option<usize>>,
 }
 
 impl FakeObjectStore {
@@ -71,6 +76,17 @@ impl FakeObjectStore {
     /// injection is replaced or [`Self::clear`] is called.
     pub fn inject(&self, key: impl Into<String>, failure: ObjectFailure) {
         self.failures.lock().unwrap().insert(key.into(), failure);
+    }
+
+    /// Makes the Nth `put_object_if_absent` call (1-based, across all keys)
+    /// fail with `ObjectError::Transient`, then clears the injection. Use this
+    /// to fail a particular put when the key is unknowable ahead of time (as
+    /// `outbound_message_id` is random). A put that the Nth countdown fails is
+    /// still recorded in [`Self::put_object_calls`]. A per-key injection by
+    /// [`Self::inject`] pre-empts the countdown entirely for the call it fails,
+    /// so a per-key fixture never consumes the countdown.
+    pub fn inject_nth_put_if_absent(&self, n: usize) {
+        *self.nth_put_failure.lock().unwrap() = Some(n);
     }
 
     /// Removes any injected failure for `key`.
@@ -223,6 +239,10 @@ impl ObjectStore for FakeObjectStore {
             .unwrap()
             .put_object_if_absent
             .push(key.to_owned());
+        // A per-key failure pre-empts the nth-call countdown: the countdown
+        // targets a particular put by call order, and a per-key fixture (a
+        // `Hang` that never resolves, or a `Permanent`/`Transient` error) is a
+        // different setup that should not consume it.
         match self.injected(key) {
             Some(ObjectFailure::Hang) => future::pending().await,
             Some(ObjectFailure::Permanent) => {
@@ -237,6 +257,25 @@ impl ObjectStore for FakeObjectStore {
             }
             // `NotFound` isn't meaningful for a put; ignored.
             Some(ObjectFailure::NotFound) | None => {}
+        }
+        let fail = {
+            let mut guard = self.nth_put_failure.lock().unwrap();
+            match *guard {
+                Some(1) => {
+                    *guard = None;
+                    true
+                }
+                Some(n) => {
+                    *guard = Some(n - 1);
+                    false
+                }
+                None => false,
+            }
+        };
+        if fail {
+            return Err(ObjectError::Transient(anyhow!(
+                "injected transient put_object_if_absent failure on the countdown call for {key}"
+            )));
         }
         let mut objects = self.objects.lock().unwrap();
         if objects.contains_key(key) {
@@ -482,5 +521,64 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "the hang must outlast a 30s timeout");
+    }
+
+    #[tokio::test]
+    async fn inject_nth_put_fails_only_the_nth_call_then_clears_itself() {
+        let store = FakeObjectStore::default();
+        store.inject_nth_put_if_absent(2);
+
+        let first = store
+            .put_object_if_absent("a", Bytes::from_static(b"first"), "text/plain")
+            .await;
+        assert_eq!(first.unwrap(), PutOutcome::Created);
+        assert!(store.contains("a"));
+
+        // The second call fails with Transient and is still recorded.
+        let second = store
+            .put_object_if_absent("b", Bytes::from_static(b"second"), "text/plain")
+            .await;
+        assert!(matches!(second, Err(ObjectError::Transient(_))));
+        assert!(!store.contains("b"));
+
+        // The countdown has cleared itself: a later put proceeds normally.
+        let third = store
+            .put_object_if_absent("c", Bytes::from_static(b"third"), "text/plain")
+            .await;
+        assert_eq!(third.unwrap(), PutOutcome::Created);
+        assert!(store.contains("c"));
+
+        assert_eq!(
+            store.put_object_calls(),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_nth_put_countdown_is_key_agnostic_and_one_based() {
+        let store = FakeObjectStore::default();
+        // 1 fails the very first call regardless of key.
+        store.inject_nth_put_if_absent(1);
+        let failed = store
+            .put_object_if_absent("whatever", Bytes::new(), "text/plain")
+            .await;
+        assert!(matches!(failed, Err(ObjectError::Transient(_))));
+        assert!(!store.contains("whatever"));
+        // The countdown cleared: a follow-up put succeeds.
+        store
+            .put_object_if_absent("whatever", Bytes::new(), "text/plain")
+            .await
+            .unwrap();
+        assert!(store.contains("whatever"));
+    }
+
+    #[tokio::test]
+    async fn inject_nth_put_countdown_does_not_block_other_operations() {
+        let store = FakeObjectStore::default();
+        store.seed("seeded", Bytes::from_static(b"body"), "text/plain");
+        store.inject_nth_put_if_absent(1);
+        // The countdown scopes only to put_object_if_absent; reads/deletes run.
+        assert!(store.get_object("seeded", 1024).await.is_ok());
+        assert!(store.delete_object("seeded").await.is_ok());
     }
 }
