@@ -258,3 +258,67 @@ async fn caches_certificate_across_verifications() {
     }
     server.verify().await;
 }
+
+#[tokio::test]
+async fn cache_dedupes_urls_differing_only_by_query_string() {
+    let fixture = SnsFixture::new();
+    // expect(1): two URLs differing only by query must dedup to a single
+    // fetch — query strings do not change which cert is served and must
+    // not produce distinct cache keys.
+    let (server, cert_url) = serve_cert(&fixture.cert_pem, 1).await;
+    let sns = verifier(&server);
+
+    for n in 0..2 {
+        let qurl = format!("{cert_url}?k={n}");
+        let mut body = notification(&qurl);
+        fixture.sign(&mut body, "2");
+        sns.verify_body(body.to_string().as_bytes()).await.unwrap();
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn cache_dedupes_urls_differing_only_by_fragment() {
+    let fixture = SnsFixture::new();
+    // expect(1): two URLs differing only by fragment must dedup to a
+    // single fetch — reqwest strips fragments before sending, so both
+    // fetches would hit the same mock endpoint, and the cache must treat
+    // them as the same key.
+    let (server, cert_url) = serve_cert(&fixture.cert_pem, 1).await;
+    let sns = verifier(&server);
+
+    for n in 0..2 {
+        let furl = format!("{cert_url}#frag{n}");
+        let mut body = notification(&furl);
+        fixture.sign(&mut body, "2");
+        sns.verify_body(body.to_string().as_bytes()).await.unwrap();
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn cache_does_not_evict_legit_entry_under_query_flood() {
+    let fixture = SnsFixture::new();
+    // expect(1): one warmup fetch, then 32 query-appended verifies that all
+    // cache-hit on the canonical key, then a final verify that also
+    // cache-hits. Without the fix, the 32 distinct query keys would have
+    // tripped `CertCache::insert`'s 32-distinct-key `clear()` rule and
+    // evicted the legit entry, forcing a re-fetch on the final verify
+    // (34 total fetches).
+    let (server, cert_url) = serve_cert(&fixture.cert_pem, 1).await;
+    let sns = verifier(&server);
+
+    let mut body = notification(&cert_url);
+    fixture.sign(&mut body, "2");
+    sns.verify_body(body.to_string().as_bytes()).await.unwrap(); // 1: warm legit entry
+    for n in 0..32 {
+        let qurl = format!("{cert_url}?k={n}");
+        let mut body = notification(&qurl);
+        fixture.sign(&mut body, "2");
+        sns.verify_body(body.to_string().as_bytes()).await.unwrap(); // 32: all cache-hit under the canonical key
+    }
+    let mut body = notification(&cert_url);
+    fixture.sign(&mut body, "2");
+    sns.verify_body(body.to_string().as_bytes()).await.unwrap(); // +1: legit cache-hit
+    server.verify().await;
+}
