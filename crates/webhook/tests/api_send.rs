@@ -529,6 +529,96 @@ async fn a_queued_send_appears_in_the_inbox_listing() {
     assert_eq!(list["messages"][0]["labels"], json!(["queued"]));
 }
 
+/// An HTML-only outbound send (a shape validation explicitly accepts) must
+/// get a non-empty preview derived from its HTML body, both on the stored
+/// message item and on the inbox listing — matching the inbound path.
+/// Before the fix, `preview_of` read only `send.text` and produced `""` for
+/// this shape, so the listing emitted `"preview": ""` while the message it
+/// pointed at demonstrably had an HTML body.
+#[tokio::test]
+async fn an_html_only_send_gets_a_non_empty_preview_on_the_message_and_listing() {
+    let h = seeded().await;
+    let mut request = body();
+    request["text"].take();
+    request["html"] = json!("<p>Hello <strong>there</strong> &amp; welcome</p>");
+
+    let (status, response) = send_it(&h, &request, None).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let message_id = response["message_id"].as_str().unwrap().to_owned();
+
+    // The stored message item carries a non-empty preview derived from HTML.
+    let message = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !message.preview.is_empty(),
+        "HTML-only outbound preview must not be empty"
+    );
+    assert!(
+        message.preview.contains("Hello") && message.preview.contains("welcome"),
+        "preview should be derived from the HTML body, got {:?}",
+        message.preview
+    );
+    assert!(
+        !message.preview.contains('<') && !message.preview.contains("&amp;"),
+        "preview should not retain raw HTML tags or entities, got {:?}",
+        message.preview
+    );
+
+    // The inbox listing surfaces the same preview on the MessageItem (the
+    // `preview` field is `Some(...)` and only skipped when `None`, so an
+    // empty preview would show up as `"preview": ""`).
+    let list_request = Request::get(format!("/v0/inboxes/{INBOX}/messages"))
+        .header("authorization", format!("Bearer {KEY}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_response = aws_messaging_webhook::app::app(h.state.clone())
+        .oneshot(list_request)
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(list["count"], 1);
+    assert!(
+        list["messages"][0]["preview"]
+            .as_str()
+            .is_some_and(|p| p.contains("Hello") && p.contains("welcome")),
+        "listing preview should be non-empty and derived from HTML, got {:?}",
+        list["messages"][0]["preview"]
+    );
+
+    // The thread listing uses `(!thread.preview.is_empty()).then(...)`, so an
+    // empty preview would OMIT the field entirely (before the fix, this is
+    // what `GET …/threads` did for an HTML-only outbound thread). A non-empty
+    // outbound preview must now make the field present on the ThreadItem.
+    let threads_request = Request::get(format!("/v0/inboxes/{INBOX}/threads"))
+        .header("authorization", format!("Bearer {KEY}"))
+        .body(Body::empty())
+        .unwrap();
+    let threads_response = aws_messaging_webhook::app::app(h.state.clone())
+        .oneshot(threads_request)
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(threads_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let threads: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(threads["count"], 1);
+    assert!(
+        threads["threads"][0]["preview"]
+            .as_str()
+            .is_some_and(|p| p.contains("Hello") && p.contains("welcome")),
+        "thread-listing preview should be present and non-empty for an HTML-only outbound thread, got {:?}",
+        threads["threads"][0]["preview"]
+    );
+}
+
 /// A client addressing a mixed-case `{inbox_id}` path still queues a send:
 /// the API normalizes the path the same way ingest normalizes the RCPT, so
 /// the inbox seeded under the lowercased id resolves (was 404 before the
