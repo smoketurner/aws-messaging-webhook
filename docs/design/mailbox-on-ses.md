@@ -143,8 +143,10 @@ Clients send a bearer key. The function hashes it with SHA-256 and compares it i
 with hashes from an SSM SecureString. The cache refreshes every five minutes and on a miss, so a
 new key works at once.
 
-If SSM fails, the last good cache stays in use. If the cache has never loaded, the API answers
-`503`, not `401`: SDKs retry `503`, and an outage must not look like a bad key.
+If SSM fails, the last good cache stays in use and the next scheduled refresh is deferred for a
+short backoff, so an outage does not turn into a parameter read on every request. If the cache has
+never loaded, the API answers `503`, not `401`: SDKs retry `503`, and an outage must not look like
+a bad key.
 
 **Why SSM, not Secrets Manager:** the same KMS encryption with no per-secret charge. Rotation is
 writing two hashes.
