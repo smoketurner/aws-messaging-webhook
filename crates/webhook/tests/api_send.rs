@@ -8,7 +8,7 @@
 
 use aws_messaging_webhook::mail::send::{SendSpec, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, content, send};
+use aws_messaging_webhook::mail::{InboxId, MESSAGE_USER_LABEL_CAP, content, labels, send};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
@@ -139,6 +139,41 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     let message_content = content::load(&h.state.services, &message).await.unwrap();
     assert_eq!(message_content.text.as_deref(), Some("the body"));
     assert!(message.expires_at > 0);
+}
+
+/// A send's labels pass through the same `normalize_labels` cap as a PATCH,
+/// so a full set of a caller's own labels plus a state toggle like `spam` is
+/// queued — the cap counts the caller's own labels, not the toggle, matching
+/// the enqueue storage cap. Before the fix this was a 400.
+#[tokio::test]
+async fn a_send_with_a_full_set_of_user_labels_and_a_system_toggle_is_queued() {
+    let h = seeded().await;
+    let mut request = body();
+    let mut labels: Vec<String> = (0..20).map(|i| format!("u{i:02}")).collect();
+    labels.push("spam".to_owned());
+    request["labels"] = json!(labels);
+
+    let (status, body) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message_id = body["message_id"].as_str().unwrap().to_owned();
+
+    let message = h
+        .state
+        .services
+        .get_message(&InboxId(INBOX.to_owned()), &message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // `queued` is auto-added by the pipeline; `spam` is a caller-owned toggle
+    // the cap does not count; the 20 `uNN` labels are all the caller's own.
+    assert_eq!(
+        labels::user_label_count(&message.labels),
+        MESSAGE_USER_LABEL_CAP
+    );
+    assert_eq!(message.labels.len(), MESSAGE_USER_LABEL_CAP + 2);
+    assert!(message.labels.contains(&"queued".to_owned()));
+    assert!(message.labels.contains(&"spam".to_owned()));
 }
 
 #[tokio::test]

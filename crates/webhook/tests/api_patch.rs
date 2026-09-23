@@ -223,6 +223,62 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
     assert!(labels.contains(&"bounced".to_owned()));
 }
 
+/// A request may name a full set of a caller's own labels plus a state toggle
+/// like `spam`: the request cap counts the caller's own labels, not the
+/// toggle, mirroring the storage cap that would accept the same state.
+/// Before the fix this returned a 400 because the request cap counted the
+/// toggle.
+#[tokio::test]
+async fn a_full_set_of_user_labels_with_a_system_toggle_is_accepted() {
+    let (h, ids) = seeded("t1", 1).await;
+    let mut labels: Vec<String> = (0..20).map(|i| format!("u{i:02}")).collect();
+    labels.push("spam".to_owned());
+
+    let (status, body) = patch(&h, &ids[0], json!({ "add_labels": labels })).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = body["labels"].as_array().unwrap();
+    // received + unread (seeded) + spam toggle + 20 user labels.
+    assert_eq!(stored.len(), 23, "{body}");
+    assert!(
+        stored.contains(&json!("spam")),
+        "spam toggle was applied: {body}"
+    );
+    assert!(stored.contains(&json!("u00")), "{body}");
+    assert!(stored.contains(&json!("u19")), "{body}");
+
+    // The change is durable, not just reflected in the response.
+    let (_, message) = send(
+        &h,
+        "GET",
+        &format!("/v0/inboxes/{INBOX}/messages/{}", ids[0]),
+        None,
+    )
+    .await;
+    assert_eq!(message["labels"].as_array().unwrap().len(), 23);
+}
+
+/// The cap a request still enforces is on a caller's own labels: naming more
+/// than 20 of those in one request is still a 400, with or without a toggle.
+#[tokio::test]
+async fn more_than_20_user_labels_in_one_request_is_still_rejected() {
+    let (h, ids) = seeded("t1", 1).await;
+    let labels: Vec<String> = (0..21).map(|i| format!("u{i:02}")).collect();
+
+    let (status, body) = patch(&h, &ids[0], json!({ "add_labels": labels })).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["name"], "ValidationError");
+    assert_eq!(body["errors"][0]["path"], "add_labels");
+    assert!(
+        body["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most 20 labels per request"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn service_owned_labels_are_rejected() {
     let (h, ids) = seeded("t1", 1).await;

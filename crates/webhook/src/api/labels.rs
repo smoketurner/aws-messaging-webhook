@@ -86,10 +86,14 @@ pub(crate) fn normalize_labels(
             cleaned.push(label);
         }
     }
-    // A request cannot name more labels than a message may carry; whether the
-    // result fits the message and thread caps is checked against what they
-    // already hold.
-    if cleaned.len() > MESSAGE_USER_LABEL_CAP {
+    // A request cannot name more user labels than a message may carry; the
+    // toggleable system labels `unread`/`spam`/`trash` are caller-owned state
+    // and, like every other system label, do not count toward the cap. This
+    // mirrors the storage cap in `mail::plan::check_user_labels`, which uses
+    // `labels::user_label_count`, so a request the store accepts is not
+    // rejected here for naming a state toggle alongside a full set of user
+    // labels.
+    if labels::user_label_count(&cleaned) > MESSAGE_USER_LABEL_CAP {
         errors.push(problem(format!(
             "at most {MESSAGE_USER_LABEL_CAP} labels per request"
         )));
