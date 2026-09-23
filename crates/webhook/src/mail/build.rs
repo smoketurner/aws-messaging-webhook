@@ -14,6 +14,7 @@
 
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address;
+use mail_builder::headers::content_type::ContentType;
 use mail_builder::mime::MimePart;
 
 use crate::mail::send::{SendSpec, SpecAttachment};
@@ -130,7 +131,7 @@ fn body_part<'a>(spec: &'a SendSpec, parts: &'a [BuiltPart<'a>]) -> MimePart<'a>
             let child = attachment_part(part);
             match &part.spec.filename {
                 Some(filename) => child.attachment(filename.as_str()),
-                None => child,
+                None => child.header("Content-Disposition", ContentType::new("attachment")),
             }
         }));
         MimePart::new("multipart/mixed", children)
@@ -291,6 +292,68 @@ mod tests {
         assert!(raw.contains("multipart/mixed"), "{raw}");
         assert_eq!(parsed.attachment_count(), 1);
         assert!(raw.contains("att_1.bin"), "{raw}");
+    }
+
+    /// A filename-less attachment is still an attachment, so it has to carry
+    /// `Content-Disposition: attachment` — without it, RFC 2183's default
+    /// disposition is `inline`, and a strict client renders the part in the
+    /// body instead of offering it as a download. `mail-builder`'s
+    /// `.attachment()` requires a filename, so the disposition is written as a
+    /// raw header in that branch.
+    #[test]
+    fn a_filenameless_attachment_still_emits_a_disposition_header() {
+        let mut spec = spec();
+        let mut attachment = part("att_1", "application/pdf", "attachment", None);
+        attachment.filename = None;
+        spec.attachments = vec![attachment.clone()];
+        let parts = vec![BuiltPart {
+            spec: &attachment,
+            bytes: b"pdf",
+        }];
+
+        let raw = build(&spec, &parts);
+        let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+
+        assert!(raw.contains("Content-Disposition: attachment"), "{raw}");
+        assert_eq!(
+            raw.matches("Content-Disposition").count(),
+            1,
+            "one disposition header per part: {raw}"
+        );
+        assert_eq!(
+            parsed.attachment_count(),
+            1,
+            "the part must parse as an attachment: {raw}"
+        );
+        assert!(raw.contains("multipart/mixed"), "{raw}");
+    }
+
+    /// The fix writes the disposition header only in the `None` arm, so the
+    /// `Some(filename)` path still goes through `.attachment(filename)` — and
+    /// because `mail-builder` pushes rather than replaces the header, that
+    /// part must keep exactly one `Content-Disposition` (no duplicates that a
+    /// strict client would reject or that `mail-parser` would misread).
+    #[test]
+    fn an_attachment_with_a_filename_has_exactly_one_disposition_header() {
+        let mut spec = spec();
+        let attachment = part("att_1", "application/pdf", "attachment", None);
+        spec.attachments = vec![attachment.clone()];
+        let parts = vec![BuiltPart {
+            spec: &attachment,
+            bytes: b"pdf",
+        }];
+
+        let raw = build(&spec, &parts);
+
+        assert_eq!(
+            raw.matches("Content-Disposition").count(),
+            1,
+            "exactly one disposition header even with a filename: {raw}"
+        );
+        assert!(
+            raw.contains("Content-Disposition: attachment;"),
+            "the disposition should carry the filename: {raw}"
+        );
     }
 
     #[test]
