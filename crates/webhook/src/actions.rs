@@ -368,9 +368,29 @@ pub async fn run<T: Services>(
             Ok("feedback")
         }
         DomainEvent::Ses { event, .. } => {
-            // Runs before suppression so a mailbox message is labelled even
-            // if suppression then fails for one of its recipients.
-            let labelled = apply_delivery_label(state, event).await?;
+            // The delivery label is informational; the SES account-level
+            // suppression list is the deliverability-critical side-effect, so
+            // a *permanent* label failure (e.g. a misconfigured mail table
+            // surfacing as `AccessDeniedException`/`ValidationException`) must
+            // not abort suppression. `process_notification` turns a permanent
+            // `ActionError` into a 200-ack with no SNS redelivery, which would
+            // lose the suppression write for good — and the stream relay never
+            // recovers it. Best-effort the label (log + count), then run
+            // suppression. A *transient* label failure still propagates so SNS
+            // redelivery re-runs both steps.
+            let labelled = match apply_delivery_label(state, event).await {
+                Ok(labelled) => labelled,
+                Err(error) if error.kind == ActionErrorKind::Permanent => {
+                    metrics::counter!(names::ACTION_FAILURES).increment(1);
+                    tracing::error!(
+                        error = ?error.source,
+                        event = "delivery_label_failure",
+                        "permanent delivery-label failure; continuing to suppression"
+                    );
+                    false
+                }
+                Err(error) => return Err(error),
+            };
 
             if let Some(bounce) = &event.bounce {
                 if !bounce.is_permanent() {

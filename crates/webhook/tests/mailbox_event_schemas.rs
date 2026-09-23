@@ -608,6 +608,106 @@ async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
     assert_eq!(types, vec!["ses.delivery"]);
 }
 
+/// A *permanent* delivery-label failure must not skip bounce suppression. The
+/// label is informational; the SES account-level suppression write is the
+/// deliverability-critical side-effect. `process_notification` acks a
+/// permanent `ActionError` with a 200 and no SNS redelivery, so coupling
+/// suppression to the label step's `?` would lose the suppression write for
+/// good — and the stream relay never recovers it. A permanent
+/// `resolve_ses_message` failure (e.g. an `AccessDeniedException` from a mail
+/// table IAM regression) must therefore be best-effort: log + count, then
+/// still suppress every bounced recipient.
+#[tokio::test]
+async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
+    let h = seeded().await;
+    let sent = sent_message(&h).await;
+    h.state
+        .services
+        .mail
+        .fail_next_resolve(ReadFailure::Permanent); // permanent resolve_ses_message
+
+    let bounce = json!({
+        "eventType": "Bounce",
+        "bounce": {"bounceType": "Permanent",
+                   "bouncedRecipients": [{"emailAddress": "a@example.net"}]},
+        "mail": {"messageId": sent.ses_message_id.unwrap()}
+    });
+    let body = webhook_test_support::wrapped(&h, &bounce);
+    let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("suppress:a@example.net:Bounce")),
+        "a permanent bounce must still suppress its recipients even when the delivery-label step fails permanently: {calls:?}"
+    );
+}
+
+/// The complaint path shares the suppression arm with bounces, so a permanent
+/// delivery-label failure must not skip complaint suppression either.
+#[tokio::test]
+async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() {
+    let h = seeded().await;
+    let sent = sent_message(&h).await;
+    h.state
+        .services
+        .mail
+        .fail_next_resolve(ReadFailure::Permanent);
+
+    let complaint = json!({
+        "notificationType": "Complaint",
+        "complaint": {"complainedRecipients": [{"emailAddress": "a@example.net"}]},
+        "mail": {"messageId": sent.ses_message_id.unwrap()}
+    });
+    let body = webhook_test_support::wrapped(&h, &complaint);
+    let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let calls = h.fake().calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("suppress:a@example.net:Complaint")),
+        "a complaint must still suppress its recipients even when the delivery-label step fails permanently: {calls:?}"
+    );
+}
+
+/// A *transient* delivery-label failure (throttling, 5xx, a dropped DynamoDB
+/// connection) is recoverable by redelivery, so it must propagate as a 5xx to
+/// recruit SNS redelivery — suppression is *not* attempted on this attempt,
+/// since the whole idempotent label+suppress pair re-runs on the redelivery.
+#[tokio::test]
+async fn transient_delivery_label_failure_returns_500_and_defers_suppression() {
+    let h = seeded().await;
+    let sent = sent_message(&h).await;
+    h.state
+        .services
+        .mail
+        .fail_next_resolve(ReadFailure::Transient);
+
+    let bounce = json!({
+        "eventType": "Bounce",
+        "bounce": {"bounceType": "Permanent",
+                   "bouncedRecipients": [{"emailAddress": "a@example.net"}]},
+        "mail": {"messageId": sent.ses_message_id.unwrap()}
+    });
+    let body = webhook_test_support::wrapped(&h, &bounce);
+    let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a transient label failure must drive a 5xx so SNS redelivers"
+    );
+    let calls = h.fake().calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("suppress")),
+        "suppression must not run before the transient label failure clears on redelivery: {calls:?}"
+    );
+}
+
 /// The fixture covers every event type the relay emits; the ones it does
 /// not emit are named here, so a refreshed fixture adding a type fails until
 /// this list or the relay accounts for it.
