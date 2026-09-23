@@ -153,8 +153,10 @@ pub fn build_received_event(
     let mut message = wire::Message::new(msg, content);
     // A body larger than the whole entry cap cannot survive the ladder
     // below, so it is dropped before the detail is built rather than after:
-    // a content document is up to 80 MB, and serializing one only to measure
-    // it is the relay's most expensive avoidable step.
+    // a content document is up to ~270 MB (the 6× worst-case JSON escape of
+    // a control-char-heavy body under the raw-mail ceiling — see
+    // `content::MAX_CONTENT_BYTES`), and serializing one only to measure it
+    // is the relay's most expensive avoidable step.
     let cap = entry_cap(event_type, event_source);
     if message.html.as_ref().is_some_and(|html| html.len() > cap) {
         message.html = None;
