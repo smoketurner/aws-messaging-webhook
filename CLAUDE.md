@@ -21,8 +21,8 @@ sam build && sam deploy
 ```
 
 Topic wiring is plain AWS CLI (subscribe over https to a webhook path, or lambda protocol +
-`add-permission` for direct invoke) — the commands live in the README's "Wire up topics" and
-"Direct SNS → Lambda" sections, as does the SES-simulator end-to-end probe.
+`add-permission` for direct invoke) — the commands live in `docs/deploy.md`; the SES-simulator
+end-to-end probe is in `docs/operations.md`.
 
 ## Architecture
 
