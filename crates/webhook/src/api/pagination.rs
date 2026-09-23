@@ -366,6 +366,31 @@ mod tests {
     }
 
     #[test]
+    fn invalid_calendar_dates_in_before_or_after_are_rejected() {
+        // Non-existent calendar dates used to roll into the next month and
+        // yield a 200 with a silently shifted window; they must now surface as
+        // a 400 validation error naming the offending parameter, in both the
+        // millisecond and whole-second forms.
+        assert_eq!(errors("after=2026-02-30T00:00:00.000Z"), vec!["after"]);
+        assert_eq!(errors("after=2026-02-29T00:00:00.000Z"), vec!["after"]); // 2026 non-leap
+        assert_eq!(errors("before=2026-04-31T00:00:00.000Z"), vec!["before"]);
+        assert_eq!(errors("before=2026-06-31T00:00:00.000Z"), vec!["before"]);
+
+        assert_eq!(errors("after=2026-02-30T00:00:00Z"), vec!["after"]);
+        assert_eq!(errors("after=2026-02-29T00:00:00Z"), vec!["after"]);
+        assert_eq!(errors("before=2026-04-31T00:00:00Z"), vec!["before"]);
+
+        // A real Feb 29 in a leap year is still accepted in both precisions
+        // (no regression in the happy path).
+        assert!(
+            parse_ok("after=2024-02-29T00:00:00.000Z")
+                .after_ms
+                .is_some()
+        );
+        assert!(parse_ok("before=2024-02-29T00:00:00Z").before_ms.is_some());
+    }
+
+    #[test]
     fn an_inverted_range_is_rejected() {
         assert_eq!(
             errors("after=2026-01-15T10:00:00.000Z&before=2026-01-15T09:00:00.000Z"),

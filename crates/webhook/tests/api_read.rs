@@ -371,6 +371,43 @@ async fn a_bad_query_parameter_reports_every_problem_at_once() {
 }
 
 #[tokio::test]
+async fn invalid_calendar_dates_in_before_or_after_return_400() {
+    // Non-existent calendar dates used to roll into the next month and yield
+    // a 200 with a silently shifted window; through the real router they must
+    // now surface as a 400 Validation error naming the offending parameter,
+    // in both the millisecond and whole-second forms.
+    let h = seeded().await;
+    insert(&h, "2026-02-28T09:00:00.000Z", "t1", |_| {}).await;
+
+    for (query, bad_path) in [
+        ("after=2026-02-30T00:00:00.000Z", "after"),
+        ("after=2026-02-29T00:00:00.000Z", "after"), // 2026 non-leap
+        ("before=2026-04-31T00:00:00.000Z", "before"),
+        ("after=2026-02-30T00:00:00Z", "after"),
+        ("before=2026-04-31T00:00:00Z", "before"),
+    ] {
+        let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(body["name"], "ValidationError", "{query}");
+        let paths: Vec<&str> = body["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec![bad_path], "{query}");
+    }
+
+    // A real Feb 29 in a leap year still yields 200 (no happy-path regression).
+    let (status, _) = get(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages?after=2024-02-29T00:00:00.000Z"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn fetching_one_message_returns_the_body_a_list_omits() {
     let h = seeded().await;
     insert(&h, "2026-01-01T09:00:00.000Z", "t1", |_| {}).await;
