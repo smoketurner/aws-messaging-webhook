@@ -675,11 +675,12 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
 }
 
 /// A *transient* delivery-label failure (throttling, 5xx, a dropped DynamoDB
-/// connection) is recoverable by redelivery, so it must propagate as a 5xx to
-/// recruit SNS redelivery — suppression is *not* attempted on this attempt,
-/// since the whole idempotent label+suppress pair re-runs on the redelivery.
+/// connection) still propagates as a 5xx to recruit redelivery, but only
+/// after suppression has run: the SES events topic reaches the function by
+/// direct invoke, whose async queue retries just twice, so suppression must
+/// not wait on the label step clearing.
 #[tokio::test]
-async fn transient_delivery_label_failure_returns_500_and_defers_suppression() {
+async fn transient_delivery_label_failure_suppresses_then_returns_500() {
     let h = seeded().await;
     let sent = sent_message(&h).await;
     h.state
@@ -703,8 +704,10 @@ async fn transient_delivery_label_failure_returns_500_and_defers_suppression() {
     );
     let calls = h.fake().calls();
     assert!(
-        !calls.iter().any(|c| c.starts_with("suppress")),
-        "suppression must not run before the transient label failure clears on redelivery: {calls:?}"
+        calls
+            .iter()
+            .any(|c| c.starts_with("suppress:a@example.net:Bounce")),
+        "suppression must run even while the label step is failing transiently: {calls:?}"
     );
 }
 

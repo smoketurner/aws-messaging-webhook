@@ -370,14 +370,15 @@ pub async fn run<T: Services>(
         DomainEvent::Ses { event, .. } => {
             // The delivery label is informational; the SES account-level
             // suppression list is the deliverability-critical side-effect, so
-            // a *permanent* label failure (e.g. a misconfigured mail table
-            // surfacing as `AccessDeniedException`/`ValidationException`) must
-            // not abort suppression. `process_notification` turns a permanent
-            // `ActionError` into a 200-ack with no SNS redelivery, which would
-            // lose the suppression write for good — and the stream relay never
-            // recovers it. Best-effort the label (log + count), then run
-            // suppression. A *transient* label failure still propagates so SNS
-            // redelivery re-runs both steps.
+            // no label failure may skip suppression. A *permanent* label
+            // failure (e.g. a misconfigured mail table surfacing as
+            // `AccessDeniedException`/`ValidationException`) is logged and
+            // counted: `process_notification` 200-acks a permanent
+            // `ActionError`, so propagating it would lose the suppression
+            // write for good. A *transient* one is held until suppression has
+            // run, then returned so redelivery re-runs both (repeat-safe)
+            // steps; the suppression write does not wait on that redelivery.
+            let mut deferred = None;
             let labelled = match apply_delivery_label(state, event).await {
                 Ok(labelled) => labelled,
                 Err(error) if error.kind == ActionErrorKind::Permanent => {
@@ -389,27 +390,36 @@ pub async fn run<T: Services>(
                     );
                     false
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    deferred = Some(error);
+                    false
+                }
             };
 
-            if let Some(bounce) = &event.bounce {
-                if !bounce.is_permanent() {
-                    return Ok(if labelled { "delivery_label" } else { "none" });
-                }
-                suppress_recipients(state, &bounce.bounced_recipients, SuppressionReason::Bounce)
-                    .await?;
-                return Ok("suppression");
-            }
-            if let Some(complaint) = &event.complaint {
-                suppress_recipients(
-                    state,
-                    &complaint.complained_recipients,
+            // A bounce that is not permanent suppresses nothing, even when
+            // the event also carries a complaint.
+            let suppression = match (&event.bounce, &event.complaint) {
+                (Some(bounce), _) if bounce.is_permanent() => Some((
+                    bounce.bounced_recipients.as_slice(),
+                    SuppressionReason::Bounce,
+                )),
+                (None, Some(complaint)) => Some((
+                    complaint.complained_recipients.as_slice(),
                     SuppressionReason::Complaint,
-                )
-                .await?;
-                return Ok("suppression");
+                )),
+                _ => None,
+            };
+            if let Some((recipients, reason)) = suppression {
+                suppress_recipients(state, recipients, reason).await?;
             }
-            Ok(if labelled { "delivery_label" } else { "none" })
+            if let Some(error) = deferred {
+                return Err(error);
+            }
+            Ok(match (suppression, labelled) {
+                (Some(_), _) => "suppression",
+                (None, true) => "delivery_label",
+                (None, false) => "none",
+            })
         }
         DomainEvent::SesInbound { event, .. } => {
             crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms).await
