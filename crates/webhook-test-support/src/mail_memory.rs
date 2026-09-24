@@ -142,6 +142,36 @@ impl MailMemoryStore {
         self.get_item(pk, sk)
     }
 
+    /// Seeds a `SendKey` item directly, bypassing the transaction path, so a
+    /// test can place an `Idempotency-Key` row with an arbitrary `expires_at`
+    /// (e.g. in the past) and exercise the read-side expiry logic in
+    /// `replay_key` — DynamoDB reaps expired rows lazily, so an expired row
+    /// that is still present is exactly the case the read path must handle.
+    pub fn seed_send_key(&self, key: &SendKey) {
+        use aws_messaging_webhook::mail::keys;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: SendKey is always serializable; a poisoned lock is a test bug"
+        )]
+        let mut item: Item = serde_dynamo::to_item(key).unwrap();
+        item.inner_mut().insert(
+            "pk".to_owned(),
+            AttributeValue::S(keys::send_key_pk(&key.key_hash)),
+        );
+        item.inner_mut().insert(
+            "sk".to_owned(),
+            AttributeValue::S(keys::send_key_sk().to_owned()),
+        );
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: a poisoned lock is a test bug"
+        )]
+        self.inner.lock().unwrap().items.insert(
+            Self::key(&keys::send_key_pk(&key.key_hash), keys::send_key_sk()),
+            item,
+        );
+    }
+
     fn string_attr(item: &Item, name: &str) -> Option<String> {
         match item.inner().get(name) {
             Some(AttributeValue::S(s)) => Some(s.clone()),
@@ -963,5 +993,36 @@ mod tests {
             .await
             .unwrap();
         assert!(hit.is_none());
+    }
+
+    /// `seed_send_key` writes a `SendKey` row exactly where `get_send_key`
+    /// reads it, so a test can place a key with an arbitrary `expires_at` and
+    /// exercise the read-side expiry logic. Like DynamoDB, the in-memory
+    /// store returns an expired row verbatim — the expiry check is the
+    /// caller's (`replay_key`), not the store's.
+    #[tokio::test]
+    async fn seed_send_key_round_trips_through_get_send_key_without_filtering_expiry() {
+        let store = MailMemoryStore::default();
+        let key = SendKey {
+            key_hash: "deadbeef".to_owned(),
+            inbox_id: InboxId("support@example.com".to_owned()),
+            message_id: "mid-1".to_owned(),
+            thread_id: "tid-1".to_owned(),
+            request_hash: "abc".to_owned(),
+            route: "send".to_owned(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            expires_at: 1, // expired in the past
+        };
+        store.seed_send_key(&key);
+
+        let fetched = store
+            .get_send_key("deadbeef")
+            .await
+            .unwrap()
+            .expect("seed_send_key writes the row get_send_key reads");
+        assert_eq!(
+            fetched, key,
+            "the store returns an expired row verbatim, like DynamoDB"
+        );
     }
 }

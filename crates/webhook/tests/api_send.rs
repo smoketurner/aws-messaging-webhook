@@ -559,3 +559,109 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
         .expect("the queued send is stored under the lowercased id");
     assert_eq!(message.inbox_id, InboxId(INBOX.to_owned()));
 }
+
+/// An expired `Idempotency-Key` row that DynamoDB has not yet reaped is
+/// treated as "no live key": a new, *different* request reusing that key is
+/// accepted as a fresh send (`200`), not refused with `409`.
+///
+/// The contract's `409` for "same key, any difference" applies only inside the
+/// 24h lifetime ("Keys are kept for 24 hours"); after that the slot is
+/// reusable. The write path already honors this with
+/// `Cond::NotExistsOrExpired`; `replay_key` must honor it on the read path
+/// too, or it short-circuits the enqueue before the reclaim can run.
+#[tokio::test]
+async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
+    use aws_messaging_webhook::mail::send::SendKey;
+    use sha2::{Digest as _, Sha256};
+
+    let h = seeded().await;
+
+    // An expired SendKey for "key-1" tied to a different request than the one
+    // we are about to send, carrying the ids a live replay would have returned.
+    let key_hash = format!("{:x}", Sha256::digest(b"key-1"));
+    let expired_key = SendKey {
+        key_hash: key_hash.clone(),
+        inbox_id: InboxId(INBOX.to_owned()),
+        message_id: "old-message-id".to_owned(),
+        thread_id: "old-thread-id".to_owned(),
+        request_hash: "a-different-request-hash".to_owned(),
+        route: "send".to_owned(),
+        created_at: "2025-01-01T00:00:00.000Z".to_owned(),
+        expires_at: 1, // long past the 24h lifetime; not yet reaped by DynamoDB
+    };
+    h.state.services.mail.seed_send_key(&expired_key);
+
+    let (status, response) = send_it(&h, &body(), Some("key-1")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an expired key is no live key; got {response}"
+    );
+
+    // A fresh send produced new ids, not the expired row's originals.
+    let message_id = response["message_id"].as_str().unwrap().to_owned();
+    let thread_id = response["thread_id"].as_str().unwrap().to_owned();
+    assert_ne!(message_id, "old-message-id");
+    assert_ne!(thread_id, "old-thread-id");
+    assert!(!message_id.is_empty());
+
+    // The slot is reclaimed under a fresh 24h lifetime: an immediate replay of
+    // the same request returns these new ids rather than descending into the
+    // stale expired row.
+    let (replay_status, replay) = send_it(&h, &body(), Some("key-1")).await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["message_id"], message_id);
+    assert_eq!(replay["thread_id"], thread_id);
+}
+
+/// Once a key's 24h lifetime has elapsed (the row still present, not yet
+/// reaped by DynamoDB), a retry of the *same* request with the same key is no
+/// longer a replay of the original ids — it falls through to enqueue and
+/// produces a brand-new send. "Keys are kept for 24 hours" is the contract,
+/// not forever.
+#[tokio::test]
+async fn an_expired_key_reused_with_the_same_request_is_a_fresh_send() {
+    use sha2::{Digest as _, Sha256};
+
+    let h = seeded().await;
+
+    // The first send records a live key for "key-1" against this request.
+    let (first_status, first) = send_it(&h, &body(), Some("key-1")).await;
+    assert_eq!(first_status, StatusCode::OK);
+    let first_message_id = first["message_id"].as_str().unwrap().to_owned();
+    let first_thread_id = first["thread_id"].as_str().unwrap().to_owned();
+
+    // Expire the recorded key in place, keeping its `request_hash` so the next
+    // request is byte-for-byte the same one the original answered — the case
+    // that used to replay the old ids and now must not.
+    let key_hash = format!("{:x}", Sha256::digest(b"key-1"));
+    let mut existing = h
+        .state
+        .services
+        .get_send_key(&key_hash)
+        .await
+        .unwrap()
+        .expect("the first send recorded a key");
+    assert!(
+        existing.expires_at > 1,
+        "a just-recorded key should be live, not expired"
+    );
+    existing.expires_at = 1; // simulate the 24h TTL having elapsed
+    h.state.services.mail.seed_send_key(&existing);
+
+    let (status, response) = send_it(&h, &body(), Some("key-1")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an expired key is no live key; got {response}"
+    );
+    let message_id = response["message_id"].as_str().unwrap().to_owned();
+    let thread_id = response["thread_id"].as_str().unwrap().to_owned();
+    assert_ne!(
+        message_id, first_message_id,
+        "after 24h the same request is a fresh send, not a replay"
+    );
+    assert_ne!(thread_id, first_thread_id);
+}

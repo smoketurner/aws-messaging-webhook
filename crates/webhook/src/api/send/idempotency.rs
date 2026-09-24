@@ -13,6 +13,7 @@ use crate::api::error::ApiError;
 use crate::api::send::SendAccepted;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::InboxId;
+use crate::mail::time;
 use crate::state::{AppState, Services};
 
 /// How long an `Idempotency-Key` is remembered.
@@ -96,6 +97,12 @@ pub(super) fn fingerprint(
 /// What a live `Idempotency-Key` recorded: the original ids when `request_hash`
 /// matches, a `409` when the key was used for a different request, `None` when
 /// there is no live key.
+///
+/// An expired key is not a live key: DynamoDB reaps TTL rows asynchronously, so
+/// an expired row can remain for hours after its 24h lifetime. Returning `None`
+/// for such a row lets the request proceed to enqueue, where the write path's
+/// `NotExistsOrExpired` condition reclaims the slot — the same expiry
+/// semantics, applied symmetrically on the read.
 pub(super) async fn replay_key<T: Services>(
     state: &AppState<T>,
     key_hash: &str,
@@ -109,6 +116,14 @@ pub(super) async fn replay_key<T: Services>(
     else {
         return Ok(None);
     };
+    // `expires_at` is epoch seconds; DynamoDB's TTL deletes expired rows
+    // lazily, so a row past its TTL may still be returned here. Treat it as
+    // absent — matching `Cond::NotExistsOrExpired` on the write path — so the
+    // request falls through to enqueue and reclaims the slot.
+    let now_epoch = time::now_ms() / 1_000;
+    if existing.expires_at < now_epoch {
+        return Ok(None);
+    }
     if existing.request_hash == request_hash {
         Ok(Some(SendAccepted {
             message_id: existing.message_id,
