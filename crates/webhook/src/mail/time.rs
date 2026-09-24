@@ -81,9 +81,7 @@ pub fn parse(s: &str) -> Option<u64> {
     let minute: u64 = s.get(14..16)?.parse().ok()?;
     let second: u64 = s.get(17..19)?.parse().ok()?;
     let millis: u64 = s.get(20..23)?.parse().ok()?;
-    // `||` short-circuits left-to-right, so `days_in_month` is only reached
-    // once `month` is known to be in `1..=12`; the helper's `_` arm is
-    // unreachable in practice. Bounding `day` to the actual length of the
+    // Bounding `day` to the actual length of the
     // month (with the leap-year rule for February) prevents `days_from_civil`
     // from silently rolling an out-of-range day (e.g. Feb 30 -> Mar 2) into a
     // different, valid-looking epoch millisecond value.
@@ -100,9 +98,8 @@ pub fn parse(s: &str) -> Option<u64> {
     Some(days * MS_PER_DAY + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * 1000 + millis)
 }
 
-/// The number of days in `month` (in `1..=12`) of `year`, applying the
-/// Gregorian leap-year rule to February. The caller must have validated
-/// `month` against `1..=12` first; the `_` arm is otherwise unreachable.
+/// The number of days in `month` of `year`, applying the Gregorian leap-year
+/// rule to February; 0 for a month outside `1..=12`, so no day is valid.
 fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -114,7 +111,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
                 28
             }
         }
-        _ => unreachable!("month is checked to be 1..=12 by the caller"),
+        _ => 0,
     }
 }
 
