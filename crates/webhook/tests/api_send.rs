@@ -428,6 +428,173 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
     );
 }
 
+/// When `content::store` fails after `upload_spec` already landed the spec
+/// and any inline parts under `outbox/`, the `?` early-return used to skip
+/// `discard_uploads`, leaving them orphaned — and `outbox/` has no lifecycle
+/// rule. The fix runs `discard_uploads` before the error escapes, so no
+/// `outbox/` object survives the failure. The content document under
+/// `messages/` was never written (the put failed), and `messages/` is
+/// reclaimed by its own lifecycle rule anyway, so it is left untouched.
+///
+/// One inline attachment makes the put sequence, in order: part(1), spec(2),
+/// content-document(3). Failing the 3rd put exercises the cleanup of both the
+/// uploaded part and the spec.
+#[tokio::test]
+async fn a_content_store_failure_discards_the_outbox_uploads() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{
+        "content": STANDARD.encode("file bytes"),
+        "filename": "notes.txt",
+        "content_type": "text/plain",
+    }]);
+    // Fail the content-document put (the 3rd) — after the spec and part
+    // already landed under outbox/.
+    h.state.services.objects.inject_nth_put_if_absent(3);
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // A transient object failure surfaces as the retryable 502 the contract
+    // promises; the body is the generic internal shape (no cause leaked).
+    assert_eq!(response["name"], "InternalServerError");
+
+    let objects = &h.state.services.objects;
+    let uploaded = objects.put_object_calls();
+    assert!(!uploaded.is_empty());
+
+    // Every outbox/ upload (the part and the spec) was reclaimed: the
+    // cleanup is the only thing that reclaims this prefix, so stranding
+    // any of it would leak forever.
+    for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
+        assert!(!objects.contains(key), "{key} was left behind");
+    }
+    // discard_uploads ran: it issued a delete for every outbox/ key the spec
+    // names, and never reached outside outbox/.
+    let deleted = objects.delete_object_calls();
+    assert!(
+        !deleted.is_empty(),
+        "discard_uploads should have issued deletes for the outbox/ uploads"
+    );
+    assert!(
+        deleted.iter().all(|k| k.starts_with("outbox/")),
+        "discard_uploads deleted outside outbox/: {deleted:?}"
+    );
+    // The spec and part keys were both passed to delete_object.
+    assert!(
+        deleted.iter().any(|k| k.ends_with("/spec.json")),
+        "the spec key was not discarded: {deleted:?}"
+    );
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the inline part key was not discarded: {deleted:?}"
+    );
+    // The content document under messages/ was never written: its put failed
+    // before the store recorded it. (messages/ is also reclaimed by the
+    // expire-messages lifecycle rule, so there is nothing to clean there.)
+    let content_key = uploaded
+        .iter()
+        .find(|k| k.starts_with("messages/"))
+        .expect("the content-document put was attempted");
+    assert!(
+        !objects.contains(content_key),
+        "{content_key} should not exist — its put failed"
+    );
+}
+
+/// When `upload_spec` fails partway — the inline parts land, then the spec
+/// write (the last put `upload_spec` issues) fails — the `?` early-return used
+/// to leave the already-uploaded parts orphaned under `outbox/`. The fix runs
+/// `discard_uploads` before the error escapes; `delete_object` treats a
+/// missing key as success, so the never-uploaded spec is a no-op delete and
+/// the uploaded part is reclaimed.
+#[tokio::test]
+async fn an_upload_spec_failure_partway_through_discards_the_uploaded_part() {
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{
+        "content": STANDARD.encode("file bytes"),
+        "filename": "notes.txt",
+        "content_type": "text/plain",
+    }]);
+    // Fail the spec write (the 2nd put) — after the inline part already
+    // landed under outbox/.../parts/.
+    h.state.services.objects.inject_nth_put_if_absent(2);
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(response["name"], "InternalServerError");
+
+    let objects = &h.state.services.objects;
+    let uploaded = objects.put_object_calls();
+    assert!(uploaded.iter().any(|k| k.starts_with("outbox/")));
+    // The part was attempted (and landed); the spec write was attempted but
+    // failed.
+    assert!(uploaded.iter().any(|k| k.contains("/parts/")));
+    assert!(uploaded.iter().any(|k| k.ends_with("/spec.json")));
+
+    // The leaked part is gone: cleanup reclaimed it. The spec key was never
+    // stored (its put failed), so it is trivially absent.
+    for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
+        assert!(!objects.contains(key), "{key} was left behind");
+    }
+    let deleted = objects.delete_object_calls();
+    assert!(
+        !deleted.is_empty(),
+        "discard_uploads should have issued deletes for the outbox/ uploads"
+    );
+    assert!(
+        deleted.iter().all(|k| k.starts_with("outbox/")),
+        "discard_uploads deleted outside outbox/: {deleted:?}"
+    );
+    assert!(
+        deleted.iter().any(|k| k.contains("/parts/")),
+        "the inline part key was not discarded: {deleted:?}"
+    );
+    assert!(
+        deleted.iter().any(|k| k.ends_with("/spec.json")),
+        "the spec key was not passed to delete_object: {deleted:?}"
+    );
+    // No content-document put was attempted: content::store is never reached
+    // when upload_spec fails first, so messages/ is untouched.
+    assert!(
+        !uploaded.iter().any(|k| k.starts_with("messages/")),
+        "no messages/ put should have run: {uploaded:?}"
+    );
+}
+
+/// A send with no inline parts still uploads the spec; a `content::store`
+/// failure right after it must reclaim that spec. This is the no-attachment
+/// variant of the content-store cleanup: the only outbox/ object to leak
+/// would be the spec, and `discard_uploads` must remove it.
+#[tokio::test]
+async fn a_content_store_failure_discards_the_spec_when_there_are_no_parts() {
+    let h = seeded().await;
+    // No attachments: the put sequence is spec(1), content-document(2).
+    h.state.services.objects.inject_nth_put_if_absent(2);
+
+    let (status, _) = send_it(&h, &body(), None).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let objects = &h.state.services.objects;
+    let uploaded = objects.put_object_calls();
+    assert!(uploaded.iter().any(|k| k.ends_with("/spec.json")));
+    for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
+        assert!(!objects.contains(key), "{key} was left behind");
+    }
+    let deleted = objects.delete_object_calls();
+    assert!(
+        deleted.iter().any(|k| k.ends_with("/spec.json")),
+        "the spec key was not discarded: {deleted:?}"
+    );
+    assert!(
+        deleted.iter().all(|k| k.starts_with("outbox/")),
+        "discard_uploads deleted outside outbox/: {deleted:?}"
+    );
+}
+
 /// Every failure a client can cause carries the JSON error body, including
 /// the ones the framework rejects before a handler runs.
 #[tokio::test]
