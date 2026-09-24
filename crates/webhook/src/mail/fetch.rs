@@ -271,13 +271,17 @@ impl AttachmentFetcher for HttpAttachmentFetcher {
 
             // Nothing here decompresses, so a compressed body would be stored
             // and sent as-is under the wrong content type.
-            if let Some(encoding) = response.headers().get(reqwest::header::CONTENT_ENCODING) {
-                let is_identity = encoding
-                    .to_str()
-                    .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity"));
-                if !is_identity {
-                    return Err(FetchError::BadEncoding);
-                }
+            if response
+                .headers()
+                .get_all(reqwest::header::CONTENT_ENCODING)
+                .iter()
+                .any(|encoding| {
+                    !encoding
+                        .to_str()
+                        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("identity"))
+                })
+            {
+                return Err(FetchError::BadEncoding);
             }
 
             // Refuse before reading anything, when the server is honest about
@@ -413,6 +417,50 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, FetchError::BadEncoding), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_content_encoding_header_is_refused_when_any_value_is_non_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dup"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"\x1f\x8bcompressed".to_vec())
+                    .insert_header("content-encoding", "identity")
+                    .append_header("content-encoding", "gzip"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = fetcher()
+            .fetch(&local(&server, "/dup"), 1_000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, FetchError::BadEncoding), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_identity_content_encoding_headers_are_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/id-id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"plain".to_vec())
+                    .insert_header("content-encoding", "identity")
+                    .append_header("content-encoding", "identity"),
+            )
+            .mount(&server)
+            .await;
+
+        let fetched = fetcher()
+            .fetch(&local(&server, "/id-id"), 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.bytes, b"plain");
     }
 
     #[tokio::test]
