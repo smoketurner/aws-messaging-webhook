@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn cache_key_strips_query_string_and_fragment() {
         let base = key_of("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem");
-        // All of these server the same cert and must share one cache slot.
+        // All of these serve the same cert and must share one cache slot.
         assert_eq!(
             key_of("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem?k=1"),
             base
