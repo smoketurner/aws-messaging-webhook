@@ -71,14 +71,24 @@ fn is_not_exists_conditioned(op: &WriteOp) -> bool {
     )
 }
 
-/// Whether `op` carries a version- or status-conditioned check
-/// (`Message`, `SendState` or `Thread`).
+/// Whether `op` carries a version- or status-conditioned check, or a
+/// `NotExists` on a `Put` (`Message`, `SendState` or `Thread`).
+///
+/// A `Thread` `Put` under `Cond::NotExists` is the planner's brand-new-thread
+/// branch: a lost check there lost a creation race, so the caller re-reads and
+/// retries rather than dropping the mail — hence `NotExists` is recognized
+/// here for the `Put` arm. (Step 2 of `decode_cancellation` returns `Duplicate`
+/// first for `Message`/`SendState` `NotExists` checks, so only the `Thread`
+/// case reaches this arm under `NotExists` in practice.)
 fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
     match op {
         WriteOp::Put { cond, .. } => {
             matches!(
                 cond,
-                Cond::VersionEquals(_) | Cond::All(_) | Cond::NotExistsOrExpired { .. }
+                Cond::NotExists
+                    | Cond::VersionEquals(_)
+                    | Cond::All(_)
+                    | Cond::NotExistsOrExpired { .. }
             )
         }
         WriteOp::Update { cond, .. } => {
@@ -333,6 +343,61 @@ mod tests {
         );
     }
 
+    /// A brand-new thread whose `NotExists` check lost to a concurrent writer
+    /// that created the same thread id: the retry loop must re-read the
+    /// now-existing thread and `apply_message` to it, so this decodes to a
+    /// retryable `VersionConflict`, not a `Permanent` drop.
+    #[test]
+    fn thread_not_exists_ccf_decodes_to_version_conflict() {
+        let ops = vec![not_exists_put(OpRole::Thread)];
+        let reasons = vec![CancellationReason::ConditionalCheckFailed];
+        assert_eq!(
+            decode_cancellation(&ops, &reasons),
+            TxnDecision::VersionConflict
+        );
+    }
+
+    /// The production race: two distinct concurrent replies to a
+    /// just-TTL-deleted-but-still-resolvable thread. The losing request's own
+    /// `Message` `NotExists` holds (distinct message id) while only its
+    /// `Thread` `NotExists` loses to the request that resurrected the thread.
+    /// The loss must be retryable so the reply is not silently dropped.
+    #[test]
+    fn thread_not_exists_ccf_in_a_distinct_message_race_decodes_to_version_conflict() {
+        let ops = vec![
+            not_exists_put(OpRole::Message),
+            not_exists_put(OpRole::Thread),
+            not_exists_put(OpRole::RfcAlias),
+        ];
+        let reasons = vec![
+            CancellationReason::None,
+            CancellationReason::ConditionalCheckFailed,
+            CancellationReason::None,
+        ];
+        assert_eq!(
+            decode_cancellation(&ops, &reasons),
+            TxnDecision::VersionConflict
+        );
+    }
+
+    /// Step 2 (`Duplicate` for a `Message`/`SendState` `NotExists`) is checked
+    /// before Step 4 (`VersionConflict` for a `Thread` `NotExists`): a
+    /// same-message redelivery's `Duplicate` still wins over a concurrent
+    /// thread-creation loss, so the redelivery is reported as the success it
+    /// is rather than retried.
+    #[test]
+    fn duplicate_beats_version_conflict_when_message_and_thread_not_exists_both_fail() {
+        let ops = vec![
+            not_exists_put(OpRole::Message),
+            not_exists_put(OpRole::Thread),
+        ];
+        let reasons = vec![
+            CancellationReason::ConditionalCheckFailed,
+            CancellationReason::ConditionalCheckFailed,
+        ];
+        assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Duplicate);
+    }
+
     #[test]
     fn permanent_for_validation_error() {
         let ops = vec![none_put(OpRole::SesRef)];
@@ -404,6 +469,19 @@ mod tests {
                         && is_not_exists_conditioned(&op.op)
                 });
                 prop_assert!(has_not_exists_failure);
+            }
+            // A `Thread` `NotExists` check that lost must never decode to
+            // `Permanent`: it is a retryable `VersionConflict` (or a higher-
+            // precedence `KeyExists`/`Duplicate`/`Retry`), never a silent drop.
+            // This guards the regression where a lost brand-new-thread
+            // creation fell through to `Permanent` and silently lost the mail.
+            let has_thread_not_exists_ccf = ops.iter().zip(&reasons).any(|(op, reason)| {
+                op.role == OpRole::Thread
+                    && *reason == CancellationReason::ConditionalCheckFailed
+                    && is_not_exists_conditioned(&op.op)
+            });
+            if has_thread_not_exists_ccf {
+                prop_assert!(decision != TxnDecision::Permanent);
             }
             if decision != TxnDecision::Retry && decision != TxnDecision::Permanent {
                 // A definite outcome was reached without falling into the
