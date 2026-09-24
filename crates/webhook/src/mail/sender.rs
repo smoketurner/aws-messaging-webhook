@@ -747,15 +747,31 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     let message_id = &finished.message_id;
     let mut keys = vec![send::spec_key(message_id)];
 
-    // The spec names the parts, so it is read before it is removed.
-    if let Ok(bytes) = state
+    // The spec names the parts, so it is read before it is removed. When that
+    // read fails for any reason but absence, the spec is left in place: it is
+    // the only record of which parts exist, and deleting it would strand them
+    // where nothing can find them.
+    match state
         .services
         .get_object(&send::spec_key(message_id), MAX_OUTBOUND_RAW_BYTES)
         .await
-        && let Ok(spec) = serde_json::from_slice::<SendSpec>(&bytes)
     {
-        for attachment in &spec.attachments {
-            keys.push(send::part_key(message_id, &attachment.attachment_id));
+        Ok(bytes) => {
+            if let Ok(spec) = serde_json::from_slice::<SendSpec>(&bytes) {
+                for attachment in &spec.attachments {
+                    keys.push(send::part_key(message_id, &attachment.attachment_id));
+                }
+            }
+        }
+        Err(ObjectError::NotFound) => {}
+        Err(error) => {
+            tracing::warn!(
+                message_id,
+                error = ?error,
+                event = "outbox_cleanup_failed",
+                "could not read the send spec, so its outbox objects are kept; the `outbox/` prefix has no retention rule, so they will need manual cleanup"
+            );
+            return;
         }
     }
 
