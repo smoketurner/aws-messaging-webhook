@@ -137,7 +137,9 @@ pub struct MessageItem {
     pub labels: Vec<String>,
     pub timestamp: String,
     pub from: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized, even empty: matches [`Message::to`] and the
+    /// module-doc "same shapes minus omitted fields" invariant.
+    #[serde(default)]
     pub to: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cc: Vec<String>,
@@ -492,6 +494,31 @@ mod tests {
         assert!(value.get("reply_to").is_none());
         assert_eq!(value["message_id"], "mid-1");
         assert_eq!(value["subject"], "Hello");
+    }
+
+    /// `to` is a required field on both the full [`Message`] view and the
+    /// list [`MessageItem`] view, so it must serialize the same way on both —
+    /// present and empty `[]` — for a message with no `to` recipients. This
+    /// locks in the fix for the list-vs-full divergence on empty `to`.
+    #[test]
+    fn message_and_message_item_agree_on_empty_to() {
+        let mut msg = sample_message();
+        msg.to = Vec::new();
+        let content = MessageContent {
+            text: None,
+            html: None,
+            headers: BTreeMap::new(),
+            references: Vec::new(),
+            reply_to: Vec::new(),
+            verdicts: None,
+        };
+        let full = serde_json::to_value(Message::new(&msg, &content)).unwrap();
+        let item = serde_json::to_value(MessageItem::from(&msg)).unwrap();
+        assert_eq!(full["to"], json!([]));
+        assert!(full.get("to").is_some());
+        assert_eq!(item["to"], json!([]));
+        assert!(item.get("to").is_some(), "{item}");
+        assert_eq!(full["to"], item["to"]);
     }
 
     #[test]
