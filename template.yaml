@@ -996,6 +996,12 @@ Resources:
                 - s3:GetObject
                 - s3:DeleteObject
               Resource: !Sub "${rMailBucket.Arn}/outbox/*"
+            # A URL attachment is fetched once and stored under
+            # outbox/<message_id>/parts/, so a retried send reuses those bytes.
+            - Sid: OutboxParts
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${rMailBucket.Arn}/outbox/*/parts/*"
             - Sid: SentObjects
               Effect: Allow
               Action: s3:PutObject
