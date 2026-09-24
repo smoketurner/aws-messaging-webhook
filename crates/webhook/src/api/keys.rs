@@ -213,11 +213,7 @@ impl KeyCache {
                 // reopened — notably a miss-driven refresh just after a
                 // successful load — the existing, longer deferral is kept, so
                 // the scheduled refresh still opens at the original five-minute
-                // mark. (The report's literal `now() - REFRESH_INTERVAL +
-                // FAILURE_BACKOFF` form, by contrast, back-dates the gate to
-                // `now() - 270 s` whenever it fires, so an early miss-refresh
-                // failure reopens the scheduled gate far earlier than five
-                // minutes — verified to fail the early-miss test.)
+                // mark.
                 if previous.is_some()
                     && let Some(rewind) = REFRESH_INTERVAL.checked_sub(FAILURE_BACKOFF)
                     && let Some(rewound) = Instant::now().checked_sub(rewind)
@@ -423,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn repro_outage_valid_key_fetches_unbounded() {
+    async fn outage_with_a_valid_key_fetches_once_per_backoff() {
         let source = FakeSource::ok(document_for(KEY, "key_1"));
         let cache = KeyCache::new();
         assert!(matches!(
@@ -449,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn repro_outage_junk_key_fetches_unbounded() {
+    async fn outage_with_a_junk_key_fetches_once_per_backoff() {
         let source = FakeSource::ok(document_for(KEY, "key_1"));
         let cache = KeyCache::new();
         assert!(matches!(

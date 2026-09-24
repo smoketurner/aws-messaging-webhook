@@ -97,6 +97,11 @@ Two workspace crates:
   *must* handle redirects; it follows them by hand, at most five hops, re-running the full
   `mail/url_policy.rs` shape and address checks on every `Location`, because the first check
   says nothing about where a redirect leads.
+- **Strongly consistent DynamoDB reads cost twice the capacity; use them only when a stale read
+  would be wrong, not merely late.** Default to eventually consistent. A stale miss that a
+  conditional write downstream already catches, or that a retry corrects, does not justify one;
+  a read that must observe what a failed condition just proved exists (the `ensure_inbox`
+  recovery) or that feeds a `VersionEquals` write does. Say why at each `consistent_read(true)`.
 - **Handler tests are the integration suite.** `crates/webhook/tests/handlers.rs` drives the
   real router with properly signed envelopes against one `FakeServices` implementing the
   `Services` trait (`state.rs` — the single bound aggregating `EventStore + PublishEvents +

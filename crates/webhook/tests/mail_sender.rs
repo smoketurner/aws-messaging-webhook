@@ -447,6 +447,10 @@ async fn an_object_store_refusal_fails_the_send_without_retrying() {
     assert_eq!(state.failure, Some(SendFailure::OutboxUnavailable));
     assert_eq!(state.transient_failures, 0);
     assert!(h.state.services.sent.lock().unwrap().is_empty());
+    // The unreadable spec is the only record of the send's parts, so cleanup
+    // keeps it rather than stranding them.
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(deleted.is_empty(), "{deleted:?}");
 }
 
 #[tokio::test(start_paused = true)]

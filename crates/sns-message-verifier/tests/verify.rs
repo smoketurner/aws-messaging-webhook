@@ -56,7 +56,9 @@ async fn accepts_valid_subscription_confirmation() {
 #[tokio::test]
 async fn rejects_tampered_fields() {
     let fixture = SnsFixture::new();
-    let (server, cert_url) = serve_cert(&fixture.cert_pem, 1).await;
+    // expect(3): a certificate is cached only after a signature verifies
+    // against it, so each tampered envelope fetches it afresh.
+    let (server, cert_url) = serve_cert(&fixture.cert_pem, 3).await;
     let sns = verifier(&server);
 
     for (field, value) in [
@@ -321,4 +323,51 @@ async fn cache_does_not_evict_legit_entry_under_query_flood() {
     fixture.sign(&mut body, "2");
     sns.verify_body(body.to_string().as_bytes()).await.unwrap(); // +1: legit cache-hit
     server.verify().await;
+}
+
+#[tokio::test]
+async fn bad_signature_envelopes_cannot_evict_a_verified_certificate() {
+    let fixture = SnsFixture::new();
+    let server = MockServer::start().await;
+    // Every path serves the genuine cert, as a host that decodes
+    // percent-escapes or serves several regions' certs effectively does.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture.cert_pem.clone()))
+        .mount(&server)
+        .await;
+    let sns = verifier(&server);
+    let cert_url = format!("{}/cert.pem", server.uri());
+
+    let mut body = notification(&cert_url);
+    fixture.sign(&mut body, "2");
+    sns.verify_body(body.to_string().as_bytes()).await.unwrap();
+
+    // More distinct URLs than the cache holds, each with a signature that
+    // fails: none of them may take a cache slot.
+    for n in 0..40 {
+        let mut body = notification(&format!("{}/cert{n}.pem", server.uri()));
+        fixture.sign(&mut body, "2");
+        body["Message"] = json!("forged");
+        let err = sns
+            .verify_body(body.to_string().as_bytes())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VerifyError::SignatureMismatch));
+    }
+
+    let mut body = notification(&cert_url);
+    fixture.sign(&mut body, "2");
+    sns.verify_body(body.to_string().as_bytes()).await.unwrap();
+
+    let fetches_of_the_verified_url = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/cert.pem")
+        .count();
+    assert_eq!(
+        fetches_of_the_verified_url, 1,
+        "the verified entry was evicted"
+    );
 }
