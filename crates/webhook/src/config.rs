@@ -16,11 +16,11 @@ pub struct Config {
     /// End User Messaging opt-out list for the STOP/START action; `None`
     /// disables that action.
     pub opt_out_list_name: Option<String>,
-    pub raw_event_retention_days: u64,
+    pub raw_event_retention_days: u32,
     /// TTL for the per-message aggregate item. Kept separate from (and
     /// typically longer than) `raw_event_retention_days` so a message's
     /// rolled-up current state outlives its bulky raw event items.
-    pub aggregate_retention_days: u64,
+    pub aggregate_retention_days: u32,
     /// Which half of the single binary this invocation runs: the webhook
     /// (Function URL + direct SNS ingress) or the mail sender (stream
     /// consumer, sweep, redrive, close). Only meaningful when [`mail`] is
@@ -105,35 +105,18 @@ impl Config {
             );
         }
 
-        let raw_event_retention_days = match optional("RAW_EVENT_RETENTION_DAYS") {
-            None => 30,
-            Some(raw) => {
-                let days = raw.parse::<u64>().with_context(|| {
-                    format!("RAW_EVENT_RETENTION_DAYS must be a positive integer, got {raw:?}")
-                })?;
-                // 0 would set a TTL of "now", purging every audit record almost
-                // immediately — reject it rather than silently destroy data.
-                anyhow::ensure!(
-                    days > 0,
-                    "RAW_EVENT_RETENTION_DAYS must be at least 1, got 0"
-                );
-                days
-            }
-        };
+        // `u32` (via `parse_positive_u32`, like `MAIL_RETENTION_DAYS`) caps
+        // the value at `u32::MAX`, so the `days × 86_400` TTL multiply in
+        // `store.rs` cannot overflow `u64` and wrap in release builds.
+        let raw_event_retention_days = parse_positive_u32(
+            "RAW_EVENT_RETENTION_DAYS",
+            &optional("RAW_EVENT_RETENTION_DAYS").unwrap_or_else(|| "30".to_owned()),
+        )?;
 
-        let aggregate_retention_days = match optional("AGGREGATE_RETENTION_DAYS") {
-            None => 365,
-            Some(raw) => {
-                let days = raw.parse::<u64>().with_context(|| {
-                    format!("AGGREGATE_RETENTION_DAYS must be a positive integer, got {raw:?}")
-                })?;
-                anyhow::ensure!(
-                    days > 0,
-                    "AGGREGATE_RETENTION_DAYS must be at least 1, got 0"
-                );
-                days
-            }
-        };
+        let aggregate_retention_days = parse_positive_u32(
+            "AGGREGATE_RETENTION_DAYS",
+            &optional("AGGREGATE_RETENTION_DAYS").unwrap_or_else(|| "365".to_owned()),
+        )?;
 
         let mail = MailConfig::from_env()?;
 
@@ -415,5 +398,28 @@ mod tests {
         assert!(parse_positive_u32("MAIL_SEND_RATE", "-1").is_err());
         assert!(parse_positive_u32("MAIL_SEND_RATE", "fast").is_err());
         assert_eq!(parse_positive_u32("MAIL_SEND_RATE", "5").unwrap(), 5);
+    }
+
+    /// `RAW_EVENT_RETENTION_DAYS` / `AGGREGATE_RETENTION_DAYS` feed `days ×
+    /// 86_400` into a `u64` TTL multiply in `store.rs`. `u32::MAX × 86_400`
+    /// fits `u64`, but anything larger would wrap in release builds — so
+    /// retention is parsed as `u32` (via `parse_positive_u32`), which
+    /// rejects values above `u32::MAX`. `213_503_982_334_602` is the wrap
+    /// threshold from the bug report; it is rejected at the config boundary
+    /// and never reaches `expiry_secs`.
+    #[test]
+    fn positive_u32_rejects_values_above_u32_max() {
+        // `u32::MAX` itself is accepted; its `× 86_400` product fits `u64`.
+        assert_eq!(
+            parse_positive_u32("RAW_EVENT_RETENTION_DAYS", "4294967295").unwrap(),
+            u32::MAX
+        );
+        // `u32::MAX + 1` does not fit `u32` — rejected.
+        assert!(parse_positive_u32("RAW_EVENT_RETENTION_DAYS", "4294967296").is_err());
+        // The bug-report wrap threshold (`213_503_982_334_602` days) — rejected.
+        assert!(
+            parse_positive_u32("RAW_EVENT_RETENTION_DAYS", "213503982334602").is_err(),
+            "the wrap-triggering retention value must be rejected at config parse time"
+        );
     }
 }
