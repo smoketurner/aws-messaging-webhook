@@ -73,14 +73,13 @@ impl SnsVerifier {
             &envelope.signing_cert_url,
             self.dangerous_allow_prefix.as_deref(),
         )?;
-        let cache_key = url.as_str();
+        let cache_key = cert::cache_key(&url);
 
-        let key = if let Some(cached) = self.cache.get(cache_key) {
+        let key = if let Some(cached) = self.cache.get(&cache_key) {
             cached
         } else {
             let fetched = Arc::new(cert::fetch_and_parse(&self.http, &url).await?);
-            self.cache
-                .insert(cache_key.to_owned(), Arc::clone(&fetched));
+            self.cache.insert(cache_key.clone(), Arc::clone(&fetched));
             fetched
         };
         signature::verify_with_key(envelope, &key)

@@ -15,6 +15,26 @@ const MAX_CERT_RESPONSE_BYTES: usize = 64 * 1024;
 
 const MAX_CACHED_CERTS: usize = 32;
 
+/// Canonical cache key for a validated cert URL: scheme, host, port
+/// (normalized to the scheme default if omitted), and path. Query and
+/// fragment are intentionally excluded — they do not change which
+/// certificate is served, so including them would let a sender manufacture
+/// cache misses (and, via the 32-distinct-key eviction rule in
+/// [`CertCache::insert`], evict otherwise-warm entries) on an
+/// otherwise-valid cert URL. `port_or_known_default` collapses an explicit
+/// `:443` and the omitted port to the same key, matching the URL policy in
+/// [`validate_sns_url`] (which only permits `None | Some(443)`).
+pub(crate) fn cache_key(url: &Url) -> String {
+    let port = url.port_or_known_default().unwrap_or(443);
+    format!(
+        "{}://{}:{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or(""),
+        port,
+        url.path(),
+    )
+}
+
 /// Validates that `raw` is an SNS service URL: `https`, port 443, and a host
 /// matching `sns.<region>.amazonaws.com(.cn)`. This is the SSRF trust anchor
 /// shared by certificate fetching and `SubscribeURL` confirmation, so both
@@ -246,6 +266,57 @@ mod tests {
                 other => panic!("expected InvalidCertUrl, got {other:?}"),
             },
             CertUrlRejection::NotHttps
+        );
+    }
+
+    fn key_of(raw: &str) -> String {
+        let url = validate_cert_url(raw, None).unwrap();
+        cache_key(&url)
+    }
+
+    #[test]
+    fn cache_key_strips_query_string_and_fragment() {
+        let base = key_of("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem");
+        // All of these server the same cert and must share one cache slot.
+        assert_eq!(
+            key_of("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem?k=1"),
+            base
+        );
+        assert_eq!(
+            key_of("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem?k=1&j=2"),
+            base
+        );
+        assert_eq!(
+            key_of("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem#frag"),
+            base
+        );
+        assert_eq!(
+            key_of(
+                "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem?k=1#frag"
+            ),
+            base
+        );
+        // An explicit `:443` and the omitted port are the same endpoint and
+        // must collapse to the same key.
+        assert_eq!(
+            key_of("https://sns.us-east-1.amazonaws.com:443/SimpleNotificationService-abc.pem"),
+            base
+        );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_different_paths_and_hosts() {
+        assert_ne!(
+            key_of("https://sns.us-east-1.amazonaws.com/cert1.pem"),
+            key_of("https://sns.us-east-1.amazonaws.com/cert2.pem")
+        );
+        assert_ne!(
+            key_of("https://sns.us-east-1.amazonaws.com/cert.pem"),
+            key_of("https://sns.us-west-2.amazonaws.com/cert.pem")
+        );
+        assert_ne!(
+            key_of("https://sns.us-east-1.amazonaws.com/cert.pem"),
+            key_of("https://sns.cn-north-1.amazonaws.com.cn/cert.pem")
         );
     }
 }
