@@ -560,8 +560,15 @@ impl flows::TxnStore for AwsServices {
     }
 }
 
-impl MailStore for AwsServices {
-    async fn get_inbox(&self, inbox: &InboxId) -> Result<Option<Inbox>, MailStoreError> {
+impl AwsServices {
+    /// Reads the inbox item. `consistent` is set only where a stale miss
+    /// would be wrong rather than merely late: a strongly consistent read
+    /// costs twice the capacity.
+    async fn read_inbox(
+        &self,
+        inbox: &InboxId,
+        consistent: bool,
+    ) -> Result<Option<Inbox>, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let output = self
             .dynamo
@@ -569,12 +576,7 @@ impl MailStore for AwsServices {
             .table_name(table_name)
             .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
             .key("sk", DynamoAv::S(keys::inbox_sk().to_owned()))
-            // Consistent: `ensure_inbox`'s conditional-check-failed arm relies on
-            // this read observing the inbox the strongly-consistent
-            // `ConditionExpression` just proved exists. An eventually-consistent
-            // read can hit a stale replica during replication lag and return
-            // `None`, tripping the "inbox disappeared" guard.
-            .consistent_read(true)
+            .consistent_read(consistent)
             .send()
             .await
             .map_err(|e| store_error_from_sdk("GetItem(inbox)", &e))?;
@@ -584,6 +586,14 @@ impl MailStore for AwsServices {
                 .map(Some)
                 .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing inbox: {e}"))),
         }
+    }
+}
+
+impl MailStore for AwsServices {
+    async fn get_inbox(&self, inbox: &InboxId) -> Result<Option<Inbox>, MailStoreError> {
+        // Eventually consistent: a stale miss only sends the caller to
+        // `ensure_inbox`, whose conditional put settles it.
+        self.read_inbox(inbox, false).await
     }
 
     async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
@@ -603,8 +613,13 @@ impl MailStore for AwsServices {
             Err(SdkError::ServiceError(ctx))
                 if ctx.err().is_conditional_check_failed_exception() =>
             {
-                self.get_inbox(inbox).await?.ok_or_else(|| {
-                    MailStoreError::Permanent(anyhow!(
+                // The failed condition proves the inbox exists, so this rare
+                // path reads consistently: a stale replica would report it
+                // missing. Absent even so means it was removed between the two
+                // calls; a retry recreates it, where a permanent error would
+                // ack the notification and drop the message.
+                self.read_inbox(inbox, true).await?.ok_or_else(|| {
+                    MailStoreError::Transient(anyhow!(
                         "inbox disappeared after a conditional check failure"
                     ))
                 })
@@ -1096,30 +1111,19 @@ mod tests {
         assert!(matches!(assemble_thread_view(None, Ok(empty)), Ok(None)));
     }
 
-    // --- get_inbox: consistent_read regression guard ----------------------
+    // --- inbox reads: consistent_read guard ---------------------------------
     //
-    // `ensure_inbox`'s `PutItem` `ConditionExpression` is evaluated strongly
-    // consistently, so a `ConditionalCheckFailedException` proves the inbox
-    // exists. The recovery read in `ensure_inbox` is `get_inbox`, so it must
-    // also read strongly consistently — otherwise an eventually-consistent
-    // `GetItem` can hit a stale replica during DynamoDB replication lag and
-    // return `Ok(None)`, tripping the "inbox disappeared after a conditional
-    // check failure" guard. That spurious `Permanent` surfaces from ingest as
-    // `Ok("ingest_failed")` (HTTP 200), which the SNS→Lambda ingress treats
-    // as success, silently dropping the inbound email with no redelivery.
+    // `ensure_inbox`'s `PutItem` condition is evaluated strongly consistently,
+    // so a `ConditionalCheckFailedException` proves the inbox exists, and the
+    // recovery read that follows must be strongly consistent too: a stale
+    // replica would report it missing. Every other inbox read tolerates a
+    // stale miss (it only leads to `ensure_inbox`), and a consistent read
+    // costs twice the capacity, so `get_inbox` stays eventually consistent.
     //
-    // The stale-read race itself can't be reproduced in a unit test
-    // (DynamoDB-Local/localstack are single-node; the in-memory test double
-    // has no replica), so this pins the *property* the fix restores directly
-    // against the AWS-backed `MailStore`: the `GetItem` `get_inbox` emits
-    // must carry `consistent_read = true`. The seam is a request interceptor
-    // on a real `aws_sdk_dynamodb::Client`: it records the typed `GetItemInput`
-    // in `read_before_execution` (always available) and short-circuits the
-    // execution with an error so the request never reaches a real DynamoDB
-    // endpoint (no network, no retries, deterministic). This guards the
-    // exact asymmetry that let the bug land: every other read in this file
-    // that conditions a follow-up write sets `.consistent_read(true)`;
-    // `get_inbox` must not regress to eventually-consistent.
+    // The seam is a request interceptor on a real `aws_sdk_dynamodb::Client`:
+    // it records the typed `GetItemInput` in `read_before_execution` and
+    // short-circuits the execution with an error, so no request reaches a
+    // real endpoint (no network, no retries, deterministic).
 
     use aws_sdk_dynamodb::config::Intercept;
     use aws_sdk_dynamodb::config::interceptors::BeforeSerializationInterceptorContextRef;
@@ -1200,36 +1204,34 @@ mod tests {
         aws
     }
 
-    /// The `GetItem` emitted by `get_inbox` reads strongly consistently, so the
-    /// conditional-check recovery in `ensure_inbox` cannot observe a stale
-    /// replica after a `PutItem` conditional-check failure.
+    /// Only the `ensure_inbox` recovery read pays for strong consistency.
     #[tokio::test]
-    async fn get_inbox_reads_strongly_consistently() {
+    async fn only_the_ensure_inbox_recovery_reads_strongly_consistently() {
         let captured = Arc::new(Mutex::new(Vec::<GetItemInput>::new()));
         let aws = aws_with_capturing_dynamo(Arc::clone(&captured));
 
         let inbox = InboxId("support@example.com".to_owned());
-        // The interceptor short-circuits every request with an error, so the
-        // call surfaces a (permanent) store error; only the emitted request
-        // is asserted on.
+        // The interceptor short-circuits every request with an error; only
+        // the emitted requests are asserted on.
         let _ = MailStore::get_inbox(&aws, &inbox).await;
+        let _ = aws.read_inbox(&inbox, true).await;
 
         let requests: Vec<GetItemInput> = captured
             .lock()
             .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        assert_eq!(requests.len(), 2);
         assert_eq!(
-            requests.len(),
-            1,
-            "get_inbox must emit exactly one GetItem request"
+            requests[0].consistent_read(),
+            Some(false),
+            "get_inbox tolerates a stale miss and must not pay for a consistent read"
         );
-        let request = &requests[0];
         assert_eq!(
-            request.consistent_read(),
+            requests[1].consistent_read(),
             Some(true),
-            "get_inbox must read strongly consistently so the conditional-check \
-             recovery in ensure_inbox cannot observe a stale replica"
+            "the recovery read after a conditional-check failure must be consistent"
         );
+        let request = &requests[1];
         assert_eq!(request.table_name(), Some(MAIL_TABLE_NAME));
         let key = request.key();
         let pk = key.and_then(|k| k.get("pk"));
