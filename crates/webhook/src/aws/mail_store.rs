@@ -569,6 +569,12 @@ impl MailStore for AwsServices {
             .table_name(table_name)
             .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
             .key("sk", DynamoAv::S(keys::inbox_sk().to_owned()))
+            // Consistent: `ensure_inbox`'s conditional-check-failed arm relies on
+            // this read observing the inbox the strongly-consistent
+            // `ConditionExpression` just proved exists. An eventually-consistent
+            // read can hit a stale replica during replication lag and return
+            // `None`, tripping the "inbox disappeared" guard.
+            .consistent_read(true)
             .send()
             .await
             .map_err(|e| store_error_from_sdk("GetItem(inbox)", &e))?;
@@ -1088,5 +1094,147 @@ mod tests {
             next: None,
         };
         assert!(matches!(assemble_thread_view(None, Ok(empty)), Ok(None)));
+    }
+
+    // --- get_inbox: consistent_read regression guard ----------------------
+    //
+    // `ensure_inbox`'s `PutItem` `ConditionExpression` is evaluated strongly
+    // consistently, so a `ConditionalCheckFailedException` proves the inbox
+    // exists. The recovery read in `ensure_inbox` is `get_inbox`, so it must
+    // also read strongly consistently — otherwise an eventually-consistent
+    // `GetItem` can hit a stale replica during DynamoDB replication lag and
+    // return `Ok(None)`, tripping the "inbox disappeared after a conditional
+    // check failure" guard. That spurious `Permanent` surfaces from ingest as
+    // `Ok("ingest_failed")` (HTTP 200), which the SNS→Lambda ingress treats
+    // as success, silently dropping the inbound email with no redelivery.
+    //
+    // The stale-read race itself can't be reproduced in a unit test
+    // (DynamoDB-Local/localstack are single-node; the in-memory test double
+    // has no replica), so this pins the *property* the fix restores directly
+    // against the AWS-backed `MailStore`: the `GetItem` `get_inbox` emits
+    // must carry `consistent_read = true`. The seam is a request interceptor
+    // on a real `aws_sdk_dynamodb::Client`: it records the typed `GetItemInput`
+    // in `read_before_execution` (always available) and short-circuits the
+    // execution with an error so the request never reaches a real DynamoDB
+    // endpoint (no network, no retries, deterministic). This guards the
+    // exact asymmetry that let the bug land: every other read in this file
+    // that conditions a follow-up write sets `.consistent_read(true)`;
+    // `get_inbox` must not regress to eventually-consistent.
+
+    use aws_sdk_dynamodb::config::Intercept;
+    use aws_sdk_dynamodb::config::interceptors::BeforeSerializationInterceptorContextRef;
+    use aws_sdk_dynamodb::operation::get_item::GetItemInput;
+    use std::sync::{Arc, Mutex};
+
+    /// Mail table name used by the capturing-dynamo fixtures below.
+    const MAIL_TABLE_NAME: &str = "mail-table";
+
+    /// Interceptor that records the typed `GetItemInput` for every `GetItem`
+    /// and then aborts the execution so the test never touches the network.
+    #[derive(Debug)]
+    struct CaptureGetItemInput(Arc<Mutex<Vec<GetItemInput>>>);
+
+    impl Intercept for CaptureGetItemInput {
+        fn name(&self) -> &'static str {
+            "CaptureGetItemInput"
+        }
+
+        fn read_before_execution(
+            &self,
+            context: &BeforeSerializationInterceptorContextRef<'_>,
+            _cfg: &mut aws_smithy_types::config_bag::ConfigBag,
+        ) -> Result<(), aws_sdk_dynamodb::error::BoxError> {
+            if let Some(input) = context.input().downcast_ref::<GetItemInput>()
+                && let Ok(mut guard) = self.0.lock()
+            {
+                guard.push(input.clone());
+            }
+            // Short-circuit after capture: a real DynamoDB endpoint isn't
+            // available in a unit test, and retries/endpoint resolution would
+            // make the test slow and non-deterministic. The captured input is
+            // all we assert on, so the surfaced (permanent) error is discarded.
+            let err: aws_sdk_dynamodb::error::BoxError =
+                String::from("interceptor short-circuit: request captured for assertion").into();
+            Err(err)
+        }
+    }
+
+    /// Builds an `AwsServices` whose DynamoDB client records every `GetItem`
+    /// input it would send and short-circuits before transmission.
+    fn aws_with_capturing_dynamo(captured: Arc<Mutex<Vec<GetItemInput>>>) -> AwsServices {
+        let dynamo_conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+            .interceptor(CaptureGetItemInput(captured))
+            .build();
+        let sdk = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build();
+        let mut aws = AwsServices::new(
+            &sdk,
+            crate::config::Config {
+                table_name: "events".to_owned(),
+                event_bus_name: "bus".to_owned(),
+                event_source: "aws-messaging-webhook".to_owned(),
+                auto_resubscribe: false,
+                opt_out_list_name: None,
+                raw_event_retention_days: 30,
+                aggregate_retention_days: 365,
+                mode: crate::config::FunctionMode::Webhook,
+                mail: Some(crate::config::MailConfig {
+                    domain: "example.com".to_owned(),
+                    table_name: MAIL_TABLE_NAME.to_owned(),
+                    bucket: "mail-bucket".to_owned(),
+                    inbox: "support@example.com".to_owned(),
+                    configuration_set: "config-set".to_owned(),
+                    identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com"
+                        .to_owned(),
+                    api_keys_parameter: "/example/api-keys".to_owned(),
+                    attachment_url_ttl: std::time::Duration::from_secs(3600),
+                    region: "us-east-1".to_owned(),
+                    retention_days: 365,
+                }),
+            },
+        );
+        aws.dynamo = aws_sdk_dynamodb::Client::from_conf(dynamo_conf);
+        aws
+    }
+
+    /// The `GetItem` emitted by `get_inbox` reads strongly consistently, so the
+    /// conditional-check recovery in `ensure_inbox` cannot observe a stale
+    /// replica after a `PutItem` conditional-check failure.
+    #[tokio::test]
+    async fn get_inbox_reads_strongly_consistently() {
+        let captured = Arc::new(Mutex::new(Vec::<GetItemInput>::new()));
+        let aws = aws_with_capturing_dynamo(Arc::clone(&captured));
+
+        let inbox = InboxId("support@example.com".to_owned());
+        // The interceptor short-circuits every request with an error, so the
+        // call surfaces a (permanent) store error; only the emitted request
+        // is asserted on.
+        let _ = MailStore::get_inbox(&aws, &inbox).await;
+
+        let requests: Vec<GetItemInput> = captured
+            .lock()
+            .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert_eq!(
+            requests.len(),
+            1,
+            "get_inbox must emit exactly one GetItem request"
+        );
+        let request = &requests[0];
+        assert_eq!(
+            request.consistent_read(),
+            Some(true),
+            "get_inbox must read strongly consistently so the conditional-check \
+             recovery in ensure_inbox cannot observe a stale replica"
+        );
+        assert_eq!(request.table_name(), Some(MAIL_TABLE_NAME));
+        let key = request.key();
+        let pk = key.and_then(|k| k.get("pk"));
+        let sk = key.and_then(|k| k.get("sk"));
+        assert_eq!(pk, Some(&DynamoAv::S(keys::inbox_pk(inbox.as_str()))));
+        assert_eq!(sk, Some(&DynamoAv::S(keys::inbox_sk().to_owned())));
     }
 }
