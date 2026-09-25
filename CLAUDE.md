@@ -26,18 +26,25 @@ end-to-end probe is in `docs/operations.md`.
 
 ## Architecture
 
-One Rust Lambda receiving AWS messaging events over SNS via two ingress pathways: HTTPS POSTs
-to a Lambda Function URL (Axum), and direct SNS→Lambda invocations. `entry.rs` dispatches each
-invocation by payload shape (top-level `Records` array = SNS event; anything else = Function URL
-request served through `lambda_http::Adapter`). The pipeline for every notification is
+One Rust binary deployed as two Lambda functions. The webhook function receives AWS messaging
+events over SNS via two ingress pathways — HTTPS POSTs to a Lambda Function URL (Axum) and
+direct SNS→Lambda invocations — and serves the bearer-authenticated `/v0` mailbox API (`api/`)
+on the same Function URL. The mail-sender function (created only when `pMailDomain` is set) is
+the same binary in `FunctionMode::Sender`, reached through the mail table's stream, a scheduled
+sweep, or an operator command. `entry.rs` dispatches each invocation by mode and payload shape:
+a top-level `Records` array is either a DynamoDB stream batch (`eventSource: aws:dynamodb`) or
+an SNS event; anything else is a Function URL request served through `lambda_http::Adapter`
+(in sender mode, a sweep or command). The pipeline for every notification is
 **verify → persist → act → publish**, in that order, and the order is load-bearing (see below).
-Two workspace crates:
+Three workspace crates:
 
 - **`crates/sns-message-verifier`** — standalone SNS signature verification (versions 1 and 2),
   no AWS SDK dependency. Trust anchor is the `SigningCertURL` host policy (`https://sns.<region>.amazonaws.com`
   only, no redirects followed, no CA-chain check — same model as AWS's own validators). The
   `test-fixtures` feature generates throwaway keys/certs so consumers can sign test envelopes.
 - **`crates/webhook`** (package `aws-messaging-webhook`) — the Lambda itself.
+- **`crates/webhook-test-support`** — test-only fakes (`FakeServices`, in-memory mail and
+  object stores) shared by the webhook crate's integration tests.
 
 ### Request flow through the webhook crate
 
@@ -63,7 +70,7 @@ Two workspace crates:
 5. `store.rs` persists to DynamoDB (event items + per-message aggregate). The conditional write
    is the idempotency mechanism; `PersistOutcome` (`Fresh` / `Duplicate`) tells the request path
    whether the aggregate was applied (idempotent actions run regardless).
-6. `actions/` runs inline lifecycle calls (delivery feedback, STOP/START opt-outs, bounce and
+6. `actions.rs` runs inline lifecycle calls (delivery feedback, STOP/START opt-outs, bounce and
    complaint suppression). AWS-native lists are the source of truth.
 7. `stream.rs` is the **sole publisher of event details**: a DynamoDB Streams consumer (same
    binary) rebuilds each
@@ -83,8 +90,10 @@ Two workspace crates:
   subseconds — rebuilding the signed canonical string from it rejects every message published
   on a whole second. `entry.rs` deserializes the record straight into `SnsEnvelope` (which
   aliases the Lambda-shape `SigningCertUrl`/`UnsubscribeUrl` casing) so signed values stay
-  verbatim. The request path persists (the outbox entry) before running idempotent actions; a
-  5xx redelivery re-runs only the repeat-safe actions, so action APIs must stay repeat-safe.
+  verbatim.
+- **Persist before acting; actions stay repeat-safe.** The request path persists (the outbox
+  entry) before running idempotent actions; a 5xx redelivery re-runs only the repeat-safe
+  actions, so action APIs must stay repeat-safe.
   Publishing is decoupled — the stream relay publishes every event detail, with its own
   retries + DLQ (the request path publishes only `subscription.changed`).
   `ActionErrorKind` splits transient (5xx, retry) from permanent (log + metric, still persist) —
@@ -102,10 +111,12 @@ Two workspace crates:
   conditional write downstream already catches, or that a retry corrects, does not justify one;
   a read that must observe what a failed condition just proved exists (the `ensure_inbox`
   recovery) or that feeds a `VersionEquals` write does. Say why at each `consistent_read(true)`.
-- **Handler tests are the integration suite.** `crates/webhook/tests/handlers.rs` drives the
-  real router with properly signed envelopes against one `FakeServices` implementing the
-  `Services` trait (`state.rs` — the single bound aggregating `EventStore + PublishEvents +
-  SmsVoiceApi + SesApi`). New downstream calls go through that trait so tests stay AWS-free.
+- **Integration tests drive the real router against fakes.** `crates/webhook/tests/handlers.rs`
+  sends properly signed SNS envelopes, and the `api_*`/`mail_*` suites exercise the mailbox,
+  all against fakes from `crates/webhook-test-support` implementing the `Services` trait
+  (`state.rs` — the single bound aggregating `EventStore`, `PublishEvents`, `SmsVoiceApi`,
+  `SesApi`, `MailStore`, `ObjectStore`, `AttachmentFetcher` and `ApiKeySource`). New
+  downstream calls go through that trait so tests stay AWS-free.
 - SNS topics and subscriptions deliberately live outside the SAM stack, except the two
   stack-owned mail topics (SES receipts and SES configuration-set events, created only when
   `pMailDomain` is set); `template.yaml` maps CloudFormation parameters to the env vars
