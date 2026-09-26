@@ -29,7 +29,7 @@ past retention, and attachments dropped for size, answer `404`.
 lowercased, trimmed and deduplicated. Remove `unread` to mark a message read.
 
 - A message holds at most 20 of your labels, and a thread 20 across its messages. A request
-  names at most 20. Exceeding a cap is a `400`.
+  names at most 20 of your labels. Exceeding a cap is a `400`.
 - Your labels plus `unread`, `spam` and `trash` are editable. Service labels, or the same label
   in both fields, are a `400`.
 - A thread keeps a label while any of its messages has it. Relabeling doesn't reorder threads.
