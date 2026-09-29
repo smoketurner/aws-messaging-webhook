@@ -54,8 +54,10 @@ pub fn content_key(inbox_id: &InboxId, message_id: &str) -> String {
 /// the same bytes.
 ///
 /// A document that would exceed [`MAX_CONTENT_BYTES`] is stored without its
-/// bodies, so every stored document can be read back; the bodies stay
-/// reachable in the raw message, as attachments past the cap do.
+/// bodies (and, if still too large, further fields; see
+/// `serialize_within`), so every stored document can be read back; what
+/// is dropped stays reachable in the raw message, as attachments past the
+/// cap do.
 ///
 /// # Errors
 ///
@@ -68,15 +70,15 @@ pub async fn store<S: ObjectStore>(
 ) -> Result<(), ObjectError> {
     let serialize_error =
         |e| ObjectError::Permanent(anyhow::anyhow!("serializing message content: {e}"));
-    let (body, bodies_dropped) =
+    let (body, fields_dropped) =
         serialize_within(content, MAX_CONTENT_BYTES).map_err(serialize_error)?;
-    if bodies_dropped {
+    if fields_dropped {
         tracing::warn!(
             inbox_id = inbox_id.as_str(),
             message_id,
             max_bytes = MAX_CONTENT_BYTES,
             event = "message_content_bodies_dropped",
-            "message content exceeds the document cap once serialized; storing it without its bodies, which remain in the raw message"
+            "message content exceeds the document cap once serialized; storing it without its bodies, and any further fields needed to fit, all of which remain in the raw message"
         );
     }
     objects
