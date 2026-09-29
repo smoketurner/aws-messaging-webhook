@@ -214,6 +214,69 @@ async fn plain_message_ingests_and_creates_a_thread() {
     );
 }
 
+/// A `References` id of control characters — the raw email is ~16 MB, under
+/// the 40 MB SES receive limit — JSON-escapes sixfold. Before the fix this
+/// stored a ~96 MB content document that `content::load` rejected with
+/// `ObjectError::TooLarge`, so `GET .../messages/{m}`, the thread page and
+/// `POST .../reply` all failed with HTTP 500 forever; after it, the id is
+/// capped at parse time and the stored document is readable with its body
+/// kept.
+#[tokio::test]
+async fn a_giant_references_id_stores_a_readable_content_document() {
+    let h = mail_harness().await;
+    let giant_id = "\0".repeat(16_000_000);
+    let raw = format!(
+        "From: a@example.com\r\nTo: support@example.com\r\n\
+         Subject: giant references\r\nMessage-ID: <m@example.com>\r\n\
+         References: <{giant_id}>\r\nMIME-Version: 1.0\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
+    );
+    h.fake()
+        .objects
+        .seed("inbound/giant-refs", Bytes::from(raw), "message/rfc822");
+
+    let body = wrapped(
+        &h,
+        &ses_inbound_s3(
+            "ses-1",
+            TS,
+            &["support@example.com"],
+            BUCKET,
+            "inbound/giant-refs",
+            "PASS",
+            "PASS",
+            "PASS",
+        ),
+    );
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    assert_eq!(status, StatusCode::OK, "ingest should accept the message");
+
+    let message_id = expected_message_id("ses-1", TS);
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
+    let stored = h
+        .fake()
+        .mail
+        .get_message(&inbox, &message_id)
+        .await
+        .unwrap()
+        .expect("the message was inserted");
+
+    // The regression: before the fix `load` returned `ObjectError::TooLarge`
+    // and every read of the message or its thread page failed with HTTP 500.
+    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    assert!(
+        stored_content
+            .text
+            .as_deref()
+            .is_some_and(|t| t.contains("body")),
+        "the body survives because the giant references id is capped at parse time, not the body"
+    );
+    assert_eq!(stored_content.references.len(), 1);
+    assert!(
+        stored_content.references[0].len() <= aws_messaging_webhook::mail::REFERENCES_MAX_BYTES
+    );
+}
+
 /// The direct SNS → Lambda pathway (`entry::dispatch`) runs the same ingest
 /// pipeline as the Function URL pathway.
 #[tokio::test]

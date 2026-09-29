@@ -12,7 +12,7 @@ use crate::mail::content::MessageContent;
 use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, Direction, HEADER_NAME_MAX,
     HEADER_VALUE_MAX, HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, InboxId, MailMessage,
-    PREVIEW_CHARS, REFERENCES_MAX, SUBJECT_MAX_BYTES,
+    PREVIEW_CHARS, REFERENCES_MAX, REFERENCES_MAX_BYTES, SUBJECT_MAX_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -213,11 +213,18 @@ fn flatten_addresses(address: Option<&Address<'_>>, cap: usize) -> Vec<String> {
 /// `Message-ID`/`In-Reply-To`/`References` are parsed by `mail-parser` with
 /// the angle brackets stripped; this re-wraps each id to the RFC form our
 /// own [`crate::mail::ids::our_rfc_message_id`] and [`crate::mail::ids::ses_rfc_ids`]
-/// produce.
+/// produce. Each id is truncated to [`REFERENCES_MAX_BYTES`] (leaving room
+/// for the `<>` wrapping) so a single oversized id — still under the SES raw
+/// receive limit but able to JSON-escape sixfold — can never push the stored
+/// content document past the read cap.
 fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
+    let id_cap = REFERENCES_MAX_BYTES.saturating_sub(2);
     match value {
-        HeaderValue::Text(id) => vec![format!("<{id}>")],
-        HeaderValue::TextList(ids) => ids.iter().map(|id| format!("<{id}>")).collect(),
+        HeaderValue::Text(id) => vec![format!("<{}>", truncate_bytes(id, id_cap))],
+        HeaderValue::TextList(ids) => ids
+            .iter()
+            .map(|id| format!("<{}>", truncate_bytes(id, id_cap)))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -387,6 +394,27 @@ mod tests {
             parsed.content.references,
             ["<root-0@example.com>", "<plain-1@example.com>"]
         );
+    }
+
+    /// A `References` id larger than the per-entry cap is truncated to it at
+    /// parse time, so a single oversized id (still under the raw receive
+    /// limit) can never push the content document past the read cap after
+    /// JSON-escaping. The `<>` wrapping survives truncation.
+    #[test]
+    fn a_giant_references_id_is_truncated_to_the_per_entry_cap() {
+        let giant_id = "\0".repeat(5_000);
+        let raw = format!(
+            "From: a@example.com\r\nTo: b@example.com\r\n\
+             Subject: cap\r\nMessage-ID: <m@example.com>\r\n\
+             References: <{giant_id}>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
+        );
+        let parsed = parse_inbound(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.content.references.len(), 1);
+        let id = &parsed.content.references[0];
+        assert_eq!(id.len(), REFERENCES_MAX_BYTES);
+        assert!(id.starts_with('<'));
+        assert!(id.ends_with('>'));
     }
 
     #[test]

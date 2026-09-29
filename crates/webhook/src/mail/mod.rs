@@ -48,6 +48,14 @@ pub const ADDRESS_MAX_BYTES: usize = 320;
 pub const INBOUND_ADDRESS_LIST_MAX: usize = 100;
 pub const OUTBOUND_RECIPIENTS_MAX: usize = 50;
 pub const REFERENCES_MAX: usize = 50;
+/// Per-entry byte cap for each stored `References`/`In-Reply-To` id (before
+/// the `<>` wrapping `mime::id_list` adds). RFC 5322 ids are short in
+/// practice, and the cap mirrors the per-line header limit
+/// ([`HEADER_VALUE_MAX`]); worst case — [`REFERENCES_MAX`] ids of control
+/// characters, which JSON-escape sixfold — is well under the content-document
+/// cap, so a single oversized id can never push the "without bodies"
+/// document past it and make the message unreadable.
+pub const REFERENCES_MAX_BYTES: usize = HEADER_VALUE_MAX;
 pub const HEADER_NAME_MAX: usize = 128;
 pub const HEADER_VALUE_MAX: usize = 998;
 pub const HEADERS_BUDGET: usize = 32_000;
