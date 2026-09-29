@@ -453,6 +453,79 @@ async fn an_object_store_refusal_fails_the_send_without_retrying() {
     assert!(deleted.is_empty(), "{deleted:?}");
 }
 
+#[tokio::test]
+async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
+    // A spec that is present but cannot be parsed as a `SendSpec` is the same
+    // hazard as a spec that cannot be read at all: the spec is the only record
+    // of which parts exist, so deleting it would strand every part under
+    // `outbox/<message_id>/parts/<attachment_id>` where nothing would find them.
+    // Enqueue uploads every inline part before the spec, so whenever a spec
+    // exists, its parts exist too — this send carries one, so a part is live at
+    // the moment `clear_outbox` runs.
+    let h = seeded().await;
+    let mut request = body();
+    request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
+    let message_id = queued(&h, &request).await;
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id))
+    );
+    let part_key = h
+        .state
+        .services
+        .objects
+        .put_object_calls()
+        .into_iter()
+        .find(|k| k.contains("/parts/"))
+        .expect("enqueue uploads the part before the spec");
+    assert!(
+        h.state.services.objects.contains(&part_key),
+        "the part should be present before cleanup"
+    );
+
+    // Overwrite the well-formed spec with bytes that will not parse, simulating
+    // a partial write or a rolling deploy whose new binary cannot read the old
+    // spec. `load_spec` treats this as a permanent `SendSpecMissing` failure,
+    // which settles and routes through `clear_outbox`.
+    h.state.services.objects.seed(
+        send::spec_key(&message_id),
+        axum::body::Bytes::from_static(b"not json"),
+        "application/json",
+    );
+
+    let handled = handle_send(&h.state, &message_id, deadline())
+        .await
+        .unwrap();
+    assert_eq!(handled, Handled::Failed);
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
+    assert_eq!(
+        state_of(&h, &message_id).failure,
+        Some(SendFailure::SendSpecMissing)
+    );
+
+    // The spec is kept as the index of the parts, and nothing is deleted — the
+    // same outcome as `an_object_store_refusal_fails_the_send_without_retrying`
+    // for the read-failure arm of the same `match`.
+    assert!(
+        h.state
+            .services
+            .objects
+            .contains(&send::spec_key(&message_id)),
+        "the unparseable spec is the only record of which parts exist; it must be kept"
+    );
+    assert!(
+        h.state.services.objects.contains(&part_key),
+        "the part must not be orphaned"
+    );
+    let deleted = h.state.services.objects.delete_object_calls();
+    assert!(
+        deleted.is_empty(),
+        "cleanup must keep the spec and parts when the spec cannot be parsed: {deleted:?}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_load_that_outlasts_the_deadline_hands_the_send_back_without_sending() {
     // A slow load must not run the invocation out while it holds the claim.
