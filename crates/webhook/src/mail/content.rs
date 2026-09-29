@@ -54,8 +54,10 @@ pub fn content_key(inbox_id: &InboxId, message_id: &str) -> String {
 /// the same bytes.
 ///
 /// A document that would exceed [`MAX_CONTENT_BYTES`] is stored without its
-/// bodies, so every stored document can be read back; the bodies stay
-/// reachable in the raw message, as attachments past the cap do.
+/// bodies (and, if still too large, further fields; see
+/// `serialize_within`), so every stored document can be read back; what
+/// is dropped stays reachable in the raw message, as attachments past the
+/// cap do.
 ///
 /// # Errors
 ///
@@ -68,15 +70,15 @@ pub async fn store<S: ObjectStore>(
 ) -> Result<(), ObjectError> {
     let serialize_error =
         |e| ObjectError::Permanent(anyhow::anyhow!("serializing message content: {e}"));
-    let (body, bodies_dropped) =
+    let (body, fields_dropped) =
         serialize_within(content, MAX_CONTENT_BYTES).map_err(serialize_error)?;
-    if bodies_dropped {
+    if fields_dropped {
         tracing::warn!(
             inbox_id = inbox_id.as_str(),
             message_id,
             max_bytes = MAX_CONTENT_BYTES,
             event = "message_content_bodies_dropped",
-            "message content exceeds the document cap once serialized; storing it without its bodies, which remain in the raw message"
+            "message content exceeds the document cap once serialized; storing it without its bodies, and any further fields needed to fit, all of which remain in the raw message"
         );
     }
     objects
@@ -89,18 +91,29 @@ pub async fn store<S: ObjectStore>(
         .map(|_outcome| ())
 }
 
-/// Serializes `content`, leaving out `text` and `html` when the whole
-/// document would exceed `max_bytes`. The rest is bounded by the header and
-/// address caps, so it always fits. Returns whether the bodies were left out.
+/// Serializes `content` to fit within `max_bytes`, degrading only as much as
+/// needed and re-checking after every step, so a stored document is always
+/// small enough for [`load`] to read back. The whole document is kept when
+/// it fits; otherwise `text` and `html` are dropped (they remain reachable in
+/// the raw message), then `references`, `reply_to`, `headers` and `verdicts`
+/// in turn until the serialized document fits. The surviving fields are
+/// bounded by their parse-time caps, so this fallback is reached only for a
+/// pathological id or header; the result is always within `max_bytes`. Returns
+/// whether any field was left out.
 fn serialize_within(
     content: &MessageContent,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, bool), serde_json::Error> {
+    let within = |bytes: &[u8]| u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max_bytes;
+
     let body = serde_json::to_vec(content)?;
-    if u64::try_from(body.len()).unwrap_or(u64::MAX) <= max_bytes {
+    if within(&body) {
         return Ok((body, false));
     }
-    let without_bodies = MessageContent {
+
+    // Drop the bodies first: they are the bulk of the bytes and remain
+    // reachable in the raw message. Avoid cloning them.
+    let mut degraded = MessageContent {
         text: None,
         html: None,
         headers: content.headers.clone(),
@@ -108,7 +121,34 @@ fn serialize_within(
         reply_to: content.reply_to.clone(),
         verdicts: content.verdicts.clone(),
     };
-    Ok((serde_json::to_vec(&without_bodies)?, true))
+    let mut body = serde_json::to_vec(&degraded)?;
+    if within(&body) {
+        return Ok((body, true));
+    }
+
+    // A pathological `References` id JSON-escapes 6× and can push the
+    // "without bodies" document past the cap on its own. Keep dropping the
+    // remaining fields until it fits; everything dropped is still reachable
+    // in the raw message.
+    degraded.references = Vec::new();
+    body = serde_json::to_vec(&degraded)?;
+    if within(&body) {
+        return Ok((body, true));
+    }
+    degraded.reply_to = Vec::new();
+    body = serde_json::to_vec(&degraded)?;
+    if within(&body) {
+        return Ok((body, true));
+    }
+    degraded.headers = BTreeMap::new();
+    body = serde_json::to_vec(&degraded)?;
+    if within(&body) {
+        return Ok((body, true));
+    }
+    degraded.verdicts = None;
+    // An empty `MessageContent` serializes to "{}" (2 bytes), so this fits
+    // for any cap as large as `MAX_CONTENT_BYTES`.
+    Ok((serde_json::to_vec(&degraded)?, true))
 }
 
 /// Loads a message's document. A missing document reads as empty content:
@@ -181,6 +221,87 @@ mod tests {
                 ..content
             }
         );
+    }
+
+    #[test]
+    fn an_oversized_references_id_is_dropped_so_the_document_fits() {
+        // A single `References` id of control characters JSON-escapes 6× and
+        // can push the "without bodies" document past the cap on its own — the
+        // case the bodies-only fallback missed. Dropping `references` next (the
+        // largest surviving field after the bodies) must bring it back under.
+        let content = MessageContent {
+            text: Some("\0".repeat(10_000)),
+            html: None,
+            references: vec!["<".to_owned() + &"\0".repeat(10_000) + ">"],
+            reply_to: vec!["a@example.com".to_owned()],
+            headers: BTreeMap::from([("Subject".to_owned(), "hi".to_owned())]),
+            verdicts: Some(serde_json::json!({"spam": "PASS"})),
+        };
+        let (body, dropped) = serialize_within(&content, 20_000).unwrap();
+        assert!(dropped);
+        assert!(body.len() <= 20_000, "{}", body.len());
+        let back: MessageContent = serde_json::from_slice(&body).unwrap();
+        assert!(back.text.is_none());
+        assert!(
+            back.references.is_empty(),
+            "the oversized id was dropped to fit"
+        );
+        // The smaller, bounded fields survive.
+        assert_eq!(back.reply_to, content.reply_to);
+        assert_eq!(back.headers, content.headers);
+        assert_eq!(back.verdicts, content.verdicts);
+    }
+
+    #[test]
+    fn degradation_drops_fields_in_order_until_the_empty_document_fits() {
+        // Every field is oversized, so each is dropped in turn — bodies,
+        // references, reply_to, headers, verdicts — until the serialized
+        // document fits. The final empty document ("{}") always fits.
+        let content = MessageContent {
+            text: Some("\0".repeat(10_000)),
+            html: Some("\0".repeat(10_000)),
+            references: vec!["<".to_owned() + &"\0".repeat(10_000) + ">"],
+            reply_to: vec!["x".repeat(10_000)],
+            headers: BTreeMap::from([("X-Big".to_owned(), "\0".repeat(10_000))]),
+            verdicts: Some(serde_json::Value::String("\0".repeat(10_000))),
+        };
+        let (body, dropped) = serialize_within(&content, 100).unwrap();
+        assert!(dropped);
+        assert!(body.len() <= 100, "{}", body.len());
+        let back: MessageContent = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back, MessageContent::default());
+    }
+
+    /// Reproduces the bug report end-to-end against the real parser: a
+    /// `References` id of NUL bytes — the raw email is ~16 MB, under the 40 MB
+    /// SES receive limit — JSON-escapes sixfold. Before the fix this kept a
+    /// ~96 MB "without bodies" document that `load()` rejected; after it, the
+    /// id is capped at parse time and the document fits with its bodies kept.
+    #[test]
+    fn a_giant_references_id_in_a_real_message_stores_within_the_cap() {
+        let giant_id = "\0".repeat(16_000_000);
+        let raw = format!(
+            "From: a@example.com\r\nTo: b@example.com\r\n\
+             Subject: repro\r\nMessage-ID: <m@example.com>\r\n\
+             References: <{giant_id}>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
+        );
+        assert!(
+            raw.len() < 40_000_000,
+            "raw email is under the SES receive limit"
+        );
+        let parsed = crate::mail::mime::parse_inbound(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.content.references.len(), 1);
+        assert_eq!(
+            parsed.content.references[0].len(),
+            crate::mail::REFERENCES_MAX_BYTES,
+            "the giant id is truncated to the per-entry cap at parse time"
+        );
+        let (body, dropped) = serialize_within(&parsed.content, MAX_CONTENT_BYTES).unwrap();
+        assert!(!dropped, "with the id capped, the bodies are kept");
+        assert!(u64::try_from(body.len()).unwrap_or(u64::MAX) <= MAX_CONTENT_BYTES);
+        let back: MessageContent = serde_json::from_slice(&body).unwrap();
+        assert!(back.text.is_some_and(|t| t.contains("body")));
     }
 
     #[test]
