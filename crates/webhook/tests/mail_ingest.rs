@@ -277,6 +277,77 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
     );
 }
 
+/// A `Message-ID` of ~500 KB — under the 40 MB SES receive limit but over the
+/// 400 KB DynamoDB per-item limit once persisted verbatim — is capped at parse
+/// time, so the message's own `rfc_message_id` stays under the per-entry cap
+/// and ingest succeeds instead of being silently dropped. Before the fix the
+/// oversized `rfc_message_id` produced a DynamoDB `Put` item over 400 KB,
+/// `TransactWriteItems` returned a permanent `TransactionCanceledException`,
+/// and `insert_into_inbox` left the already-written S3 content document
+/// orphaned while ingest returned `"ingest_failed"` (HTTP 200) with no SNS
+/// redelivery — dropping the message from every read path.
+#[tokio::test]
+async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
+    let h = mail_harness().await;
+    let giant_id = "a".repeat(500_000);
+    let raw = format!(
+        "From: a@example.com\r\nTo: support@example.com\r\n\
+         Subject: giant message-id\r\nMessage-ID: <{giant_id}@example.com>\r\n\
+         MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
+    );
+    h.fake()
+        .objects
+        .seed("inbound/giant-mid", Bytes::from(raw), "message/rfc822");
+
+    let body = wrapped(
+        &h,
+        &ses_inbound_s3(
+            "ses-1",
+            TS,
+            &["support@example.com"],
+            BUCKET,
+            "inbound/giant-mid",
+            "PASS",
+            "PASS",
+            "PASS",
+        ),
+    );
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    assert_eq!(status, StatusCode::OK, "ingest should accept the message");
+
+    let message_id = expected_message_id("ses-1", TS);
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
+    let stored = h
+        .fake()
+        .mail
+        .get_message(&inbox, &message_id)
+        .await
+        .unwrap()
+        .expect("the message was inserted, not silently dropped");
+
+    // The regression: before the fix the uncapped `rfc_message_id` blew the
+    // 400 KB DynamoDB item limit and the message was silently dropped.
+    let stored_mid = &stored.rfc_message_id;
+    assert_eq!(
+        stored_mid.len(),
+        aws_messaging_webhook::mail::REFERENCES_MAX_BYTES,
+        "the oversized Message-ID is capped at parse time"
+    );
+    assert!(stored_mid.starts_with('<'));
+    assert!(stored_mid.ends_with('>'));
+
+    // The body survives in the S3 content document, which before the fix was
+    // orphaned by the permanent transaction cancellation.
+    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    assert!(
+        stored_content
+            .text
+            .as_deref()
+            .is_some_and(|t| t.contains("body")),
+        "the body survives because the Message-ID, not the body, is capped"
+    );
+}
+
 /// The direct SNS → Lambda pathway (`entry::dispatch`) runs the same ingest
 /// pipeline as the Function URL pathway.
 #[tokio::test]

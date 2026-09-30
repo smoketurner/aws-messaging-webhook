@@ -88,9 +88,20 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     let bcc = flatten_addresses(parsed.bcc(), INBOUND_ADDRESS_LIST_MAX);
     let reply_to = flatten_addresses(parsed.reply_to(), INBOUND_ADDRESS_LIST_MAX);
 
+    // Capped to `REFERENCES_MAX_BYTES` (leaving room for the `<>` wrapping)
+    // for the same reason `id_list` caps `In-Reply-To`/`References` ids: an
+    // oversized `Message-ID` persisted verbatim into the DynamoDB `Put` item
+    // would exceed the 400 KB per-item limit, yielding a permanent
+    // `TransactionCanceledException` that silently drops the message (the S3
+    // content document is already written and orphaned). Capping at parse
+    // time keeps `MailMessage`'s docstring — "Every field here is bounded by
+    // the caps above" — true of `rfc_message_id`.
     let rfc_message_id = parsed
         .message_id()
-        .map(|id| format!("<{id}>"))
+        .map(|id| {
+            let id_cap = REFERENCES_MAX_BYTES.saturating_sub(2);
+            format!("<{}>", truncate_bytes(id, id_cap))
+        })
         .unwrap_or_default();
     let in_reply_to = id_list(parsed.in_reply_to()).into_iter().next();
     let mut references = id_list(parsed.references());
@@ -394,6 +405,28 @@ mod tests {
             parsed.content.references,
             ["<root-0@example.com>", "<plain-1@example.com>"]
         );
+    }
+
+    /// The message's own `Message-ID` is capped to `REFERENCES_MAX_BYTES` at
+    /// parse time, mirroring `id_list` for `References`/`In-Reply-To`. Without
+    /// this cap an oversized `Message-ID` is persisted verbatim into the
+    /// DynamoDB `Put` item, exceeding the 400 KB per-item limit and yielding
+    /// a permanent `TransactionCanceledException` that silently drops the
+    /// message (the S3 content document is already written and orphaned).
+    /// The `<>` wrapping survives truncation.
+    #[test]
+    fn a_giant_message_id_is_truncated_to_the_per_entry_cap() {
+        let giant_id = "a".repeat(500_000);
+        let raw = format!(
+            "From: a@example.com\r\nTo: b@example.com\r\n\
+             Subject: cap\r\nMessage-ID: <{giant_id}@example.com>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
+        );
+        let parsed = parse_inbound(raw.as_bytes()).unwrap();
+        let id = &parsed.message.rfc_message_id;
+        assert_eq!(id.len(), REFERENCES_MAX_BYTES);
+        assert!(id.starts_with('<'));
+        assert!(id.ends_with('>'));
     }
 
     /// A `References` id larger than the per-entry cap is truncated to it at
