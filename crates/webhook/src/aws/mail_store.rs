@@ -276,7 +276,7 @@ where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if aws::sdk_error_is_transient(error, &aws::THROTTLING_CODES) {
+    if aws::sdk_error_is_transient(error) {
         MailStoreError::Transient(source)
     } else {
         MailStoreError::Permanent(source)
@@ -1238,5 +1238,140 @@ mod tests {
         let sk = key.and_then(|k| k.get("sk"));
         assert_eq!(pk, Some(&DynamoAv::S(keys::inbox_pk(inbox.as_str()))));
         assert_eq!(sk, Some(&DynamoAv::S(keys::inbox_sk().to_owned())));
+    }
+
+    // --- store_error_from_sdk: classifying DynamoDB throttles ------------
+    //
+    // `store_error_from_sdk` stamps every non-transient SDK error
+    // `Permanent`; `actions::run`'s `Ses` arm then swallows a permanent
+    // delivery-label failure with a 200, so a misclassified throttle
+    // silently drops the label with no SNS redelivery. DynamoDB serves its
+    // throughput throttles over HTTP 400, so the `code()`-list branch is the
+    // only one that can catch them. These tests pin both legs of
+    // `apply_delivery_label`: the `GetItem` read (`resolve_ses_message`) and
+    // the top-level `TransactWriteItems` write (`RequestLimitExceeded` falls
+    // through `attempt_transaction`'s explicit variant arms to
+    // `store_error_from_sdk`).
+
+    use aws_sdk_dynamodb::config::http::HttpResponse;
+    use aws_sdk_dynamodb::operation::get_item::GetItemError;
+    use aws_sdk_dynamodb::types::error::{
+        ProvisionedThroughputExceededException, RequestLimitExceeded,
+    };
+    use aws_smithy_types::body::SdkBody;
+    use aws_smithy_types::error::ErrorMetadata;
+
+    /// One `GetItem` service error whose typed variant carries `code` (so
+    /// `ProvideErrorMetadata::code()` returns it, as a real DynamoDB
+    /// response deserializes), served over `status`. The two DynamoDB
+    /// throughput codes use their modeled variants; any other code falls
+    /// back to an unhandled error that still carries `code`.
+    fn get_item_service_error(code: &str, status: u16) -> SdkError<GetItemError> {
+        let meta = ErrorMetadata::builder().code(code).build();
+        let err = match code {
+            "ProvisionedThroughputExceededException" => {
+                GetItemError::ProvisionedThroughputExceededException(
+                    ProvisionedThroughputExceededException::builder()
+                        .meta(meta)
+                        .build(),
+                )
+            }
+            "RequestLimitExceeded" => GetItemError::RequestLimitExceeded(
+                RequestLimitExceeded::builder().meta(meta).build(),
+            ),
+            _ => GetItemError::generic(meta),
+        };
+        let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        SdkError::service_error(err, response)
+    }
+
+    /// The account-level `RequestLimitExceeded` as a top-level
+    /// `TransactWriteItems` error: the realistic write-leg trigger, surfaced
+    /// on the request itself (not as a cancellation reason) and so falling
+    /// through `attempt_transaction`'s explicit variant arms to
+    /// `store_error_from_sdk`.
+    fn transact_write_request_limit_exceeded(status: u16) -> SdkError<TransactWriteItemsError> {
+        let meta = ErrorMetadata::builder()
+            .code("RequestLimitExceeded")
+            .build();
+        let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        SdkError::service_error(
+            TransactWriteItemsError::RequestLimitExceeded(
+                RequestLimitExceeded::builder().meta(meta).build(),
+            ),
+            response,
+        )
+    }
+
+    /// Read leg: a `ProvisionedThroughputExceededException` throttling the
+    /// `GetItem` in `resolve_ses_message` is transient, not a permanent label
+    /// failure the `Ses` arm would swallow with a 200.
+    #[test]
+    fn provisioned_throughput_exceeded_on_the_read_leg_is_transient() {
+        let error = get_item_service_error("ProvisionedThroughputExceededException", 400);
+        assert!(
+            matches!(
+                store_error_from_sdk("GetItem", &error),
+                MailStoreError::Transient(_)
+            ),
+            "a throttled GetItem must be transient so the delivery label is retried"
+        );
+    }
+
+    /// Read leg's realistic trigger is the account-level ceiling: a
+    /// `RequestLimitExceeded` on the `GetItem` is transient too.
+    #[test]
+    fn request_limit_exceeded_on_the_read_leg_is_transient() {
+        let error = get_item_service_error("RequestLimitExceeded", 400);
+        assert!(
+            matches!(
+                store_error_from_sdk("GetItem", &error),
+                MailStoreError::Transient(_)
+            ),
+            "an account-level request limit on GetItem must be transient"
+        );
+    }
+
+    /// Write leg: a top-level `RequestLimitExceeded` on `TransactWriteItems`
+    /// is transient. This is the realistic write-leg trigger — it surfaces on
+    /// the request, not as a `TransactionCanceledException` cancellation
+    /// reason, so it reaches `store_error_from_sdk` via the fall-through arm.
+    #[test]
+    fn request_limit_exceeded_on_the_write_leg_is_transient() {
+        let error = transact_write_request_limit_exceeded(400);
+        assert!(
+            matches!(
+                store_error_from_sdk("TransactWriteItems", &error),
+                MailStoreError::Transient(_)
+            ),
+            "an account-level request limit on TransactWriteItems must be transient"
+        );
+    }
+
+    /// `PutItem(inbox)` racing a transaction on the same item gets a 400
+    /// `TransactionConflictException`; it must be transient, or the ingest
+    /// notification is acked and the message dropped.
+    #[test]
+    fn a_transaction_conflict_on_a_plain_write_is_transient() {
+        let error = get_item_service_error("TransactionConflictException", 400);
+        assert!(matches!(
+            store_error_from_sdk("PutItem(inbox)", &error),
+            MailStoreError::Transient(_)
+        ));
+    }
+
+    /// A non-throttling `GetItem` 400 keeps classifying permanent: the fix
+    /// adds throttling codes only, so a genuinely-bad request (validation,
+    /// access denied) still surfaces as permanent rather than retrying.
+    #[test]
+    fn a_non_throttling_get_item_failure_stays_permanent() {
+        let error = get_item_service_error("ValidationException", 400);
+        assert!(
+            matches!(
+                store_error_from_sdk("GetItem", &error),
+                MailStoreError::Permanent(_)
+            ),
+            "a non-throttling 400 must remain permanent"
+        );
     }
 }
