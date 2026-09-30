@@ -276,7 +276,7 @@ where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if aws::sdk_error_is_transient(error, &aws::THROTTLING_CODES) {
+    if aws::sdk_error_is_transient(error) {
         MailStoreError::Transient(source)
     } else {
         MailStoreError::Permanent(source)
@@ -1346,6 +1346,18 @@ mod tests {
             ),
             "an account-level request limit on TransactWriteItems must be transient"
         );
+    }
+
+    /// `PutItem(inbox)` racing a transaction on the same item gets a 400
+    /// `TransactionConflictException`; it must be transient, or the ingest
+    /// notification is acked and the message dropped.
+    #[test]
+    fn a_transaction_conflict_on_a_plain_write_is_transient() {
+        let error = get_item_service_error("TransactionConflictException", 400);
+        assert!(matches!(
+            store_error_from_sdk("PutItem(inbox)", &error),
+            MailStoreError::Transient(_)
+        ));
     }
 
     /// A non-throttling `GetItem` 400 keeps classifying permanent: the fix

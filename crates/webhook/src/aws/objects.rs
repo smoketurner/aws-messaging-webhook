@@ -29,10 +29,6 @@ fn timeout_override() -> S3ConfigBuilder {
     S3ConfigBuilder::new().timeout_config(timeout_config)
 }
 
-/// S3's throttling error codes — a different vocabulary from the
-/// DynamoDB/Pinpoint/SES actions and mail store (`aws::THROTTLING_CODES`).
-const THROTTLING_CODES: [&str; 2] = ["ThrottlingException", "SlowDown"];
-
 /// Maps an S3 SDK failure onto [`ObjectError`]: a 404 (missing key — the
 /// `s3:ListBucket` grant is what makes this a real 404 rather than a 403) is
 /// [`ObjectError::NotFound`]; a 403 is [`ObjectError::Permanent`]; timeouts,
@@ -57,7 +53,7 @@ where
         }
     }
     let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if aws::sdk_error_is_transient(error, &THROTTLING_CODES) {
+    if aws::sdk_error_is_transient(error) {
         ObjectError::Transient(source)
     } else {
         ObjectError::Permanent(source)
@@ -244,6 +240,7 @@ mod tests {
     use aws_sdk_s3::config::http::HttpResponse;
     use aws_sdk_s3::operation::put_object::PutObjectError;
     use aws_smithy_types::body::SdkBody;
+    use aws_smithy_types::error::ErrorMetadata;
 
     use super::*;
 
@@ -252,6 +249,20 @@ mod tests {
     fn service_error(status: u16) -> SdkError<PutObjectError> {
         let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
         SdkError::service_error(PutObjectError::unhandled("s3 error"), response)
+    }
+
+    /// S3 answers a stalled upload with a 400 `RequestTimeout`; the SDK's own
+    /// retry classifier treats it as transient, and so must the object store
+    /// or a mail-object write fails permanently on a slow connection.
+    #[test]
+    fn a_request_timeout_400_is_transient() {
+        let meta = ErrorMetadata::builder().code("RequestTimeout").build();
+        let response = HttpResponse::new(400.try_into().unwrap(), SdkBody::empty());
+        let error = SdkError::service_error(PutObjectError::generic(meta), response);
+        assert!(matches!(
+            classify_object_error("PutObject", &error),
+            ObjectError::Transient(_)
+        ));
     }
 
     #[test]

@@ -322,23 +322,42 @@ impl PublishEvents for AwsServices {
     }
 }
 
-/// Throttling error codes for DynamoDB/Pinpoint/SES actions and the mail
-/// store. S3 (`aws::objects`) uses a different vocabulary and keeps its own
-/// list.
-pub(crate) const THROTTLING_CODES: [&str; 5] = [
+/// AWS error codes that mean "throttled or briefly unavailable — try again",
+/// whatever the HTTP status they arrive with. Several services send these as
+/// a 400 (DynamoDB's throughput and request-rate throttles, its
+/// `TransactionConflictException`, S3's `RequestTimeout`), so the status
+/// check alone misses them.
+///
+/// One service-agnostic list, shared by every classifier, so a new call site
+/// cannot pick up an incomplete per-service vocabulary. It mirrors the SDK's
+/// own retry classifier (`aws_runtime::retries::classifiers`'
+/// `THROTTLING_ERRORS` and `TRANSIENT_ERRORS`) plus DynamoDB's
+/// `TransactionConflictException`, minus `LimitExceededException`, which
+/// SES and others also use for account quotas a retry cannot clear — that
+/// must stay permanent rather than become a retry storm.
+pub(crate) const TRANSIENT_ERROR_CODES: [&str; 15] = [
+    "Throttling",
     "ThrottlingException",
-    "TooManyRequestsException",
+    "ThrottledException",
+    "RequestThrottledException",
     "RequestThrottled",
+    "TooManyRequestsException",
     "ProvisionedThroughputExceededException",
     "RequestLimitExceeded",
+    "TransactionConflictException",
+    "TransactionInProgressException",
+    "BandwidthLimitExceeded",
+    "SlowDown",
+    "PriorRequestNotComplete",
+    "RequestTimeout",
+    "RequestTimeoutException",
 ];
 
 /// Maps an SDK failure onto the transient/permanent retry policy shared by
 /// actions, the mail store, and the object store: network faults, timeouts,
-/// and 5xx/429/throttling responses are transient (worth a retry);
-/// everything else is permanent. `throttling_codes` is the calling API's own
-/// vocabulary for its throttling error code, since it differs per service.
-pub(crate) fn sdk_error_is_transient<E>(error: &SdkError<E>, throttling_codes: &[&str]) -> bool
+/// 5xx/429 responses, and any [`TRANSIENT_ERROR_CODES`] code are transient
+/// (worth a retry); everything else is permanent.
+pub(crate) fn sdk_error_is_transient<E>(error: &SdkError<E>) -> bool
 where
     E: ProvideErrorMetadata,
 {
@@ -353,7 +372,7 @@ where
                 || ctx
                     .err()
                     .code()
-                    .is_some_and(|code| throttling_codes.contains(&code))
+                    .is_some_and(|code| TRANSIENT_ERROR_CODES.contains(&code))
         }
         _ => false,
     }
@@ -368,7 +387,7 @@ where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if sdk_error_is_transient(error, &THROTTLING_CODES) {
+    if sdk_error_is_transient(error) {
         ActionError::transient(source)
     } else {
         ActionError::permanent(source)
@@ -655,7 +674,7 @@ mod tests {
     //
     // `sdk_error_is_transient` recognises transport failures, HTTP 5xx and
     // 429 directly; service-specific throttling is matched by `code()`
-    // against `THROTTLING_CODES`. DynamoDB serves its throughput throttles
+    // against `TRANSIENT_ERROR_CODES`. DynamoDB serves its throughput throttles
     // (`ProvisionedThroughputExceededException`, `RequestLimitExceeded`)
     // over HTTP 400, not 429/5xx, so only the `code()`-list branch can catch
     // them. Before the fix those codes were missing from the list and
@@ -715,7 +734,7 @@ mod tests {
     fn dynamodb_provisioned_throughput_exceeded_is_transient() {
         let error = get_item_service_error("ProvisionedThroughputExceededException", 400);
         assert!(
-            sdk_error_is_transient(&error, &THROTTLING_CODES),
+            sdk_error_is_transient(&error),
             "a DynamoDB throughput throttle (HTTP 400) must be transient so SNS redelivers"
         );
     }
@@ -727,7 +746,7 @@ mod tests {
     fn dynamodb_request_limit_exceeded_is_transient() {
         let error = get_item_service_error("RequestLimitExceeded", 400);
         assert!(
-            sdk_error_is_transient(&error, &THROTTLING_CODES),
+            sdk_error_is_transient(&error),
             "an account-level DynamoDB request limit (HTTP 400) must be transient"
         );
     }
@@ -737,7 +756,7 @@ mod tests {
     #[test]
     fn dynamodb_throttling_exception_stays_transient() {
         let error = get_item_service_error("ThrottlingException", 400);
-        assert!(sdk_error_is_transient(&error, &THROTTLING_CODES));
+        assert!(sdk_error_is_transient(&error));
     }
 
     /// A genuinely-permanent DynamoDB 400 (missing table, validation, access
@@ -746,27 +765,49 @@ mod tests {
     fn a_genuinely_permanent_dynamodb_400_stays_permanent() {
         let error = get_item_service_error("ResourceNotFoundException", 400);
         assert!(
-            !sdk_error_is_transient(&error, &THROTTLING_CODES),
+            !sdk_error_is_transient(&error),
             "a non-throttling 400 must remain permanent"
         );
+    }
+
+    /// A non-transactional write that collides with an in-flight
+    /// transaction on the same item (the mail store's `PutItem(inbox)`
+    /// against a `TransactWriteItems` touching the inbox) is a 400
+    /// `TransactionConflictException`: a retry settles it.
+    #[test]
+    fn dynamodb_transaction_conflict_is_transient() {
+        let error = get_item_service_error("TransactionConflictException", 400);
+        assert!(sdk_error_is_transient(&error));
+    }
+
+    /// Every classifier shares one code list, so each code in it classifies
+    /// transient over a plain 400 — the per-service lists this replaced were
+    /// how DynamoDB's throttles went missing.
+    #[test]
+    fn every_listed_transient_code_is_transient_over_http_400() {
+        for code in TRANSIENT_ERROR_CODES {
+            assert!(
+                sdk_error_is_transient(&get_item_service_error(code, 400)),
+                "{code} over HTTP 400 must be transient"
+            );
+        }
+    }
+
+    /// `LimitExceededException` is deliberately left off the list: SES and
+    /// others use it for account quotas a retry cannot clear.
+    #[test]
+    fn a_quota_limit_exceeded_stays_permanent() {
+        let error = get_item_service_error("LimitExceededException", 400);
+        assert!(!sdk_error_is_transient(&error));
     }
 
     /// HTTP 5xx and 429 are transient regardless of `code()`, so they must
     /// not depend on the throttling-code list.
     #[test]
     fn http_5xx_and_429_are_transient_without_a_throttling_code() {
-        assert!(sdk_error_is_transient(
-            &unhandled_get_item_error(500),
-            &THROTTLING_CODES
-        ));
-        assert!(sdk_error_is_transient(
-            &unhandled_get_item_error(503),
-            &THROTTLING_CODES
-        ));
-        assert!(sdk_error_is_transient(
-            &unhandled_get_item_error(429),
-            &THROTTLING_CODES
-        ));
+        assert!(sdk_error_is_transient(&unhandled_get_item_error(500)));
+        assert!(sdk_error_is_transient(&unhandled_get_item_error(503)));
+        assert!(sdk_error_is_transient(&unhandled_get_item_error(429)));
     }
 
     fn record(source: Option<Source>, aggregate_id: &str) -> EventRecord {
