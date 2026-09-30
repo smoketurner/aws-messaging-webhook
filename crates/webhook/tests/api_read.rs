@@ -519,6 +519,43 @@ async fn a_thread_preview_tracks_the_last_message_not_the_first() {
     assert_eq!(messages[0]["preview"], "First message body");
 }
 
+/// A message ingested late (an SNS redelivery after a transient failure)
+/// that is older than the thread's newest message still joins the thread,
+/// but neither pulls the thread down the list nor takes over its
+/// `preview`/`last_message_id`: those follow the newest message by time.
+#[tokio::test]
+async fn a_late_older_message_does_not_rewind_the_thread() {
+    let h = seeded().await;
+    insert(&h, "2026-01-01T09:00:00.000Z", "t1", |_| {}).await;
+    let newest_at = "2026-01-01T11:00:00.000Z";
+    let newest_id = ids::inbound_message_id(
+        &format!("ses-{newest_at}-t1"),
+        time::parse(newest_at).unwrap(),
+    )
+    .to_string();
+    insert(&h, newest_at, "t1", |m| {
+        m.preview = "Newest message body".to_owned();
+    })
+    .await;
+    insert(&h, "2026-01-01T10:00:00.000Z", "t2", |_| {}).await;
+    // Ingested last, but older than t1's newest message.
+    insert(&h, "2026-01-01T10:30:00.000Z", "t1", |m| {
+        m.preview = "Late older body".to_owned();
+    })
+    .await;
+
+    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 2);
+    let thread = &body["threads"][0];
+    assert_eq!(thread["thread_id"], "t1");
+    assert_eq!(thread["message_count"], 3);
+    assert_eq!(thread["timestamp"], newest_at);
+    assert_eq!(thread["last_message_id"], newest_id);
+    assert_eq!(thread["preview"], "Newest message body");
+    assert_eq!(body["threads"][1]["thread_id"], "t2");
+}
+
 #[tokio::test]
 async fn listing_threads_orders_by_last_activity() {
     let h = seeded().await;
