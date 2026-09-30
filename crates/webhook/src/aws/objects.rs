@@ -16,7 +16,7 @@ use axum::body::Bytes;
 use crate::aws::{self, AwsServices};
 use crate::mail::ObjectMeta;
 use crate::mail::PutOutcome;
-use crate::mail::objects::{DOWNLOAD_URL_TTL, ObjectError, ObjectStore};
+use crate::mail::objects::{ObjectError, ObjectStore};
 
 /// The per-attempt and per-operation S3 timeouts, applied to every call
 /// via `.customize().config_override(...)` since the shared `s3` client
@@ -218,9 +218,10 @@ impl ObjectStore for AwsServices {
         key: &str,
         disposition: Option<&str>,
         content_type: Option<&str>,
+        ttl: Duration,
     ) -> Result<String, ObjectError> {
         let bucket = self.mail_bucket()?;
-        let config = PresigningConfig::expires_in(DOWNLOAD_URL_TTL)
+        let config = PresigningConfig::expires_in(ttl)
             .map_err(|e| ObjectError::Permanent(anyhow!("building the presigning config: {e}")))?;
 
         let mut request = self.s3.get_object().bucket(bucket).key(key);

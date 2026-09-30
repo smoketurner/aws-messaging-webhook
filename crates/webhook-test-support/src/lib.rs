@@ -29,7 +29,7 @@ pub mod objects;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use api_keys::FakeApiKeys;
@@ -329,9 +329,10 @@ impl ObjectStore for FakeServices {
         key: &str,
         disposition: Option<&str>,
         content_type: Option<&str>,
+        ttl: Duration,
     ) -> Result<String, ObjectError> {
         self.objects
-            .presign_get(key, disposition, content_type)
+            .presign_get(key, disposition, content_type, ttl)
             .await
     }
 }
@@ -569,7 +570,7 @@ pub fn test_mail_config() -> MailConfig {
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),
-        attachment_url_ttl: std::time::Duration::from_secs(3600),
+        attachment_url_ttl: Duration::from_secs(3600),
         region: "us-east-1".to_owned(),
         retention_days: 365,
     }

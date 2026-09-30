@@ -15,10 +15,13 @@ use axum::body::Bytes;
 
 use crate::mail::{ObjectMeta, PutOutcome};
 
-/// How long a download URL stays valid. Long enough for a client to follow
-/// the link it was just handed, short enough that a leaked URL — it carries
-/// its own authorization, and the API's bearer key is not needed to use it —
-/// stops working quickly.
+/// The default presigned download URL lifetime, used when
+/// `ATTACHMENT_URL_TTL_SECONDS` is unset (see [`crate::config::MailConfig`]).
+/// Long enough for a client to follow the link it was just handed, short
+/// enough that a leaked URL — it carries its own authorization, and the
+/// API's bearer key is not needed to use it — stops working quickly. An
+/// operator may shorten it (down to 60 s) for faster revocation or extend
+/// it (up to 3,600 s) for a longer download window.
 pub const DOWNLOAD_URL_TTL: Duration = Duration::from_mins(15);
 
 pub trait ObjectStore: Send + Sync {
@@ -51,7 +54,7 @@ pub trait ObjectStore: Send + Sync {
     /// wanted it absent, and it is.
     fn delete_object(&self, key: &str) -> impl Future<Output = Result<(), ObjectError>> + Send;
 
-    /// A presigned `GET` URL for `key`, valid for [`DOWNLOAD_URL_TTL`].
+    /// A presigned `GET` URL for `key`, valid for `ttl`.
     ///
     /// `disposition` and `content_type`, when given, are signed in as
     /// response-header overrides so the browser names the download and treats
@@ -65,6 +68,7 @@ pub trait ObjectStore: Send + Sync {
         key: &str,
         disposition: Option<&str>,
         content_type: Option<&str>,
+        ttl: Duration,
     ) -> impl Future<Output = Result<String, ObjectError>> + Send;
 }
 

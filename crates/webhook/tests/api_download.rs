@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt as _;
 use webhook_test_support::mail_memory::sample_message;
-use webhook_test_support::{Harness, harness};
+use webhook_test_support::{Harness, harness, mail_harness};
 
 const KEY: &str = "am_live_key";
 const INBOX: &str = "support@example.com";
@@ -47,11 +47,14 @@ fn attachment(id: &str, filename: Option<&str>, key: Option<&str>) -> Attachment
     }
 }
 
-/// Seeds one message, letting the caller shape it, and returns its id.
-async fn seeded(
+/// Seeds one message into `h`, letting the caller shape it, and returns its
+/// id. Seeding is split from harness construction so a test can build its own
+/// harness (e.g. [`mail_harness`] with a configured attachment URL TTL) and
+/// reuse the same setup.
+async fn seed_in(
+    h: Harness,
     adjust: impl FnOnce(&mut aws_messaging_webhook::mail::MailMessage),
 ) -> (Harness, String) {
-    let h = harness().await;
     h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
     h.state
         .services
@@ -66,6 +69,13 @@ async fn seeded(
     adjust(&mut msg);
     h.state.services.insert_message(&msg).await.unwrap();
     (h, id)
+}
+
+/// Seeds one message in the plain (no-mail) harness, and returns its id.
+async fn seeded(
+    adjust: impl FnOnce(&mut aws_messaging_webhook::mail::MailMessage),
+) -> (Harness, String) {
+    seed_in(harness().await, adjust).await
 }
 
 #[tokio::test]
@@ -202,4 +212,96 @@ async fn downloads_require_a_key() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The configured `attachment_url_ttl` (here 3,600 s, the harness default for
+/// mail) must reach both the presigned URL and the `expires_at` header, not
+/// the hardcoded 15-minute constant. Before the fix both read the constant
+/// and the env var had no effect, so `X-Amz-Expires` was `900` and
+/// `expires_at` was `now + 15 min` regardless.
+#[tokio::test]
+async fn the_configured_ttl_surfaces_in_the_presigned_url_and_expires_at_header() {
+    let (h, id) = seed_in(mail_harness().await, |m| {
+        m.raw_s3_key = Some("inbound/raw-1".to_owned());
+    })
+    .await;
+
+    let now = time::now_ms();
+    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}/raw")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The URL carries the configured lifetime (3,600 s), not the 15-minute
+    // (900 s) constant.
+    let url = body["download_url"].as_str().unwrap();
+    assert!(url.contains("X-Amz-Expires=3600"), "{url}");
+    assert!(!url.contains("X-Amz-Expires=900"), "{url}");
+
+    // The header matches now + 3,600 s within a generous slack for the test's
+    // own runtime, and is not the constant's now + 900 s.
+    let expires_at = body["expires_at"].as_str().unwrap();
+    let expires_ms = time::parse(expires_at).unwrap();
+    assert!(
+        expires_ms >= now + 3_600_000 && expires_ms <= now + 3_600_000 + 5_000,
+        "expires_at={expires_at} should be ~now+3600s (now={now}, got={expires_ms})"
+    );
+    assert_ne!(
+        expires_ms,
+        now + 900_000,
+        "expires_at must not be the hardcoded 15-minute default"
+    );
+}
+
+/// The attachment route honors the configured TTL too, not just the raw-MIME
+/// route.
+#[tokio::test]
+async fn the_configured_ttl_surfaces_on_the_attachment_route() {
+    let (h, id) = seed_in(mail_harness().await, |m| {
+        m.attachments = vec![attachment(
+            "att_1",
+            Some("invoice.pdf"),
+            Some("attachments/a-1"),
+        )];
+    })
+    .await;
+
+    let now = time::now_ms();
+    let (status, body) = get(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{id}/attachments/att_1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let url = body["download_url"].as_str().unwrap();
+    assert!(url.contains("X-Amz-Expires=3600"), "{url}");
+
+    let expires_at = body["expires_at"].as_str().unwrap();
+    let expires_ms = time::parse(expires_at).unwrap();
+    assert!(
+        expires_ms >= now + 3_600_000 && expires_ms <= now + 3_600_000 + 5_000,
+        "expires_at={expires_at} should be ~now+3600s (now={now}, got={expires_ms})"
+    );
+}
+
+/// When mail is not configured (the plain `harness`), the download TTL falls
+/// back to the documented 15-minute default, so the URL and header stay
+/// self-consistent. This guards against a regression that would leave the
+/// no-mail path without a usable lifetime.
+#[tokio::test]
+async fn the_default_ttl_applies_when_mail_is_not_configured() {
+    let (h, id) = seeded(|m| m.raw_s3_key = Some("inbound/raw-1".to_owned())).await;
+
+    let now = time::now_ms();
+    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}/raw")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let url = body["download_url"].as_str().unwrap();
+    assert!(url.contains("X-Amz-Expires=900"), "{url}");
+
+    let expires_at = body["expires_at"].as_str().unwrap();
+    let expires_ms = time::parse(expires_at).unwrap();
+    assert!(
+        expires_ms >= now + 900_000 && expires_ms <= now + 900_000 + 5_000,
+        "expires_at={expires_at} should be ~now+900s (now={now}, got={expires_ms})"
+    );
 }
