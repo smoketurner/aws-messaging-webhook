@@ -325,10 +325,12 @@ impl PublishEvents for AwsServices {
 /// Throttling error codes for DynamoDB/Pinpoint/SES actions and the mail
 /// store. S3 (`aws::objects`) uses a different vocabulary and keeps its own
 /// list.
-pub(crate) const THROTTLING_CODES: [&str; 3] = [
+pub(crate) const THROTTLING_CODES: [&str; 5] = [
     "ThrottlingException",
     "TooManyRequestsException",
     "RequestThrottled",
+    "ProvisionedThroughputExceededException",
+    "RequestLimitExceeded",
 ];
 
 /// Maps an SDK failure onto the transient/permanent retry policy shared by
@@ -646,6 +648,124 @@ mod tests {
         assert!(matches!(
             classify_send_result(Err(construction)),
             SendOutcome::Failed { .. }
+        ));
+    }
+
+    // --- sdk_error_is_transient: DynamoDB throughput throttles ------------
+    //
+    // `sdk_error_is_transient` recognises transport failures, HTTP 5xx and
+    // 429 directly; service-specific throttling is matched by `code()`
+    // against `THROTTLING_CODES`. DynamoDB serves its throughput throttles
+    // (`ProvisionedThroughputExceededException`, `RequestLimitExceeded`)
+    // over HTTP 400, not 429/5xx, so only the `code()`-list branch can catch
+    // them. Before the fix those codes were missing from the list and
+    // classed permanent, which dropped the delivery label with no SNS
+    // redelivery. These tests pin both that they now classify transient and
+    // that a genuinely-permanent 400 stays permanent.
+
+    use aws_sdk_dynamodb::config::http::HttpResponse;
+    use aws_sdk_dynamodb::operation::get_item::GetItemError;
+    use aws_sdk_dynamodb::types::error::{
+        ProvisionedThroughputExceededException, RequestLimitExceeded, ResourceNotFoundException,
+        ThrottlingException,
+    };
+    use aws_smithy_types::body::SdkBody;
+    use aws_smithy_types::error::ErrorMetadata;
+
+    /// One `GetItem` service error whose typed variant carries `code` (so
+    /// `ProvideErrorMetadata::code()` returns exactly that string, the way
+    /// a real DynamoDB response deserializes), served over `status`.
+    fn get_item_service_error(code: &str, status: u16) -> SdkError<GetItemError> {
+        let meta = ErrorMetadata::builder().code(code).build();
+        let err = match code {
+            "ProvisionedThroughputExceededException" => {
+                GetItemError::ProvisionedThroughputExceededException(
+                    ProvisionedThroughputExceededException::builder()
+                        .meta(meta)
+                        .build(),
+                )
+            }
+            "RequestLimitExceeded" => GetItemError::RequestLimitExceeded(
+                RequestLimitExceeded::builder().meta(meta).build(),
+            ),
+            "ThrottlingException" => {
+                GetItemError::ThrottlingException(ThrottlingException::builder().meta(meta).build())
+            }
+            "ResourceNotFoundException" => GetItemError::ResourceNotFoundException(
+                ResourceNotFoundException::builder().meta(meta).build(),
+            ),
+            _ => GetItemError::generic(meta),
+        };
+        let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        SdkError::service_error(err, response)
+    }
+
+    /// An unhandled `GetItem` error with no `code()`, served over `status`:
+    /// exercises the status-code branches of `sdk_error_is_transient` in
+    /// isolation from the `code()`-list branch.
+    fn unhandled_get_item_error(status: u16) -> SdkError<GetItemError> {
+        let response = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        SdkError::service_error(GetItemError::unhandled("dynamo error"), response)
+    }
+
+    /// DynamoDB's per-partition throughput throttle is HTTP 400, so only the
+    /// `code()`-list branch can catch it. Misclassifying it permanent would
+    /// silently drop the delivery label with no SNS redelivery.
+    #[test]
+    fn dynamodb_provisioned_throughput_exceeded_is_transient() {
+        let error = get_item_service_error("ProvisionedThroughputExceededException", 400);
+        assert!(
+            sdk_error_is_transient(&error, &THROTTLING_CODES),
+            "a DynamoDB throughput throttle (HTTP 400) must be transient so SNS redelivers"
+        );
+    }
+
+    /// The account-level request ceiling is the realistic trigger for both
+    /// legs of `apply_delivery_label` (the `GetItem` read and the
+    /// `TransactWriteItems` write) and is served over HTTP 400.
+    #[test]
+    fn dynamodb_request_limit_exceeded_is_transient() {
+        let error = get_item_service_error("RequestLimitExceeded", 400);
+        assert!(
+            sdk_error_is_transient(&error, &THROTTLING_CODES),
+            "an account-level DynamoDB request limit (HTTP 400) must be transient"
+        );
+    }
+
+    /// The pre-existing DynamoDB throttle code must keep classifying
+    /// transient once the throughput codes join it.
+    #[test]
+    fn dynamodb_throttling_exception_stays_transient() {
+        let error = get_item_service_error("ThrottlingException", 400);
+        assert!(sdk_error_is_transient(&error, &THROTTLING_CODES));
+    }
+
+    /// A genuinely-permanent DynamoDB 400 (missing table, validation, access
+    /// denied) must stay permanent: the fix adds throttling codes only.
+    #[test]
+    fn a_genuinely_permanent_dynamodb_400_stays_permanent() {
+        let error = get_item_service_error("ResourceNotFoundException", 400);
+        assert!(
+            !sdk_error_is_transient(&error, &THROTTLING_CODES),
+            "a non-throttling 400 must remain permanent"
+        );
+    }
+
+    /// HTTP 5xx and 429 are transient regardless of `code()`, so they must
+    /// not depend on the throttling-code list.
+    #[test]
+    fn http_5xx_and_429_are_transient_without_a_throttling_code() {
+        assert!(sdk_error_is_transient(
+            &unhandled_get_item_error(500),
+            &THROTTLING_CODES
+        ));
+        assert!(sdk_error_is_transient(
+            &unhandled_get_item_error(503),
+            &THROTTLING_CODES
+        ));
+        assert!(sdk_error_is_transient(
+            &unhandled_get_item_error(429),
+            &THROTTLING_CODES
         ));
     }
 
