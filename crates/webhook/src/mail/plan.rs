@@ -1060,6 +1060,46 @@ mod tests {
         assert!(ops.iter().all(|o| o.role != OpRole::RfcAlias));
     }
 
+    /// A `Message-ID` truncated to `REFERENCES_MAX_BYTES` by `mime::parse_inbound`
+    /// is still too long to carry an alias row: `strip_angle_brackets` yields
+    /// `REFERENCES_MAX_BYTES - 2` bytes, which exceeds `ALIAS_ID_MAX_BYTES`, so
+    /// `push_alias` skips it — exactly as before the cap, when the id was even
+    /// longer. The fix shrinks the DynamoDB attribute without changing
+    /// alias-join behavior.
+    #[test]
+    fn plan_insert_still_skips_an_alias_for_a_message_id_truncated_to_the_cap() {
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        // Simulate what `mime::parse_inbound` now produces for an oversized id:
+        // a `rfc_message_id` of exactly `REFERENCES_MAX_BYTES` bytes (the cap).
+        let id_body = "a".repeat(crate::mail::REFERENCES_MAX_BYTES.saturating_sub(2));
+        msg.rfc_message_id = format!("<{id_body}>");
+        assert_eq!(msg.rfc_message_id.len(), crate::mail::REFERENCES_MAX_BYTES);
+        let thread = new_thread(&msg);
+        let ops = plan_insert(&msg, None, &thread).unwrap();
+        assert!(
+            ops.iter().all(|o| o.role != OpRole::RfcAlias),
+            "an id at the REFERENCES_MAX_BYTES cap is still over ALIAS_ID_MAX_BYTES \
+             once stripped, so the alias must still be skipped"
+        );
+    }
+
+    /// Truncating `rfc_message_id` to `REFERENCES_MAX_BYTES` only preserves
+    /// the alias-join and thread-resolution identities because every id the cap
+    /// touches (stripped length > `REFERENCES_MAX_BYTES - 2`) is already larger
+    /// than `ALIAS_ID_MAX_BYTES`, so it carries no alias row both before and
+    /// after the fix. This ordering — `REFERENCES_MAX_BYTES - 2 > ALIAS_ID_MAX_BYTES`
+    /// — is load-bearing: a maintainer who pushes `REFERENCES_MAX_BYTES` down to
+    /// `ALIAS_ID_MAX_BYTES + 2` or below would break the alias-join identity.
+    /// Gate it with a test rather than a comment.
+    #[test]
+    fn references_cap_stays_above_the_alias_cap() {
+        assert!(
+            crate::mail::REFERENCES_MAX_BYTES.saturating_sub(2) > ALIAS_ID_MAX_BYTES,
+            "REFERENCES_MAX_BYTES - 2 must exceed ALIAS_ID_MAX_BYTES so truncating a \
+             Message-ID never changes which ids carry an alias row"
+        );
+    }
+
     proptest! {
         /// How many labels a message or its thread carries does not change
         /// how many items the ingest transaction writes — the labels live in

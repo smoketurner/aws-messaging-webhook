@@ -88,10 +88,11 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     let bcc = flatten_addresses(parsed.bcc(), INBOUND_ADDRESS_LIST_MAX);
     let reply_to = flatten_addresses(parsed.reply_to(), INBOUND_ADDRESS_LIST_MAX);
 
-    let rfc_message_id = parsed
-        .message_id()
-        .map(|id| format!("<{id}>"))
-        .unwrap_or_default();
+    // Capped like `In-Reply-To`/`References`: persisted verbatim, an
+    // oversized `Message-ID` would push the DynamoDB message item past the
+    // 400 KB item limit — a permanent transaction cancellation that drops
+    // the message and orphans its already-written content document.
+    let rfc_message_id = parsed.message_id().map(wrap_id).unwrap_or_default();
     let in_reply_to = id_list(parsed.in_reply_to()).into_iter().next();
     let mut references = id_list(parsed.references());
     if references.len() > REFERENCES_MAX {
@@ -211,20 +212,26 @@ fn flatten_addresses(address: Option<&Address<'_>>, cap: usize) -> Vec<String> {
 }
 
 /// `Message-ID`/`In-Reply-To`/`References` are parsed by `mail-parser` with
-/// the angle brackets stripped; this re-wraps each id to the RFC form our
+/// the angle brackets stripped; this re-wraps an id to the RFC form our
 /// own [`crate::mail::ids::our_rfc_message_id`] and [`crate::mail::ids::ses_rfc_ids`]
-/// produce. Each id is truncated to [`REFERENCES_MAX_BYTES`] (leaving room
+/// produce. The id is truncated to [`REFERENCES_MAX_BYTES`] (leaving room
 /// for the `<>` wrapping) so a single oversized id — still under the SES raw
 /// receive limit but able to JSON-escape sixfold — can never push the stored
-/// content document past the read cap.
+/// content document past the read cap, nor the message item past DynamoDB's
+/// item-size limit.
+fn wrap_id(id: &str) -> String {
+    format!(
+        "<{}>",
+        truncate_bytes(id, REFERENCES_MAX_BYTES.saturating_sub(2))
+    )
+}
+
+/// Every id in an `In-Reply-To`/`References` header, each through
+/// [`wrap_id`].
 fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
-    let id_cap = REFERENCES_MAX_BYTES.saturating_sub(2);
     match value {
-        HeaderValue::Text(id) => vec![format!("<{}>", truncate_bytes(id, id_cap))],
-        HeaderValue::TextList(ids) => ids
-            .iter()
-            .map(|id| format!("<{}>", truncate_bytes(id, id_cap)))
-            .collect(),
+        HeaderValue::Text(id) => vec![wrap_id(id)],
+        HeaderValue::TextList(ids) => ids.iter().map(|id| wrap_id(id)).collect(),
         _ => Vec::new(),
     }
 }
@@ -394,6 +401,28 @@ mod tests {
             parsed.content.references,
             ["<root-0@example.com>", "<plain-1@example.com>"]
         );
+    }
+
+    /// The message's own `Message-ID` is capped to `REFERENCES_MAX_BYTES` at
+    /// parse time, mirroring `id_list` for `References`/`In-Reply-To`. Without
+    /// this cap an oversized `Message-ID` is persisted verbatim into the
+    /// DynamoDB `Put` item, exceeding the 400 KB per-item limit and yielding
+    /// a permanent `TransactionCanceledException` that silently drops the
+    /// message (the S3 content document is already written and orphaned).
+    /// The `<>` wrapping survives truncation.
+    #[test]
+    fn a_giant_message_id_is_truncated_to_the_per_entry_cap() {
+        let giant_id = "a".repeat(500_000);
+        let raw = format!(
+            "From: a@example.com\r\nTo: b@example.com\r\n\
+             Subject: cap\r\nMessage-ID: <{giant_id}@example.com>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
+        );
+        let parsed = parse_inbound(raw.as_bytes()).unwrap();
+        let id = &parsed.message.rfc_message_id;
+        assert_eq!(id.len(), REFERENCES_MAX_BYTES);
+        assert!(id.starts_with('<'));
+        assert!(id.ends_with('>'));
     }
 
     /// A `References` id larger than the per-entry cap is truncated to it at
