@@ -1019,6 +1019,7 @@ mod tests {
         );
         second.timestamp = "00000002-0000".to_owned();
         second.from = "other@example.com".to_owned();
+        second.preview = "Second message body".to_owned();
         let after = apply_message(&before, &second);
 
         let ops = plan_insert(&second, Some(&before), &after).unwrap();
@@ -1034,6 +1035,11 @@ mod tests {
         assert_eq!(snapshot.message_count, 2);
         assert_eq!(snapshot.senders, after.senders);
         assert_eq!(snapshot.recipients, after.recipients);
+        // The snapshot is built from `thread_after` (the apply_message result),
+        // so it carries the last-processed message's preview, not the first's.
+        assert_eq!(snapshot.preview, after.preview);
+        assert_eq!(snapshot.preview, "Second message body");
+        assert_eq!(snapshot.last_message_id, "mid-2");
     }
 
     #[test]

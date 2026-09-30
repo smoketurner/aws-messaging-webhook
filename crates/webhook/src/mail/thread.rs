@@ -178,9 +178,15 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
 /// (computed in Rust from a consistent read, then `Put` version-checked
 /// in the same transaction as the message itself).
 ///
-/// Received/sent timestamps: `received_timestamp` is set once, at the first
-/// inbound message, and never moves; `sent_timestamp` tracks the most recent
-/// outbound message.
+/// The "last message" roll-ups — `timestamp`, `last_message_id`, `preview`,
+/// and the per-direction `received_timestamp`/`sent_timestamp` — follow the
+/// newest message by its own `timestamp`, not whichever was processed last:
+/// SNS redelivers a transiently failed ingest long after a newer message in
+/// the same thread may have landed, and a late older message must neither
+/// pull the thread down the list (`timestamp` is the thread index's sort key)
+/// nor repoint its preview at a message that is no longer the latest. A tie
+/// goes to the message processed later. Timestamps are fixed-width
+/// (`mail::time::format`), so they compare as strings.
 #[must_use]
 pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     let mut next = existing.clone();
@@ -195,14 +201,17 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
         *next.label_counts.entry(label.clone()).or_insert(0) += 1;
     }
 
-    next.last_message_id.clone_from(&msg.message_id);
     next.message_count += 1;
     next.size += msg.size;
-    if matches!(msg.direction, Direction::Inbound) && next.received_timestamp.is_none() {
-        next.received_timestamp = Some(msg.timestamp.clone());
-    }
-    if matches!(msg.direction, Direction::Outbound) {
-        next.sent_timestamp = Some(msg.timestamp.clone());
+    let direction_timestamp = match msg.direction {
+        Direction::Inbound => &mut next.received_timestamp,
+        Direction::Outbound => &mut next.sent_timestamp,
+    };
+    if direction_timestamp
+        .as_deref()
+        .is_none_or(|current| msg.timestamp.as_str() >= current)
+    {
+        *direction_timestamp = Some(msg.timestamp.clone());
     }
 
     for attachment in &msg.attachments {
@@ -212,7 +221,14 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
         next.attachments.remove(0);
     }
 
-    next.timestamp.clone_from(&msg.timestamp);
+    // `preview` is "Text preview of last message in thread" (the same wording
+    // the schema uses for `last_message_id`), so it moves with
+    // `last_message_id`/`timestamp` — all three describe the same message.
+    if msg.timestamp >= next.timestamp {
+        next.timestamp.clone_from(&msg.timestamp);
+        next.last_message_id.clone_from(&msg.message_id);
+        next.preview.clone_from(&msg.preview);
+    }
     next.version += 1;
     next.updated_at.clone_from(&msg.updated_at);
     next.expires_at = next.expires_at.max(msg.expires_at);
@@ -380,16 +396,127 @@ mod tests {
         let mut second = message(Direction::Inbound, &["received", "unread"]);
         second.message_id = "mid-2".to_owned();
         second.from = "other@example.com".to_owned();
+        second.preview = "Second body".to_owned();
 
         let after = apply_message(&before, &second);
         assert_eq!(after.version, before.version + 1);
         assert_eq!(after.message_count, 2);
         assert_eq!(after.label_counts["received"], 2);
         assert_eq!(after.last_message_id, "mid-2");
+        // `preview` is "Text preview of last message in thread" — the same
+        // wording the schema uses for `last_message_id` — so it advances to
+        // the last-processed message rather than staying at the first.
+        assert_eq!(after.preview, "Second body");
         assert_eq!(
             after.senders,
             vec!["other@example.com", "sender@example.com"]
         );
+    }
+
+    /// A thread's `preview` advances to the newest message, matching the
+    /// direction-neutral roll-up of `last_message_id`/`timestamp`. This holds across an outbound reply
+    /// too: the schema's "last message in thread" wording carries no
+    /// "received" qualifier, so a reply's preview becomes the thread's.
+    #[test]
+    fn apply_message_advances_preview_across_an_outbound_reply() {
+        let first = message(Direction::Inbound, &["received", "unread"]);
+        let before = new_thread(&first);
+        assert_eq!(before.preview, "Hello there");
+
+        let mut reply = message(Direction::Outbound, &["sent"]);
+        reply.message_id = "mid-reply".to_owned();
+        reply.preview = "Re: Hello, here is the answer".to_owned();
+        let after = apply_message(&before, &reply);
+
+        assert_eq!(after.last_message_id, "mid-reply");
+        assert_eq!(after.preview, "Re: Hello, here is the answer");
+    }
+
+    /// `preview` is the only message-level roll-up that was silently frozen at
+    /// the first-processed message; `subject` is deliberately a stable
+    /// thread-identity field ("Subject of thread.", no "last" qualifier), so a
+    /// second message with a different subject must not overwrite the first's.
+    #[test]
+    fn apply_message_advances_preview_but_keeps_the_first_subject() {
+        let first = message(Direction::Inbound, &["received", "unread"]);
+        let before = new_thread(&first);
+        assert_eq!(before.subject, "Hello");
+
+        let mut second = message(Direction::Inbound, &["received", "unread"]);
+        second.message_id = "mid-2".to_owned();
+        second.subject = "Re: Hello".to_owned();
+        second.preview = "Second body".to_owned();
+        let after = apply_message(&before, &second);
+
+        assert_eq!(after.preview, "Second body");
+        assert_eq!(after.subject, "Hello");
+    }
+
+    /// SNS can redeliver an older message's transiently failed ingest after a
+    /// newer message in the same thread has landed: the late arrival still
+    /// counts, but the "last message" roll-ups stay on the newer message, so
+    /// `timestamp` (the thread list's sort key), `last_message_id` and
+    /// `preview` keep describing the same, newest message.
+    #[test]
+    fn apply_message_out_of_order_keeps_the_newest_message_as_last() {
+        let mut newer = message(Direction::Inbound, &["received", "unread"]);
+        newer.message_id = "mid-newer".to_owned();
+        newer.timestamp = "00000002-0000".to_owned();
+        newer.preview = "Newer body".to_owned();
+        let before = new_thread(&newer);
+
+        let mut older = message(Direction::Inbound, &["received", "unread"]);
+        older.message_id = "mid-older".to_owned();
+        older.from = "other@example.com".to_owned();
+        older.timestamp = "00000001-0000".to_owned();
+        older.preview = "Older body".to_owned();
+        let after = apply_message(&before, &older);
+
+        assert_eq!(after.message_count, 2);
+        assert_eq!(after.version, before.version + 1);
+        assert!(after.senders.contains(&"other@example.com".to_owned()));
+        assert_eq!(after.timestamp, "00000002-0000");
+        assert_eq!(after.last_message_id, "mid-newer");
+        assert_eq!(after.preview, "Newer body");
+        assert_eq!(after.received_timestamp.as_deref(), Some("00000002-0000"));
+    }
+
+    /// `received_timestamp` is "Timestamp of last received message" and
+    /// `sent_timestamp` "Timestamp of last sent message": each follows the
+    /// newest message of its direction, and neither moves backwards.
+    #[test]
+    fn apply_message_direction_timestamps_track_the_newest_of_each_direction() {
+        let mut first = message(Direction::Inbound, &["received"]);
+        first.timestamp = "00000001-0000".to_owned();
+        let thread = new_thread(&first);
+
+        let mut reply = message(Direction::Outbound, &["sent"]);
+        reply.message_id = "mid-reply".to_owned();
+        reply.timestamp = "00000003-0000".to_owned();
+        let thread = apply_message(&thread, &reply);
+        assert_eq!(thread.received_timestamp.as_deref(), Some("00000001-0000"));
+        assert_eq!(thread.sent_timestamp.as_deref(), Some("00000003-0000"));
+
+        let mut second = message(Direction::Inbound, &["received"]);
+        second.message_id = "mid-2".to_owned();
+        second.timestamp = "00000004-0000".to_owned();
+        let thread = apply_message(&thread, &second);
+        assert_eq!(thread.received_timestamp.as_deref(), Some("00000004-0000"));
+
+        let mut late_inbound = message(Direction::Inbound, &["received"]);
+        late_inbound.message_id = "mid-late-in".to_owned();
+        late_inbound.timestamp = "00000002-0000".to_owned();
+        let thread = apply_message(&thread, &late_inbound);
+        assert_eq!(thread.received_timestamp.as_deref(), Some("00000004-0000"));
+
+        let mut late_outbound = message(Direction::Outbound, &["sent"]);
+        late_outbound.message_id = "mid-late-out".to_owned();
+        late_outbound.timestamp = "00000002-0000".to_owned();
+        let thread = apply_message(&thread, &late_outbound);
+        assert_eq!(thread.sent_timestamp.as_deref(), Some("00000003-0000"));
+        assert_eq!(thread.timestamp, "00000004-0000");
+        assert_eq!(thread.last_message_id, "mid-2");
+        assert_eq!(thread.message_count, 5);
     }
 
     #[test]
@@ -469,11 +596,14 @@ mod tests {
         let mut second = message(Direction::Inbound, &["received", "unread"]);
         second.message_id = "mid-2".to_owned();
         second.from = "other@example.com".to_owned();
+        second.preview = "Second body".to_owned();
         let after = apply_message(&before, &second);
 
         let snapshot = ThreadSnapshot::from(&after);
         assert_eq!(snapshot.thread_id, after.thread_id);
         assert_eq!(snapshot.subject, after.subject);
+        assert_eq!(snapshot.preview, after.preview);
+        assert_eq!(snapshot.preview, "Second body");
         assert_eq!(snapshot.message_count, 2);
         assert_eq!(snapshot.labels, after.labels);
         assert_eq!(snapshot.senders, after.senders);
