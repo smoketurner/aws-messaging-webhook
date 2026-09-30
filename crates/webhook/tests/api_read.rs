@@ -469,6 +469,56 @@ async fn a_thread_embeds_its_messages_oldest_first() {
     assert_eq!(body["messages"][1]["subject"], "Second");
 }
 
+/// A thread's rolled-up `preview` is "Text preview of last message in thread"
+/// (the same wording the schema uses for `last_message_id`), so after two
+/// inbound messages with differing previews it tracks the last-processed
+/// message — not the first — and agrees with `last_message_id` on which
+/// message that is. The thread-list endpoint surfaces no `messages[]`, so
+/// `preview` is its only source for the last message's text.
+#[tokio::test]
+async fn a_thread_preview_tracks_the_last_message_not_the_first() {
+    let h = seeded().await;
+    insert(&h, "2026-01-01T09:00:00.000Z", "t1", |m| {
+        m.preview = "First message body".to_owned();
+    })
+    .await;
+    let second_at = "2026-01-01T10:00:00.000Z";
+    let second_id = ids::inbound_message_id(
+        &format!("ses-{second_at}-t1"),
+        time::parse(second_at).unwrap(),
+    )
+    .to_string();
+    insert(&h, second_at, "t1", |m| {
+        m.preview = "Second message body".to_owned();
+    })
+    .await;
+
+    // The list endpoint surfaces only the rolled-up state (no `messages[]`),
+    // so `preview` is its sole source for the last message's text.
+    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1);
+    let thread = &body["threads"][0];
+    assert_eq!(thread["message_count"], 2);
+    assert_eq!(thread["last_message_id"], second_id);
+    assert_eq!(thread["preview"], "Second message body");
+
+    // The detail endpoint carries the same rolled-up `preview` alongside the
+    // per-message `preview`s (oldest first), so the two must agree on the last
+    // message.
+    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads/t1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["preview"], "Second message body");
+    assert_eq!(body["last_message_id"], second_id);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1]["message_id"], second_id);
+    assert_eq!(messages[1]["preview"], "Second message body");
+    assert_eq!(body["preview"], messages[1]["preview"]);
+    // The first message's preview differs and is not what the thread shows.
+    assert_eq!(messages[0]["preview"], "First message body");
+}
+
 #[tokio::test]
 async fn listing_threads_orders_by_last_activity() {
     let h = seeded().await;

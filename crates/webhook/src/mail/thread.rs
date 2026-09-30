@@ -213,6 +213,11 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     }
 
     next.timestamp.clone_from(&msg.timestamp);
+    // `preview` is "Text preview of last message in thread" (the same wording
+    // the schema uses for `last_message_id`), so it tracks the last-processed
+    // message — advancing here, consistent with `last_message_id`/`timestamp`,
+    // rather than staying frozen at the first-processed one.
+    next.preview.clone_from(&msg.preview);
     next.version += 1;
     next.updated_at.clone_from(&msg.updated_at);
     next.expires_at = next.expires_at.max(msg.expires_at);
@@ -380,16 +385,61 @@ mod tests {
         let mut second = message(Direction::Inbound, &["received", "unread"]);
         second.message_id = "mid-2".to_owned();
         second.from = "other@example.com".to_owned();
+        second.preview = "Second body".to_owned();
 
         let after = apply_message(&before, &second);
         assert_eq!(after.version, before.version + 1);
         assert_eq!(after.message_count, 2);
         assert_eq!(after.label_counts["received"], 2);
         assert_eq!(after.last_message_id, "mid-2");
+        // `preview` is "Text preview of last message in thread" — the same
+        // wording the schema uses for `last_message_id` — so it advances to
+        // the last-processed message rather than staying at the first.
+        assert_eq!(after.preview, "Second body");
         assert_eq!(
             after.senders,
             vec!["other@example.com", "sender@example.com"]
         );
+    }
+
+    /// A thread's `preview` advances to the last-processed message on every
+    /// `apply_message` call, matching the direction-neutral roll-up of
+    /// `last_message_id`/`timestamp`. This holds across an outbound reply
+    /// too: the schema's "last message in thread" wording carries no
+    /// "received" qualifier, so a reply's preview becomes the thread's.
+    #[test]
+    fn apply_message_advances_preview_across_an_outbound_reply() {
+        let first = message(Direction::Inbound, &["received", "unread"]);
+        let before = new_thread(&first);
+        assert_eq!(before.preview, "Hello there");
+
+        let mut reply = message(Direction::Outbound, &["sent"]);
+        reply.message_id = "mid-reply".to_owned();
+        reply.preview = "Re: Hello, here is the answer".to_owned();
+        let after = apply_message(&before, &reply);
+
+        assert_eq!(after.last_message_id, "mid-reply");
+        assert_eq!(after.preview, "Re: Hello, here is the answer");
+    }
+
+    /// `preview` is the only message-level roll-up that was silently frozen at
+    /// the first-processed message; `subject` is deliberately a stable
+    /// thread-identity field ("Subject of thread.", no "last" qualifier), so a
+    /// second message with a different subject must not overwrite the first's.
+    #[test]
+    fn apply_message_advances_preview_but_keeps_the_first_subject() {
+        let first = message(Direction::Inbound, &["received", "unread"]);
+        let before = new_thread(&first);
+        assert_eq!(before.subject, "Hello");
+
+        let mut second = message(Direction::Inbound, &["received", "unread"]);
+        second.message_id = "mid-2".to_owned();
+        second.subject = "Re: Hello".to_owned();
+        second.preview = "Second body".to_owned();
+        let after = apply_message(&before, &second);
+
+        assert_eq!(after.preview, "Second body");
+        assert_eq!(after.subject, "Hello");
     }
 
     #[test]
@@ -469,11 +519,14 @@ mod tests {
         let mut second = message(Direction::Inbound, &["received", "unread"]);
         second.message_id = "mid-2".to_owned();
         second.from = "other@example.com".to_owned();
+        second.preview = "Second body".to_owned();
         let after = apply_message(&before, &second);
 
         let snapshot = ThreadSnapshot::from(&after);
         assert_eq!(snapshot.thread_id, after.thread_id);
         assert_eq!(snapshot.subject, after.subject);
+        assert_eq!(snapshot.preview, after.preview);
+        assert_eq!(snapshot.preview, "Second body");
         assert_eq!(snapshot.message_count, 2);
         assert_eq!(snapshot.labels, after.labels);
         assert_eq!(snapshot.senders, after.senders);
