@@ -24,6 +24,10 @@ pub mod names {
     pub const ALLOWLIST_REJECTIONS: &str = "AllowlistRejections";
     pub const UNCLASSIFIED_PAYLOADS: &str = "UnclassifiedPayloads";
     pub const DUPLICATES: &str = "Duplicates";
+    /// Stale out-of-order `current_status` transitions suppressed by the
+    /// precedence guard (see `aws::status_transition`): the raw event was
+    /// durable but the status did not regress.
+    pub const STATUS_TRANSITIONS_SUPPRESSED: &str = "StatusTransitionsSuppressed";
     pub const EVENTS_PUBLISHED: &str = "EventsPublished";
     pub const PUBLISH_FAILURES: &str = "PublishFailures";
     pub const INTERNAL_ERRORS: &str = "InternalErrors";

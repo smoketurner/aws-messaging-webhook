@@ -122,7 +122,9 @@ pub struct StoreError(#[from] pub anyhow::Error);
 pub trait EventStore: Send + Sync {
     /// Persists the event record and applies the aggregate projection in one
     /// atomic write, keyed so that an SNS redelivery is detected as a
-    /// duplicate rather than re-persisted.
+    /// duplicate rather than re-persisted. A precedence-guarded status
+    /// transition that cannot live in that write is applied after it, on
+    /// both outcomes, so a redelivery recovers one that failed.
     fn persist_new(
         &self,
         record: &EventRecord,

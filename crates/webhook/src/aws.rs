@@ -27,6 +27,7 @@ use crate::actions::{
 };
 use crate::config::{Config, MailConfig};
 use crate::mail::fetch::{AttachmentFetcher, FetchError, Fetched, HttpAttachmentFetcher};
+use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::{SesBounce, SesEngagement};
 use crate::publish::{OutboundEvent, PublishError, PublishEvents};
@@ -79,6 +80,56 @@ impl AwsServices {
     /// on mail being configured; each maps `None` into its own error type.
     pub(crate) fn mail_config(&self) -> Option<&MailConfig> {
         self.config.mail.as_ref()
+    }
+
+    /// Applies a precedence-guarded `current_status` transition (built by
+    /// [`status_transition`]) as a standalone `UpdateItem` after the
+    /// raw-event/aggregate `TransactWriteItems` has committed.
+    ///
+    /// A `ConditionalCheckFailed` is the benign, expected outcome for a stale
+    /// out-of-order retry: the event cannot regress the more-terminal
+    /// `current_status` a sibling already set, so no `message.status.changed`
+    /// regression is published and the raw event stays durable. (A redelivery
+    /// of an event whose transition already applied settles the same way.)
+    ///
+    /// Any other failure is a `StoreError` (5xx): the raw event is committed,
+    /// but the redelivery it recruits resolves as a `Duplicate` `Put` and
+    /// re-applies this guarded — hence repeat-safe — transition, so a
+    /// throttle or timeout between the two writes cannot silently lose the
+    /// status.
+    async fn apply_status_transition(
+        &self,
+        sns_message_id: &str,
+        transition: Update,
+    ) -> Result<(), StoreError> {
+        let result = self
+            .dynamo
+            .update_item()
+            .set_table_name(Some(transition.table_name))
+            .set_key(Some(transition.key))
+            .set_update_expression(Some(transition.update_expression))
+            .set_condition_expression(transition.condition_expression)
+            .set_expression_attribute_values(transition.expression_attribute_values)
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(SdkError::ServiceError(ctx))
+                if ctx.err().is_conditional_check_failed_exception() =>
+            {
+                metrics::counter!(names::STATUS_TRANSITIONS_SUPPRESSED).increment(1);
+                tracing::debug!(
+                    sns_message_id,
+                    event = "status_transition_suppressed",
+                    "stale out-of-order event cannot regress current_status; raw event durable",
+                );
+                Ok(())
+            }
+            Err(error) => Err(StoreError(anyhow!(
+                "status transition failed: {}",
+                DisplayErrorContext(&error)
+            ))),
+        }
     }
 }
 
@@ -142,11 +193,23 @@ fn aggregate_update(
                 None
             }
         }
+        // SES `current_status` is set three ways:
+        //  - `Send` uses an `if_not_exists` guard here — it is the initial
+        //    rung and must not overwrite a terminal status set by an
+        //    out-of-order sibling.
+        //  - permanent `Bounce`/final `SmsDelivery` clobber here deliberately
+        //    (test-pinned).
+        //  - `Delivery` and `Complaint` set `current_status` in a separate,
+        //    precedence-guarded `UpdateItem` *after* the transaction (see
+        //    [`status_transition`]). An unconditional clobber here let a stale
+        //    out-of-order retry regress a more-terminal status a sibling had
+        //    already set (e.g. a `Delivery` retry overwriting `complained`),
+        //    and a guard inside the `TransactWriteItems` would cancel the
+        //    raw-event `Put` on failure and loop. So Delivery contributes
+        //    nothing to this aggregate (it falls through to the wildcard
+        //    below), and Complaint records only its idempotent timestamp here.
         DomainEvent::Ses { event, .. } => match event.kind.as_str() {
-            // Send never overwrites a terminal status: events arrive out of
-            // order under at-least-once delivery.
             "Send" => Some(set_status(&mut set_clauses, "sent", false)),
-            "Delivery" => Some(set_status(&mut set_clauses, "delivered", true)),
             "Bounce" => {
                 let permanent = event.bounce.as_ref().is_some_and(SesBounce::is_permanent);
                 if let Some(bounce) = &event.bounce {
@@ -162,8 +225,11 @@ fn aggregate_update(
                 permanent.then(|| set_status(&mut set_clauses, "bounced", true))
             }
             "Complaint" => {
+                // `complained_at` is an idempotent timestamp — safe in the
+                // transaction. `current_status` moves to the post-transaction
+                // guarded update (see [`status_transition`]).
                 set_clauses.push("complained_at = :ts");
-                Some(set_status(&mut set_clauses, "complained", true))
+                None
             }
             "Open" => {
                 set_clauses.push("last_opened_at = :ts");
@@ -185,6 +251,10 @@ fn aggregate_update(
                 });
                 None
             }
+            // Delivery (its `current_status` is applied post-transaction by
+            // [`status_transition`]) and non-status SES kinds
+            // (Reject/DeliveryDelay/Subscription/…) set no in-transaction
+            // current_status.
             _ => None,
         },
         DomainEvent::Unknown { .. } => None,
@@ -205,6 +275,73 @@ fn aggregate_update(
         .build()
         .context("failed to build aggregate update")?;
     Ok(update)
+}
+
+/// A `current_status` transition applied as a standalone `UpdateItem` *after*
+/// the raw-event/aggregate `TransactWriteItems` commits — for `Delivery` and
+/// `Complaint`, the only status-setting SES branches that neither guard
+/// `current_status` (like `Send`) nor deliberately pin an unconditional clobber
+/// (like permanent `Bounce`/final `SmsDelivery`).
+///
+/// The transition is precedence-guarded: it takes effect only when
+/// `current_status` is unset or one of the less-terminal rungs below it on the
+/// SES ladder
+/// (`sent` → `delivered` → `{complained}`), so a stale out-of-order retry —
+/// whose first delivery failed pre-persist, then lands after a sibling event
+/// has already set `current_status` — cannot regress the rolled-up status. The
+/// `UpdateItem` returns `ConditionalCheckFailed`, a benign no-op: the raw event
+/// is already durable and the relay sees no `current_status` transition, so no
+/// `message.status.changed` regression (e.g. `complained` → `delivered`) is
+/// published for the retry.
+///
+/// The guard lives on a separate `UpdateItem`, not the in-transaction
+/// `Update`: a condition failure inside `TransactWriteItems` cancels the
+/// raw-event `Put` too, and the dedup path (`duplicate_outcome`) inspects only
+/// cancellation index 0, so the stale retry would resurface as an unhandled
+/// `StoreError` (5xx) and loop instead of settling. Splitting the update keeps
+/// the raw event durable unconditionally; a transient failure of the split
+/// update is a 5xx whose redelivery (a `Duplicate`) re-applies it.
+fn status_transition(
+    table_name: &str,
+    record: &EventRecord,
+    event: &DomainEvent,
+) -> Option<Update> {
+    // `bounced` and `complained` are both terminal, so neither appears in the
+    // other's allowed priors: a stale `Delivery`/`Complaint` retry arriving
+    // after either settles as a `ConditionalCheckFailed` no-op.
+    let DomainEvent::Ses { event, .. } = event else {
+        return None;
+    };
+    let (status, priors): (&'static str, &'static [&'static str]) = match event.kind.as_str() {
+        "Delivery" => ("delivered", &["sent"]),
+        "Complaint" => ("complained", &["sent", "delivered"]),
+        _ => return None,
+    };
+    let mut condition = "attribute_not_exists(current_status)".to_owned();
+    let mut builder = Update::builder()
+        .table_name(table_name)
+        .key("pk", AttributeValue::S(partition_key(record)))
+        .key("sk", AttributeValue::S("AGG".to_owned()))
+        .update_expression("SET current_status = :status")
+        .expression_attribute_values(":status", AttributeValue::S(status.to_owned()));
+    for (i, prior) in priors.iter().enumerate() {
+        let placeholder = format!(":prev{i}");
+        condition.push_str(" OR current_status = ");
+        condition.push_str(&placeholder);
+        builder = builder
+            .expression_attribute_values(placeholder, AttributeValue::S((*prior).to_owned()));
+    }
+    match builder.condition_expression(condition).build() {
+        Ok(update) => Some(update),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                event = "status_transition_build_failure",
+                "failed to build precedence-guarded status update",
+            );
+            None
+        }
+    }
 }
 
 impl EventStore for AwsServices {
@@ -254,10 +391,20 @@ impl EventStore for AwsServices {
             .send()
             .await;
 
-        match result {
-            Ok(_) => Ok(PersistOutcome::Fresh),
-            Err(error) => duplicate_outcome(&error).map_err(StoreError),
+        let outcome = match result {
+            Ok(_) => PersistOutcome::Fresh,
+            Err(error) => duplicate_outcome(&error).map_err(StoreError)?,
+        };
+        // The precedence-guarded `current_status` transition for
+        // Delivery/Complaint runs on the fresh *and* the duplicate path: it is
+        // not part of the transaction, so a failure (or a crash) after the
+        // commit is recovered only by the redelivery re-applying it. The guard
+        // makes that repeat-safe.
+        if let Some(transition) = status_transition(&self.config.table_name, record, event) {
+            self.apply_status_transition(&record.sns_message_id, transition)
+                .await?;
         }
+        Ok(outcome)
     }
 }
 
@@ -949,5 +1096,255 @@ mod tests {
             expression_for(r#"{"eventType":"TEXT_QUEUED","messageId":"m","isFinal":false}"#);
         assert!(!queued.contains("current_status"));
         assert!(!keys.contains(&":status".to_owned()));
+    }
+
+    // Delivery and Complaint no longer set `current_status` in the
+    // in-transaction aggregate: their transition is applied post-transaction
+    // by a precedence-guarded `UpdateItem` (see `status_transition`) so a
+    // stale out-of-order retry cannot regress a more-terminal sibling status.
+
+    #[test]
+    fn delivery_does_not_set_current_status_in_transaction() {
+        let (expr, keys) = expression_for(r#"{"eventType":"Delivery","mail":{"messageId":"m"}}"#);
+        assert!(!expr.contains("current_status"));
+        assert!(!keys.contains(&":status".to_owned()));
+    }
+
+    #[test]
+    fn complaint_records_timestamp_but_not_current_status_in_transaction() {
+        // complained_at is an idempotent timestamp that stays in the
+        // transaction; current_status moves to the post-transaction guard.
+        let (expr, keys) = expression_for(
+            r#"{"eventType":"Complaint","complaint":{"complainedRecipients":[]},
+                "mail":{"messageId":"m"}}"#,
+        );
+        assert!(expr.contains("complained_at = :ts"));
+        assert!(!expr.contains("current_status"));
+        assert!(!keys.contains(&":status".to_owned()));
+    }
+
+    #[test]
+    fn only_delivery_and_complaint_have_status_transitions() {
+        // Branches whose current_status stays in the transaction (or is not
+        // set at all) produce no post-transaction transition.
+        for message in [
+            r#"{"eventType":"Send","mail":{"messageId":"m"}}"#,
+            r#"{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[]},"mail":{"messageId":"m"}}"#,
+            r#"{"eventType":"Open","mail":{"messageId":"m"}}"#,
+            r#"{"eventType":"Click","mail":{"messageId":"m"}}"#,
+            r#"{"eventType":"TEXT_DELIVERED","messageId":"m","isFinal":true}"#,
+            "not json",
+        ] {
+            let event = DomainEvent::classify(message);
+            assert!(
+                status_transition("t", &record(event.family(), "agg-1"), &event).is_none(),
+                "no transition expected for: {message}"
+            );
+        }
+        for message in [
+            r#"{"eventType":"Delivery","mail":{"messageId":"m"}}"#,
+            r#"{"eventType":"Complaint","complaint":{"complainedRecipients":[]},"mail":{"messageId":"m"}}"#,
+        ] {
+            let event = DomainEvent::classify(message);
+            assert!(
+                status_transition("t", &record(event.family(), "agg-1"), &event).is_some(),
+                "transition expected for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_status_transition_advances_from_unset_or_sent_only() {
+        let event = DomainEvent::classify(r#"{"eventType":"Delivery","mail":{"messageId":"m"}}"#);
+        let update = status_transition("t", &record(event.family(), "agg-1"), &event).unwrap();
+        assert_eq!(update.update_expression, "SET current_status = :status");
+        let condition = update.condition_expression.unwrap();
+        assert!(condition.contains("attribute_not_exists(current_status)"));
+        assert!(condition.contains("current_status = :prev0"));
+        assert!(!condition.contains(":prev1"));
+        let values = update.expression_attribute_values.unwrap();
+        assert_eq!(values[":status"], AttributeValue::S("delivered".to_owned()));
+        assert_eq!(values[":prev0"], AttributeValue::S("sent".to_owned()));
+        assert!(!values.contains_key(":prev1"));
+        // No terminal (delivered/complained/bounced) is whitelisted as a
+        // prior, so a stale Delivery retry landing after any of them settles
+        // as a benign ConditionalCheckFailed instead of regressing the status.
+        assert!(!values.contains_key(":prev2"));
+    }
+
+    #[test]
+    fn complaint_status_transition_advances_from_unset_sent_or_delivered_only() {
+        let event = DomainEvent::classify(
+            r#"{"eventType":"Complaint","complaint":{"complainedRecipients":[]},
+                "mail":{"messageId":"m"}}"#,
+        );
+        let update = status_transition("t", &record(event.family(), "agg-1"), &event).unwrap();
+        let condition = update.condition_expression.unwrap();
+        assert!(condition.contains("attribute_not_exists(current_status)"));
+        assert!(condition.contains("current_status = :prev0"));
+        assert!(condition.contains("current_status = :prev1"));
+        assert!(!condition.contains(":prev2"));
+        let values = update.expression_attribute_values.unwrap();
+        assert_eq!(
+            values[":status"],
+            AttributeValue::S("complained".to_owned())
+        );
+        assert_eq!(values[":prev0"], AttributeValue::S("sent".to_owned()));
+        assert_eq!(values[":prev1"], AttributeValue::S("delivered".to_owned()));
+        assert!(!values.contains_key(":prev2"));
+    }
+
+    // `persist_new` against a stub DynamoDB endpoint: the guarded transition
+    // is applied on the duplicate path too, and a transient failure of it is
+    // surfaced (5xx) rather than swallowed — otherwise a throttle or crash
+    // between the transaction and the split update would lose the status for
+    // good, since every redelivery resolves as a `Duplicate`.
+    mod persist {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+
+        const TRANSACT: &str = "DynamoDB_20120810.TransactWriteItems";
+        const UPDATE: &str = "DynamoDB_20120810.UpdateItem";
+        const DELIVERY: &str = r#"{"eventType":"Delivery","mail":{"messageId":"m"}}"#;
+
+        fn json(status: u16, body: &str) -> ResponseTemplate {
+            ResponseTemplate::new(status)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(body.to_owned())
+        }
+
+        fn dynamo_error(status: u16, kind: &str) -> ResponseTemplate {
+            json(
+                status,
+                &format!(r#"{{"__type":"com.amazonaws.dynamodb.v20120810#{kind}","message":"x"}}"#),
+            )
+        }
+
+        fn duplicate_put() -> ResponseTemplate {
+            json(
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+                    "Message":"cancelled",
+                    "CancellationReasons":[{"Code":"ConditionalCheckFailed"},{"Code":"None"}]}"#,
+            )
+        }
+
+        async fn mount(server: &MockServer, target: &str, response: ResponseTemplate) {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", target))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+
+        fn aws(server: &MockServer) -> AwsServices {
+            let dynamo_conf = aws_sdk_dynamodb::Config::builder()
+                .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+                .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                    "AKID", "secret", None, None, "test",
+                ))
+                .endpoint_url(server.uri())
+                .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                .build();
+            let sdk = aws_config::SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .build();
+            let mut aws = AwsServices::new(
+                &sdk,
+                Config {
+                    table_name: "events".to_owned(),
+                    event_bus_name: "bus".to_owned(),
+                    event_source: "aws-messaging-webhook".to_owned(),
+                    auto_resubscribe: false,
+                    opt_out_list_name: None,
+                    raw_event_retention_days: 30,
+                    aggregate_retention_days: 365,
+                    mode: crate::config::FunctionMode::Webhook,
+                    mail: None,
+                },
+            );
+            aws.dynamo = aws_sdk_dynamodb::Client::from_conf(dynamo_conf);
+            aws
+        }
+
+        async fn persist(server: &MockServer, message: &str) -> Result<PersistOutcome, StoreError> {
+            let event = DomainEvent::classify(message);
+            aws(server)
+                .persist_new(&record(event.family(), "agg-1"), &event)
+                .await
+        }
+
+        async fn update_calls(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.headers.get("x-amz-target").is_some_and(|v| v == UPDATE))
+                .count()
+        }
+
+        #[tokio::test]
+        async fn a_fresh_delivery_applies_the_guarded_transition() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, json(200, "{}")).await;
+            mount(&server, UPDATE, json(200, "{}")).await;
+            assert_eq!(
+                persist(&server, DELIVERY).await.unwrap(),
+                PersistOutcome::Fresh
+            );
+            assert_eq!(update_calls(&server).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_duplicate_delivery_re_applies_the_guarded_transition() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, duplicate_put()).await;
+            mount(&server, UPDATE, json(200, "{}")).await;
+            assert_eq!(
+                persist(&server, DELIVERY).await.unwrap(),
+                PersistOutcome::Duplicate
+            );
+            assert_eq!(update_calls(&server).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_suppressed_stale_transition_is_benign() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, json(200, "{}")).await;
+            mount(
+                &server,
+                UPDATE,
+                dynamo_error(400, "ConditionalCheckFailedException"),
+            )
+            .await;
+            assert_eq!(
+                persist(&server, DELIVERY).await.unwrap(),
+                PersistOutcome::Fresh
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_transition_is_surfaced_for_redelivery() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, json(200, "{}")).await;
+            mount(&server, UPDATE, dynamo_error(500, "InternalServerError")).await;
+            assert!(persist(&server, DELIVERY).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn events_without_a_transition_send_no_update() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, duplicate_put()).await;
+            let open = r#"{"eventType":"Open","mail":{"messageId":"m"}}"#;
+            assert_eq!(
+                persist(&server, open).await.unwrap(),
+                PersistOutcome::Duplicate
+            );
+            assert_eq!(update_calls(&server).await, 0);
+        }
     }
 }
