@@ -89,12 +89,19 @@ impl AwsServices {
     /// A `ConditionalCheckFailed` is the benign, expected outcome for a stale
     /// out-of-order retry: the event cannot regress the more-terminal
     /// `current_status` a sibling already set, so no `message.status.changed`
-    /// regression is published and the raw event stays durable. Any other
-    /// failure is logged and swallowed — the raw event is already committed,
-    /// and surfacing the error as a `StoreError` (5xx) would only recruit a
-    /// redelivery that re-rolls a `Duplicate` `Put` with no chance to re-apply
-    /// this transition.
-    async fn apply_status_transition(&self, sns_message_id: &str, transition: Update) {
+    /// regression is published and the raw event stays durable. (A redelivery
+    /// of an event whose transition already applied settles the same way.)
+    ///
+    /// Any other failure is a `StoreError` (5xx): the raw event is committed,
+    /// but the redelivery it recruits resolves as a `Duplicate` `Put` and
+    /// re-applies this guarded — hence repeat-safe — transition, so a
+    /// throttle or timeout between the two writes cannot silently lose the
+    /// status.
+    async fn apply_status_transition(
+        &self,
+        sns_message_id: &str,
+        transition: Update,
+    ) -> Result<(), StoreError> {
         let result = self
             .dynamo
             .update_item()
@@ -106,7 +113,7 @@ impl AwsServices {
             .send()
             .await;
         match result {
-            Ok(_) => {}
+            Ok(_) => Ok(()),
             Err(SdkError::ServiceError(ctx))
                 if ctx.err().is_conditional_check_failed_exception() =>
             {
@@ -116,15 +123,12 @@ impl AwsServices {
                     event = "status_transition_suppressed",
                     "stale out-of-order event cannot regress current_status; raw event durable",
                 );
+                Ok(())
             }
-            Err(error) => {
-                tracing::error!(
-                    ?error,
-                    sns_message_id,
-                    event = "status_transition_failed",
-                    "precedence-guarded status update failed; raw event durable",
-                );
-            }
+            Err(error) => Err(StoreError(anyhow!(
+                "status transition failed: {}",
+                DisplayErrorContext(&error)
+            ))),
         }
     }
 }
@@ -295,8 +299,8 @@ fn aggregate_update(
 /// raw-event `Put` too, and the dedup path (`duplicate_outcome`) inspects only
 /// cancellation index 0, so the stale retry would resurface as an unhandled
 /// `StoreError` (5xx) and loop instead of settling. Splitting the update keeps
-/// the raw event durable unconditionally and degrades a status failure
-/// gracefully.
+/// the raw event durable unconditionally; a transient failure of the split
+/// update is a 5xx whose redelivery (a `Duplicate`) re-applies it.
 fn status_transition(
     table_name: &str,
     record: &EventRecord,
@@ -387,25 +391,20 @@ impl EventStore for AwsServices {
             .send()
             .await;
 
-        match result {
-            Ok(_) => {
-                // The precedence-guarded `current_status` transition for
-                // Delivery/Complaint runs only on the fresh path — a
-                // redelivery is a Duplicate and never re-applies the aggregate.
-                // It is best-effort: the raw event is already durable, a
-                // `ConditionalCheckFailed` is a benign suppression, and any
-                // other failure is logged rather than surfaced as a 5xx (a
-                // retry would only re-roll a `Duplicate` Put that cannot
-                // re-apply this transition).
-                if let Some(transition) = status_transition(&self.config.table_name, record, event)
-                {
-                    self.apply_status_transition(&record.sns_message_id, transition)
-                        .await;
-                }
-                Ok(PersistOutcome::Fresh)
-            }
-            Err(error) => duplicate_outcome(&error).map_err(StoreError),
+        let outcome = match result {
+            Ok(_) => PersistOutcome::Fresh,
+            Err(error) => duplicate_outcome(&error).map_err(StoreError)?,
+        };
+        // The precedence-guarded `current_status` transition for
+        // Delivery/Complaint runs on the fresh *and* the duplicate path: it is
+        // not part of the transaction, so a failure (or a crash) after the
+        // commit is recovered only by the redelivery re-applying it. The guard
+        // makes that repeat-safe.
+        if let Some(transition) = status_transition(&self.config.table_name, record, event) {
+            self.apply_status_transition(&record.sns_message_id, transition)
+                .await?;
         }
+        Ok(outcome)
     }
 }
 
@@ -1032,5 +1031,159 @@ mod tests {
         assert_eq!(values[":prev0"], AttributeValue::S("sent".to_owned()));
         assert_eq!(values[":prev1"], AttributeValue::S("delivered".to_owned()));
         assert!(!values.contains_key(":prev2"));
+    }
+
+    // `persist_new` against a stub DynamoDB endpoint: the guarded transition
+    // is applied on the duplicate path too, and a transient failure of it is
+    // surfaced (5xx) rather than swallowed — otherwise a throttle or crash
+    // between the transaction and the split update would lose the status for
+    // good, since every redelivery resolves as a `Duplicate`.
+    mod persist {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+
+        const TRANSACT: &str = "DynamoDB_20120810.TransactWriteItems";
+        const UPDATE: &str = "DynamoDB_20120810.UpdateItem";
+        const DELIVERY: &str = r#"{"eventType":"Delivery","mail":{"messageId":"m"}}"#;
+
+        fn json(status: u16, body: &str) -> ResponseTemplate {
+            ResponseTemplate::new(status)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(body.to_owned())
+        }
+
+        fn dynamo_error(status: u16, kind: &str) -> ResponseTemplate {
+            json(
+                status,
+                &format!(r#"{{"__type":"com.amazonaws.dynamodb.v20120810#{kind}","message":"x"}}"#),
+            )
+        }
+
+        fn duplicate_put() -> ResponseTemplate {
+            json(
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+                    "Message":"cancelled",
+                    "CancellationReasons":[{"Code":"ConditionalCheckFailed"},{"Code":"None"}]}"#,
+            )
+        }
+
+        async fn mount(server: &MockServer, target: &str, response: ResponseTemplate) {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", target))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+
+        fn aws(server: &MockServer) -> AwsServices {
+            let dynamo_conf = aws_sdk_dynamodb::Config::builder()
+                .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+                .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                    "AKID", "secret", None, None, "test",
+                ))
+                .endpoint_url(server.uri())
+                .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                .build();
+            let sdk = aws_config::SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .build();
+            let mut aws = AwsServices::new(
+                &sdk,
+                Config {
+                    table_name: "events".to_owned(),
+                    event_bus_name: "bus".to_owned(),
+                    event_source: "aws-messaging-webhook".to_owned(),
+                    auto_resubscribe: false,
+                    opt_out_list_name: None,
+                    raw_event_retention_days: 30,
+                    aggregate_retention_days: 365,
+                    mode: crate::config::FunctionMode::Webhook,
+                    mail: None,
+                },
+            );
+            aws.dynamo = aws_sdk_dynamodb::Client::from_conf(dynamo_conf);
+            aws
+        }
+
+        async fn persist(server: &MockServer, message: &str) -> Result<PersistOutcome, StoreError> {
+            let event = DomainEvent::classify(message);
+            aws(server)
+                .persist_new(&record(event.family(), "agg-1"), &event)
+                .await
+        }
+
+        async fn update_calls(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.headers.get("x-amz-target").is_some_and(|v| v == UPDATE))
+                .count()
+        }
+
+        #[tokio::test]
+        async fn a_fresh_delivery_applies_the_guarded_transition() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, json(200, "{}")).await;
+            mount(&server, UPDATE, json(200, "{}")).await;
+            assert_eq!(
+                persist(&server, DELIVERY).await.unwrap(),
+                PersistOutcome::Fresh
+            );
+            assert_eq!(update_calls(&server).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_duplicate_delivery_re_applies_the_guarded_transition() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, duplicate_put()).await;
+            mount(&server, UPDATE, json(200, "{}")).await;
+            assert_eq!(
+                persist(&server, DELIVERY).await.unwrap(),
+                PersistOutcome::Duplicate
+            );
+            assert_eq!(update_calls(&server).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_suppressed_stale_transition_is_benign() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, json(200, "{}")).await;
+            mount(
+                &server,
+                UPDATE,
+                dynamo_error(400, "ConditionalCheckFailedException"),
+            )
+            .await;
+            assert_eq!(
+                persist(&server, DELIVERY).await.unwrap(),
+                PersistOutcome::Fresh
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_transition_is_surfaced_for_redelivery() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, json(200, "{}")).await;
+            mount(&server, UPDATE, dynamo_error(500, "InternalServerError")).await;
+            assert!(persist(&server, DELIVERY).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn events_without_a_transition_send_no_update() {
+            let server = MockServer::start().await;
+            mount(&server, TRANSACT, duplicate_put()).await;
+            let open = r#"{"eventType":"Open","mail":{"messageId":"m"}}"#;
+            assert_eq!(
+                persist(&server, open).await.unwrap(),
+                PersistOutcome::Duplicate
+            );
+            assert_eq!(update_calls(&server).await, 0);
+        }
     }
 }
