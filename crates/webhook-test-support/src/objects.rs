@@ -3,8 +3,10 @@
 //! paused-time deadline tests.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use aws_messaging_webhook::mail::ObjectMeta;
@@ -317,15 +319,19 @@ impl ObjectStore for FakeObjectStore {
         Ok(())
     }
 
-    /// A recognizable stand-in for a presigned URL, carrying the key and the
-    /// signed response overrides so a test can assert on all three. The real
-    /// implementation signs locally and never checks that the object exists,
-    /// so this does not either — only an injected failure makes it fail.
+    /// A recognizable stand-in for a presigned URL, carrying the key, the
+    /// signed response overrides, and the requested lifetime so a test can
+    /// assert on all four. The real implementation signs locally and never
+    /// checks that the object exists, so this does not either — only an
+    /// injected failure makes it fail. `X-Amz-Expires` mirrors the query
+    /// parameter the real S3 signer emits, so a test can confirm the
+    /// configured TTL reaches the URL.
     async fn presign_get(
         &self,
         key: &str,
         disposition: Option<&str>,
         content_type: Option<&str>,
+        ttl: Duration,
     ) -> Result<String, ObjectError> {
         match self.injected(key) {
             Some(ObjectFailure::Hang) => future::pending().await,
@@ -344,6 +350,7 @@ impl ObjectStore for FakeObjectStore {
         }
         let mut url =
             format!("https://example-bucket.s3.amazonaws.test/{key}?X-Amz-Signature=fake");
+        let _ = write!(url, "&X-Amz-Expires={}", ttl.as_secs());
         if let Some(disposition) = disposition {
             url.push_str("&response-content-disposition=");
             url.push_str(&urlencode(disposition));
@@ -375,8 +382,6 @@ fn urlencode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     #[tokio::test]
@@ -580,5 +585,28 @@ mod tests {
         // The countdown scopes only to put_object_if_absent; reads/deletes run.
         assert!(store.get_object("seeded", 1024).await.is_ok());
         assert!(store.delete_object("seeded").await.is_ok());
+    }
+
+    /// `presign_get` echoes the requested lifetime as `X-Amz-Expires`
+    /// (seconds), mirroring the query parameter the real S3 signer emits, so
+    /// a handler test can confirm the configured TTL reaches the URL. Without
+    /// this, the fake would silently drop the TTL and the URL-level
+    /// assertion would be impossible in-process.
+    #[tokio::test]
+    async fn presign_get_echoes_the_ttl_as_x_amz_expires() {
+        let store = FakeObjectStore::default();
+        for ttl in [
+            Duration::from_secs(60),
+            Duration::from_mins(15),
+            Duration::from_secs(3600),
+        ] {
+            let url = store.presign_get("k", None, None, ttl).await.unwrap();
+            assert!(
+                url.contains(&format!("X-Amz-Expires={}", ttl.as_secs())),
+                "ttl={ttl:?} url={url}"
+            );
+            // The key and signed overrides are still present.
+            assert!(url.contains("/k"), "{url}");
+        }
     }
 }

@@ -10,12 +10,14 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
+use crate::config::Config;
 use crate::mail::keys::{self, PageKey, decode_page_token, encode_page_token};
 use crate::mail::objects;
 use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
@@ -248,15 +250,16 @@ pub async fn get_raw<T: Services>(
     let key = message.raw_s3_key.as_deref().ok_or(ApiError::NotFound)?;
 
     let disposition = objects::attachment_disposition(Some(&format!("{message_id}.eml")));
+    let ttl = download_ttl(&state.config);
     let url = state
         .services
-        .presign_get(key, Some(&disposition), Some("message/rfc822"))
+        .presign_get(key, Some(&disposition), Some("message/rfc822"), ttl)
         .await
         .map_err(ApiError::from)?;
 
     Ok(Json(wire::Download {
         download_url: url,
-        expires_at: expires_at(),
+        expires_at: expires_at(ttl),
         size: message.size,
         message_id: Some(message_id),
         attachment_id: None,
@@ -294,15 +297,16 @@ pub async fn get_attachment<T: Services>(
     let key = attachment.object_key.as_deref().ok_or(ApiError::NotFound)?;
 
     let disposition = objects::attachment_disposition(attachment.filename.as_deref());
+    let ttl = download_ttl(&state.config);
     let url = state
         .services
-        .presign_get(key, Some(&disposition), Some(&attachment.content_type))
+        .presign_get(key, Some(&disposition), Some(&attachment.content_type), ttl)
         .await
         .map_err(ApiError::from)?;
 
     Ok(Json(wire::Download {
         download_url: url,
-        expires_at: expires_at(),
+        expires_at: expires_at(ttl),
         size: attachment.size,
         message_id: Some(message_id),
         attachment_id: Some(attachment_id),
@@ -316,9 +320,22 @@ pub async fn get_attachment<T: Services>(
     }))
 }
 
-/// When the URL just issued stops working.
-fn expires_at() -> String {
-    let ttl_ms = u64::try_from(objects::DOWNLOAD_URL_TTL.as_millis()).unwrap_or(0);
+/// The presigned-URL lifetime the operator configured, falling back to the
+/// documented default when mail is not configured. The download routes are
+/// only reachable in that case through a test harness that builds a plain
+/// `Request` without mail config; in production the presigning path errors
+/// first (it requires `MailConfig.bucket`), so the fallback never surfaces.
+fn download_ttl(config: &Config) -> Duration {
+    config
+        .mail
+        .as_ref()
+        .map_or(objects::DOWNLOAD_URL_TTL, |mail| mail.attachment_url_ttl)
+}
+
+/// When the URL just issued stops working — `now + ttl`, so it matches the
+/// lifetime the presigned URL was actually signed for.
+fn expires_at(ttl: Duration) -> String {
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(0);
     time::format(time::now_ms().saturating_add(ttl_ms))
 }
 
