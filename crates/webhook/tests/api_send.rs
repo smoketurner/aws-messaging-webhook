@@ -112,7 +112,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     assert_eq!(status, StatusCode::OK);
     let message_id = body["message_id"].as_str().unwrap().to_owned();
     let thread_id = body["thread_id"].as_str().unwrap().to_owned();
-    assert!(!message_id.is_empty());
+    assert_ne!(message_id, "");
 
     // The message is readable straight away, labelled queued.
     let message = h
@@ -351,7 +351,7 @@ async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let objects = &h.state.services.objects;
     let uploaded = objects.put_object_calls();
-    assert!(!uploaded.is_empty());
+    assert_ne!(uploaded, [] as [String; 0]);
 
     // Every outbox/ upload is gone: the cleanup is the only thing that reclaims
     // this prefix, so stranding any of it would leak forever.
@@ -409,7 +409,7 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
 
     let objects = &h.state.services.objects;
     let uploaded = objects.put_object_calls();
-    assert!(!uploaded.is_empty());
+    assert_ne!(uploaded, [] as [String; 0]);
     for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
         assert!(!objects.contains(key), "{key} was left behind");
     }
@@ -461,7 +461,7 @@ async fn a_content_store_failure_discards_the_outbox_uploads() {
 
     let objects = &h.state.services.objects;
     let uploaded = objects.put_object_calls();
-    assert!(!uploaded.is_empty());
+    assert_ne!(uploaded, [] as [String; 0]);
 
     // Every outbox/ upload (the part and the spec) was reclaimed: the
     // cleanup is the only thing that reclaims this prefix, so stranding
@@ -670,7 +670,10 @@ async fn an_invalid_request_queues_nothing() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(response["name"], "ValidationError");
     // Nothing was uploaded on the way to the rejection.
-    assert!(h.state.services.objects.put_object_calls().is_empty());
+    assert_eq!(
+        h.state.services.objects.put_object_calls(),
+        [] as [String; 0]
+    );
 }
 
 #[tokio::test]
@@ -839,7 +842,7 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
 
     assert_eq!(status, StatusCode::OK, "mixed-case path should not 404");
     let message_id = body["message_id"].as_str().unwrap().to_owned();
-    assert!(!message_id.is_empty());
+    assert_ne!(message_id, "");
 
     // The send lands on the inbox ingest/reads know — the lowercased id.
     let message = h
@@ -896,7 +899,7 @@ async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
     let thread_id = response["thread_id"].as_str().unwrap().to_owned();
     assert_ne!(message_id, "old-message-id");
     assert_ne!(thread_id, "old-thread-id");
-    assert!(!message_id.is_empty());
+    assert_ne!(message_id, "");
 
     // The slot is reclaimed under a fresh 24h lifetime: an immediate replay of
     // the same request returns these new ids rather than descending into the

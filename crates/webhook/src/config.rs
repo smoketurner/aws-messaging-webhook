@@ -297,8 +297,8 @@ mod tests {
     fn only_webhook_mode_requires_the_events_table_and_bus() {
         let unset = |_: &str| None;
         let (table, bus) = events_targets(FunctionMode::Sender, unset).unwrap();
-        assert!(table.is_empty());
-        assert!(bus.is_empty());
+        assert_eq!(table, "");
+        assert_eq!(bus, "");
 
         let error = events_targets(FunctionMode::Webhook, unset).unwrap_err();
         assert!(error.to_string().contains("TABLE_NAME"), "{error}");

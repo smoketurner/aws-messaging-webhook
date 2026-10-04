@@ -446,8 +446,8 @@ mod tests {
     fn a_patch_that_changes_nothing_reports_nothing() {
         let current = vec!["received".to_owned()];
         let patch = patch_labels(&current, &["received".to_owned()], &["spam".to_owned()]);
-        assert!(patch.added.is_empty());
-        assert!(patch.removed.is_empty());
+        assert_eq!(patch.added, [] as [String; 0]);
+        assert_eq!(patch.removed, [] as [String; 0]);
         assert_eq!(patch.labels, current);
     }
 }

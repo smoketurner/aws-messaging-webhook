@@ -552,7 +552,7 @@ async fn ses_driven_events_match_the_schema() {
 async fn ses_events_for_other_senders_publish_no_mailbox_event() {
     let h = seeded().await;
     publish_ses_example(&h, "event-delivery.json", "ses-someone-else").await;
-    assert!(mailbox_details(&h).is_empty());
+    assert_eq!(mailbox_details(&h), [] as [serde_json::Value; 0]);
     assert_eq!(h.fake().published.lock().unwrap().len(), 1);
 }
 
@@ -767,7 +767,7 @@ fn the_checker_rejects_departures_from_the_schema() {
             "timestamp": "2026-01-15T09:50:00.000Z",
         },
     });
-    assert!(violations(&valid).is_empty());
+    assert_eq!(violations(&valid), [] as [String; 0]);
 
     let mut extra = valid.clone();
     extra["meta"] = json!({});

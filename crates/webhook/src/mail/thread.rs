@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn candidate_ids_with_no_headers_is_empty() {
-        assert!(candidate_ids(None, &[]).is_empty());
+        assert_eq!(candidate_ids(None, &[]), [] as [String; 0]);
     }
 
     #[test]
