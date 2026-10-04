@@ -180,29 +180,29 @@ mod tests {
     fn labels_are_lowercased_trimmed_sorted_and_deduplicated() {
         let (cleaned, errors) = clean_all(&["  Urgent ", "urgent", "Billing"]);
         assert_eq!(cleaned, vec!["billing", "urgent"]);
-        assert!(errors.is_empty());
+        assert_eq!(errors, [] as [String; 0]);
     }
 
     #[test]
     fn reserved_labels_are_rejected_but_the_toggleable_ones_are_not() {
         let (cleaned, errors) = clean_all(&["received"]);
-        assert!(cleaned.is_empty());
+        assert_eq!(cleaned, [] as [String; 0]);
         assert_eq!(errors.len(), 1);
 
         let (cleaned, errors) = clean_all(&["unread", "spam", "trash"]);
         assert_eq!(cleaned, vec!["spam", "trash", "unread"]);
-        assert!(errors.is_empty());
+        assert_eq!(errors, [] as [String; 0]);
     }
 
     #[test]
     fn empty_and_oversized_labels_are_rejected() {
         let (cleaned, errors) = clean_all(&["   "]);
-        assert!(cleaned.is_empty());
+        assert_eq!(cleaned, [] as [String; 0]);
         assert_eq!(errors.len(), 1);
 
         let long = "x".repeat(LABEL_MAX_BYTES + 1);
         let (cleaned, errors) = clean_all(&[&long]);
-        assert!(cleaned.is_empty());
+        assert_eq!(cleaned, [] as [String; 0]);
         assert_eq!(errors.len(), 1);
     }
 
@@ -222,7 +222,10 @@ mod tests {
         let mut errors = Vec::new();
         let absent: Option<Labels> = None;
         let labels = absent.map(Labels::into_vec).unwrap_or_default();
-        assert!(normalize_labels(labels, "add_labels", &mut errors).is_empty());
+        assert_eq!(
+            normalize_labels(labels, "add_labels", &mut errors),
+            [] as [String; 0]
+        );
         assert!(errors.is_empty());
     }
 

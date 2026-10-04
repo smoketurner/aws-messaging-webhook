@@ -62,7 +62,7 @@ async fn tampered_signature_rejected_and_nothing_touched() {
     let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
 }
 
 #[tokio::test]
@@ -80,7 +80,7 @@ async fn unlisted_topic_rejected_before_any_verification_work() {
     let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
     h.server.verify().await;
 }
 
@@ -108,7 +108,7 @@ async fn non_json_body_is_bad_request() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
 }
 
 #[tokio::test]
@@ -216,7 +216,7 @@ async fn auto_resubscribe_disabled_leaves_unsubscribe_alone() {
     let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
     h.server.verify().await;
 }
 
@@ -725,7 +725,7 @@ async fn direct_invoke_tampered_signature_is_dropped_not_retried() {
     let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
 
     assert!(result.is_ok());
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
 }
 
 #[tokio::test]
@@ -742,7 +742,7 @@ async fn direct_invoke_unlisted_topic_rejected_before_any_verification_work() {
     let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
 
     assert!(result.is_ok());
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
     h.server.verify().await;
 }
 
@@ -796,7 +796,7 @@ async fn unrecognized_invoke_payload_is_an_error() {
     let h = harness().await;
     let result = invoke(h.state.clone(), json!({"hello": "world"})).await;
     assert!(result.is_err());
-    assert!(h.fake().calls().is_empty());
+    assert_eq!(h.fake().calls(), [] as [String; 0]);
 }
 
 #[tokio::test]

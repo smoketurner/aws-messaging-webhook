@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(send.to, vec!["to@example.com"]);
         assert_eq!(send.subject, "Hello");
         assert_eq!(send.text.as_deref(), Some("body"));
-        assert!(send.attachments.is_empty());
+        assert_eq!(send.attachments, [] as [ValidatedAttachment; 0]);
     }
 
     #[test]

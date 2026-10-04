@@ -221,7 +221,7 @@ async fn without_reply_all_only_the_sender_is_addressed() {
 
     let spec = spec(&h, response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
-    assert!(spec.envelope.cc.is_empty());
+    assert_eq!(spec.envelope.cc, [] as [String; 0]);
 }
 
 #[tokio::test]

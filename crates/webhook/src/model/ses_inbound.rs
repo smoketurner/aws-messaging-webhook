@@ -217,7 +217,7 @@ mod tests {
             r#"{"notificationType":"Received","receipt":{},"mail":{"messageId":"m1"}}"#,
         )
         .unwrap();
-        assert!(event.receipt.recipients.is_empty());
+        assert_eq!(event.receipt.recipients, [] as [String; 0]);
         assert_eq!(event.receipt.timestamp, None);
     }
 
