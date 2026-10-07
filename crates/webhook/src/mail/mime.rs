@@ -181,13 +181,42 @@ fn truncate_bytes(input: &str, max_bytes: usize) -> String {
 
 /// `Name <address>` when a non-empty display name is present, else the bare
 /// address. `None` for a malformed entry with no address at all.
+///
+/// The whole rendering is kept within [`ADDRESS_MAX_BYTES`] (a DynamoDB
+/// item-size guard), but the cap is applied to the **display name** with the
+/// `<address>` portion held whole, rather than to the combined string from
+/// the left. The reply path re-uses these display strings as the source of
+/// recipients and re-parses them with `mail-parser`; a left-truncation that
+/// dropped the `<address>` (or its closing `>` or `@`) would make the stored
+/// value unround-trippable and the message unrepliable through the default
+/// reply flow. When the address alone already exceeds the cap, the bare
+/// address is truncated instead — the value is capped, the round-trip is no
+/// worse than the no-name path.
 fn format_addr(addr: &Addr<'_>) -> Option<String> {
     let address = addr.address.as_deref()?;
-    let formatted = match addr.name.as_deref().map(str::trim) {
-        Some(name) if !name.is_empty() => format!("{name} <{address}>"),
-        _ => address.to_owned(),
+    let name = addr
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let Some(name) = name else {
+        // No display name: truncate the bare address.
+        return Some(truncate_bytes(address, ADDRESS_MAX_BYTES));
     };
-    Some(truncate_bytes(&formatted, ADDRESS_MAX_BYTES))
+    // " <" + address + ">" framing around the name. If the address alone
+    // already fills the budget, fall back to the bare-address path so the
+    // stored value is capped and round-trips as well as that path does.
+    let framing = " <".len() + address.len() + ">".len();
+    if framing >= ADDRESS_MAX_BYTES {
+        return Some(truncate_bytes(address, ADDRESS_MAX_BYTES));
+    }
+    // Keep the address whole; trim the display name to what remains.
+    let name = if name.len() + framing > ADDRESS_MAX_BYTES {
+        truncate_bytes(name, ADDRESS_MAX_BYTES - framing)
+    } else {
+        name.to_owned()
+    };
+    Some(format!("{name} <{address}>"))
 }
 
 /// Flattens an address header (a plain list, or a group — whose member
@@ -567,5 +596,140 @@ mod tests {
         let parsed = fixture!("plain.eml");
         assert!(parsed.content.html.is_none());
         assert!(parsed.content.text.is_some());
+    }
+
+    /// `format_addr` direct unit tests, one per branch and edge. They pin the
+    /// storage cap and — crucially — the round-trip guarantee the reply path
+    /// depends on: the `<address>` portion survives every code path, so a
+    /// value this service wrote can be re-parsed by the same `mail-parser` to
+    /// recover the mailbox it carries.
+    fn addr<'a>(name: Option<&'a str>, address: Option<&'a str>) -> Addr<'a> {
+        Addr {
+            name: name.map(std::borrow::Cow::Borrowed),
+            address: address.map(std::borrow::Cow::Borrowed),
+        }
+    }
+
+    #[test]
+    fn format_addr_without_a_name_keeps_the_bare_address() {
+        assert_eq!(
+            format_addr(&addr(None, Some("alice@example.com"))).as_deref(),
+            Some("alice@example.com")
+        );
+        // It still owns no display name — the original behavior.
+        assert_eq!(
+            format_addr(&addr(Some(""), Some("alice@example.com"))).as_deref(),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn format_addr_with_a_short_name_renders_the_full_name_and_address() {
+        assert_eq!(
+            format_addr(&addr(Some("Alice Sender"), Some("alice@example.com"))).as_deref(),
+            Some("Alice Sender <alice@example.com>")
+        );
+    }
+
+    /// A whitespace-only display name is treated as no name at all, matching
+    /// the pre-fix behavior (`addr.name.as_deref().map(str::trim)`).
+    #[test]
+    fn format_addr_with_a_whitespace_name_falls_back_to_the_bare_address() {
+        assert_eq!(
+            format_addr(&addr(Some("   "), Some("alice@example.com"))).as_deref(),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn format_addr_returns_none_when_there_is_no_address() {
+        assert_eq!(format_addr(&addr(Some("Alice"), None)), None);
+        assert_eq!(format_addr(&addr(None, None)), None);
+    }
+
+    /// The bug: a display name large enough that the combined `Name <address>`
+    /// rendering would overflow the cap used to lose the `<address>` entirely,
+    /// because the whole rendering was truncated from the left. The fix
+    /// truncates the **display name** with the address held whole.
+    #[test]
+    fn format_addr_with_an_oversized_name_preserves_the_full_address() {
+        let name = "X".repeat(400);
+        let formatted = format_addr(&addr(Some(&name), Some("alice@example.com"))).unwrap();
+        let len = formatted.len();
+        assert!(len <= ADDRESS_MAX_BYTES, "{len} > {ADDRESS_MAX_BYTES}");
+        // The mailbox — including the closing `>` and the `@` — survives.
+        assert!(formatted.ends_with(" <alice@example.com>"));
+        assert!(formatted.contains('@'));
+    }
+
+    /// The exact scenario the end-to-end regression test in
+    /// `tests/reply_truncated_from.rs` exercises: 400 Xs with an
+    /// `alice@example.com` address land on the 320-byte cap with the address
+    /// intact and a 300-byte display name.
+    #[test]
+    fn format_addr_oversized_name_lands_exactly_on_the_cap() {
+        let name = "X".repeat(400);
+        let formatted = format_addr(&addr(Some(&name), Some("alice@example.com"))).unwrap();
+        assert_eq!(formatted.len(), ADDRESS_MAX_BYTES);
+        assert_eq!(
+            formatted,
+            format!("{} <alice@example.com>", "X".repeat(300))
+        );
+    }
+
+    /// An address whose own framing (`" <" + address + ">"`) already meets the
+    /// cap cannot carry a display name at all; it falls back to the bare
+    /// (capped) address so the stored value is never longer than the cap and
+    /// round-trips as well as the no-name path.
+    #[test]
+    fn format_addr_with_an_address_filling_the_cap_drops_the_name() {
+        // framing == ADDRESS_MAX_BYTES ⇒ bare path; the address (317 bytes)
+        // already fits, so it is kept whole under the cap.
+        let address = "a".repeat(ADDRESS_MAX_BYTES - " <".len() - ">".len());
+        assert_eq!(address.len(), 317);
+        let formatted = format_addr(&addr(Some("Alice"), Some(&address))).unwrap();
+        assert!(formatted.len() <= ADDRESS_MAX_BYTES);
+        // The display name and its framing are dropped — bare address only.
+        assert_eq!(formatted, address);
+        assert!(!formatted.contains('<'));
+    }
+
+    /// An address longer than the cap itself is truncated to the cap on the
+    /// bare path — the stored value is never longer than `ADDRESS_MAX_BYTES`.
+    #[test]
+    fn format_addr_with_an_address_exceeding_the_cap_is_truncated_bare() {
+        let address = "a".repeat(ADDRESS_MAX_BYTES + 50);
+        let formatted = format_addr(&addr(Some("Alice"), Some(&address))).unwrap();
+        assert_eq!(formatted.len(), ADDRESS_MAX_BYTES);
+        assert_eq!(formatted, "a".repeat(ADDRESS_MAX_BYTES));
+        assert!(!formatted.contains('<'));
+        assert!(!formatted.contains('@'));
+    }
+
+    /// Just under the framing threshold: the name fits in the one remaining
+    /// byte, so it is kept rather than dropped.
+    #[test]
+    fn format_addr_keeps_a_one_byte_name_when_exactly_one_byte_remains() {
+        let address = "a".repeat(ADDRESS_MAX_BYTES - " <".len() - ">".len() - 1);
+        let formatted = format_addr(&addr(Some("Z"), Some(&address))).unwrap();
+        assert_eq!(formatted.len(), ADDRESS_MAX_BYTES);
+        assert_eq!(formatted, format!("Z <{address}>"));
+    }
+
+    /// Truncation lands on a UTF-8 character boundary: a multi-byte display
+    /// name shortened by `truncate_bytes` never produces an invalid string, so
+    /// the stored value stays re-parseable.
+    #[test]
+    fn format_addr_truncates_a_multi_byte_name_on_a_char_boundary() {
+        // 200 `é` (2 bytes each) + framing(20 for alice@example.com) = 420;
+        // 320 - 20 = 300 bytes for the name ⇒ 150 `é`.
+        let name = "é".repeat(200);
+        let formatted = format_addr(&addr(Some(&name), Some("alice@example.com"))).unwrap();
+        assert!(formatted.len() <= ADDRESS_MAX_BYTES);
+        assert!(formatted.ends_with(" <alice@example.com>"));
+        // The truncated name is whole `é` characters, not a split codepoint.
+        let name_part = &formatted[..formatted.len() - " <alice@example.com>".len()];
+        assert!(name_part.chars().all(|c| c == 'é'));
+        assert_eq!(name_part.chars().count(), 150);
     }
 }
