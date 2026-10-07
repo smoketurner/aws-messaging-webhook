@@ -181,13 +181,60 @@ fn truncate_bytes(input: &str, max_bytes: usize) -> String {
 
 /// `Name <address>` when a non-empty display name is present, else the bare
 /// address. `None` for a malformed entry with no address at all.
+///
+/// The result has to parse back to the same mailbox: a reply re-reads these
+/// strings with `mail-parser` (`validate::envelope_address`) to find its
+/// recipients. So the name is the part that gives way to
+/// [`ADDRESS_MAX_BYTES`], never the `<address>`, and a name `mail-parser`
+/// decoded from a quoted string or an encoded word is written back as an
+/// RFC 5322 phrase (section 3.2.5): quoted when it holds a special, with
+/// control characters (a decoded `=0A`) folded to spaces.
 fn format_addr(addr: &Addr<'_>) -> Option<String> {
     let address = addr.address.as_deref()?;
-    let formatted = match addr.name.as_deref().map(str::trim) {
-        Some(name) if !name.is_empty() => format!("{name} <{address}>"),
-        _ => address.to_owned(),
-    };
-    Some(truncate_bytes(&formatted, ADDRESS_MAX_BYTES))
+    let framing = " <".len() + address.len() + ">".len();
+    let name = addr
+        .name
+        .as_deref()
+        .zip(ADDRESS_MAX_BYTES.checked_sub(framing))
+        .and_then(|(name, budget)| display_name(name, budget));
+    Some(match name {
+        Some(name) => format!("{name} <{address}>"),
+        None => truncate_bytes(address, ADDRESS_MAX_BYTES),
+    })
+}
+
+/// RFC 5322 `specials` (section 3.2.3): a phrase holding any of them has to
+/// be a quoted string.
+const PHRASE_SPECIALS: &[char] = &[
+    '(', ')', '<', '>', '[', ']', ':', ';', '@', '\\', ',', '.', '"',
+];
+
+/// `name` as a phrase of at most `budget` bytes, or `None` when nothing of
+/// it fits. Truncation drops whole characters, so it never splits a `\"`
+/// escape or a UTF-8 sequence.
+fn display_name(name: &str, budget: usize) -> Option<String> {
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let name = name.trim();
+    if !name.contains(PHRASE_SPECIALS) {
+        let kept = truncate_bytes(name, budget);
+        let kept = kept.trim_end();
+        return (!kept.is_empty()).then(|| kept.to_owned());
+    }
+    let mut quoted = String::from("\"");
+    for c in name.chars() {
+        let escape = matches!(c, '"' | '\\');
+        if quoted.len() + usize::from(escape) + c.len_utf8() + "\"".len() > budget {
+            break;
+        }
+        if escape {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    (quoted.len() > 1).then(|| quoted + "\"")
 }
 
 /// Flattens an address header (a plain list, or a group — whose member
