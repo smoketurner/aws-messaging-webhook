@@ -4,6 +4,7 @@
 //! answers.
 
 use aws_messaging_webhook::mail::content::{self, MessageContent};
+use aws_messaging_webhook::mail::mime::parse_inbound;
 use aws_messaging_webhook::mail::send::SendSpec;
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, MailMessage, ids, send, time};
@@ -371,4 +372,98 @@ async fn a_reply_addressing_a_mixed_case_inbox_path_is_queued() {
             .as_str()
             .is_some_and(|id| !id.is_empty())
     );
+}
+
+/// The `From` a reply goes to is the one ingest stored, re-parsed. Every
+/// shape of sender `mail-parser` reads on the way in has to come back out as
+/// the same mailbox: the RFC 5322 appendix A examples, names that only
+/// parse quoted, names decoded from encoded words, and a name long enough to
+/// meet `ADDRESS_MAX_BYTES`.
+#[tokio::test]
+async fn a_reply_reaches_the_mailbox_ingest_read_from_the_sender() {
+    let long = "X".repeat(400);
+    let senders = [
+        ("John Doe <jdoe@machine.example>", "jdoe@machine.example"),
+        (
+            "\"Joe Q. Public\" <john.q.public@example.com>",
+            "john.q.public@example.com",
+        ),
+        (
+            "Pete(A nice \\) chap) <pete(his account)@silly.test(his host)>",
+            "pete@silly.test",
+        ),
+        ("\"Smith, John\" <jsmith@example.com>", "jsmith@example.com"),
+        ("\"Ops <oncall>\" <ops@example.com>", "ops@example.com"),
+        ("\"Team: ops;\" <team@example.com>", "team@example.com"),
+        ("\"Say \\\"hi\\\"\" <hi@example.com>", "hi@example.com"),
+        ("\"Back\\\\slash\" <bs@example.com>", "bs@example.com"),
+        (
+            "=?utf-8?Q?Jos=C3=A9_Garc=C3=ADa?= <jose@example.com>",
+            "jose@example.com",
+        ),
+        (
+            "=?utf-8?Q?Two=0ALines?= <lines@example.com>",
+            "lines@example.com",
+        ),
+        ("=?utf-8?Q?A=22B?= <quote@example.com>", "quote@example.com"),
+        (&format!("{long} <long@example.com>"), "long@example.com"),
+        (
+            &format!("\"Smith, {long}\" <comma@example.com>"),
+            "comma@example.com",
+        ),
+        (
+            &format!("\"{}\" <esc@example.com>", "\\\"".repeat(200)),
+            "esc@example.com",
+        ),
+    ];
+    for (header, mailbox) in senders {
+        let raw = format!(
+            "From: {header}\r\nTo: {INBOX}\r\nSubject: hi\r\n\
+             Message-ID: <rt@example.net>\r\n\r\nbody\r\n"
+        );
+        let stored = parse_inbound(raw.as_bytes()).unwrap().message.from;
+        assert!(stored.len() <= aws_messaging_webhook::mail::ADDRESS_MAX_BYTES);
+
+        let (h, original_id) = seeded(|m| m.from.clone_from(&stored)).await;
+        let (status, response) = post(
+            &h,
+            &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+            &body(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{header} stored as {stored:?}: {response}"
+        );
+        let spec = spec(&h, response["message_id"].as_str().unwrap());
+        assert_eq!(
+            spec.envelope.to,
+            vec![mailbox],
+            "{header} stored as {stored:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reply_all_never_copies_this_inbox_under_a_display_name() {
+    let (h, original_id) = seeded(|m| {
+        m.to = vec![format!("Support Desk <{INBOX}>")];
+        m.cc = vec!["Watcher <watcher@example.net>".to_owned()];
+    })
+    .await;
+
+    let mut request = body();
+    request["reply_all"] = json!(true);
+    let (_, response) = post(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &request,
+    )
+    .await;
+
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
+    assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
 }

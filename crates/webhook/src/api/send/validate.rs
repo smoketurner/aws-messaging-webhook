@@ -264,7 +264,7 @@ fn contains_newline(value: &str) -> bool {
 /// `Err` names what is wrong for the caller's error list. An entry names one
 /// recipient, in whatever syntax: one that carries no address, or that names
 /// several, is refused rather than resolved to one of them.
-fn envelope_address(value: &str) -> Result<String, &'static str> {
+pub(super) fn envelope_address(value: &str) -> Result<String, &'static str> {
     // `parse_address` reads a header body, which ends at a newline.
     let mut header = value.as_bytes().to_vec();
     header.push(b'\n');

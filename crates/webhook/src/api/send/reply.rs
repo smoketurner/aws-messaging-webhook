@@ -10,7 +10,7 @@ use axum::http::HeaderMap;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
-use crate::api::send::validate::{Addresses, ReplyRequest};
+use crate::api::send::validate::{Addresses, ReplyRequest, envelope_address};
 use crate::api::send::{SendAccepted, enqueue};
 use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
 use crate::state::{AppState, Services};
@@ -109,7 +109,7 @@ fn reply_recipients(
     }
     // A message this inbox sent is replied to by writing to its recipients
     // again, not to itself.
-    if original.from.eq_ignore_ascii_case(inbox.as_str()) {
+    if is_inbox(inbox, &original.from) {
         return original.to.clone();
     }
     vec![original.from.clone()]
@@ -125,12 +125,18 @@ fn reply_all_recipients(
     let direct = reply_recipients(inbox, original, original_reply_to);
     let mut out = Vec::new();
     for address in original.to.iter().chain(&original.cc) {
-        let is_self = address.eq_ignore_ascii_case(inbox.as_str());
-        if !is_self && !direct.contains(address) && !out.contains(address) {
+        if !is_inbox(inbox, address) && !direct.contains(address) && !out.contains(address) {
             out.push(address.clone());
         }
     }
     out
+}
+
+/// Whether a stored participant names this inbox. Inbound participants are
+/// stored in display form (`Support <support@example.com>`), so the mailbox
+/// is parsed out before comparing.
+fn is_inbox(inbox: &InboxId, participant: &str) -> bool {
+    envelope_address(participant).is_ok_and(|address| address.eq_ignore_ascii_case(inbox.as_str()))
 }
 
 /// Prefixes `Re:` unless the subject already carries one.
