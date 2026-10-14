@@ -13,6 +13,21 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
+    # The crypto stack is version-coupled to rsa 0.9 (CLAUDE.md, "Dependencies"):
+    # any one of these moving breaks the build and fails the whole group.
+    ignore:
+      - dependency-name: rand
+        versions: [">= 0.9"]
+      - dependency-name: rsa
+        versions: [">= 0.10"]
+      - dependency-name: sha1
+        versions: [">= 0.11"]
+      - dependency-name: sha2
+        versions: [">= 0.11"]
+      - dependency-name: x509-cert
+        versions: [">= 0.3"]
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     directory: /
@@ -23,3 +38,5 @@ updates:
     commit-message:
       prefix: "ci:"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
