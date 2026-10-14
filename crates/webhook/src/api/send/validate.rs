@@ -261,6 +261,10 @@ fn contains_newline(value: &str) -> bool {
 /// quoted names containing commas or angle brackets, `=?utf-8?B?…?=` encoded
 /// words and comments all parse rather than confusing a hand-rolled split.
 ///
+/// The reduced value is then put in the form SES accepts by [`ses_mailbox`],
+/// or refused: anything SES would reject is a terminal failure after the
+/// caller has already been told `200`.
+///
 /// `Err` names what is wrong for the caller's error list. An entry names one
 /// recipient, in whatever syntax: one that carries no address, or that names
 /// several, is refused rather than resolved to one of them.
@@ -291,12 +295,10 @@ pub(super) fn envelope_address(value: &str) -> Result<String, &'static str> {
             "names more than one address"
         });
     };
-    addr.address
-        .as_deref()
-        .map(str::trim)
-        .filter(|address| !address.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or("is not an email address")
+    let Some(address) = addr.address.as_deref() else {
+        return Err("is not an email address");
+    };
+    ses_mailbox(address.trim())
 }
 
 fn addresses(
@@ -329,17 +331,49 @@ fn addresses(
                 continue;
             }
         };
-        // Not a full RFC 5322 parse: SES is the authority on deliverability.
-        // This only rejects what cannot be an address at all.
-        if !address.contains('@') {
-            errors.push(field(path, format!("`{address}` is not an email address")));
-            continue;
-        }
         if !out.contains(&address) {
             out.push(address);
         }
     }
     out
+}
+
+/// A parser-reduced address in the form SES accepts as a destination.
+///
+/// Not an RFC 5322 parse — SES is the authority on deliverability — but it
+/// refuses what SES is documented to reject, and what `parse_address` hands
+/// back mangled: a quoted local part it silently drops (`"a b"@example.com`
+/// reduces to `@example.com`), or stray whitespace and an extra `@` it keeps
+/// (`ada@ example.com`, `a@b@example.com`).
+///
+/// SES does not support SMTPUTF8, so "the local part of a destination email
+/// address … may only contain 7-bit ASCII characters", and a non-ASCII domain
+/// "must be encoded using Punycode"
+/// (<https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_Destination.html>).
+/// The domain is encoded here rather than refused; the local part has no
+/// encoding to fall back on.
+fn ses_mailbox(address: &str) -> Result<String, &'static str> {
+    let Some((local, domain)) = address.split_once('@') else {
+        return Err("is not an email address");
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || address.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("is not an email address");
+    }
+    if !local.is_ascii() {
+        return Err("has a non-ASCII local part, which SES cannot deliver to");
+    }
+    if domain.is_ascii() {
+        return Ok(address.to_owned());
+    }
+    // Strict: STD3 label rules, hyphen placement and DNS length limits, so an
+    // encoded domain is one DNS could hold rather than whatever survived
+    // UTS #46 mapping.
+    let domain = idna::domain_to_ascii_strict(domain).map_err(|_| "is not an email address")?;
+    Ok(format!("{local}@{domain}"))
 }
 
 /// Whether `name` is an RFC 5322 header field name: printable ASCII with no
@@ -727,6 +761,146 @@ mod tests {
             "ok@example.com\r\nBcc: victim@example.com".to_owned(),
         ));
         assert_eq!(paths(request), vec!["to", "to"]);
+    }
+
+    /// `envelope_address` reduces an entry through mail-parser and then
+    /// refuses any reduced value that is not a plausible mailbox. mail-parser
+    /// 0.11.9 silently drops a quoted-string local part, and a space or an
+    /// extra `@` are kept verbatim by the parser — each of those would later be
+    /// a terminal SES refusal after the caller already received `200`.
+    #[test]
+    fn envelope_address_rejects_malformed_reductions() {
+        // Quoted local part: parser drops it, leaving `@example.com`.
+        assert_eq!(
+            envelope_address(r#""a b"@example.com"#),
+            Err("is not an email address")
+        );
+        assert_eq!(
+            envelope_address(r#""a,b"@example.com"#),
+            Err("is not an email address")
+        );
+        assert_eq!(
+            envelope_address(r#""ada"@example.com"#),
+            Err("is not an email address")
+        );
+        // Embedded whitespace kept verbatim by the parser.
+        assert_eq!(
+            envelope_address("ada@ example.com"),
+            Err("is not an email address")
+        );
+        assert_eq!(
+            envelope_address("ada @example.com"),
+            Err("is not an email address")
+        );
+        // Double `@` kept verbatim.
+        assert_eq!(
+            envelope_address("a@b@example.com"),
+            Err("is not an email address")
+        );
+        // Empty local part or domain.
+        assert_eq!(
+            envelope_address("@example.com"),
+            Err("is not an email address")
+        );
+        assert_eq!(envelope_address("ada@"), Err("is not an email address"));
+    }
+
+    /// A valid reduction is returned unchanged.
+    #[test]
+    fn envelope_address_accepts_valid_mailboxes() {
+        assert_eq!(
+            envelope_address("ada@example.com"),
+            Ok("ada@example.com".to_owned())
+        );
+        assert_eq!(
+            envelope_address("user.name+tag@sub.example.com"),
+            Ok("user.name+tag@sub.example.com".to_owned())
+        );
+        assert_eq!(
+            envelope_address("Ada Lovelace <ada@example.com>"),
+            Ok("ada@example.com".to_owned())
+        );
+        // Leading/trailing whitespace is trimmed from the reduced value.
+        assert_eq!(
+            envelope_address("ada@example.com "),
+            Ok("ada@example.com".to_owned())
+        );
+    }
+
+    /// The error for a quoted local part names the *original* entry, not the
+    /// corrupted reduction — a caller who wrote `"a b"@example.com` should not
+    /// have to guess that it silently became `@example.com`.
+    #[test]
+    fn the_error_for_a_quoted_local_part_names_the_original_entry() {
+        let mut request = minimal();
+        request.to = Some(Addresses::One(r#""a b"@example.com"#.to_owned()));
+        match validate(request) {
+            Err(ApiError::Validation(errors)) => {
+                let msg = &errors[0].message;
+                assert!(
+                    msg.contains(r#""a b"@example.com"#),
+                    "error should name the original entry, got {msg:?}"
+                );
+            }
+            other => panic!("expected a validation failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ses_mailbox_keeps_ascii_addresses_verbatim() {
+        for address in [
+            "a@b.com",
+            "user.name+tag@sub.example.com",
+            "Ada@EXAMPLE.com",
+        ] {
+            assert_eq!(ses_mailbox(address), Ok(address.to_owned()));
+        }
+    }
+
+    #[test]
+    fn ses_mailbox_refuses_what_is_not_a_mailbox() {
+        for address in [
+            "",
+            "example.com",
+            "@example.com",
+            "ada@",
+            "ada@ example.com",
+            "ada @example.com",
+            "a\ta@b.com",
+            "a@b@example.com",
+            "ada\u{7}@example.com",
+            "ada@example\u{7f}.com",
+        ] {
+            assert_eq!(
+                ses_mailbox(address),
+                Err("is not an email address"),
+                "{address:?}"
+            );
+        }
+    }
+
+    /// SES does not support SMTPUTF8: the local part may only be 7-bit ASCII,
+    /// and a non-ASCII domain must be sent as Punycode.
+    #[test]
+    fn ses_mailbox_encodes_a_non_ascii_domain_and_refuses_a_non_ascii_local_part() {
+        assert_eq!(
+            ses_mailbox("ada@éxample.com"),
+            Ok("ada@xn--xample-9ua.com".to_owned())
+        );
+        assert_eq!(
+            ses_mailbox("ada@bücher.example"),
+            Ok("ada@xn--bcher-kva.example".to_owned())
+        );
+        assert_eq!(
+            ses_mailbox("üser@example.com"),
+            Err("has a non-ASCII local part, which SES cannot deliver to")
+        );
+        assert_eq!(
+            ses_mailbox("üser@éxample.com"),
+            Err("has a non-ASCII local part, which SES cannot deliver to")
+        );
+        // A domain IDNA cannot encode is refused rather than sent as-is.
+        assert_eq!(ses_mailbox("ada@é-.com"), Err("is not an email address"));
     }
 
     #[test]

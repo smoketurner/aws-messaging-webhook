@@ -67,6 +67,7 @@ for `message.sent` or a delivery event to learn the outcome.
 | Any other body | 1 MiB |
 | Refused headers | `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`, `Date`, `Message-ID`, `In-Reply-To`, `References`, `Return-Path`, `MIME-Version`, `Content-*` |
 | CR or LF | Refused in any address, header name or header value |
+| Non-ASCII address | Refused in the local part (SES has no SMTPUTF8 support). A non-ASCII domain is sent as Punycode |
 
 ### Retrying safely
 
