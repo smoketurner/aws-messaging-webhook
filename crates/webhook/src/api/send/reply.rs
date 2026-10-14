@@ -10,7 +10,7 @@ use axum::http::HeaderMap;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
-use crate::api::send::validate::{Addresses, ReplyRequest, envelope_address};
+use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest, envelope_address};
 use crate::api::send::{SendAccepted, enqueue};
 use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
 use crate::state::{AppState, Services};
@@ -70,17 +70,13 @@ pub async fn reply<T: Services>(
     // Recipients default to whoever should receive a reply to the original,
     // unless the caller named its own.
     if send.to.is_none() && send.cc.is_none() && send.bcc.is_none() {
-        send.to = Some(Addresses::Many(reply_recipients(
+        address_reply(
+            &mut send,
             &inbox,
             &original,
             &original_content.reply_to,
-        )));
-        if request.reply_all {
-            let others = reply_all_recipients(&inbox, &original, &original_content.reply_to);
-            if !others.is_empty() {
-                send.cc = Some(Addresses::Many(others));
-            }
-        }
+            request.reply_all,
+        );
     }
     if send.subject.is_none() {
         send.subject = Some(reply_subject(&original.subject));
@@ -97,32 +93,44 @@ pub async fn reply<T: Services>(
     .await
 }
 
-/// Who a reply goes to: the original's `Reply-To` if it set one, else its
-/// sender.
-fn reply_recipients(
+/// Addresses a reply: to the original's `Reply-To` if it set one, else its
+/// sender, plus its other participants in `cc` for `reply_all`.
+fn address_reply(
+    send: &mut SendRequest,
     inbox: &InboxId,
-    original: &crate::mail::MailMessage,
+    original: &MailMessage,
     original_reply_to: &[String],
-) -> Vec<String> {
-    if !original_reply_to.is_empty() {
-        return original_reply_to.to_vec();
-    }
+    reply_all: bool,
+) {
     // A message this inbox sent is replied to by writing to its recipients
-    // again, not to itself.
-    if is_inbox(inbox, &original.from) {
-        return original.to.clone();
+    // again, not to itself. A send needs a recipient in only one of `to`,
+    // `cc` and `bcc`, so the first list that has one is used.
+    let direct = if !original_reply_to.is_empty() {
+        original_reply_to.to_vec()
+    } else if !is_inbox(inbox, &original.from) {
+        vec![original.from.clone()]
+    } else if !original.to.is_empty() {
+        original.to.clone()
+    } else if !original.cc.is_empty() {
+        original.cc.clone()
+    } else {
+        // Blind copies stay blind rather than seeing each other in `To`. With
+        // no `to` or `cc` there is no one else for `reply_all` to add.
+        send.bcc = Some(Addresses::Many(original.bcc.clone()));
+        return;
+    };
+    if reply_all {
+        let others = reply_all_recipients(inbox, original, &direct);
+        if !others.is_empty() {
+            send.cc = Some(Addresses::Many(others));
+        }
     }
-    vec![original.from.clone()]
+    send.to = Some(Addresses::Many(direct));
 }
 
 /// The other participants, for `reply_all`. This inbox is excluded so a reply
 /// never arrives back in the inbox that sent it.
-fn reply_all_recipients(
-    inbox: &InboxId,
-    original: &crate::mail::MailMessage,
-    original_reply_to: &[String],
-) -> Vec<String> {
-    let direct = reply_recipients(inbox, original, original_reply_to);
+fn reply_all_recipients(inbox: &InboxId, original: &MailMessage, direct: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for address in original.to.iter().chain(&original.cc) {
         if !is_inbox(inbox, address) && !direct.contains(address) && !out.contains(address) {

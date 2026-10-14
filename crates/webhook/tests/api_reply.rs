@@ -7,7 +7,7 @@ use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::mime::parse_inbound;
 use aws_messaging_webhook::mail::send::SendSpec;
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, MailMessage, ids, send, time};
+use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ids, send, time};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -466,4 +466,113 @@ async fn reply_all_never_copies_this_inbox_under_a_display_name() {
     let spec = spec(&h, response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
+}
+
+/// Seeds a message this inbox sent, with no recipients until `adjust` adds
+/// them.
+async fn seeded_sent(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
+    seeded(|m| {
+        m.direction = Direction::Outbound;
+        INBOX.clone_into(&mut m.from);
+        m.to = Vec::new();
+        m.cc = Vec::new();
+        m.bcc = Vec::new();
+        adjust(m);
+    })
+    .await
+}
+
+async fn reply_to_sent(
+    adjust: impl FnOnce(&mut MailMessage),
+    reply_all: bool,
+) -> (StatusCode, Value, Option<SendSpec>) {
+    let (h, original_id) = seeded_sent(adjust).await;
+    let mut request = body();
+    request["reply_all"] = json!(reply_all);
+    let (status, response) = post(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &request,
+    )
+    .await;
+    let spec = response["message_id"].as_str().map(|id| spec(&h, id));
+    (status, response, spec)
+}
+
+#[tokio::test]
+async fn a_reply_to_a_sent_message_goes_to_its_to_recipients() {
+    let (status, response, spec) = reply_to_sent(
+        |m| {
+            m.to = vec!["primary@example.net".to_owned()];
+            m.cc = vec!["watcher@example.net".to_owned()];
+        },
+        false,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let spec = spec.unwrap();
+    assert_eq!(spec.envelope.to, vec!["primary@example.net"]);
+    assert_eq!(spec.envelope.cc, [] as [String; 0]);
+    assert_eq!(spec.envelope.bcc, [] as [String; 0]);
+}
+
+#[tokio::test]
+async fn reply_all_to_a_sent_message_keeps_its_to_and_cc_apart() {
+    let (status, response, spec) = reply_to_sent(
+        |m| {
+            m.to = vec!["primary@example.net".to_owned()];
+            m.cc = vec!["watcher@example.net".to_owned()];
+        },
+        true,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let spec = spec.unwrap();
+    assert_eq!(spec.envelope.to, vec!["primary@example.net"]);
+    assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
+}
+
+/// A send needs a recipient in only one of `to`, `cc` and `bcc`, so a reply
+/// to one with no `to` still has someone to go to.
+#[tokio::test]
+async fn a_reply_to_a_cc_only_sent_message_goes_to_its_cc_recipients() {
+    for reply_all in [false, true] {
+        let (status, response, spec) =
+            reply_to_sent(|m| m.cc = vec!["group@example.net".to_owned()], reply_all).await;
+
+        assert_eq!(status, StatusCode::OK, "reply_all={reply_all}: {response}");
+        let spec = spec.unwrap();
+        assert_eq!(spec.envelope.to, vec!["group@example.net"]);
+        assert_eq!(spec.envelope.cc, [] as [String; 0]);
+        assert_eq!(response["thread_id"], "thread-1");
+    }
+}
+
+/// Blind copies stay blind: the reply goes back to them as `bcc`, so they
+/// never see each other in `To`.
+#[tokio::test]
+async fn a_reply_to_a_bcc_only_sent_message_goes_to_its_bcc_recipients() {
+    for reply_all in [false, true] {
+        let (status, response, spec) = reply_to_sent(
+            |m| {
+                m.bcc = vec![
+                    "hidden-1@example.net".to_owned(),
+                    "hidden-2@example.net".to_owned(),
+                ];
+            },
+            reply_all,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "reply_all={reply_all}: {response}");
+        let spec = spec.unwrap();
+        assert_eq!(spec.envelope.to, [] as [String; 0]);
+        assert_eq!(spec.envelope.cc, [] as [String; 0]);
+        assert_eq!(
+            spec.envelope.bcc,
+            vec!["hidden-1@example.net", "hidden-2@example.net"]
+        );
+    }
 }
