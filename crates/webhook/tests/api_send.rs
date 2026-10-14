@@ -1051,3 +1051,42 @@ async fn a_normal_send_is_still_accepted_after_the_guard() {
         vec!["ada@example.com", "grace@example.com"]
     );
 }
+
+/// SES takes a non-ASCII domain only as Punycode, so the envelope carries the
+/// encoded form whatever the caller wrote.
+#[tokio::test]
+async fn a_non_ascii_domain_reaches_the_envelope_as_punycode() {
+    let h = seeded().await;
+    let mut request = body();
+    request["to"] = json!(["Ada <ada@éxample.com>"]);
+    request["cc"] = json!("grace@bücher.example");
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(spec.envelope.to, vec!["ada@xn--xample-9ua.com"]);
+    assert_eq!(spec.envelope.cc, vec!["grace@xn--bcher-kva.example"]);
+}
+
+/// SES does not support SMTPUTF8, so a non-ASCII local part is refused before
+/// anything is queued rather than failing at the SES call.
+#[tokio::test]
+async fn a_non_ascii_local_part_is_rejected_before_queueing() {
+    let h = seeded().await;
+    let mut request = body();
+    request["to"] = json!("üser@example.com");
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(response["errors"][0]["path"], "to");
+    assert_eq!(
+        response["errors"][0]["message"],
+        "`üser@example.com` has a non-ASCII local part, which SES cannot deliver to"
+    );
+    assert_eq!(
+        h.state.services.objects.put_object_calls(),
+        [] as [String; 0]
+    );
+}

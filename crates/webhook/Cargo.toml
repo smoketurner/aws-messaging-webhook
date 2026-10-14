@@ -54,6 +54,7 @@ aws_lambda_events = { workspace = true, features = ["dynamodb"] }
 axum = { workspace = true, features = ["json", "query"] }
 # Page tokens (mail::keys) are base64url-encoded.
 base64 = { workspace = true, features = ["std"] }
+idna = { workspace = true, features = ["std", "compiled_data"] }
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
 mail-builder.workspace = true
 mail-parser.workspace = true
