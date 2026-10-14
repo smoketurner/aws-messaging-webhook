@@ -67,6 +67,8 @@ for `message.sent` or a delivery event to learn the outcome.
 | Any other body | 1 MiB |
 | Refused headers | `From`, `Sender`, `To`, `Cc`, `Bcc`, `Reply-To`, `Subject`, `Date`, `Message-ID`, `In-Reply-To`, `References`, `Return-Path`, `MIME-Version`, `Content-*` |
 | CR or LF | Refused in any address, header name or header value |
+| Address syntax | Each entry is one address, with or without a display name (`Ada <ada@example.com>`). The address must be an RFC 5321 mailbox ([`specs/rfc5321.txt`](../../specs/rfc5321.txt) section 4.1.2) on a fully-qualified domain: local part at most 64 octets, domain at most 255. Groups and lists are refused |
+| Address form sent | Minimum quoting (`"ada"@example.com` is sent as `ada@example.com`), domain lowercased |
 | Non-ASCII address | Refused in the local part (SES has no SMTPUTF8 support). A non-ASCII domain is sent as Punycode |
 
 ### Retrying safely

@@ -11,12 +11,12 @@
 //! inbox.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use mail_parser::parsers::MessageStream;
-use mail_parser::{Addr as MailAddr, Address as MailAddress, HeaderValue};
 use serde::Deserialize;
+use structured_email_address::{Config, EmailAddress, Strictness};
 
 use crate::api::error::{ApiError, FieldError};
 use crate::mail::url_policy::{self, AttachmentUrl};
@@ -246,8 +246,31 @@ fn contains_newline(value: &str) -> bool {
     value.contains('\r') || value.contains('\n')
 }
 
+/// Reads one recipient entry: RFC 5322 syntax around the address (display
+/// name, comments, whitespace between tokens) is accepted, and groups are
+/// refused because an entry names one recipient.
+static ENTRY_CONFIG: LazyLock<Config> = LazyLock::new(|| {
+    Config::builder()
+        .strictness(Strictness::Standard)
+        .allow_domain_literal()
+        .allow_display_name()
+        .build()
+});
+
+/// The RFC 5321 section 4.1.2 `Mailbox` grammar, which is narrower than the
+/// RFC 5322 one the entry is read with: a quoted local part may not hold a
+/// tab, for one (`qtextSMTP`, `quoted-pairSMTP`).
+static ENVELOPE_CONFIG: LazyLock<Config> = LazyLock::new(|| {
+    Config::builder()
+        .strictness(Strictness::Strict)
+        .allow_quoted_local_part()
+        .allow_domain_literal()
+        .build()
+});
+
 /// The address the envelope carries for one recipient entry: the address
-/// itself, with any display name, comment or encoded word around it removed.
+/// itself, with any display name or comment around it removed, in the form
+/// SES accepts.
 ///
 /// A caller may write `Ada Lovelace <ada@example.com>`, and a reply derives
 /// its recipients from the stored `From` of the message it answers, which is
@@ -256,49 +279,26 @@ fn contains_newline(value: &str) -> bool {
 /// to; a display form reaches it as `BadRequestException: Missing '<'`,
 /// after the message is already queued.
 ///
-/// Parsed by `mail-parser`, the same RFC 5322 parser that reads the header
-/// on the way in, so a value this service wrote is a value it can read back:
-/// quoted names containing commas or angle brackets, `=?utf-8?B?…?=` encoded
-/// words and comments all parse rather than confusing a hand-rolled split.
+/// The result uses the minimum quoting possible, as RFC 5321 section 4.1.2
+/// asks of a sender (`"ada"@example.com` becomes `ada@example.com`), with
+/// the domain lowercased and a non-ASCII domain in Punycode.
 ///
-/// The reduced value is then put in the form SES accepts by [`ses_mailbox`],
-/// or refused: anything SES would reject is a terminal failure after the
-/// caller has already been told `200`.
+/// SES does not support SMTPUTF8, so "the local part of a destination email
+/// address … may only contain 7-bit ASCII characters", and a non-ASCII domain
+/// "must be encoded using Punycode"
+/// (<https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_Destination.html>).
 ///
-/// `Err` names what is wrong for the caller's error list. An entry names one
-/// recipient, in whatever syntax: one that carries no address, or that names
-/// several, is refused rather than resolved to one of them.
-pub(super) fn envelope_address(value: &str) -> Result<String, &'static str> {
-    // `parse_address` reads a header body, which ends at a newline.
-    let mut header = value.as_bytes().to_vec();
-    header.push(b'\n');
-
-    let parsed = MessageStream::new(&header).parse_address();
-    // Every address the entry names, however it names them: a bare address
-    // and a `Name <addr>` each parse as a one-entry list, and a group
-    // (`Team: ada@example.com;`) carries its members. They are counted, not
-    // combined — an entry that names two addresses is refused below rather
-    // than resolved to one of them.
-    let addresses: Vec<&MailAddr<'_>> = match &parsed {
-        HeaderValue::Address(MailAddress::List(list)) => list.iter().collect(),
-        HeaderValue::Address(MailAddress::Group(groups)) => groups
-            .iter()
-            .flat_map(|group| group.addresses.iter())
-            .collect(),
-        _ => return Err("is not an email address"),
-    };
-
-    let [addr] = addresses.as_slice() else {
-        return Err(if addresses.is_empty() {
-            "is not an email address"
-        } else {
-            "names more than one address"
-        });
-    };
-    let Some(address) = addr.address.as_deref() else {
-        return Err("is not an email address");
-    };
-    ses_mailbox(address.trim())
+/// `Err` says what is wrong, for the caller's error list.
+pub(super) fn envelope_address(value: &str) -> Result<String, String> {
+    let address = EmailAddress::parse_with(value, &ENTRY_CONFIG)
+        .map_err(|error| format!("is not an email address: {error}"))?;
+    if !address.local_part().is_ascii() {
+        return Err("has a non-ASCII local part, which SES cannot deliver to".to_owned());
+    }
+    let address = address.canonical();
+    EmailAddress::parse_with(&address, &ENVELOPE_CONFIG)
+        .map_err(|error| format!("is not an SMTP mailbox: {error}"))?;
+    Ok(address)
 }
 
 fn addresses(
@@ -336,44 +336,6 @@ fn addresses(
         }
     }
     out
-}
-
-/// A parser-reduced address in the form SES accepts as a destination.
-///
-/// Not an RFC 5322 parse — SES is the authority on deliverability — but it
-/// refuses what SES is documented to reject, and what `parse_address` hands
-/// back mangled: a quoted local part it silently drops (`"a b"@example.com`
-/// reduces to `@example.com`), or stray whitespace and an extra `@` it keeps
-/// (`ada@ example.com`, `a@b@example.com`).
-///
-/// SES does not support SMTPUTF8, so "the local part of a destination email
-/// address … may only contain 7-bit ASCII characters", and a non-ASCII domain
-/// "must be encoded using Punycode"
-/// (<https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_Destination.html>).
-/// The domain is encoded here rather than refused; the local part has no
-/// encoding to fall back on.
-fn ses_mailbox(address: &str) -> Result<String, &'static str> {
-    let Some((local, domain)) = address.split_once('@') else {
-        return Err("is not an email address");
-    };
-    if local.is_empty()
-        || domain.is_empty()
-        || domain.contains('@')
-        || address.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err("is not an email address");
-    }
-    if !local.is_ascii() {
-        return Err("has a non-ASCII local part, which SES cannot deliver to");
-    }
-    if domain.is_ascii() {
-        return Ok(address.to_owned());
-    }
-    // Strict: STD3 label rules, hyphen placement and DNS length limits, so an
-    // encoded domain is one DNS could hold rather than whatever survived
-    // UTS #46 mapping.
-    let domain = idna::domain_to_ascii_strict(domain).map_err(|_| "is not an email address")?;
-    Ok(format!("{local}@{domain}"))
 }
 
 /// Whether `name` is an RFC 5322 header field name: printable ASCII with no
@@ -712,7 +674,6 @@ mod tests {
             ),
             ("ada@example.com (Ada Lovelace)", "ada@example.com"),
             ("<ada@example.com>", "ada@example.com"),
-            ("Team: ada@example.com;", "ada@example.com"),
         ] {
             let mut request = minimal();
             request.to = Some(Addresses::One(input.to_owned()));
@@ -729,6 +690,7 @@ mod tests {
     fn an_entry_naming_more_than_one_address_is_rejected() {
         for input in [
             "ada@example.com, grace@example.com",
+            "Team: ada@example.com;",
             "Team: ada@example.com, grace@example.com;",
         ] {
             let mut request = minimal();
@@ -763,144 +725,109 @@ mod tests {
         assert_eq!(paths(request), vec!["to", "to"]);
     }
 
-    /// `envelope_address` reduces an entry through mail-parser and then
-    /// refuses any reduced value that is not a plausible mailbox. mail-parser
-    /// 0.11.9 silently drops a quoted-string local part, and a space or an
-    /// extra `@` are kept verbatim by the parser — each of those would later be
-    /// a terminal SES refusal after the caller already received `200`.
+    /// RFC 5321 section 4.1.2 `Mailbox`, sent with "the minimum quoting
+    /// possible" and the domain lowercased.
     #[test]
-    fn envelope_address_rejects_malformed_reductions() {
-        // Quoted local part: parser drops it, leaving `@example.com`.
-        assert_eq!(
-            envelope_address(r#""a b"@example.com"#),
-            Err("is not an email address")
-        );
-        assert_eq!(
-            envelope_address(r#""a,b"@example.com"#),
-            Err("is not an email address")
-        );
-        assert_eq!(
-            envelope_address(r#""ada"@example.com"#),
-            Err("is not an email address")
-        );
-        // Embedded whitespace kept verbatim by the parser.
-        assert_eq!(
-            envelope_address("ada@ example.com"),
-            Err("is not an email address")
-        );
-        assert_eq!(
-            envelope_address("ada @example.com"),
-            Err("is not an email address")
-        );
-        // Double `@` kept verbatim.
-        assert_eq!(
-            envelope_address("a@b@example.com"),
-            Err("is not an email address")
-        );
-        // Empty local part or domain.
-        assert_eq!(
-            envelope_address("@example.com"),
-            Err("is not an email address")
-        );
-        assert_eq!(envelope_address("ada@"), Err("is not an email address"));
-    }
-
-    /// A valid reduction is returned unchanged.
-    #[test]
-    fn envelope_address_accepts_valid_mailboxes() {
-        assert_eq!(
-            envelope_address("ada@example.com"),
-            Ok("ada@example.com".to_owned())
-        );
-        assert_eq!(
-            envelope_address("user.name+tag@sub.example.com"),
-            Ok("user.name+tag@sub.example.com".to_owned())
-        );
-        assert_eq!(
-            envelope_address("Ada Lovelace <ada@example.com>"),
-            Ok("ada@example.com".to_owned())
-        );
-        // Leading/trailing whitespace is trimmed from the reduced value.
-        assert_eq!(
-            envelope_address("ada@example.com "),
-            Ok("ada@example.com".to_owned())
-        );
-    }
-
-    /// The error for a quoted local part names the *original* entry, not the
-    /// corrupted reduction — a caller who wrote `"a b"@example.com` should not
-    /// have to guess that it silently became `@example.com`.
-    #[test]
-    fn the_error_for_a_quoted_local_part_names_the_original_entry() {
-        let mut request = minimal();
-        request.to = Some(Addresses::One(r#""a b"@example.com"#.to_owned()));
-        match validate(request) {
-            Err(ApiError::Validation(errors)) => {
-                let msg = &errors[0].message;
-                assert!(
-                    msg.contains(r#""a b"@example.com"#),
-                    "error should name the original entry, got {msg:?}"
-                );
-            }
-            other => panic!("expected a validation failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ses_mailbox_keeps_ascii_addresses_verbatim() {
-        for address in [
-            "a@b.com",
-            "user.name+tag@sub.example.com",
-            "Ada@EXAMPLE.com",
+    fn envelope_address_accepts_an_rfc5321_mailbox() {
+        let longest_local_part = format!("{}@example.com", "a".repeat(64));
+        for (input, expected) in [
+            ("ada@example.com", "ada@example.com"),
+            (
+                "user.name+tag@sub.example.com",
+                "user.name+tag@sub.example.com",
+            ),
+            ("Ada@EXAMPLE.com", "Ada@example.com"),
+            ("ada@example.com ", "ada@example.com"),
+            ("Ada Lovelace <ada@example.com>", "ada@example.com"),
+            (r#""ada"@example.com"#, "ada@example.com"),
+            (r#"Ada <"ada"@example.com>"#, "ada@example.com"),
+            (r#""a\b"@example.com"#, "ab@example.com"),
+            (r#""a b"@example.com"#, r#""a b"@example.com"#),
+            (r#"Ada <"a b"@example.com>"#, r#""a b"@example.com"#),
+            (r#""a,b"@example.com"#, r#""a,b"@example.com"#),
+            (r#""a\"b"@example.com"#, r#""a\"b"@example.com"#),
+            ("ada@[192.0.2.1]", "ada@[192.0.2.1]"),
+            // ABNF strings are case-insensitive (RFC 5234 section 2.3).
+            ("ada@[IPv6:2001:db8::1]", "ada@[ipv6:2001:db8::1]"),
+            (longest_local_part.as_str(), longest_local_part.as_str()),
         ] {
-            assert_eq!(ses_mailbox(address), Ok(address.to_owned()));
+            assert_eq!(envelope_address(input).as_deref(), Ok(expected), "{input}");
         }
     }
 
     #[test]
-    fn ses_mailbox_refuses_what_is_not_a_mailbox() {
-        for address in [
+    fn envelope_address_refuses_what_rfc5321_refuses() {
+        let long_local_part = format!("{}@example.com", "a".repeat(65));
+        let long_label = format!("ada@{}.com", "a".repeat(64));
+        let long_domain = format!("ada@{}.com", vec!["a".repeat(62); 4].join("."));
+        for input in [
             "",
             "example.com",
             "@example.com",
             "ada@",
-            "ada@ example.com",
-            "ada @example.com",
-            "a\ta@b.com",
             "a@b@example.com",
+            "a..b@example.com",
+            ".ada@example.com",
+            "ada.@example.com",
+            "ada@example..com",
+            "ada@-example.com",
+            "ada@example-.com",
+            "ada@exa_mple.com",
+            // Section 2.3.5: only fully-qualified domain names.
+            "ada@example",
+            // `Snum` is 0 through 255.
+            "ada@[192.0.2.256]",
+            "a\ta@example.com",
             "ada\u{7}@example.com",
-            "ada@example\u{7f}.com",
+            // RFC 5322 allows a tab in a quoted string; RFC 5321 does not.
+            "\"a\tb\"@example.com",
+            "\"a\\\tb\"@example.com",
+            // Section 4.5.3.1: 64-octet local part, 63-octet label, 255-octet
+            // domain.
+            long_local_part.as_str(),
+            long_label.as_str(),
+            long_domain.as_str(),
         ] {
-            assert_eq!(
-                ses_mailbox(address),
-                Err("is not an email address"),
-                "{address:?}"
-            );
+            assert!(envelope_address(input).is_err(), "{input:?}");
         }
     }
 
     /// SES does not support SMTPUTF8: the local part may only be 7-bit ASCII,
     /// and a non-ASCII domain must be sent as Punycode.
     #[test]
-    fn ses_mailbox_encodes_a_non_ascii_domain_and_refuses_a_non_ascii_local_part() {
+    fn envelope_address_encodes_a_non_ascii_domain_and_refuses_a_non_ascii_local_part() {
         assert_eq!(
-            ses_mailbox("ada@éxample.com"),
-            Ok("ada@xn--xample-9ua.com".to_owned())
+            envelope_address("ada@éxample.com").as_deref(),
+            Ok("ada@xn--xample-9ua.com")
         );
         assert_eq!(
-            ses_mailbox("ada@bücher.example"),
-            Ok("ada@xn--bcher-kva.example".to_owned())
+            envelope_address("Ada <ada@bücher.example>").as_deref(),
+            Ok("ada@xn--bcher-kva.example")
         );
-        assert_eq!(
-            ses_mailbox("üser@example.com"),
-            Err("has a non-ASCII local part, which SES cannot deliver to")
-        );
-        assert_eq!(
-            ses_mailbox("üser@éxample.com"),
-            Err("has a non-ASCII local part, which SES cannot deliver to")
-        );
-        // A domain IDNA cannot encode is refused rather than sent as-is.
-        assert_eq!(ses_mailbox("ada@é-.com"), Err("is not an email address"));
+        for input in ["üser@example.com", "üser@éxample.com"] {
+            assert_eq!(
+                envelope_address(input),
+                Err("has a non-ASCII local part, which SES cannot deliver to".to_owned()),
+                "{input}"
+            );
+        }
+    }
+
+    /// The error names the entry as the caller wrote it, with the reason.
+    #[test]
+    fn the_error_names_the_entry_and_the_reason() {
+        let mut request = minimal();
+        request.to = Some(Addresses::One("a..b@example.com".to_owned()));
+        match validate(request) {
+            Err(ApiError::Validation(errors)) => {
+                let message = &errors[0].message;
+                assert!(
+                    message.starts_with("`a..b@example.com` is not an email address: "),
+                    "{message:?}"
+                );
+            }
+            other => panic!("expected a validation failure, got {other:?}"),
+        }
     }
 
     #[test]
