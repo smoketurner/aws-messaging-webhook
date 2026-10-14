@@ -26,6 +26,8 @@ updates:
         versions: [">= 0.11"]
       - dependency-name: x509-cert
         versions: [">= 0.3"]
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     directory: /
@@ -36,3 +38,5 @@ updates:
     commit-message:
       prefix: "ci:"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
