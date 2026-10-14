@@ -216,9 +216,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.126.0"
+version = "1.130.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84916ddc26951545be16e11fe45277e2d2561b9d0f2d0538274fb750c09b3eae"
+checksum = "093ade632b7d671f9374e89a3784463731987df9ece9259c75247111ea3ac985"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -234,7 +234,6 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http 0.2.12",
  "http 1.5.0",
  "regex-lite",
  "tracing",
@@ -243,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-eventbridge"
-version = "1.118.0"
+version = "1.122.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80606a95121956eb3acb0aadcbd671f431d9deafdae8c1f5adb1d9f1aaf31d36"
+checksum = "5b665bae2c80672a198b5abb9ab34d62eebb933f95281e878369a20b1d1f73f0"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -261,7 +260,6 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http 0.2.12",
  "http 1.5.0",
  "regex-lite",
  "tracing",
@@ -269,9 +267,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-pinpointsmsvoicev2"
-version = "1.124.0"
+version = "1.128.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2f56cd6343982c3136d671326e4a7a6088a409ba97ab939494763ca07cd0598"
+checksum = "51db5b4a242f0862c6cec038036a3a1b7c1ec7803d255a2cd4b9c53bc7530698"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -287,7 +285,6 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http 0.2.12",
  "http 1.5.0",
  "regex-lite",
  "tracing",
@@ -331,9 +328,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sesv2"
-version = "1.136.0"
+version = "1.140.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a40a31f42641e84407f6da928f04f211af94834c0fdc9abc0639ca392c132212"
+checksum = "5d6ad3ad31e23871f5b0b1d920698745288e8f4c86afc27fe28aafc7b6e2ee8b"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -349,7 +346,6 @@ dependencies = [
  "aws-types",
  "bytes",
  "fastrand",
- "http 0.2.12",
  "http 1.5.0",
  "regex-lite",
  "tracing",
@@ -1936,7 +1932,7 @@ dependencies = [
  "num-integer",
  "num-iter",
  "num-traits",
- "rand 0.8.7",
+ "rand 0.8.8",
  "smallvec",
  "zeroize",
 ]
@@ -2218,9 +2214,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha",
@@ -2732,7 +2728,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "proptest",
- "rand 0.8.7",
+ "rand 0.8.8",
  "reqwest",
  "rsa",
  "serde",

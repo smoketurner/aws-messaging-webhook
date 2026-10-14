@@ -16,11 +16,11 @@ repository = "https://github.com/smoketurner/aws-messaging-webhook"
 anyhow = { version = "=1.0.104", default-features = false }
 aws-config = { version = "=1.12.0", default-features = false }
 aws-messaging-webhook = { path = "crates/webhook" }
-aws-sdk-dynamodb = { version = "=1.126.0", default-features = false }
-aws-sdk-eventbridge = { version = "=1.118.0", default-features = false }
-aws-sdk-pinpointsmsvoicev2 = { version = "=1.124.0", default-features = false }
+aws-sdk-dynamodb = { version = "=1.130.0", default-features = false }
+aws-sdk-eventbridge = { version = "=1.122.0", default-features = false }
+aws-sdk-pinpointsmsvoicev2 = { version = "=1.128.0", default-features = false }
 aws-sdk-s3 = { version = "=1.152.0", default-features = false }
-aws-sdk-sesv2 = { version = "=1.136.0", default-features = false }
+aws-sdk-sesv2 = { version = "=1.140.0", default-features = false }
 aws-sdk-ssm = { version = "=1.128.0", default-features = false }
 aws-smithy-types = { version = "=1.8.1", default-features = false }
 aws_lambda_events = { version = "=1.2.0", default-features = false }
@@ -33,7 +33,7 @@ metrics = { version = "=0.24.6", default-features = false }
 metrics_cloudwatch_embedded = { version = "=0.10.0", default-features = false }
 mime = { version = "=0.3.17", default-features = false }
 proptest = { version = "=1.12.0", default-features = false }
-rand = { version = "=0.8.7", default-features = false }
+rand = { version = "=0.8.8", default-features = false }
 reqwest = { version = "=0.13.5", default-features = false }
 rsa = { version = "=0.9.10", default-features = false }
 serde = { version = "=1.0.229", default-features = false }
