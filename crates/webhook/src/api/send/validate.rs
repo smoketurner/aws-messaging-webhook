@@ -261,6 +261,13 @@ fn contains_newline(value: &str) -> bool {
 /// quoted names containing commas or angle brackets, `=?utf-8?B?…?=` encoded
 /// words and comments all parse rather than confusing a hand-rolled split.
 ///
+/// The reduced value is then checked by [`is_plausible_mailbox`]: a quoted
+/// local part that the parser silently drops (`"a b"@example.com` →
+/// `@example.com`), or a value the parser keeps with stray whitespace or an
+/// extra `@` (`ada@ example.com`, `a@b@example.com`), is refused here rather
+/// than queued — each is a terminal SES refusal after the caller has already
+/// been told `200`.
+///
 /// `Err` names what is wrong for the caller's error list. An entry names one
 /// recipient, in whatever syntax: one that carries no address, or that names
 /// several, is refused rather than resolved to one of them.
@@ -294,7 +301,7 @@ pub(super) fn envelope_address(value: &str) -> Result<String, &'static str> {
     addr.address
         .as_deref()
         .map(str::trim)
-        .filter(|address| !address.is_empty())
+        .filter(|address| is_plausible_mailbox(address))
         .map(ToOwned::to_owned)
         .ok_or("is not an email address")
 }
@@ -330,8 +337,11 @@ fn addresses(
             }
         };
         // Not a full RFC 5322 parse: SES is the authority on deliverability.
-        // This only rejects what cannot be an address at all.
-        if !address.contains('@') {
+        // This only rejects what cannot be an address at all — a check kept
+        // as defense in depth: `envelope_address` already refuses a reduced
+        // value that is not a plausible mailbox, so this re-asserts the same
+        // invariant before the address enters the envelope.
+        if !is_plausible_mailbox(&address) {
             errors.push(field(path, format!("`{address}` is not an email address")));
             continue;
         }
@@ -340,6 +350,25 @@ fn addresses(
         }
     }
     out
+}
+
+/// Whether a parser-reduced address is structurally a plausible mailbox:
+/// exactly one `@`, a non-empty local part and domain, and no whitespace.
+///
+/// Not an RFC 5322 parse — SES is the authority on deliverability — but
+/// `parse_address` can silently drop a quoted local part (`"a b"@example.com`
+/// reduces to `@example.com`) or leave stray whitespace and an extra `@`
+/// untouched (`ada@ example.com`, `a@b@example.com`). Each of those is a
+/// terminal SES refusal after the caller has already been told `200`, so it
+/// is rejected here rather than queued.
+fn is_plausible_mailbox(address: &str) -> bool {
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && !address.chars().any(char::is_whitespace)
 }
 
 /// Whether `name` is an RFC 5322 header field name: printable ASCII with no
@@ -727,6 +756,111 @@ mod tests {
             "ok@example.com\r\nBcc: victim@example.com".to_owned(),
         ));
         assert_eq!(paths(request), vec!["to", "to"]);
+    }
+
+    /// `envelope_address` reduces an entry through mail-parser and then
+    /// refuses any reduced value that is not a plausible mailbox. mail-parser
+    /// 0.11.9 silently drops a quoted-string local part, and a space or an
+    /// extra `@` are kept verbatim by the parser — each of those would later be
+    /// a terminal SES refusal after the caller already received `200`.
+    #[test]
+    fn envelope_address_rejects_malformed_reductions() {
+        // Quoted local part: parser drops it, leaving `@example.com`.
+        assert_eq!(
+            envelope_address(r#""a b"@example.com"#),
+            Err("is not an email address")
+        );
+        assert_eq!(
+            envelope_address(r#""a,b"@example.com"#),
+            Err("is not an email address")
+        );
+        assert_eq!(
+            envelope_address(r#""ada"@example.com"#),
+            Err("is not an email address")
+        );
+        // Embedded whitespace kept verbatim by the parser.
+        assert_eq!(
+            envelope_address("ada@ example.com"),
+            Err("is not an email address")
+        );
+        assert_eq!(
+            envelope_address("ada @example.com"),
+            Err("is not an email address")
+        );
+        // Double `@` kept verbatim.
+        assert_eq!(
+            envelope_address("a@b@example.com"),
+            Err("is not an email address")
+        );
+        // Empty local part or domain.
+        assert_eq!(
+            envelope_address("@example.com"),
+            Err("is not an email address")
+        );
+        assert_eq!(envelope_address("ada@"), Err("is not an email address"));
+    }
+
+    /// A valid reduction is returned unchanged.
+    #[test]
+    fn envelope_address_accepts_valid_mailboxes() {
+        assert_eq!(
+            envelope_address("ada@example.com"),
+            Ok("ada@example.com".to_owned())
+        );
+        assert_eq!(
+            envelope_address("user.name+tag@sub.example.com"),
+            Ok("user.name+tag@sub.example.com".to_owned())
+        );
+        assert_eq!(
+            envelope_address("Ada Lovelace <ada@example.com>"),
+            Ok("ada@example.com".to_owned())
+        );
+        // Leading/trailing whitespace is trimmed from the reduced value.
+        assert_eq!(
+            envelope_address("ada@example.com "),
+            Ok("ada@example.com".to_owned())
+        );
+    }
+
+    /// The error for a quoted local part names the *original* entry, not the
+    /// corrupted reduction — a caller who wrote `"a b"@example.com` should not
+    /// have to guess that it silently became `@example.com`.
+    #[test]
+    fn the_error_for_a_quoted_local_part_names_the_original_entry() {
+        let mut request = minimal();
+        request.to = Some(Addresses::One(r#""a b"@example.com"#.to_owned()));
+        match validate(request) {
+            Err(ApiError::Validation(errors)) => {
+                let msg = &errors[0].message;
+                assert!(
+                    msg.contains(r#""a b"@example.com"#),
+                    "error should name the original entry, got {msg:?}"
+                );
+            }
+            other => panic!("expected a validation failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_plausible_mailbox_accepts_and_rejects() {
+        // Plausible mailboxes.
+        assert!(is_plausible_mailbox("a@b.com"));
+        assert!(is_plausible_mailbox("user.name+tag@sub.example.com"));
+        assert!(is_plausible_mailbox("üser@éxample.com"));
+        // No `@`.
+        assert!(!is_plausible_mailbox("example.com"));
+        // Empty local part.
+        assert!(!is_plausible_mailbox("@example.com"));
+        // Empty domain.
+        assert!(!is_plausible_mailbox("ada@"));
+        // Whitespace anywhere.
+        assert!(!is_plausible_mailbox("ada@ example.com"));
+        assert!(!is_plausible_mailbox("ada @example.com"));
+        assert!(!is_plausible_mailbox("a\ta@b.com"));
+        // Double `@`.
+        assert!(!is_plausible_mailbox("a@b@example.com"));
+        // Empty string.
+        assert!(!is_plausible_mailbox(""));
     }
 
     #[test]

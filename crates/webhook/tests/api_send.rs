@@ -960,3 +960,94 @@ async fn an_expired_key_reused_with_the_same_request_is_a_fresh_send() {
     );
     assert_ne!(thread_id, first_thread_id);
 }
+
+/// A send with a malformed envelope address is rejected with `400` before
+/// anything is queued — the documented contract, since a queued-then-undeliverable
+/// send fails terminally at the SES call after the caller has already been told
+/// `200`. Before the fix, these slipped past the `contains('@')` gate and were
+/// queued verbatim, causing a permanent `rejected` later.
+///
+/// Each case is a real mail-parser 0.11.9 behavior, not a hypothetical:
+/// - A quoted local part is silently dropped (`"a b"@example.com` → `@example.com`).
+/// - Embedded whitespace and a double `@` are kept verbatim.
+#[tokio::test]
+async fn a_send_with_a_malformed_envelope_address_is_rejected_before_queueing() {
+    for bad_to in [
+        r#""a b"@example.com"#,
+        r#""a,b"@example.com"#,
+        "ada@ example.com",
+        "ada @example.com",
+        "a@b@example.com",
+        "@example.com",
+        "ada@",
+    ] {
+        let h = seeded().await;
+        let mut request = body();
+        request["to"] = json!(bad_to);
+
+        let (status, response) = send_it(&h, &request, None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{bad_to:?} should be rejected before queueing, got {response}"
+        );
+        assert_eq!(
+            response["name"], "ValidationError",
+            "{bad_to:?}: {response}"
+        );
+        assert_eq!(
+            response["errors"][0]["path"], "to",
+            "{bad_to:?}: {response}"
+        );
+
+        // Nothing was uploaded on the way to the rejection.
+        assert_eq!(
+            h.state.services.objects.put_object_calls(),
+            [] as [String; 0],
+            "{bad_to:?}: nothing should be uploaded for a rejected send"
+        );
+    }
+}
+
+/// A send whose `cc` or `bcc` carries a malformed address is also rejected —
+/// the validation applies to every recipient list, not just `to`.
+#[tokio::test]
+async fn a_send_with_a_malformed_cc_or_bcc_is_rejected_before_queueing() {
+    for (field, bad) in [("cc", "a@b@example.com"), ("bcc", r#""a b"@example.com"#)] {
+        let h = seeded().await;
+        let mut request = body();
+        request[field] = json!(bad);
+
+        let (status, response) = send_it(&h, &request, None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{field}={bad:?} should be rejected, got {response}"
+        );
+        assert_eq!(
+            response["errors"][0]["path"], field,
+            "{field}={bad:?}: {response}"
+        );
+    }
+}
+
+/// A normal, valid address is still accepted — the guard rejects only what
+/// cannot be a mailbox, not anything the parser reformats.
+#[tokio::test]
+async fn a_normal_send_is_still_accepted_after_the_guard() {
+    let h = seeded().await;
+    let mut request = body();
+    request["to"] = json!(["ada@example.com", "Name <grace@example.com>"]);
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let message_id = response["message_id"].as_str().unwrap();
+    let spec = spec(&h, message_id);
+    assert_eq!(
+        spec.envelope.to,
+        vec!["ada@example.com", "grace@example.com"]
+    );
+}
