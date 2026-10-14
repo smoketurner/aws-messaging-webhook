@@ -2855,9 +2855,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "structured-email-address"
-version = "0.0.20"
+version = "0.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1ed1cf809db6132e28d9bd14e5c7653c5ddbba52c8c21861813393ed5af398b"
+checksum = "433ad3c046dd7c6a558e30a5bc53b0e7c4d7786d4a7d521ab1d7652dfb1074bb"
 dependencies = [
  "idna",
  "serde",

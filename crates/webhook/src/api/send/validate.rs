@@ -246,16 +246,25 @@ fn contains_newline(value: &str) -> bool {
     value.contains('\r') || value.contains('\n')
 }
 
-/// Parses an address the way RFC 5321 delivers to it: RFC 5322 syntax around
-/// the address (display names, comments, quoted strings) is accepted, and
-/// the address itself must be an RFC 5321 `Mailbox` (section 4.1.2) within
-/// the section 4.5.3.1 length limits. Groups are refused: an entry names one
-/// recipient.
-static ADDRESS_CONFIG: LazyLock<Config> = LazyLock::new(|| {
+/// Reads one recipient entry: RFC 5322 syntax around the address (display
+/// name, comments, whitespace between tokens) is accepted, and groups are
+/// refused because an entry names one recipient.
+static ENTRY_CONFIG: LazyLock<Config> = LazyLock::new(|| {
     Config::builder()
         .strictness(Strictness::Standard)
         .allow_domain_literal()
         .allow_display_name()
+        .build()
+});
+
+/// The RFC 5321 section 4.1.2 `Mailbox` grammar, which is narrower than the
+/// RFC 5322 one the entry is read with: a quoted local part may not hold a
+/// tab, for one (`qtextSMTP`, `quoted-pairSMTP`).
+static ENVELOPE_CONFIG: LazyLock<Config> = LazyLock::new(|| {
+    Config::builder()
+        .strictness(Strictness::Strict)
+        .allow_quoted_local_part()
+        .allow_domain_literal()
         .build()
 });
 
@@ -281,12 +290,15 @@ static ADDRESS_CONFIG: LazyLock<Config> = LazyLock::new(|| {
 ///
 /// `Err` says what is wrong, for the caller's error list.
 pub(super) fn envelope_address(value: &str) -> Result<String, String> {
-    let address = EmailAddress::parse_with(value, &ADDRESS_CONFIG)
+    let address = EmailAddress::parse_with(value, &ENTRY_CONFIG)
         .map_err(|error| format!("is not an email address: {error}"))?;
     if !address.local_part().is_ascii() {
         return Err("has a non-ASCII local part, which SES cannot deliver to".to_owned());
     }
-    Ok(address.canonical())
+    let address = address.canonical();
+    EmailAddress::parse_with(&address, &ENVELOPE_CONFIG)
+        .map_err(|error| format!("is not an SMTP mailbox: {error}"))?;
+    Ok(address)
 }
 
 fn addresses(
@@ -767,6 +779,9 @@ mod tests {
             "ada@[192.0.2.256]",
             "a\ta@example.com",
             "ada\u{7}@example.com",
+            // RFC 5322 allows a tab in a quoted string; RFC 5321 does not.
+            "\"a\tb\"@example.com",
+            "\"a\\\tb\"@example.com",
             // Section 4.5.3.1: 64-octet local part, 63-octet label, 255-octet
             // domain.
             long_local_part.as_str(),

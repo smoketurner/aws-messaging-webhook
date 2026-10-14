@@ -42,7 +42,7 @@ serde_json = { version = "=1.0.151", default-features = false }
 sha1 = { version = "=0.10.7", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
 sns-message-verifier = { path = "crates/sns-message-verifier" }
-structured-email-address = { version = "=0.0.20", default-features = false }
+structured-email-address = { version = "=0.0.21", default-features = false }
 subtle = { version = "=2.6.1", default-features = false }
 thiserror = { version = "=2.0.20", default-features = false }
 tokio = { version = "=1.53.1", default-features = false }
