@@ -108,9 +108,13 @@ fn reply_recipients(
         return original_reply_to.to_vec();
     }
     // A message this inbox sent is replied to by writing to its recipients
-    // again, not to itself.
+    // again, not to itself. A cc-only send keeps its recipients out of `to`,
+    // so the `cc` list is needed as well, or the reply has no one to reach
+    // and `validate` rejects it as if the caller forgot a recipient. This
+    // reads the same two lists as `reply_all_recipients`, so a plain reply
+    // and a reply-all derive from the same set of recipients.
     if is_inbox(inbox, &original.from) {
-        return original.to.clone();
+        return original.to.iter().chain(&original.cc).cloned().collect();
     }
     vec![original.from.clone()]
 }

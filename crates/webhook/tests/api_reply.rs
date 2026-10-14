@@ -7,7 +7,7 @@ use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::mime::parse_inbound;
 use aws_messaging_webhook::mail::send::SendSpec;
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, MailMessage, ids, send, time};
+use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ids, send, time};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -466,4 +466,106 @@ async fn reply_all_never_copies_this_inbox_under_a_display_name() {
     let spec = spec(&h, response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
+}
+
+/// Seeds an outbound message this inbox sent, letting the caller shape its
+/// recipients. Mirrors [`seeded`] but stores the message as one the inbox
+/// itself sent, so the reply endpoint's `is_inbox` branch is what derives the
+/// recipients.
+async fn seeded_outbound(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
+    let (h, id) = seeded(|m| {
+        m.direction = Direction::Outbound;
+        INBOX.clone_into(&mut m.from);
+        m.to = Vec::new();
+        m.cc = Vec::new();
+        m.bcc = Vec::new();
+        adjust(m);
+    })
+    .await;
+    (h, id)
+}
+
+/// A cc-only send is valid (`validate` counts recipients across `to`+`cc`+
+/// `bcc`), so a plain reply to it must derive the `cc` recipient into the
+/// envelope rather than fail with a `400` that points at `to`. Before the
+/// fix `reply_recipients` returned the original's empty `to` and the reply
+/// was rejected as if the caller had forgotten a recipient.
+#[tokio::test]
+async fn a_plain_reply_to_a_cc_only_sent_message_derives_the_cc_recipient() {
+    let (h, original_id) = seeded_outbound(|m| {
+        m.cc = vec!["group@example.net".to_owned()];
+    })
+    .await;
+
+    let (status, response) = post(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &body(),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "plain reply to a cc-only sent message failed: {response}"
+    );
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(spec.envelope.to, vec!["group@example.net"]);
+    assert_eq!(spec.envelope.cc, [] as [String; 0]);
+    // The reply still joins the original's thread.
+    assert_eq!(response["thread_id"], "thread-1");
+    assert_eq!(spec.in_reply_to.as_deref(), Some("<original@example.net>"));
+}
+
+/// A plain reply to a sent message with both `to` and `cc` recipients writes
+/// to all of them again, not just the `to` list — the same set
+/// `reply_all_recipients` reads, so the two derivation paths agree.
+#[tokio::test]
+async fn a_plain_reply_to_a_sent_message_derives_to_and_cc_recipients() {
+    let (h, original_id) = seeded_outbound(|m| {
+        m.to = vec!["primary@example.net".to_owned()];
+        m.cc = vec!["watcher@example.net".to_owned()];
+    })
+    .await;
+
+    let (_, response) = post(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &body(),
+    )
+    .await;
+
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(
+        spec.envelope.to,
+        vec!["primary@example.net", "watcher@example.net"]
+    );
+    assert_eq!(spec.envelope.cc, [] as [String; 0]);
+}
+
+/// `reply_all` to a cc-only sent message used to land the sole recipient in
+/// `cc` (while the plain reply failed outright); with the shared derivation
+/// both paths address the same recipient as `to`, which is what a single
+/// recipient should be. Regression guard for the sibling path the fix leans
+/// on.
+#[tokio::test]
+async fn reply_all_to_a_cc_only_sent_message_addresses_the_cc_recipient() {
+    let (h, original_id) = seeded_outbound(|m| {
+        m.cc = vec!["group@example.net".to_owned()];
+    })
+    .await;
+
+    let mut request = body();
+    request["reply_all"] = json!(true);
+    let (status, response) = post(
+        &h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &request,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "reply_all failed: {response}");
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(spec.envelope.to, vec!["group@example.net"]);
+    assert_eq!(spec.envelope.cc, [] as [String; 0]);
 }
