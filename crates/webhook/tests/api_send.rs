@@ -961,25 +961,18 @@ async fn an_expired_key_reused_with_the_same_request_is_a_fresh_send() {
     assert_ne!(thread_id, first_thread_id);
 }
 
-/// A send with a malformed envelope address is rejected with `400` before
-/// anything is queued — the documented contract, since a queued-then-undeliverable
-/// send fails terminally at the SES call after the caller has already been told
-/// `200`. Before the fix, these slipped past the `contains('@')` gate and were
-/// queued verbatim, causing a permanent `rejected` later.
-///
-/// Each case is a real mail-parser 0.11.9 behavior, not a hypothetical:
-/// - A quoted local part is silently dropped (`"a b"@example.com` → `@example.com`).
-/// - Embedded whitespace and a double `@` are kept verbatim.
+/// A send with an address that is not an RFC 5321 mailbox is rejected with
+/// `400` before anything is queued: a queued-then-undeliverable send fails
+/// terminally at the SES call after the caller has already been told `200`.
 #[tokio::test]
 async fn a_send_with_a_malformed_envelope_address_is_rejected_before_queueing() {
     for bad_to in [
-        r#""a b"@example.com"#,
-        r#""a,b"@example.com"#,
-        "ada@ example.com",
-        "ada @example.com",
         "a@b@example.com",
         "@example.com",
         "ada@",
+        "a..b@example.com",
+        "ada@-example.com",
+        "ada@example",
     ] {
         let h = seeded().await;
         let mut request = body();
@@ -1014,7 +1007,7 @@ async fn a_send_with_a_malformed_envelope_address_is_rejected_before_queueing() 
 /// the validation applies to every recipient list, not just `to`.
 #[tokio::test]
 async fn a_send_with_a_malformed_cc_or_bcc_is_rejected_before_queueing() {
-    for (field, bad) in [("cc", "a@b@example.com"), ("bcc", r#""a b"@example.com"#)] {
+    for (field, bad) in [("cc", "a@b@example.com"), ("bcc", "a..b@example.com")] {
         let h = seeded().await;
         let mut request = body();
         request[field] = json!(bad);
@@ -1088,5 +1081,24 @@ async fn a_non_ascii_local_part_is_rejected_before_queueing() {
     assert_eq!(
         h.state.services.objects.put_object_calls(),
         [] as [String; 0]
+    );
+}
+
+/// A quoted local part is a mailbox RFC 5321 delivers to, sent with the
+/// minimum quoting it needs: kept where the content requires it, dropped
+/// where it does not.
+#[tokio::test]
+async fn a_quoted_local_part_reaches_the_envelope_minimally_quoted() {
+    let h = seeded().await;
+    let mut request = body();
+    request["to"] = json!([r#"Ada <"a b"@example.com>"#, r#""grace"@example.com"#]);
+
+    let (status, response) = send_it(&h, &request, None).await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    assert_eq!(
+        spec.envelope.to,
+        vec![r#""a b"@example.com"#, "grace@example.com"]
     );
 }

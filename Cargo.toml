@@ -26,7 +26,6 @@ aws-smithy-types = { version = "=1.6.4", default-features = false }
 aws_lambda_events = { version = "=1.2.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
 base64 = { version = "=0.23.1", default-features = false }
-idna = { version = "=1.1.0", default-features = false }
 lambda_http = { version = "=1.3.1", default-features = false }
 mail-builder = { version = "=1.0.0", default-features = false }
 mail-parser = { version = "=0.11.9", default-features = false }
@@ -43,6 +42,7 @@ serde_json = { version = "=1.0.151", default-features = false }
 sha1 = { version = "=0.10.7", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
 sns-message-verifier = { path = "crates/sns-message-verifier" }
+structured-email-address = { version = "=0.0.20", default-features = false }
 subtle = { version = "=2.6.1", default-features = false }
 thiserror = { version = "=2.0.20", default-features = false }
 tokio = { version = "=1.53.1", default-features = false }
