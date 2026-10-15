@@ -21,7 +21,13 @@ and HTTPS alias records. This needs:
 
 - `pHostedZoneId`, to validate the certificate and publish the records;
 - a stack in us-east-1, the only region CloudFront takes certificates from;
-- a subdomain of `pMailDomain`, or another domain already verified in SES.
+- a subdomain of a domain already verified in SES, such as `pMailDomain` after its first deploy.
+
+SES rejects a configuration set whose tracking domain isn't verified yet, and the stack's
+`pMailDomain` identity isn't verified until its DKIM records resolve. On a new mail domain, deploy
+without `pMailTrackingDomain` (pass `pMailTrackingDomain=""` if a failed deploy already set it;
+an omitted parameter keeps its previous value), wait for DKIM `SUCCESS` (see
+[setup.md](setup.md#after-the-first-deploy)), then deploy again with it.
 
 `pMailTrackingHttpsPolicy` controls which links use HTTPS: `REQUIRE` (default, all),
 `REQUIRE_OPEN_ONLY` (pixel only) or `OPTIONAL`.
