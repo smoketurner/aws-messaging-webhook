@@ -87,12 +87,14 @@ Parameters:
   pMailSenderMaxConcurrency:
     Type: Number
     Default: 2
-    MinValue: 1
+    MinValue: 0
     MaxValue: 100
     Description: >-
       How many sends may run at once. Each concurrent execution can make one
       SES call at a time, so this is the ceiling on the send rate this stack
-      asks SES for; raise it only alongside the account's sending quota.
+      asks SES for; raise it only alongside the account's sending quota. 0
+      reserves nothing, for accounts whose concurrency quota is too low to
+      reserve any; the stream's one batch per shard then bounds sends instead.
   pMailBucketName:
     Type: String
     Default: ""
@@ -235,6 +237,7 @@ Conditions:
   cHasMailDomain: !Not [!Equals [!Ref pMailDomain, ""]]
   cHasHostedZone: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pHostedZoneId, ""]]]
   cNoHostedZone: !And [!Condition cHasMailDomain, !Equals [!Ref pHostedZoneId, ""]]
+  cReserveSenderConcurrency: !Not [!Equals [!Ref pMailSenderMaxConcurrency, "0"]]
   cHasTrackingDomain: !And [!Condition cHasMailDomain, !Not [!Equals [!Ref pMailTrackingDomain, ""]]]
   cCreateReceiptRuleSet: !And [!Condition cHasMailDomain, !Equals [!Ref pExistingReceiptRuleSetName, ""]]
   cHasMailBucketName: !Not [!Equals [!Ref pMailBucketName, ""]]
@@ -940,7 +943,7 @@ Resources:
       Timeout: 120
       # One SES call at a time per environment keeps a burst of queued mail
       # from running into the account's sending rate.
-      ReservedConcurrentExecutions: !Ref pMailSenderMaxConcurrency
+      ReservedConcurrentExecutions: !If [cReserveSenderConcurrency, !Ref pMailSenderMaxConcurrency, !Ref AWS::NoValue]
       LoggingConfig:
         LogFormat: JSON
         ApplicationLogLevel: !Ref pLogLevel
