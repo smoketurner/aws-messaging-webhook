@@ -112,7 +112,20 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     // other kind when a message has only one, as a convenience for callers
     // that want "the body" in either form. A5 wants only genuine parts of
     // each kind, so each iterator is filtered to its real `PartType`.
-    let text = join_body_parts(parsed.text_bodies().filter(|part| !part.is_text_html()));
+    //
+    // `text_bodies()` can also contain inline non-text parts (e.g. an inline
+    // `image/svg+xml` in `multipart/mixed`) — `is_text_html()` does not weed
+    // those out, since it only matches `PartType::Html`. Filtering on
+    // `is_text()` (which is true for `PartType::Text` and `PartType::Html`
+    // alone) keeps the media type's "text/*" guarantee the comment claims,
+    // and excludes inline `Binary`/`InlineBinary` parts whose decoded bytes
+    // may be valid UTF-8 (SVG XML always is) and would otherwise be joined
+    // verbatim into `content.text` via `join_body_parts`.
+    let text = join_body_parts(
+        parsed
+            .text_bodies()
+            .filter(|part| part.is_text() && !part.is_text_html()),
+    );
     let html = join_body_parts(parsed.html_bodies().filter(|part| part.is_text_html()));
 
     let headers = collect_headers(&parsed);
@@ -614,5 +627,37 @@ mod tests {
         let parsed = fixture!("plain.eml");
         assert!(parsed.content.html.is_none());
         assert!(parsed.content.text.is_some());
+    }
+
+    /// An inline non-text part in a `multipart/mixed` message is placed in
+    /// `text_bodies()` by `mail-parser`, but it is not a genuine text part.
+    /// `is_text_html()` only matches `PartType::Html`, so the old
+    /// `!part.is_text_html()` filter let such parts through; their decoded
+    /// bytes are valid UTF-8 (SVG XML always is; the base64 `image/png` here
+    /// decodes to `hello`), so `join_body_parts` concatenated them into
+    /// `content.text` after the real body. The inline images must be kept
+    /// only as attachments, never appended to the plain text body — and the
+    /// fix must hold regardless of `Content-Transfer-Encoding`.
+    #[test]
+    fn inline_image_in_multipart_mixed_is_not_appended_to_text_body() {
+        let parsed = fixture!("inline-image-mixed.eml");
+        assert_eq!(parsed.content.text.as_deref(), Some("Hello body."));
+        assert!(parsed.content.html.is_none());
+
+        assert_eq!(parsed.attachments.len(), 2);
+
+        let svg = &parsed.attachments[0];
+        assert_eq!(svg.content_type, "image/svg+xml");
+        assert_eq!(svg.content_disposition, "inline");
+        assert_eq!(svg.content_id.as_deref(), Some("badge123"));
+        assert_eq!(svg.filename.as_deref(), Some("badge.svg"));
+        assert!(std::str::from_utf8(&svg.bytes).unwrap().contains("<svg"));
+
+        let png = &parsed.attachments[1];
+        assert_eq!(png.content_type, "image/png");
+        assert_eq!(png.content_disposition, "inline");
+        assert_eq!(png.content_id.as_deref(), Some("dot123"));
+        assert_eq!(png.filename.as_deref(), Some("dot.png"));
+        assert_eq!(png.bytes.as_ref(), b"hello");
     }
 }

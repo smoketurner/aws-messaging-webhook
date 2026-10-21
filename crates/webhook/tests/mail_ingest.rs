@@ -214,6 +214,98 @@ async fn plain_message_ingests_and_creates_a_thread() {
     );
 }
 
+/// A `multipart/mixed` message with a `text/plain` body plus inline
+/// `image/svg+xml` (8bit) and `image/png` (base64, decodes to valid-UTF-8
+/// `hello`) parts: the inline image bytes that `mail-parser` routes into
+/// `text_bodies()` must not leak into the served `content.text` (the bug
+/// report's "garbage in `text`" regression), while the parts are still kept
+/// as `inline` attachments with their original bytes intact in the object
+/// store. Closes the loop from `parse_inbound` through the stored content
+/// document that the read API and `message.received` events serve verbatim.
+#[tokio::test]
+async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body() {
+    let h = mail_harness().await;
+    let raw = include_bytes!("fixtures/mail/inline-image-mixed.eml");
+    h.fake().objects.seed(
+        "inbound/inline-img",
+        Bytes::from_static(raw),
+        "message/rfc822",
+    );
+    let body = wrapped(
+        &h,
+        &ses_inbound_s3(
+            "ses-1",
+            TS,
+            &["support@example.com"],
+            BUCKET,
+            "inbound/inline-img",
+            "PASS",
+            "PASS",
+            "PASS",
+        ),
+    );
+
+    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let message_id = expected_message_id("ses-1", TS);
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
+    let stored = h
+        .fake()
+        .mail
+        .get_message(&inbox, &message_id)
+        .await
+        .unwrap()
+        .expect("message was inserted");
+
+    // The regression: before the fix the inline SVG and decoded PNG bytes
+    // were appended to `content.text` after the real body, so `content.text`
+    // was `"Hello body.\n<svg ...>...</svg>\nhello"`.
+    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    assert_eq!(
+        stored_content.text.as_deref(),
+        Some("Hello body."),
+        "inline image bytes must not leak into the served plain-text body"
+    );
+    assert!(
+        stored_content.html.is_none(),
+        "an inline image is not a genuine HTML part"
+    );
+
+    // Both inline image parts are still kept as `inline` attachments with
+    // their original bytes in the object store, not dropped by the text-body
+    // filter.
+    assert_eq!(stored.attachments.len(), 2);
+    let svg_id = ids::attachment_id(&inbound_message_id("ses-1", parse_ts(TS).unwrap()), 0);
+    let png_id = ids::attachment_id(&inbound_message_id("ses-1", parse_ts(TS).unwrap()), 1);
+    assert_eq!(stored.attachments[0].attachment_id, svg_id);
+    assert_eq!(stored.attachments[0].content_type, "image/svg+xml");
+    assert_eq!(stored.attachments[1].attachment_id, png_id);
+    assert_eq!(stored.attachments[1].content_type, "image/png");
+
+    let svg_key = format!("attachments/{message_id}/{svg_id}");
+    let png_key = format!("attachments/{message_id}/{png_id}");
+    let svg_bytes = h
+        .fake()
+        .objects
+        .get(&svg_key)
+        .expect("SVG attachment was put in the object store");
+    let png_bytes = h
+        .fake()
+        .objects
+        .get(&png_key)
+        .expect("PNG attachment was put in the object store");
+    assert!(
+        std::str::from_utf8(&svg_bytes).unwrap().contains("<svg"),
+        "SVG bytes are intact in the object store"
+    );
+    assert_eq!(
+        png_bytes.as_ref(),
+        b"hello",
+        "PNG bytes are intact in the object store"
+    );
+}
+
 /// A `References` id of control characters — the raw email is ~16 MB, under
 /// the 40 MB SES receive limit — JSON-escapes sixfold. Before the fix this
 /// stored a ~96 MB content document that `content::load` rejected with
