@@ -271,6 +271,7 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
         stored_content.html.is_none(),
         "an inline image is not a genuine HTML part"
     );
+    assert_eq!(stored.preview, "Hello body.");
 
     // Both inline image parts are still kept as `inline` attachments with
     // their original bytes in the object store, not dropped by the text-body

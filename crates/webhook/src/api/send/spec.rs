@@ -4,13 +4,12 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
-use mail_parser::parsers::preview::{preview_html, preview_text};
 
 use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::labels::SystemLabel;
 use crate::mail::send::{self as send_mod, Envelope, SendSpec, SendStatus, SpecAttachment};
-use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, PREVIEW_CHARS, ids};
+use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime};
 use crate::state::Services;
 
 /// Builds the spec the sender will assemble the message from.
@@ -172,25 +171,13 @@ pub(super) fn queued_message(
     }
 }
 
-/// The snippet stored on the queued message, derived the same way the
-/// inbound path derives it: `mail_parser`'s `preview_text` over `send.text`,
-/// falling back to `preview_html` over `send.html` when there is no text
-/// body. An HTML-only send is a first-class, validation-accepted shape
+/// The snippet stored on the queued message, derived by the same
+/// [`mime::preview`] the inbound path uses, so the two listings agree for the
+/// same body. An HTML-only send is a first-class, validation-accepted shape
 /// (`text.is_none() && html.is_none()` is the only case validation rejects),
-/// so it must get a non-empty snippet — and matching the inbound
-/// `body_preview` derivation keeps the two listings consistent for the same
-/// body, instead of hand-rolling a tag stripper that would not collapse
-/// whitespace or decode entities the way `preview_html` does.
+/// so it must get a non-empty snippet.
 pub(super) fn preview_of(send: &ValidatedSend) -> String {
-    let preview = match send.text.as_deref() {
-        Some(text) => preview_text(text.into(), PREVIEW_CHARS),
-        None => send
-            .html
-            .as_deref()
-            .map(|html| preview_html(html.into(), PREVIEW_CHARS))
-            .unwrap_or_default(),
-    };
-    preview.into_owned()
+    mime::preview(send.text.as_deref(), send.html.as_deref())
 }
 
 /// Removes what a send uploaded under `outbox/` before its commit failed: the
@@ -293,12 +280,8 @@ mod tests {
     }
 
     /// Outbound and inbound must derive the same preview for the same body.
-    /// Inbound parses raw MIME and calls `mail_parser::Message::body_preview`
-    /// (`mime.rs`), which for an HTML-only message runs `preview_html`; the
-    /// outbound path now runs the same `preview_html`. Feeding the same HTML
-    /// to both must produce identical snippets — the strongest form of the
-    /// parity guarantee, and a regression guard against any future divergence
-    /// between the two derivations.
+    /// Both go through `mime::preview`; feeding the same HTML to both, one of
+    /// them through a real MIME parse, pins that they still do.
     #[test]
     fn outbound_preview_matches_inbound_preview_for_the_same_html_body() {
         use crate::mail::mime::parse_inbound;
