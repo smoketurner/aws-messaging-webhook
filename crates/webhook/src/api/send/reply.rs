@@ -129,11 +129,23 @@ fn address_reply(
 }
 
 /// The other participants, for `reply_all`. This inbox is excluded so a reply
-/// never arrives back in the inbox that sent it.
+/// never arrives back in the inbox that sent it, and so is the direct
+/// recipient. `direct` and the original's `to`/`cc` participants are stored
+/// verbatim from the inbound headers — sometimes as a bare mailbox,
+/// sometimes in display form (`Alice <alice@example.net>`) — so the mailbox
+/// is parsed out before comparing, the same way [`is_inbox`] does, so two
+/// spellings of the same mailbox are not both addressed.
 fn reply_all_recipients(inbox: &InboxId, original: &MailMessage, direct: &[String]) -> Vec<String> {
+    let direct_mailboxes: Vec<String> = direct
+        .iter()
+        .filter_map(|d| envelope_address(d).ok())
+        .map(|mailbox| mailbox.to_ascii_lowercase())
+        .collect();
     let mut out = Vec::new();
     for address in original.to.iter().chain(&original.cc) {
-        if !is_inbox(inbox, address) && !direct.contains(address) && !out.contains(address) {
+        let is_direct = envelope_address(address)
+            .is_ok_and(|mailbox| direct_mailboxes.contains(&mailbox.to_ascii_lowercase()));
+        if !is_inbox(inbox, address) && !is_direct && !out.contains(address) {
             out.push(address.clone());
         }
     }
