@@ -25,6 +25,7 @@ judgement columns come from the batch's record in `.local/`.
 | 2026-09-30 | 5 | 5 | 0 | 1 | 1 | not recorded | not recorded | not recorded | 0 |
 | 2026-10-07 | 1 | 1 | 0 | 0 | 0 | 1 (#145 superseded) | #145 closed; class fix #146 | 0 (no prior record) | 0 requested (CLI unavailable) |
 | 2026-10-14 | 2 | 2 | 0 | 0 | 0 | 2 (#152, #153 superseded) | #152 → #155; #153 → #154, then #156 | 1 (#151 continues the 10-07 address class) | 2 requested: rule_a7516916 not pulled (generated before #156 merged, stale on whitespace); refinement rule_22417fef synced |
+| 2026-10-21 | 2 | 2 | 0 | 0 | 0 | 1 (#170 superseded) | #170 → #173 (class + clippy guardrail); #171 instance, pending merge after advisory fix #172 | 1 (#169 continues the 10-07 participant class) | 0 requested (CLI unavailable) |
 
 Batches before 2026-09-22 were single findings (2026-08-12, 08-18, 09-08,
 09-15) or fix PRs with no new issue; run the script for their counts. No
@@ -96,3 +97,25 @@ request, made after the merge and naming the stale rule, produced
 `rule_22417fef`. Its line references matched main, and it was the one pulled.
 Request rules only after the class fix is on main.
 
+## 2026-10-21 — inbound body parts and reply-all identity
+
+| month | n | no attr | median age | p90 age | <30d | >90d |
+|-------|---|---------|-----------|---------|------|------|
+| 2026-10 | 5 | 0 | 28 | 35 | 3 | 0 |
+
+Two findings, both in #42 code that is 35 days old, and neither recently merged. October's median age is climbing (28 days)
+while `<30d` stays flat. That's the start of the backlog-excavation signature, so throughput is the response here, not a
+new process guardrail.
+
+- **#168 (class):** mail-parser's `text_bodies()` lists inline non-text parts. Detail's #170 filtered them out of
+  `content.text` but left `body_preview`, which reads only `text_bodies()[0]`. With an inline image before the text, the
+  preview came back empty (reproduced on #170's branch). #173 superseded it: the inbound preview is now derived from the
+  filtered bodies through `mime::preview`, shared with the outbound path, and `clippy.toml` disallows mail-parser's
+  unfiltered body accessors. I checked the guardrail by breaking the code.
+- **#169 (instance):** reply-all compared `direct` raw against stored participants. This is the member #146's `is_inbox`
+  fix missed. The sibling hunt found only harmless members (in-list cc dedup, which validation repeats, and the
+  display-only thread sets), so #171 merges as written.
+- `main` was red on cargo deny (RUSTSEC-2026-0382/0383); fixed in #172.
+
+Lesson: when a fix filters an iterator, also check every other reader of the *same* unfiltered source. Here
+that was mail-parser's own `body_preview` convenience, which no diff hunk showed.
