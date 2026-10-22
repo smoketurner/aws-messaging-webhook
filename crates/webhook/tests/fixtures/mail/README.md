@@ -12,6 +12,8 @@ committed here.
 | `attachment-content-id.eml` | Inline image with a `Content-ID` |
 | `reply-references.eml` | `In-Reply-To` and multi-entry `References` |
 | `inline-text-parts.eml` | Multiple `text/plain` body parts (A5 concatenation) |
+| `inline-image-mixed.eml` | `multipart/mixed` with `text/plain` + inline `image/svg+xml` and base64 `image/png` parts |
+| `inline-image-first.eml` | `multipart/mixed` with an inline SVG before the `text/plain` body |
 | `nested-rfc822.eml` | A `message/rfc822` attachment (not flattened) |
 | `encoded-word-filename.eml` | RFC 2231 continuation-encoded filename |
 | `no-filename.eml` | An attachment with neither a Content-Disposition nor Content-Type filename |

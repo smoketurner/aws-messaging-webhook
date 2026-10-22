@@ -2,3 +2,10 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 doc-valid-idents = ["DynamoDB", "EventBridge", "GovCloud", "SNS", "SES", ".."]
+disallowed-methods = [
+    { path = "mail_parser::Message::text_bodies", reason = "lists inline non-text parts; read bodies through mime::parse_inbound's filtered text/html" },
+    { path = "mail_parser::Message::html_bodies", reason = "falls back to text parts; read bodies through mime::parse_inbound's filtered text/html" },
+    { path = "mail_parser::Message::body_text", reason = "reads the unfiltered body list; use mime::parse_inbound's filtered text" },
+    { path = "mail_parser::Message::body_html", reason = "reads the unfiltered body list; use mime::parse_inbound's filtered html" },
+    { path = "mail_parser::Message::body_preview", reason = "reads the unfiltered first body part; use mime::preview" },
+]

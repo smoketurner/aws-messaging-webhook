@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
+use mail_parser::parsers::preview::{preview_html, preview_text};
 use mail_parser::{
     Addr, Address, ContentType, HeaderValue, Message as MimeMessage, MessageParser, MessagePart,
     MimeHeaders,
@@ -103,17 +104,29 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     }
 
     let subject = truncate_bytes(parsed.subject().unwrap_or_default(), SUBJECT_MAX_BYTES);
-    let preview = parsed
-        .body_preview(PREVIEW_CHARS)
-        .map(std::borrow::Cow::into_owned)
-        .unwrap_or_default();
 
     // `mail-parser`'s `text_bodies()`/`html_bodies()` each fall back to the
     // other kind when a message has only one, as a convenience for callers
-    // that want "the body" in either form. A5 wants only genuine parts of
-    // each kind, so each iterator is filtered to its real `PartType`.
-    let text = join_body_parts(parsed.text_bodies().filter(|part| !part.is_text_html()));
-    let html = join_body_parts(parsed.html_bodies().filter(|part| part.is_text_html()));
+    // that want "the body" in either form, and `text_bodies()` also lists
+    // inline non-text parts (an inline `image/svg+xml` in `multipart/mixed`),
+    // whose bytes `text_contents` returns whenever they are valid UTF-8. A5
+    // wants only genuine parts of each kind, so each iterator is filtered to
+    // its real `PartType`, and the preview is derived from the filtered
+    // bodies rather than `body_preview`, which reads the unfiltered first
+    // part and comes back empty when an inline image precedes the text.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one place the unfiltered body lists are read, filtered here"
+    )]
+    let (text, html) = (
+        join_body_parts(
+            parsed
+                .text_bodies()
+                .filter(|part| part.is_text() && !part.is_text_html()),
+        ),
+        join_body_parts(parsed.html_bodies().filter(|part| part.is_text_html())),
+    );
+    let preview = preview(text.as_deref(), html.as_deref());
 
     let headers = collect_headers(&parsed);
 
@@ -281,6 +294,20 @@ fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
         HeaderValue::TextList(ids) => ids.iter().map(|id| wrap_id(id)).collect(),
         _ => Vec::new(),
     }
+}
+
+/// A message's listing snippet: `preview_text` over the text body, else
+/// `preview_html` over the HTML body. Inbound and outbound both derive it
+/// here, so the same body lists the same way whichever way it travelled.
+#[must_use]
+pub fn preview(text: Option<&str>, html: Option<&str>) -> String {
+    let preview = match text {
+        Some(text) => preview_text(text.into(), PREVIEW_CHARS),
+        None => html
+            .map(|html| preview_html(html.into(), PREVIEW_CHARS))
+            .unwrap_or_default(),
+    };
+    preview.into_owned()
 }
 
 /// Concatenates every part's text with `\n` (A5); `None` when there are no
@@ -614,5 +641,49 @@ mod tests {
         let parsed = fixture!("plain.eml");
         assert!(parsed.content.html.is_none());
         assert!(parsed.content.text.is_some());
+    }
+
+    /// An inline non-text part in a `multipart/mixed` message is placed in
+    /// `text_bodies()` by `mail-parser`, but it is not a genuine text part.
+    /// `is_text_html()` only matches `PartType::Html`, so the old
+    /// `!part.is_text_html()` filter let such parts through; their decoded
+    /// bytes are valid UTF-8 (SVG XML always is; the base64 `image/png` here
+    /// decodes to `hello`), so `join_body_parts` concatenated them into
+    /// `content.text` after the real body. The inline images must be kept
+    /// only as attachments, never appended to the plain text body — and the
+    /// fix must hold regardless of `Content-Transfer-Encoding`.
+    #[test]
+    fn inline_image_in_multipart_mixed_is_not_appended_to_text_body() {
+        let parsed = fixture!("inline-image-mixed.eml");
+        assert_eq!(parsed.content.text.as_deref(), Some("Hello body."));
+        assert_eq!(parsed.message.preview, "Hello body.");
+        assert!(parsed.content.html.is_none());
+
+        assert_eq!(parsed.attachments.len(), 2);
+
+        let svg = &parsed.attachments[0];
+        assert_eq!(svg.content_type, "image/svg+xml");
+        assert_eq!(svg.content_disposition, "inline");
+        assert_eq!(svg.content_id.as_deref(), Some("badge123"));
+        assert_eq!(svg.filename.as_deref(), Some("badge.svg"));
+        assert!(std::str::from_utf8(&svg.bytes).unwrap().contains("<svg"));
+
+        let png = &parsed.attachments[1];
+        assert_eq!(png.content_type, "image/png");
+        assert_eq!(png.content_disposition, "inline");
+        assert_eq!(png.content_id.as_deref(), Some("dot123"));
+        assert_eq!(png.filename.as_deref(), Some("dot.png"));
+        assert_eq!(png.bytes.as_ref(), b"hello");
+    }
+
+    /// An inline image ahead of the text is the first entry in
+    /// `text_bodies()`, which is all `body_preview` reads, so the preview came
+    /// back empty while the text body was correct.
+    #[test]
+    fn inline_image_before_the_text_leaves_text_and_preview_intact() {
+        let parsed = fixture!("inline-image-first.eml");
+        assert_eq!(parsed.content.text.as_deref(), Some("Hello body."));
+        assert_eq!(parsed.message.preview, "Hello body.");
+        assert_eq!(parsed.attachments.len(), 1);
     }
 }

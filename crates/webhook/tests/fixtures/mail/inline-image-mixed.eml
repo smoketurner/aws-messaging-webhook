@@ -1,0 +1,27 @@
+From: Alice Sender <alice@example.com>
+To: Bob Recipient <bob@example.com>
+Subject: Multipart mixed with inline image parts
+Date: Mon, 1 Sep 2025 10:45:00 +0000
+Message-ID: <inline-image-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mx-boundary"
+
+--mx-boundary
+Content-Type: text/plain; charset=utf-8
+
+Hello body.
+--mx-boundary
+Content-Type: image/svg+xml
+Content-Transfer-Encoding: 8bit
+Content-Disposition: inline; filename="badge.svg"
+Content-ID: <badge123>
+
+<svg xmlns="http://www.w3.org/2000/svg"><text>hello svg</text></svg>
+--mx-boundary
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-Disposition: inline; filename="dot.png"
+Content-ID: <dot123>
+
+aGVsbG8=
+--mx-boundary--
