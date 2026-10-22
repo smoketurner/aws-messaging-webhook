@@ -21,6 +21,7 @@ pub mod txn;
 pub mod url_policy;
 pub mod wire;
 
+pub mod address;
 pub mod build;
 pub mod content;
 pub mod events;

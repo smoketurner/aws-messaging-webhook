@@ -183,7 +183,7 @@ fn truncate_bytes(input: &str, max_bytes: usize) -> String {
 /// address. `None` for a malformed entry with no address at all.
 ///
 /// The result has to parse back to the same mailbox: a reply re-reads these
-/// strings with `validate::envelope_address` to find its recipients. So the
+/// strings with `address::envelope_address` to find its recipients. So the
 /// name is the part that gives way to [`ADDRESS_MAX_BYTES`], never the
 /// `<address>`, and a name `mail-parser`
 /// decoded from a quoted string or an encoded word is written back as an

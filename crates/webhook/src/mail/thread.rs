@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mail::address::same_mailbox;
 use crate::mail::{
     AttachmentMeta, Direction, InboxId, MailMessage, THREAD_ATTACHMENT_SUMMARIES, ThreadSnapshot,
 };
@@ -110,11 +111,13 @@ fn add_label(labels: &mut Vec<String>, label: &str) {
     }
 }
 
-/// Appends `value` to `set` (sorted, deduplicated, capped at `cap`): once at
-/// cap, a new value is dropped rather than evicting an existing one — the
-/// existing senders/recipients stay stable across a long-running thread.
+/// Appends the participant `value` to `set` (sorted, one entry per mailbox
+/// by [`same_mailbox`], capped at `cap`): the first spelling of a mailbox is the one
+/// kept, and once at cap a new value is dropped rather than evicting an
+/// existing one — the existing senders/recipients stay stable across a
+/// long-running thread.
 fn add_to_capped_set(set: &mut Vec<String>, value: &str, cap: usize) {
-    if set.iter().any(|existing| existing == value) {
+    if set.iter().any(|existing| same_mailbox(existing, value)) {
         return;
     }
     if set.len() >= cap {
@@ -517,6 +520,29 @@ mod tests {
         assert_eq!(thread.timestamp, "00000004-0000");
         assert_eq!(thread.last_message_id, "mid-2");
         assert_eq!(thread.message_count, 5);
+    }
+
+    /// Participants are stored as each header wrote them, so the same mailbox
+    /// arrives bare in one message and with a display name in the next. The
+    /// thread lists it once, in the spelling it first arrived in.
+    #[test]
+    fn senders_and_recipients_hold_each_mailbox_once() {
+        let mut first = message(Direction::Inbound, &["received"]);
+        "Alice <alice@example.net>".clone_into(&mut first.from);
+        first.cc = vec!["bob@example.net".to_owned()];
+        let thread = new_thread(&first);
+
+        let mut next = message(Direction::Inbound, &["received"]);
+        "ALICE@example.net".clone_into(&mut next.from);
+        next.to = vec!["Support <support@example.com>".to_owned()];
+        next.cc = vec!["Bob <Bob@Example.net>".to_owned()];
+        let thread = apply_message(&thread, &next);
+
+        assert_eq!(thread.senders, vec!["Alice <alice@example.net>"]);
+        assert_eq!(
+            thread.recipients,
+            vec!["bob@example.net", "support@example.com"]
+        );
     }
 
     #[test]

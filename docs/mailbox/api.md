@@ -84,7 +84,9 @@ Send an `Idempotency-Key` header:
 `…/reply` takes the same body plus `reply_all`. It fills in the thread, `In-Reply-To`,
 `References`, a `Re:` subject (never doubled) and the recipient: the original's `Reply-To`, or
 its sender. A reply to a message this inbox sent goes to that message's `to`, else its `cc`,
-else its `bcc` (as `bcc`). `reply_all` adds the original's other recipients, minus this inbox.
+else its `bcc` (as `bcc`), and ignores its `Reply-To`, which was addressed to those recipients.
+`reply_all` adds the original's other recipients. Recipients are compared by mailbox, however
+each header wrote them: each is addressed once, and this inbox only when no one else is.
 Setting `to`, `cc` or `bcc` overrides the recipients and keeps the threading.
 
 ### URL attachments
