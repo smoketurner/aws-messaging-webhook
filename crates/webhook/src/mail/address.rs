@@ -67,14 +67,55 @@ pub fn envelope_address(value: &str) -> Result<String, String> {
     Ok(address)
 }
 
+/// Reads a stored participant for comparison: the entry grammar, with the
+/// local part lowercased as well as the domain, matching how
+/// [`InboxId`](crate::mail::InboxId) treats an address.
+static PARTICIPANT_CONFIG: LazyLock<Config> = LazyLock::new(|| {
+    Config::builder()
+        .strictness(Strictness::Standard)
+        .allow_domain_literal()
+        .allow_display_name()
+        .lowercase_all()
+        .build()
+});
+
 /// Whether two stored participants name the same mailbox, however each
-/// header wrote it: compared in [`envelope_address`] form, ignoring ASCII
-/// case as [`InboxId`](crate::mail::InboxId) does. A participant that does
-/// not parse matches only its own spelling.
+/// header wrote it. [`EmailAddress`] equality is the mailbox alone, display
+/// name excluded. A participant that does not parse matches only its own
+/// spelling.
 #[must_use]
 pub fn same_mailbox(a: &str, b: &str) -> bool {
-    match (envelope_address(a), envelope_address(b)) {
-        (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(&b),
+    match (
+        EmailAddress::parse_with(a, &PARTICIPANT_CONFIG),
+        EmailAddress::parse_with(b, &PARTICIPANT_CONFIG),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
         _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_mailbox;
+
+    #[test]
+    fn spellings_of_one_mailbox_are_the_same_mailbox() {
+        for (a, b) in [
+            ("Bob <bob@example.net>", "bob@example.net"),
+            ("bob@example.net", "BOB@Example.NET"),
+            ("\"Bob, B.\" <bob@example.net>", "Robert <bob@example.net>"),
+            ("\"bob\"@example.net", "bob@example.net"),
+            ("bob@bücher.example", "bob@xn--bcher-kva.example"),
+        ] {
+            assert!(same_mailbox(a, b), "{a} / {b}");
+        }
+    }
+
+    #[test]
+    fn different_mailboxes_and_unparsable_participants_do_not_match() {
+        assert!(!same_mailbox("bob@example.net", "bob@example.com"));
+        assert!(!same_mailbox("bob+tag@example.net", "bob@example.net"));
+        assert!(same_mailbox("not an address", "NOT AN ADDRESS"));
+        assert!(!same_mailbox("not an address", "bob@example.net"));
     }
 }
