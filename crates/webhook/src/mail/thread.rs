@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mail::address::Mailbox;
+use crate::mail::address::same_mailbox;
 use crate::mail::{
     AttachmentMeta, Direction, InboxId, MailMessage, THREAD_ATTACHMENT_SUMMARIES, ThreadSnapshot,
 };
@@ -111,14 +111,13 @@ fn add_label(labels: &mut Vec<String>, label: &str) {
     }
 }
 
-/// Appends the participant `value` to `set` (sorted, one entry per
-/// [`Mailbox`], capped at `cap`): the first spelling of a mailbox is the one
+/// Appends the participant `value` to `set` (sorted, one entry per mailbox
+/// by [`same_mailbox`], capped at `cap`): the first spelling of a mailbox is the one
 /// kept, and once at cap a new value is dropped rather than evicting an
 /// existing one — the existing senders/recipients stay stable across a
 /// long-running thread.
 fn add_to_capped_set(set: &mut Vec<String>, value: &str, cap: usize) {
-    let mailbox = Mailbox::of(value);
-    if set.iter().any(|existing| Mailbox::of(existing) == mailbox) {
+    if set.iter().any(|existing| same_mailbox(existing, value)) {
         return;
     }
     if set.len() >= cap {

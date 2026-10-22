@@ -12,7 +12,7 @@ use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
 use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest};
 use crate::api::send::{SendAccepted, enqueue};
-use crate::mail::address::Mailbox;
+use crate::mail::address::same_mailbox;
 use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
 use crate::state::{AppState, Services};
 
@@ -148,17 +148,15 @@ fn address_reply(
 
 /// The other participants, for `reply_all`: each mailbox once, never this
 /// inbox and never one already addressed directly. Participants are compared
-/// by [`Mailbox`], since the same one is often stored in two spellings.
+/// with [`same_mailbox`], since the same one is often stored in two spellings.
 fn reply_all_recipients(inbox: &InboxId, original: &MailMessage, direct: &[String]) -> Vec<String> {
-    let mut seen: Vec<Mailbox> = direct
-        .iter()
-        .map(|participant| Mailbox::of(participant))
-        .collect();
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for participant in original.to.iter().chain(&original.cc) {
-        let mailbox = Mailbox::of(participant);
-        if !mailbox.is(inbox.as_str()) && !seen.contains(&mailbox) {
-            seen.push(mailbox);
+        let addressed = direct
+            .iter()
+            .chain(&out)
+            .any(|seen| same_mailbox(seen, participant));
+        if !is_inbox(inbox, participant) && !addressed {
             out.push(participant.clone());
         }
     }
@@ -167,7 +165,7 @@ fn reply_all_recipients(inbox: &InboxId, original: &MailMessage, direct: &[Strin
 
 /// Whether a stored participant names this inbox.
 fn is_inbox(inbox: &InboxId, participant: &str) -> bool {
-    Mailbox::of(participant).is(inbox.as_str())
+    same_mailbox(participant, inbox.as_str())
 }
 
 /// `participants` without this inbox.

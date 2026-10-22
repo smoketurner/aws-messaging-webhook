@@ -3,8 +3,8 @@
 //!
 //! Participants are stored the way they arrived — `Alice <alice@example.net>`
 //! from one header, `alice@example.net` from another — so the read API shows
-//! what the sender wrote. Two participants are the same recipient when they
-//! name the same [`Mailbox`], never when their strings are equal.
+//! what the sender wrote. Two participants are the same recipient when
+//! [`same_mailbox`] says so, never because their strings are equal.
 
 use std::sync::LazyLock;
 
@@ -67,28 +67,14 @@ pub fn envelope_address(value: &str) -> Result<String, String> {
     Ok(address)
 }
 
-/// The mailbox a participant names, for comparing participants. Built only by
-/// [`Mailbox::of`], so two participants compare by the address they name
-/// rather than by how it was written, and ASCII case is folded throughout to
-/// match how this service compares inbox ids.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mailbox(String);
-
-impl Mailbox {
-    /// The mailbox `participant` names. A participant that does not parse as
-    /// an address stands for itself, so it still matches its own spelling and
-    /// nothing else.
-    #[must_use]
-    pub fn of(participant: &str) -> Self {
-        Self(envelope_address(participant).map_or_else(
-            |_| participant.to_ascii_lowercase(),
-            |address| address.to_ascii_lowercase(),
-        ))
-    }
-
-    /// Whether this is the mailbox `address` (an inbox id, say) names.
-    #[must_use]
-    pub fn is(&self, address: &str) -> bool {
-        self.0.eq_ignore_ascii_case(address)
+/// Whether two stored participants name the same mailbox, however each
+/// header wrote it: compared in [`envelope_address`] form, ignoring ASCII
+/// case as [`InboxId`](crate::mail::InboxId) does. A participant that does
+/// not parse matches only its own spelling.
+#[must_use]
+pub fn same_mailbox(a: &str, b: &str) -> bool {
+    match (envelope_address(a), envelope_address(b)) {
+        (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(&b),
+        _ => a.eq_ignore_ascii_case(b),
     }
 }
