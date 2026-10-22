@@ -665,3 +665,103 @@ async fn reply_all_never_copies_a_reply_to_recipient_into_cc_in_a_different_spel
         spec.envelope.cc
     );
 }
+
+/// Replies to `original_id` and returns the queued spec.
+async fn reply_spec(h: &Harness, original_id: &str, reply_all: bool) -> SendSpec {
+    let mut request = body();
+    request["reply_all"] = json!(reply_all);
+    let (status, response) = post(
+        h,
+        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    spec(h, response["message_id"].as_str().unwrap())
+}
+
+/// A send's `reply_to` tells its recipients where to answer. Following up on
+/// that send goes to the recipients again, not to the `Reply-To` — which is
+/// usually this inbox or its own team, so the follow-up would never reach the
+/// people it was meant for.
+#[tokio::test]
+async fn a_follow_up_to_a_sent_message_ignores_its_reply_to() {
+    let (h, original_id) = seeded_sent(|m| {
+        m.to = vec!["primary@example.net".to_owned()];
+        m.cc = vec!["watcher@example.net".to_owned()];
+    })
+    .await;
+    store_content(
+        &h,
+        &original_id,
+        MessageContent {
+            reply_to: vec!["team@example.com".to_owned()],
+            ..MessageContent::default()
+        },
+    )
+    .await;
+
+    let spec = reply_spec(&h, &original_id, true).await;
+    assert_eq!(spec.envelope.to, vec!["primary@example.net"]);
+    assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
+}
+
+/// A send this inbox also addressed to itself is followed up with everyone
+/// else, not with another copy to itself.
+#[tokio::test]
+async fn a_follow_up_never_addresses_this_inbox_among_the_recipients() {
+    let (h, original_id) = seeded_sent(|m| {
+        m.to = vec![
+            "Support <SUPPORT@example.com>".to_owned(),
+            "primary@example.net".to_owned(),
+        ];
+    })
+    .await;
+
+    let spec = reply_spec(&h, &original_id, false).await;
+    assert_eq!(spec.envelope.to, vec!["primary@example.net"]);
+}
+
+/// When this inbox is its only recipient there is no one else to write to,
+/// so a follow-up to a note to itself still goes to itself.
+#[tokio::test]
+async fn a_follow_up_to_a_note_to_itself_goes_to_this_inbox() {
+    let (h, original_id) = seeded_sent(|m| m.to = vec![INBOX.to_owned()]).await;
+
+    let spec = reply_spec(&h, &original_id, false).await;
+    assert_eq!(spec.envelope.to, vec![INBOX]);
+}
+
+/// A `Reply-To` that names only this inbox would send the reply back here;
+/// the sender is the one to answer.
+#[tokio::test]
+async fn a_reply_to_naming_only_this_inbox_falls_back_to_the_sender() {
+    let (h, original_id) = seeded(|_| {}).await;
+    store_content(
+        &h,
+        &original_id,
+        MessageContent {
+            reply_to: vec![format!("Support <{INBOX}>")],
+            ..MessageContent::default()
+        },
+    )
+    .await;
+
+    let spec = reply_spec(&h, &original_id, false).await;
+    assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
+}
+
+/// The same mailbox stored in two spellings across `to` and `cc` is copied
+/// once.
+#[tokio::test]
+async fn reply_all_copies_each_mailbox_once_however_it_was_written() {
+    let (h, original_id) = seeded(|m| {
+        m.to = vec![INBOX.to_owned(), "Bob <bob@example.net>".to_owned()];
+        m.cc = vec!["BOB@example.net".to_owned()];
+    })
+    .await;
+
+    let spec = reply_spec(&h, &original_id, true).await;
+    assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
+    assert_eq!(spec.envelope.cc, vec!["bob@example.net"]);
+}

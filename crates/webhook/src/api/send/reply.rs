@@ -10,8 +10,9 @@ use axum::http::HeaderMap;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
-use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest, envelope_address};
+use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest};
 use crate::api::send::{SendAccepted, enqueue};
+use crate::mail::address::Mailbox;
 use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
 use crate::state::{AppState, Services};
 
@@ -93,8 +94,15 @@ pub async fn reply<T: Services>(
     .await
 }
 
-/// Addresses a reply: to the original's `Reply-To` if it set one, else its
-/// sender, plus its other participants in `cc` for `reply_all`.
+/// Addresses a reply, plus the original's other participants in `cc` for
+/// `reply_all`.
+///
+/// A reply to someone else's message goes to its `Reply-To` if it set one,
+/// else its sender. A reply to a message this inbox sent goes to that
+/// message's recipients again, and its `Reply-To` plays no part: that header
+/// names where the author "suggests replies be sent" (RFC 5322 section
+/// 3.6.2), which is advice to the recipients, not to the author following
+/// up. This inbox is addressed only when no one else is.
 fn address_reply(
     send: &mut SendRequest,
     inbox: &InboxId,
@@ -102,22 +110,32 @@ fn address_reply(
     original_reply_to: &[String],
     reply_all: bool,
 ) {
-    // A message this inbox sent is replied to by writing to its recipients
-    // again, not to itself. A send needs a recipient in only one of `to`,
-    // `cc` and `bcc`, so the first list that has one is used.
-    let direct = if !original_reply_to.is_empty() {
-        original_reply_to.to_vec()
-    } else if !is_inbox(inbox, &original.from) {
-        vec![original.from.clone()]
-    } else if !original.to.is_empty() {
-        original.to.clone()
-    } else if !original.cc.is_empty() {
-        original.cc.clone()
+    let direct = if is_inbox(inbox, &original.from) {
+        // A send needs a recipient in only one of `to`, `cc` and `bcc`, so
+        // the first list that names someone else is used.
+        let to = without_inbox(inbox, &original.to);
+        let cc = without_inbox(inbox, &original.cc);
+        let bcc = without_inbox(inbox, &original.bcc);
+        if !to.is_empty() {
+            to
+        } else if !cc.is_empty() {
+            cc
+        } else if !bcc.is_empty() {
+            // Blind copies stay blind rather than seeing each other in `To`.
+            // With no `to` or `cc` there is no one else for `reply_all` to add.
+            send.bcc = Some(Addresses::Many(bcc));
+            return;
+        } else {
+            // A note to itself: there is no one else to write to.
+            vec![original.from.clone()]
+        }
     } else {
-        // Blind copies stay blind rather than seeing each other in `To`. With
-        // no `to` or `cc` there is no one else for `reply_all` to add.
-        send.bcc = Some(Addresses::Many(original.bcc.clone()));
-        return;
+        let reply_to = without_inbox(inbox, original_reply_to);
+        if reply_to.is_empty() {
+            vec![original.from.clone()]
+        } else {
+            reply_to
+        }
     };
     if reply_all {
         let others = reply_all_recipients(inbox, original, &direct);
@@ -128,35 +146,37 @@ fn address_reply(
     send.to = Some(Addresses::Many(direct));
 }
 
-/// The other participants, for `reply_all`. This inbox is excluded so a reply
-/// never arrives back in the inbox that sent it, and so is the direct
-/// recipient. `direct` and the original's `to`/`cc` participants are stored
-/// verbatim from the inbound headers — sometimes as a bare mailbox,
-/// sometimes in display form (`Alice <alice@example.net>`) — so the mailbox
-/// is parsed out before comparing, the same way [`is_inbox`] does, so two
-/// spellings of the same mailbox are not both addressed.
+/// The other participants, for `reply_all`: each mailbox once, never this
+/// inbox and never one already addressed directly. Participants are compared
+/// by [`Mailbox`], since the same one is often stored in two spellings.
 fn reply_all_recipients(inbox: &InboxId, original: &MailMessage, direct: &[String]) -> Vec<String> {
-    let direct_mailboxes: Vec<String> = direct
+    let mut seen: Vec<Mailbox> = direct
         .iter()
-        .filter_map(|d| envelope_address(d).ok())
-        .map(|mailbox| mailbox.to_ascii_lowercase())
+        .map(|participant| Mailbox::of(participant))
         .collect();
     let mut out = Vec::new();
-    for address in original.to.iter().chain(&original.cc) {
-        let is_direct = envelope_address(address)
-            .is_ok_and(|mailbox| direct_mailboxes.contains(&mailbox.to_ascii_lowercase()));
-        if !is_inbox(inbox, address) && !is_direct && !out.contains(address) {
-            out.push(address.clone());
+    for participant in original.to.iter().chain(&original.cc) {
+        let mailbox = Mailbox::of(participant);
+        if !mailbox.is(inbox.as_str()) && !seen.contains(&mailbox) {
+            seen.push(mailbox);
+            out.push(participant.clone());
         }
     }
     out
 }
 
-/// Whether a stored participant names this inbox. Inbound participants are
-/// stored in display form (`Support <support@example.com>`), so the mailbox
-/// is parsed out before comparing.
+/// Whether a stored participant names this inbox.
 fn is_inbox(inbox: &InboxId, participant: &str) -> bool {
-    envelope_address(participant).is_ok_and(|address| address.eq_ignore_ascii_case(inbox.as_str()))
+    Mailbox::of(participant).is(inbox.as_str())
+}
+
+/// `participants` without this inbox.
+fn without_inbox(inbox: &InboxId, participants: &[String]) -> Vec<String> {
+    participants
+        .iter()
+        .filter(|participant| !is_inbox(inbox, participant))
+        .cloned()
+        .collect()
 }
 
 /// Prefixes `Re:` unless the subject already carries one.
