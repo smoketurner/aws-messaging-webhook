@@ -45,7 +45,7 @@ sns-message-verifier = { path = "crates/sns-message-verifier" }
 structured-email-address = { version = "=0.0.21", default-features = false }
 subtle = { version = "=2.6.1", default-features = false }
 thiserror = { version = "=2.0.21", default-features = false }
-tokio = { version = "=1.53.2", default-features = false }
+tokio = { version = "=1.54.1", default-features = false }
 tower = { version = "=0.5.3", default-features = false }
 tower-http = { version = "=0.7.1", default-features = false }
 tracing = { version = "=0.1.44", default-features = false }
