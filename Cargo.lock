@@ -267,9 +267,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-pinpointsmsvoicev2"
-version = "1.128.0"
+version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51db5b4a242f0862c6cec038036a3a1b7c1ec7803d255a2cd4b9c53bc7530698"
+checksum = "6962e7082d87d67f1608a06e58019a6ff0eed58335eb80fff968cde1b0f4e700"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -328,9 +328,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sesv2"
-version = "1.140.0"
+version = "1.140.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d6ad3ad31e23871f5b0b1d920698745288e8f4c86afc27fe28aafc7b6e2ee8b"
+checksum = "bf26866eb72be4a43eb1366424e4098567ca621486feec75083b34d1d2b17fee"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -2940,9 +2940,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

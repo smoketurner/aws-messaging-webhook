@@ -18,9 +18,9 @@ aws-config = { version = "=1.12.0", default-features = false }
 aws-messaging-webhook = { path = "crates/webhook" }
 aws-sdk-dynamodb = { version = "=1.130.0", default-features = false }
 aws-sdk-eventbridge = { version = "=1.122.0", default-features = false }
-aws-sdk-pinpointsmsvoicev2 = { version = "=1.128.0", default-features = false }
+aws-sdk-pinpointsmsvoicev2 = { version = "=1.129.0", default-features = false }
 aws-sdk-s3 = { version = "=1.152.0", default-features = false }
-aws-sdk-sesv2 = { version = "=1.140.0", default-features = false }
+aws-sdk-sesv2 = { version = "=1.140.1", default-features = false }
 aws-sdk-ssm = { version = "=1.128.0", default-features = false }
 aws-smithy-types = { version = "=1.8.1", default-features = false }
 aws_lambda_events = { version = "=1.2.0", default-features = false }
@@ -45,7 +45,7 @@ sns-message-verifier = { path = "crates/sns-message-verifier" }
 structured-email-address = { version = "=0.0.21", default-features = false }
 subtle = { version = "=2.6.1", default-features = false }
 thiserror = { version = "=2.0.21", default-features = false }
-tokio = { version = "=1.53.2", default-features = false }
+tokio = { version = "=1.53.3", default-features = false }
 tower = { version = "=0.5.3", default-features = false }
 tower-http = { version = "=0.7.1", default-features = false }
 tracing = { version = "=0.1.44", default-features = false }
