@@ -480,8 +480,8 @@ async fn insert_into_all_targets<T: Services>(
 }
 
 /// Stores this message's content document and inserts its item for one
-/// target inbox: thread resolution, label assignment, the document, then
-/// `insert_message` (`Duplicate` counts as success). The document goes
+/// target inbox: label assignment, the document, then `insert_message`,
+/// which resolves the thread (`Duplicate` counts as success). The document goes
 /// first so an item never exists without it.
 #[expect(
     clippy::too_many_arguments,
@@ -512,9 +512,11 @@ async fn insert_into_inbox<T: Services>(
         .map(|id| strip_angle_brackets(id).to_owned())
         .collect();
     // The message's own `Message-ID` goes first: when this inbox already
-    // holds a message by that id — its own send arriving back, since SES
-    // writes the same id over ours on both copies — the copy joins that
-    // message's thread.
+    // holds a row for that id — its own send arriving back, since SES writes
+    // the same id over ours on both copies, or a placeholder an earlier reply
+    // left for it — the message joins that row's thread. `insert_message`
+    // resolves the thread from these and leaves a placeholder for each
+    // referenced id that no row maps yet.
     let own_id = strip_angle_brackets(&template.rfc_message_id);
     let mut candidates = Vec::new();
     if !own_id.is_empty() {
@@ -525,16 +527,11 @@ async fn insert_into_inbox<T: Services>(
             candidates.push(candidate);
         }
     }
-    let thread_hit = state
-        .services
-        .resolve_rfc_ids(inbox_id, &candidates)
-        .await
-        .map_err(map_store_error)?;
-    let thread_id = thread_hit.map_or_else(|| message_id.to_owned(), |hit| hit.thread_id);
 
     let mut msg = template.clone();
     msg.inbox_id = inbox_id.clone();
-    msg.thread_id = thread_id;
+    // The thread this message starts if no candidate resolves.
+    msg.thread_id = message_id.to_owned();
     msg.message_id = message_id.to_owned();
     msg.ses_message_id = Some(event.mail.message_id.clone());
     msg.labels = message_labels.to_vec();
@@ -555,7 +552,7 @@ async fn insert_into_inbox<T: Services>(
 
     state
         .services
-        .insert_message(&msg)
+        .insert_message(&msg, &candidates)
         .await
         .map(|_outcome| ())
         .map_err(map_store_error)

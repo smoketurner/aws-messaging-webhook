@@ -52,7 +52,7 @@ use aws_messaging_webhook::mail::store::{
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
 use aws_messaging_webhook::mail::thread::ThreadState;
 use aws_messaging_webhook::mail::{
-    Inbox, InboxId, InsertOutcome, MailMessage, ObjectMeta, PutOutcome, RfcHit,
+    Inbox, InboxId, InsertOutcome, MailMessage, ObjectMeta, PutOutcome,
 };
 use aws_messaging_webhook::model::DomainEvent;
 use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
@@ -182,16 +182,12 @@ impl MailStore for FakeServices {
         self.mail.message_exists(inbox, message_id).await
     }
 
-    async fn resolve_rfc_ids(
+    async fn insert_message(
         &self,
-        inbox: &InboxId,
+        msg: &MailMessage,
         candidates: &[String],
-    ) -> Result<Option<RfcHit>, MailStoreError> {
-        self.mail.resolve_rfc_ids(inbox, candidates).await
-    }
-
-    async fn insert_message(&self, msg: &MailMessage) -> Result<InsertOutcome, MailStoreError> {
-        self.mail.insert_message(msg).await
+    ) -> Result<InsertOutcome, MailStoreError> {
+        self.mail.insert_message(msg, candidates).await
     }
 
     async fn get_message(

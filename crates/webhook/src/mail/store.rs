@@ -1,7 +1,7 @@
 //! The mail table store trait: every read and write the mailbox performs.
 //!
 //! Three groups. Ingest (`get_inbox`, `ensure_inbox`, `message_exists`,
-//! `resolve_rfc_ids`, `insert_message`, `get_message`), the read API
+//! `insert_message`, `get_message`), the read API
 //! (`list_inboxes`, `list_messages`, `list_threads`, `get_thread`,
 //! `update_labels`), and sending (`enqueue_send`, `get_send_key`,
 //! `claim_send`, `note_ses_call`, `mark_send`, `get_send_state`,
@@ -17,7 +17,7 @@ use std::future::Future;
 use crate::mail::keys::PageKey;
 use crate::mail::send::{SendFailure, SendKey, SendState, SendStatus};
 use crate::mail::thread::ThreadState;
-use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
+use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage};
 
 /// Default page size when the caller doesn't ask for one.
 pub const DEFAULT_LIMIT: usize = 20;
@@ -139,17 +139,14 @@ pub trait MailStore: Send + Sync {
         message_id: &str,
     ) -> impl Future<Output = Result<bool, MailStoreError>> + Send;
 
-    /// Resolves an `In-Reply-To`/`References` candidate list to the
-    /// thread it belongs to, nearest id first.
-    fn resolve_rfc_ids(
-        &self,
-        inbox: &InboxId,
-        candidates: &[String],
-    ) -> impl Future<Output = Result<Option<RfcHit>, MailStoreError>> + Send;
-
+    /// Inserts an inbound message into the thread its `candidates` resolve
+    /// to (its own `Message-ID`, then `In-Reply-To`, then `References`
+    /// nearest first, angle brackets stripped), or into the new thread
+    /// `msg.thread_id` names when none resolves.
     fn insert_message(
         &self,
         msg: &MailMessage,
+        candidates: &[String],
     ) -> impl Future<Output = Result<InsertOutcome, MailStoreError>> + Send;
 
     fn get_message(

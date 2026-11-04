@@ -9,18 +9,23 @@
 //! request's `Thread` `NotExists` check fails — exactly the post-TTL-deletion
 //! concurrent-reply race the bug report describes. Before the fix both flows
 //! returned `MailStoreError::Permanent` here (a silently dropped mail).
+//!
+//! The same wrapper drives the placeholder race: two replies to a parent the
+//! inbox never received, where the second loses the parent's placeholder and
+//! must join the first one's thread.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::de::DeserializeOwned;
 use webhook_test_support::mail_memory::{MailMemoryStore, sample_message};
 
-use aws_messaging_webhook::mail::InsertOutcome;
 use aws_messaging_webhook::mail::flows::{self, TxnOutcome, TxnStore};
 use aws_messaging_webhook::mail::plan::{self, PlannedOp};
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
-use aws_messaging_webhook::mail::thread::new_thread;
+use aws_messaging_webhook::mail::thread::{AliasLookup, new_thread};
+use aws_messaging_webhook::mail::{InboxId, InsertOutcome, RfcHit};
 
 /// A `TxnStore` wrapper that, on the first `run_txn`, first commits a
 /// competing message's full insert plan against the inner store — simulating a
@@ -41,6 +46,14 @@ impl TxnStore for ConcurrentThreadWinner<'_> {
         sk: &str,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
         self.inner.read_item::<T>(pk, sk)
+    }
+
+    fn read_aliases(
+        &self,
+        inbox: &InboxId,
+        ids: &[String],
+    ) -> impl Future<Output = Result<HashMap<String, RfcHit>, MailStoreError>> + Send {
+        self.inner.read_aliases(inbox, ids)
     }
 
     fn run_txn(
@@ -80,7 +93,8 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
     let r1 = sample_message("support@example.com", "mid-r1", "shared-thread");
     let mut r2 = sample_message("support@example.com", "mid-r2", "shared-thread");
     r2.timestamp = "00000002-0000".to_owned();
-    let competing_plan = plan::plan_insert(&r1, None, &new_thread(&r1)).unwrap();
+    let competing_plan =
+        plan::plan_insert(&r1, None, &new_thread(&r1), &AliasLookup::default()).unwrap();
 
     let store = ConcurrentThreadWinner {
         inner: &store_inner,
@@ -88,7 +102,7 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
         armed: AtomicBool::new(true),
     };
 
-    let outcome = flows::insert_message(&store, &r2).await.unwrap();
+    let outcome = flows::insert_message(&store, &r2, &[]).await.unwrap();
     assert_eq!(outcome, InsertOutcome::Fresh);
 
     // The losing reply landed, and the resurrecting reply did too — the race
@@ -132,7 +146,8 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
     r2.direction = aws_messaging_webhook::mail::Direction::Outbound;
     r2.labels = vec!["queued".to_owned()];
     r2.timestamp = "00000002-0000".to_owned();
-    let competing_plan = plan::plan_insert(&r1, None, &new_thread(&r1)).unwrap();
+    let competing_plan =
+        plan::plan_insert(&r1, None, &new_thread(&r1), &AliasLookup::default()).unwrap();
 
     let state = SendState::queued(
         r2.inbox_id.clone(),
@@ -167,5 +182,62 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
             .message_exists(&r1.inbox_id, "mid-r1")
             .await
             .unwrap()
+    );
+}
+
+/// Two replies to a parent this inbox never received, arriving together:
+/// both read no row for the parent and plan a placeholder for it. The one
+/// that commits second loses the placeholder check and must re-read, find the
+/// winner's placeholder, and join the winner's thread rather than commit
+/// into a thread of its own.
+#[tokio::test]
+async fn insert_message_joins_the_thread_of_a_sibling_that_won_the_placeholder() {
+    let store_inner = MailMemoryStore::default();
+    let parent = "parent@example.com".to_owned();
+
+    let r1 = sample_message("support@example.com", "mid-r1", "mid-r1");
+    let r1_aliases = AliasLookup {
+        candidates: vec!["mid-r1@example.com".to_owned(), parent.clone()],
+        found: HashMap::new(),
+    };
+    let competing_plan = plan::plan_insert(&r1, None, &new_thread(&r1), &r1_aliases).unwrap();
+
+    let mut r2 = sample_message("support@example.com", "mid-r2", "mid-r2");
+    r2.timestamp = "00000002-0000".to_owned();
+
+    let store = ConcurrentThreadWinner {
+        inner: &store_inner,
+        competing_plan,
+        armed: AtomicBool::new(true),
+    };
+    let outcome = flows::insert_message(
+        &store,
+        &r2,
+        &["mid-r2@example.com".to_owned(), parent.clone()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, InsertOutcome::Fresh);
+
+    let stored = store_inner
+        .get_message(&r2.inbox_id, "mid-r2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.thread_id, "mid-r1");
+
+    let thread = store_inner
+        .get_thread(&r2.inbox_id, "mid-r1", 100, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.messages.items.len(), 2);
+    assert!(
+        store_inner
+            .get_thread(&r2.inbox_id, "mid-r2", 100, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "the loser must not leave a thread of its own"
     );
 }

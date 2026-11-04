@@ -67,7 +67,7 @@ async fn seed_in(
     let mut msg = sample_message(INBOX, &id, "t1");
     AT.clone_into(&mut msg.timestamp);
     adjust(&mut msg);
-    h.state.services.insert_message(&msg).await.unwrap();
+    h.state.services.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

@@ -59,7 +59,7 @@ async fn insert(h: &Harness, at: &str, thread: &str, adjust: impl FnOnce(&mut Ma
     msg.created_at = at.to_owned();
     msg.updated_at = at.to_owned();
     adjust(&mut msg);
-    h.state.services.insert_message(&msg).await.unwrap();
+    h.state.services.insert_message(&msg, &[]).await.unwrap();
 }
 
 type MailMessageOwned = aws_messaging_webhook::mail::MailMessage;

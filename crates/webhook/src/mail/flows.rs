@@ -13,6 +13,7 @@
 //! apart on retry counts, conflict handling or which read conditions which
 //! write.
 
+use std::collections::HashMap;
 use std::future::Future;
 
 use serde::de::DeserializeOwned;
@@ -20,9 +21,9 @@ use serde::de::DeserializeOwned;
 use crate::mail::plan::{self, PlannedOp};
 use crate::mail::send::{SendKey, SendState, SendStatus, label_changes};
 use crate::mail::store::{EnqueueOutcome, MailStoreError, MarkOutcome};
-use crate::mail::thread::{ThreadState, apply_label_patch, apply_message, new_thread};
+use crate::mail::thread::{AliasLookup, ThreadState, apply_label_patch, apply_message, new_thread};
 use crate::mail::txn::{TxnDecision, drop_taken_aliases};
-use crate::mail::{InboxId, InsertOutcome, MailMessage, keys};
+use crate::mail::{InboxId, InsertOutcome, MailMessage, RfcHit, keys};
 
 /// How many times a cancelled transaction is replanned before the caller is
 /// told the write conflicted.
@@ -52,6 +53,19 @@ pub trait TxnStore {
         pk: &str,
         sk: &str,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send;
+
+    /// Reads the RFC alias rows for `ids` (angle brackets already
+    /// stripped), consistently, keyed by id. An id with no row is absent
+    /// from the map.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's own error for a failed read.
+    fn read_aliases(
+        &self,
+        inbox: &InboxId,
+        ids: &[String],
+    ) -> impl Future<Output = Result<HashMap<String, RfcHit>, MailStoreError>> + Send;
 
     /// Runs one transaction attempt.
     ///
@@ -111,6 +125,13 @@ fn thread_for(msg: &MailMessage, before: Option<&ThreadState>) -> ThreadState {
 
 /// Inserts an inbound message with its thread and `Message-ID` aliases.
 ///
+/// Every attempt resolves the thread afresh from the alias rows for
+/// `candidates`: the first candidate with a row names the thread, and with
+/// none the message starts the thread `msg.thread_id` names. Losing an
+/// alias check means another message just wrote that row, possibly a
+/// placeholder pointing into a thread this message belongs in, so the
+/// attempt is replanned from a new read rather than committed without it.
+///
 /// # Errors
 ///
 /// [`MailStoreError::Conflict`] when the retries are exhausted, or the
@@ -119,14 +140,21 @@ fn thread_for(msg: &MailMessage, before: Option<&ThreadState>) -> ThreadState {
 pub async fn insert_message<S: TxnStore>(
     store: &S,
     msg: &MailMessage,
+    candidates: &[String],
 ) -> Result<InsertOutcome, MailStoreError> {
-    let mut taken = Vec::new();
+    let new_thread_id = msg.thread_id.clone();
+    let mut msg = msg.clone();
     for attempt in 0..=MAX_TXN_RETRIES {
-        let thread_before = read_thread(store, &msg.inbox_id, &msg.thread_id).await?;
-        let thread_after = thread_for(msg, thread_before.as_ref());
+        let aliases = AliasLookup {
+            candidates: candidates.to_vec(),
+            found: store.read_aliases(&msg.inbox_id, candidates).await?,
+        };
+        msg.thread_id = aliases.thread_id().unwrap_or(&new_thread_id).to_owned();
 
-        let mut ops = plan::plan_insert(msg, thread_before.as_ref(), &thread_after)?;
-        drop_taken_aliases(&mut ops, &taken);
+        let thread_before = read_thread(store, &msg.inbox_id, &msg.thread_id).await?;
+        let thread_after = thread_for(&msg, thread_before.as_ref());
+
+        let ops = plan::plan_insert(&msg, thread_before.as_ref(), &thread_after, &aliases)?;
 
         match store.run_txn(&ops).await? {
             TxnOutcome::Committed => return Ok(InsertOutcome::Fresh),
@@ -134,7 +162,7 @@ pub async fn insert_message<S: TxnStore>(
             TxnOutcome::Cancelled(TxnDecision::Retry | TxnDecision::VersionConflict) => {
                 store.pause(attempt).await;
             }
-            TxnOutcome::Cancelled(TxnDecision::AliasTaken(keys)) => taken.extend(keys),
+            TxnOutcome::Cancelled(TxnDecision::AliasTaken(_)) => {}
             TxnOutcome::Cancelled(TxnDecision::Permanent | TxnDecision::KeyExists) => {
                 return Err(MailStoreError::Permanent(anyhow::anyhow!(
                     "ingest transaction for message {} was cancelled",

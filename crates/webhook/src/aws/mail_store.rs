@@ -366,7 +366,14 @@ fn to_transact_item(table_name: &str, op: &WriteOp) -> Result<TransactWriteItem,
             message_id,
             thread_id,
             expires_at,
-        } => alias_transact_item(table_name, pk, sk, message_id, thread_id, *expires_at),
+        } => alias_transact_item(
+            table_name,
+            pk,
+            sk,
+            message_id.as_deref(),
+            thread_id,
+            *expires_at,
+        ),
     }
 }
 
@@ -457,18 +464,25 @@ fn alias_transact_item(
     table_name: &str,
     pk: &str,
     sk: &str,
-    message_id: &str,
+    message_id: Option<&str>,
     thread_id: &str,
     expires_at: u64,
 ) -> Result<TransactWriteItem, MailStoreError> {
-    let put = Put::builder()
+    let mut put = Put::builder()
         .table_name(table_name)
         .item("pk", DynamoAv::S(pk.to_owned()))
         .item("sk", DynamoAv::S(sk.to_owned()))
-        .item("message_id", DynamoAv::S(message_id.to_owned()))
         .item("thread_id", DynamoAv::S(thread_id.to_owned()))
-        .item("expires_at", DynamoAv::N(expires_at.to_string()))
-        .condition_expression("attribute_not_exists(pk)")
+        .item("expires_at", DynamoAv::N(expires_at.to_string()));
+    put = match message_id {
+        // A real alias takes over a placeholder (a row with no message id)
+        // but never another message's alias.
+        Some(message_id) => put
+            .item("message_id", DynamoAv::S(message_id.to_owned()))
+            .condition_expression("attribute_not_exists(pk) OR attribute_not_exists(message_id)"),
+        None => put.condition_expression("attribute_not_exists(pk)"),
+    };
+    let put = put
         .build()
         .map_err(|e| MailStoreError::Permanent(anyhow!("building alias Put: {e}")))?;
     Ok(TransactWriteItem::builder().put(put).build())
@@ -549,6 +563,100 @@ impl flows::TxnStore for AwsServices {
                     .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing item: {e}")))
             })
             .transpose()
+    }
+
+    async fn read_aliases(
+        &self,
+        inbox: &InboxId,
+        ids: &[String],
+    ) -> Result<HashMap<String, RfcHit>, MailStoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let table_name = self.mail_table_name()?.to_owned();
+
+        let mut pending_keys: Vec<HashMap<String, DynamoAv>> = ids
+            .iter()
+            .map(|id| {
+                HashMap::from([
+                    (
+                        "pk".to_owned(),
+                        DynamoAv::S(keys::rfc_alias_pk(inbox.as_str(), id)),
+                    ),
+                    (
+                        "sk".to_owned(),
+                        DynamoAv::S(keys::rfc_alias_sk().to_owned()),
+                    ),
+                ])
+            })
+            .collect();
+
+        let mut found: HashMap<String, RfcHit> = HashMap::new();
+        let mut attempts = 0u32;
+        while !pending_keys.is_empty() {
+            if attempts >= MAX_BATCH_GET_ATTEMPTS {
+                return Err(MailStoreError::Transient(anyhow!(
+                    "read_aliases: BatchGetItem left unprocessed keys after {MAX_BATCH_GET_ATTEMPTS} attempts"
+                )));
+            }
+            if attempts > 0 {
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempts))).await;
+            }
+            attempts += 1;
+
+            // Consistent: the transaction planned from this read writes a
+            // placeholder for every id it misses, conditioned on the row
+            // being absent, so a stale miss is a cancelled attempt.
+            let request_items = KeysAndAttributes::builder()
+                .set_keys(Some(pending_keys.clone()))
+                .consistent_read(true)
+                .build()
+                .map_err(|e| {
+                    MailStoreError::Permanent(anyhow!("building KeysAndAttributes: {e}"))
+                })?;
+            let output = self
+                .dynamo
+                .batch_get_item()
+                .request_items(table_name.clone(), request_items)
+                .send()
+                .await
+                .map_err(|e| store_error_from_sdk("BatchGetItem(rfc_alias)", &e))?;
+
+            if let Some(mut responses) = output.responses
+                && let Some(items) = responses.remove(&table_name)
+            {
+                for item in items {
+                    let Some(pk) = item_attribute_string(&item, "pk") else {
+                        continue;
+                    };
+                    let message_id = item_attribute_string(&item, "message_id");
+                    let Some(thread_id) = item_attribute_string(&item, "thread_id") else {
+                        continue;
+                    };
+                    found.insert(
+                        pk,
+                        RfcHit {
+                            message_id,
+                            thread_id,
+                        },
+                    );
+                }
+            }
+
+            pending_keys = output
+                .unprocessed_keys
+                .and_then(|mut m| m.remove(&table_name))
+                .map(|attrs| attrs.keys().to_vec())
+                .unwrap_or_default();
+        }
+
+        let mut by_id = HashMap::with_capacity(found.len());
+        for id in ids {
+            if let Some(hit) = found.remove(&keys::rfc_alias_pk(inbox.as_str(), id)) {
+                by_id.insert(id.clone(), hit);
+            }
+        }
+        Ok(by_id)
     }
 
     async fn run_txn(&self, ops: &[PlannedOp]) -> Result<flows::TxnOutcome, MailStoreError> {
@@ -647,98 +755,12 @@ impl MailStore for AwsServices {
         Ok(output.item.is_some())
     }
 
-    async fn resolve_rfc_ids(
+    async fn insert_message(
         &self,
-        inbox: &InboxId,
+        msg: &MailMessage,
         candidates: &[String],
-    ) -> Result<Option<RfcHit>, MailStoreError> {
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-        let table_name = self.mail_table_name()?.to_owned();
-
-        let mut pending_keys: Vec<HashMap<String, DynamoAv>> = candidates
-            .iter()
-            .map(|candidate| {
-                HashMap::from([
-                    (
-                        "pk".to_owned(),
-                        DynamoAv::S(keys::rfc_alias_pk(inbox.as_str(), candidate)),
-                    ),
-                    (
-                        "sk".to_owned(),
-                        DynamoAv::S(keys::rfc_alias_sk().to_owned()),
-                    ),
-                ])
-            })
-            .collect();
-
-        let mut found: HashMap<String, RfcHit> = HashMap::new();
-        let mut attempts = 0u32;
-        while !pending_keys.is_empty() {
-            if attempts >= MAX_BATCH_GET_ATTEMPTS {
-                return Err(MailStoreError::Transient(anyhow!(
-                    "resolve_rfc_ids: BatchGetItem left unprocessed keys after {MAX_BATCH_GET_ATTEMPTS} attempts"
-                )));
-            }
-            if attempts > 0 {
-                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempts))).await;
-            }
-            attempts += 1;
-
-            let request_items = KeysAndAttributes::builder()
-                .set_keys(Some(pending_keys.clone()))
-                .consistent_read(true)
-                .build()
-                .map_err(|e| {
-                    MailStoreError::Permanent(anyhow!("building KeysAndAttributes: {e}"))
-                })?;
-            let output = self
-                .dynamo
-                .batch_get_item()
-                .request_items(table_name.clone(), request_items)
-                .send()
-                .await
-                .map_err(|e| store_error_from_sdk("BatchGetItem(rfc_alias)", &e))?;
-
-            if let Some(mut responses) = output.responses
-                && let Some(items) = responses.remove(&table_name)
-            {
-                for item in items {
-                    let Some(pk) = item_attribute_string(&item, "pk") else {
-                        continue;
-                    };
-                    let Some(message_id) = item_attribute_string(&item, "message_id") else {
-                        continue;
-                    };
-                    let Some(thread_id) = item_attribute_string(&item, "thread_id") else {
-                        continue;
-                    };
-                    found.insert(
-                        pk,
-                        RfcHit {
-                            message_id,
-                            thread_id,
-                        },
-                    );
-                }
-            }
-
-            pending_keys = output
-                .unprocessed_keys
-                .and_then(|mut m| m.remove(&table_name))
-                .map(|attrs| attrs.keys().to_vec())
-                .unwrap_or_default();
-        }
-
-        Ok(candidates
-            .iter()
-            .find_map(|candidate| found.get(&keys::rfc_alias_pk(inbox.as_str(), candidate)))
-            .cloned())
-    }
-
-    async fn insert_message(&self, msg: &MailMessage) -> Result<InsertOutcome, MailStoreError> {
-        flows::insert_message(self, msg).await
+    ) -> Result<InsertOutcome, MailStoreError> {
+        flows::insert_message(self, msg, candidates).await
     }
 
     async fn get_message(
@@ -1016,6 +1038,44 @@ fn assemble_thread_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alias_put(message_id: Option<&str>) -> aws_sdk_dynamodb::types::Put {
+        let op = WriteOp::AliasFirstWriter {
+            pk: "RFC#support@example.com#a@example.com".to_owned(),
+            sk: "RFC".to_owned(),
+            message_id: message_id.map(str::to_owned),
+            thread_id: "tid-1".to_owned(),
+            expires_at: 1_900_000_000,
+        };
+        to_transact_item("mail", &op)
+            .unwrap()
+            .put
+            .expect("an alias renders as a Put")
+    }
+
+    #[test]
+    fn a_real_alias_may_land_on_a_placeholder_but_not_on_another_alias() {
+        let put = alias_put(Some("mid-1"));
+        assert_eq!(
+            put.condition_expression(),
+            Some("attribute_not_exists(pk) OR attribute_not_exists(message_id)")
+        );
+        assert_eq!(
+            put.item().get("message_id"),
+            Some(&DynamoAv::S("mid-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_placeholder_lands_only_where_no_row_exists_and_carries_no_message_id() {
+        let put = alias_put(None);
+        assert_eq!(put.condition_expression(), Some("attribute_not_exists(pk)"));
+        assert!(!put.item().contains_key("message_id"));
+        assert_eq!(
+            put.item().get("thread_id"),
+            Some(&DynamoAv::S("tid-1".to_owned()))
+        );
+    }
 
     /// Every declared placeholder must appear in the expression, and every
     /// placeholder in the expression must be declared.

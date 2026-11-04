@@ -9,7 +9,7 @@ The mail table (output `MailTableName`) is keyed by inbox and message.
 | Inbox | `INBOX#<inbox>` | `META` | Address, display name, metadata, timestamps |
 | Message | `INBOX#<inbox>` | `MSG#<messageId>` | Addresses, subject, preview, labels, attachment metadata, send status |
 | Thread | `INBOX#<inbox>` | `THR#<threadId>` | Rolled-up subject, preview, senders, recipients, labels, counts |
-| RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | Maps a `Message-ID` to its message and thread |
+| RFC alias | `RFC#<inbox>#<rfc-id>` | `RFC` | Maps a `Message-ID` to its message and thread, or a referenced id with no message yet (a placeholder) to the thread that referenced it |
 | Send state | `OUTBOX#<messageId>` | `STATE` | Send status, envelope, claim and failure details |
 | Send key | `SENDKEY#<sha256>` | `KEY` | What an `Idempotency-Key` resolves to |
 | SES reference | `SESMSG#<sesMessageId>` | `REF` | Maps an SES message id to a mailbox message |

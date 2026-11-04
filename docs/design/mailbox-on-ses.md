@@ -125,6 +125,15 @@ stays correct.
 (nearest first) against known aliases. No match starts a new thread. There is no subject
 matching, because wrongly joining threads is worse than splitting one.
 
+Each referenced id that no alias maps yet gets a placeholder alias pointing at the message's
+thread, the same role as the empty containers in Jamie Zawinski's
+[threading algorithm](https://www.jwz.org/doc/threading.html). A reply that arrives before its
+parent, and replies to a parent this inbox never received, therefore share one thread: the
+parent's own `Message-ID` and its other replies' references find the placeholder. When the
+parent arrives, its real alias replaces the placeholder. A placeholder is written only where no
+row exists. A message that loses that race re-reads the aliases and joins the thread that won.
+Two threads that a later message links stay separate.
+
 SES replaces a sent message's `Message-ID` with its own. When a send succeeds, both SES forms
 (`<id@email.amazonses.com>` and the regional form) become aliases, so replies thread correctly.
 
