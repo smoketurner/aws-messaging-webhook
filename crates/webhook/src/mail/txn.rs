@@ -24,7 +24,9 @@ pub enum TxnDecision {
     VersionConflict,
     /// Only `Message-ID` alias writes lost their check: these aliases
     /// already belong to an earlier message. The first writer keeps an
-    /// alias, so the caller drops these and commits the rest.
+    /// alias, so the caller drops these and commits the rest — or, on
+    /// ingest, re-reads them, since a row it just lost may move the
+    /// message into another thread.
     AliasTaken(Vec<String>),
     /// Anything else: log and surface as a permanent failure.
     Permanent,
@@ -233,7 +235,7 @@ mod tests {
             WriteOp::AliasFirstWriter {
                 pk: pk.to_owned(),
                 sk: "RFC".to_owned(),
-                message_id: "mid-2".to_owned(),
+                message_id: Some("mid-2".to_owned()),
                 thread_id: "tid-2".to_owned(),
                 expires_at: 0,
             },

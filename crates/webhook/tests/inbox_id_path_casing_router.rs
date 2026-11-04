@@ -58,7 +58,7 @@ async fn seeded() -> (Harness, String) {
     AT.clone_into(&mut msg.timestamp);
     AT.clone_into(&mut msg.created_at);
     AT.clone_into(&mut msg.updated_at);
-    h.state.services.insert_message(&msg).await.unwrap();
+    h.state.services.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

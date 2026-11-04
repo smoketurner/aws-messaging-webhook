@@ -70,7 +70,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     "Order 42".clone_into(&mut msg.subject);
     "<original@example.net>".clone_into(&mut msg.rfc_message_id);
     adjust(&mut msg);
-    h.state.services.insert_message(&msg).await.unwrap();
+    h.state.services.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

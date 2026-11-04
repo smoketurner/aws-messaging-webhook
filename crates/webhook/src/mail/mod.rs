@@ -138,10 +138,13 @@ pub struct Inbox {
     pub updated_at: String,
 }
 
-/// A first-writer-wins RFC alias hit: the message the alias points to.
+/// A first-writer-wins RFC alias hit: the thread the alias points to, and
+/// the message too unless the row is a placeholder for an id that was only
+/// referenced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RfcHit {
-    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub thread_id: String,
 }
 

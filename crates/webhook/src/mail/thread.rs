@@ -4,13 +4,14 @@
 //! version-conditioned, in the same transaction as whatever changed it, so
 //! two messages arriving at once cannot each overwrite the other's effect.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use crate::mail::address::same_mailbox;
 use crate::mail::{
-    AttachmentMeta, Direction, InboxId, MailMessage, THREAD_ATTACHMENT_SUMMARIES, ThreadSnapshot,
+    AttachmentMeta, Direction, InboxId, MailMessage, RfcHit, THREAD_ATTACHMENT_SUMMARIES,
+    ThreadSnapshot,
 };
 
 /// The maximum candidate ids [`candidate_ids`] returns.
@@ -101,6 +102,35 @@ pub fn candidate_ids(in_reply_to: Option<&str>, references: &[String]) -> Vec<St
     }
     ids.truncate(CANDIDATE_ID_CAP);
     ids
+}
+
+/// A message's candidate ids, in lookup order, and the alias rows a
+/// consistent read found for them, keyed by candidate id.
+#[derive(Debug, Clone, Default)]
+pub struct AliasLookup {
+    pub candidates: Vec<String>,
+    pub found: HashMap<String, RfcHit>,
+}
+
+impl AliasLookup {
+    /// The thread the first candidate with a row belongs to. A placeholder
+    /// counts: it records a thread that already referenced the id.
+    #[must_use]
+    pub fn thread_id(&self) -> Option<&str> {
+        self.candidates
+            .iter()
+            .find_map(|candidate| self.found.get(candidate))
+            .map(|hit| hit.thread_id.as_str())
+    }
+
+    /// Whether a real alias for `id` may be written: no row maps it yet, or
+    /// only a placeholder does.
+    #[must_use]
+    pub fn is_claimable(&self, id: &str) -> bool {
+        self.found
+            .get(id)
+            .is_none_or(|hit| hit.message_id.is_none())
+    }
 }
 
 /// Builds the sorted, deduplicated union of `existing` and `label`,
@@ -350,6 +380,40 @@ mod tests {
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
             expires_at: 0,
         }
+    }
+
+    fn hit(message_id: Option<&str>, thread_id: &str) -> RfcHit {
+        RfcHit {
+            message_id: message_id.map(str::to_owned),
+            thread_id: thread_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn alias_lookup_takes_the_first_candidate_with_a_row_placeholders_included() {
+        let lookup = AliasLookup {
+            candidates: vec!["own".to_owned(), "parent".to_owned(), "root".to_owned()],
+            found: HashMap::from([
+                ("parent".to_owned(), hit(None, "t-parent")),
+                ("root".to_owned(), hit(Some("m-root"), "t-root")),
+            ]),
+        };
+        assert_eq!(lookup.thread_id(), Some("t-parent"));
+        assert_eq!(AliasLookup::default().thread_id(), None);
+    }
+
+    #[test]
+    fn alias_lookup_lets_a_real_alias_claim_only_a_missing_or_placeholder_row() {
+        let lookup = AliasLookup {
+            candidates: Vec::new(),
+            found: HashMap::from([
+                ("placeholder".to_owned(), hit(None, "t1")),
+                ("real".to_owned(), hit(Some("m1"), "t1")),
+            ]),
+        };
+        assert!(lookup.is_claimable("missing"));
+        assert!(lookup.is_claimable("placeholder"));
+        assert!(!lookup.is_claimable("real"));
     }
 
     #[test]

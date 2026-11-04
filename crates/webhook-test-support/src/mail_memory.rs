@@ -266,10 +266,12 @@ impl MailMemoryStore {
                     "expires_at".to_owned(),
                     AttributeValue::N(expires_at.to_string()),
                 );
-                item.inner_mut().insert(
-                    "message_id".to_owned(),
-                    AttributeValue::S(message_id.clone()),
-                );
+                if let Some(message_id) = message_id {
+                    item.inner_mut().insert(
+                        "message_id".to_owned(),
+                        AttributeValue::S(message_id.clone()),
+                    );
+                }
                 item.inner_mut()
                     .insert("thread_id".to_owned(), AttributeValue::S(thread_id.clone()));
                 items.insert(Self::key(pk, sk), item);
@@ -302,10 +304,21 @@ impl MailMemoryStore {
             };
         }
 
-        let cond_of = |op: &WriteOp| -> Cond {
+        let holds = |items: &HashMap<(String, String), Item>, op: &WriteOp, pk: &str, sk: &str| {
             match op {
-                WriteOp::Put { cond, .. } | WriteOp::Update { cond, .. } => cond.clone(),
-                WriteOp::AliasFirstWriter { .. } => Cond::NotExists,
+                WriteOp::Put { cond, .. } | WriteOp::Update { cond, .. } => {
+                    Self::eval_cond(items, pk, sk, cond)
+                }
+                // `attribute_not_exists(pk)` for a placeholder; a real alias
+                // also lands on a row without a `message_id`.
+                WriteOp::AliasFirstWriter { message_id, .. } => {
+                    match items.get(&Self::key(pk, sk)) {
+                        None => true,
+                        Some(existing) => {
+                            message_id.is_some() && !existing.inner().contains_key("message_id")
+                        }
+                    }
+                }
             }
         };
 
@@ -316,8 +329,7 @@ impl MailMemoryStore {
                 reasons.push(CancellationReason::None);
                 continue;
             };
-            let cond = cond_of(&planned.op);
-            if Self::eval_cond(&guard.items, &pk, &sk, &cond) {
+            if holds(&guard.items, &planned.op, &pk, &sk) {
                 reasons.push(CancellationReason::None);
             } else {
                 all_ok = false;
@@ -449,6 +461,34 @@ impl flows::TxnStore for MailMemoryStore {
         std::future::ready(result)
     }
 
+    fn read_aliases(
+        &self,
+        inbox: &InboxId,
+        ids: &[String],
+    ) -> impl Future<Output = Result<HashMap<String, RfcHit>, MailStoreError>> + Send {
+        use aws_messaging_webhook::mail::keys;
+        let mut found = HashMap::new();
+        for id in ids {
+            let Some(item) = self.get_item(
+                &keys::rfc_alias_pk(inbox.as_str(), id),
+                keys::rfc_alias_sk(),
+            ) else {
+                continue;
+            };
+            let Some(thread_id) = Self::string_attr(&item, "thread_id") else {
+                continue;
+            };
+            found.insert(
+                id.clone(),
+                RfcHit {
+                    message_id: Self::string_attr(&item, "message_id"),
+                    thread_id,
+                },
+            );
+        }
+        std::future::ready(Ok(found))
+    }
+
     fn run_txn(
         &self,
         ops: &[PlannedOp],
@@ -519,32 +559,12 @@ impl MailStore for MailMemoryStore {
         std::future::ready(Ok(exists))
     }
 
-    fn resolve_rfc_ids(
-        &self,
-        inbox: &InboxId,
-        candidates: &[String],
-    ) -> impl Future<Output = Result<Option<RfcHit>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let hit = candidates.iter().find_map(|candidate| {
-            let item = self.get_item(
-                &keys::rfc_alias_pk(inbox.as_str(), candidate),
-                keys::rfc_alias_sk(),
-            )?;
-            let message_id = Self::string_attr(&item, "message_id")?;
-            let thread_id = Self::string_attr(&item, "thread_id")?;
-            Some(RfcHit {
-                message_id,
-                thread_id,
-            })
-        });
-        std::future::ready(Ok(hit))
-    }
-
     fn insert_message(
         &self,
         msg: &MailMessage,
+        candidates: &[String],
     ) -> impl Future<Output = Result<InsertOutcome, MailStoreError>> + Send {
-        flows::insert_message(self, msg)
+        flows::insert_message(self, msg, candidates)
     }
 
     fn get_send_key(
@@ -805,34 +825,181 @@ mod tests {
         let store = MailMemoryStore::default();
         let msg = message("mid-1", "mid-1");
 
-        let outcome = store.insert_message(&msg).await.unwrap();
+        let outcome = store.insert_message(&msg, &[]).await.unwrap();
         assert_eq!(outcome, InsertOutcome::Fresh);
         assert!(store.message_exists(&msg.inbox_id, "mid-1").await.unwrap());
 
-        let redelivered = store.insert_message(&msg).await.unwrap();
+        let redelivered = store.insert_message(&msg, &[]).await.unwrap();
         assert_eq!(redelivered, InsertOutcome::Duplicate);
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_owned()).collect()
+    }
+
+    fn alias_row(store: &MailMemoryStore, id: &str) -> Option<RfcHit> {
+        use aws_messaging_webhook::mail::keys;
+        let item = store.get_item(
+            &keys::rfc_alias_pk("support@example.com", id),
+            keys::rfc_alias_sk(),
+        )?;
+        Some(RfcHit {
+            message_id: MailMemoryStore::string_attr(&item, "message_id"),
+            thread_id: MailMemoryStore::string_attr(&item, "thread_id")?,
+        })
     }
 
     #[tokio::test]
     async fn insert_message_into_an_existing_thread_updates_it_and_resolves_by_rfc_id() {
         let store = MailMemoryStore::default();
         let first = message("mid-1", "mid-1");
-        store.insert_message(&first).await.unwrap();
+        store
+            .insert_message(&first, &ids(&["mid-1@example.com"]))
+            .await
+            .unwrap();
 
-        let mut second = message("mid-2", "mid-1");
+        let mut second = message("mid-2", "mid-2");
         second.in_reply_to = Some("mid-1@example.com".to_owned());
+        let outcome = store
+            .insert_message(&second, &ids(&["mid-2@example.com", "mid-1@example.com"]))
+            .await
+            .unwrap();
+        assert_eq!(outcome, InsertOutcome::Fresh);
 
-        let candidates =
-            aws_messaging_webhook::mail::thread::candidate_ids(second.in_reply_to.as_deref(), &[]);
-        let hit = store
-            .resolve_rfc_ids(&second.inbox_id, &candidates)
+        let stored = store
+            .get_message(&second.inbox_id, "mid-2")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(hit.thread_id, "mid-1");
+        assert_eq!(stored.thread_id, "mid-1");
+    }
 
-        let outcome = store.insert_message(&second).await.unwrap();
-        assert_eq!(outcome, InsertOutcome::Fresh);
+    #[tokio::test]
+    async fn an_unresolved_reference_leaves_a_placeholder_in_the_new_thread() {
+        let store = MailMemoryStore::default();
+        let reply = message("mid-2", "mid-2");
+        store
+            .insert_message(&reply, &ids(&["mid-2@example.com", "parent@example.com"]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alias_row(&store, "parent@example.com"),
+            Some(RfcHit {
+                message_id: None,
+                thread_id: "mid-2".to_owned(),
+            })
+        );
+        assert_eq!(
+            alias_row(&store, "mid-2@example.com"),
+            Some(RfcHit {
+                message_id: Some("mid-2".to_owned()),
+                thread_id: "mid-2".to_owned(),
+            })
+        );
+    }
+
+    /// The parent arriving after its reply joins the reply's thread through
+    /// the placeholder, and takes the placeholder's row over.
+    #[tokio::test]
+    async fn a_late_parent_joins_its_replys_thread_and_claims_the_placeholder() {
+        let store = MailMemoryStore::default();
+        store
+            .insert_message(
+                &message("mid-2", "mid-2"),
+                &ids(&["mid-2@example.com", "parent@example.com"]),
+            )
+            .await
+            .unwrap();
+
+        let mut parent = message("mid-1", "mid-1");
+        parent.rfc_message_id = "<parent@example.com>".to_owned();
+        store
+            .insert_message(&parent, &ids(&["parent@example.com"]))
+            .await
+            .unwrap();
+
+        let stored = store
+            .get_message(&parent.inbox_id, "mid-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.thread_id, "mid-2");
+        assert_eq!(
+            alias_row(&store, "parent@example.com"),
+            Some(RfcHit {
+                message_id: Some("mid-1".to_owned()),
+                thread_id: "mid-2".to_owned(),
+            })
+        );
+    }
+
+    /// A second message carrying an id another message's alias already holds
+    /// joins that thread but leaves the row alone.
+    #[tokio::test]
+    async fn a_real_alias_is_never_replaced() {
+        let store = MailMemoryStore::default();
+        store
+            .insert_message(&message("mid-1", "mid-1"), &ids(&["mid-1@example.com"]))
+            .await
+            .unwrap();
+
+        let mut copy = message("mid-2", "mid-2");
+        copy.rfc_message_id = "<mid-1@example.com>".to_owned();
+        store
+            .insert_message(&copy, &ids(&["mid-1@example.com"]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alias_row(&store, "mid-1@example.com"),
+            Some(RfcHit {
+                message_id: Some("mid-1".to_owned()),
+                thread_id: "mid-1".to_owned(),
+            })
+        );
+    }
+
+    fn alias_op(id: &str, message_id: Option<&str>, thread_id: &str) -> PlannedOp {
+        use aws_messaging_webhook::mail::keys;
+        use aws_messaging_webhook::mail::plan::OpRole;
+        PlannedOp {
+            role: OpRole::RfcAlias,
+            op: WriteOp::AliasFirstWriter {
+                pk: keys::rfc_alias_pk("support@example.com", id),
+                sk: keys::rfc_alias_sk().to_owned(),
+                message_id: message_id.map(str::to_owned),
+                thread_id: thread_id.to_owned(),
+                expires_at: 0,
+            },
+        }
+    }
+
+    /// The alias conditions themselves: a placeholder lands only where no
+    /// row exists, and a real alias also where only a placeholder does.
+    #[test]
+    fn alias_conditions_match_the_real_store() {
+        let store = MailMemoryStore::default();
+        let committed =
+            |op: PlannedOp| matches!(store.attempt(&[op]).unwrap(), flows::TxnOutcome::Committed);
+
+        assert!(committed(alias_op("a@example.com", None, "t1")));
+        assert!(
+            !committed(alias_op("a@example.com", None, "t2")),
+            "a placeholder never replaces a placeholder"
+        );
+        assert!(
+            committed(alias_op("a@example.com", Some("m1"), "t1")),
+            "a real alias takes over a placeholder"
+        );
+        assert!(
+            !committed(alias_op("a@example.com", Some("m2"), "t1")),
+            "a real alias never replaces a real alias"
+        );
+        assert!(
+            !committed(alias_op("a@example.com", None, "t1")),
+            "a placeholder never replaces a real alias"
+        );
     }
 
     #[tokio::test]
@@ -840,7 +1007,7 @@ mod tests {
         let store = MailMemoryStore::default();
         store.inject(Injected::Conflict);
         let msg = message("mid-1", "mid-1");
-        let outcome = store.insert_message(&msg).await.unwrap();
+        let outcome = store.insert_message(&msg, &[]).await.unwrap();
         assert_eq!(outcome, InsertOutcome::Fresh);
     }
 
@@ -849,7 +1016,7 @@ mod tests {
         let store = MailMemoryStore::default();
         store.inject(Injected::Transient);
         let msg = message("mid-1", "mid-1");
-        let err = store.insert_message(&msg).await.unwrap_err();
+        let err = store.insert_message(&msg, &[]).await.unwrap_err();
         assert!(matches!(err, MailStoreError::Transient(_)));
     }
 
@@ -921,7 +1088,7 @@ mod tests {
         let mut msg = message("mid-1", "mid-1");
         msg.labels = vec!["received".to_owned(), "unread".to_owned()];
         let inbox = msg.inbox_id.clone();
-        store.insert_message(&msg).await.unwrap();
+        store.insert_message(&msg, &[]).await.unwrap();
         let before = store.get_message(&inbox, "mid-1").await.unwrap().unwrap();
 
         let labels = store
@@ -952,7 +1119,7 @@ mod tests {
         let store = MailMemoryStore::default();
         let inbox = InboxId("support@example.com".to_owned());
         for id in ["mid-1", "mid-2"] {
-            store.insert_message(&message(id, id)).await.unwrap();
+            store.insert_message(&message(id, id), &[]).await.unwrap();
         }
 
         let query = |start: Option<PageKey>| ListQuery {
@@ -980,19 +1147,20 @@ mod tests {
             store.inject(Injected::Throttle);
         }
         let msg = message("mid-1", "mid-1");
-        let err = store.insert_message(&msg).await.unwrap_err();
+        let err = store.insert_message(&msg, &[]).await.unwrap_err();
         assert!(matches!(err, MailStoreError::Conflict));
     }
 
     #[tokio::test]
-    async fn resolve_rfc_ids_returns_none_for_unknown_candidates() {
+    async fn read_aliases_omits_unknown_ids() {
+        use aws_messaging_webhook::mail::flows::TxnStore;
         let store = MailMemoryStore::default();
         let inbox = InboxId("support@example.com".to_owned());
-        let hit = store
-            .resolve_rfc_ids(&inbox, &["nope@example.com".to_owned()])
+        let found = store
+            .read_aliases(&inbox, &ids(&["nope@example.com"]))
             .await
             .unwrap();
-        assert!(hit.is_none());
+        assert!(found.is_empty());
     }
 
     /// `seed_send_key` writes a `SendKey` row exactly where `get_send_key`

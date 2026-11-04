@@ -3,15 +3,17 @@
 //! uniformly by `mail::txn::decode_cancellation`.
 //!
 //! `plan_insert` plans the ingest transaction: the message, its versioned
-//! thread, and the `Message-ID` alias. It is pure — every input (the message
-//! and the thread state before and after) is computed by the caller from
-//! consistent reads; this module only turns that data into `WriteOp`s.
+//! thread, its `Message-ID` alias and placeholder aliases for the ids it
+//! references that no row maps yet. It is pure — every input (the message,
+//! the thread state before and after, the alias rows) is computed by the
+//! caller from consistent reads; this module only turns that data into
+//! `WriteOp`s.
 
 use serde_dynamo::AttributeValue;
 
 use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, SesSent};
-use crate::mail::thread::ThreadState;
+use crate::mail::thread::{AliasLookup, ThreadState};
 use crate::mail::{
     Direction, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP, ThreadSnapshot, ids,
     keys, labels,
@@ -64,12 +66,17 @@ pub enum WriteOp {
         remove: Vec<String>,
         cond: Cond,
     },
-    /// The RFC-alias first-writer-wins put: unconditioned by version,
-    /// just `NotExists` on the alias key.
+    /// The RFC-alias first-writer-wins put: unconditioned by version.
+    ///
+    /// With a `message_id` it is a real alias, which may land where no row
+    /// exists or where only a placeholder does: the message a placeholder
+    /// stood in for takes its row over. Without one it is a placeholder for
+    /// a referenced id this inbox holds no message for, which lands only
+    /// where no row exists.
     AliasFirstWriter {
         pk: String,
         sk: String,
-        message_id: String,
+        message_id: Option<String>,
         thread_id: String,
         /// The aliased message's TTL: an alias outliving its message would
         /// thread a later reply into a thread that no longer exists.
@@ -186,13 +193,19 @@ fn strip_angle_brackets(rfc_id: &str) -> &str {
 /// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
 const ALIAS_ID_MAX_BYTES: usize = 900;
 
-/// Plans the ingest transaction: the message, its versioned thread, and the
-/// `Message-ID` alias.
+/// Plans the ingest transaction: the message, its versioned thread, its
+/// `Message-ID` alias, and a placeholder alias for every candidate id in
+/// `aliases` that no row maps yet.
 ///
 /// `thread_before` is the thread's state from a consistent read, or `None`
 /// for a brand-new thread; `thread_after` is the caller-computed result of
 /// applying `msg` to it ([`crate::mail::thread::new_thread`] /
 /// [`crate::mail::thread::apply_message`]).
+///
+/// The message's own alias is written only where `aliases` found no row or
+/// a placeholder, which it takes over; a row another message already holds
+/// stays that message's. A placeholder points at `msg`'s thread, so a later
+/// message that references the same id, or turns out to be it, lands there.
 ///
 /// Not capped by labels: an inbound message carries only system labels, a
 /// fixed set, so it can never push a thread over the user-label cap — and
@@ -205,6 +218,7 @@ pub fn plan_insert(
     msg: &MailMessage,
     thread_before: Option<&ThreadState>,
     thread_after: &ThreadState,
+    aliases: &AliasLookup,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
     debug_assert!(
         is_sorted_and_deduped(&msg.labels),
@@ -215,11 +229,19 @@ pub fn plan_insert(
         "thread labels must be sorted and deduplicated before planning"
     );
 
-    // Message, thread, and at most one `Message-ID` alias.
-    let mut ops = Vec::with_capacity(3);
+    let mut ops = Vec::with_capacity(3 + aliases.candidates.len());
     ops.push(message_put(msg, thread_after)?);
     ops.push(thread_put(thread_before, thread_after)?);
-    push_rfc_alias_op(&mut ops, msg);
+
+    let own_id = strip_angle_brackets(&msg.rfc_message_id);
+    if !own_id.is_empty() && aliases.is_claimable(own_id) {
+        push_rfc_alias_op(&mut ops, msg);
+    }
+    for candidate in &aliases.candidates {
+        if candidate != own_id && !aliases.found.contains_key(candidate) {
+            push_placeholder(&mut ops, msg, candidate);
+        }
+    }
 
     Ok(ops)
 }
@@ -582,6 +604,22 @@ fn push_rfc_alias_op(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
 /// Pushes an alias op mapping `rfc_id` to `msg` and its thread, skipping ids
 /// over [`ALIAS_ID_MAX_BYTES`].
 fn push_alias(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
+    push_alias_row(ops, msg, rfc_id, Some(msg.message_id.clone()));
+}
+
+/// Pushes a placeholder alias mapping `rfc_id`, which `msg` references but
+/// this inbox holds no message for, to `msg`'s thread. It expires with `msg`,
+/// the message whose reference it records.
+fn push_placeholder(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
+    push_alias_row(ops, msg, rfc_id, None);
+}
+
+fn push_alias_row(
+    ops: &mut Vec<PlannedOp>,
+    msg: &MailMessage,
+    rfc_id: &str,
+    message_id: Option<String>,
+) {
     let stripped = strip_angle_brackets(rfc_id);
     if stripped.len() <= ALIAS_ID_MAX_BYTES {
         ops.push(PlannedOp {
@@ -589,7 +627,7 @@ fn push_alias(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
             op: WriteOp::AliasFirstWriter {
                 pk: keys::rfc_alias_pk(msg.inbox_id.as_str(), stripped),
                 sk: keys::rfc_alias_sk().to_owned(),
-                message_id: msg.message_id.clone(),
+                message_id,
                 thread_id: msg.thread_id.clone(),
                 expires_at: msg.expires_at,
             },
@@ -679,7 +717,7 @@ mod tests {
             &["received", "unread"],
         );
         let thread = new_thread(&msg);
-        let ops = plan_insert(&msg, None, &thread).unwrap();
+        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
 
         let roles: Vec<OpRole> = ops.iter().map(|o| o.role).collect();
         assert_eq!(
@@ -693,6 +731,129 @@ mod tests {
             panic!("expected a Put");
         };
         assert_eq!(*cond, Cond::NotExists);
+    }
+
+    fn alias_writes(ops: &[PlannedOp]) -> Vec<(String, Option<String>)> {
+        ops.iter()
+            .filter_map(|o| match &o.op {
+                WriteOp::AliasFirstWriter { pk, message_id, .. } => {
+                    Some((pk.clone(), message_id.clone()))
+                }
+                WriteOp::Put { .. } | WriteOp::Update { .. } => None,
+            })
+            .collect()
+    }
+
+    fn lookup(candidates: &[&str], found: &[(&str, Option<&str>)]) -> AliasLookup {
+        AliasLookup {
+            candidates: candidates.iter().map(|c| (*c).to_owned()).collect(),
+            found: found
+                .iter()
+                .map(|(id, message_id)| {
+                    (
+                        (*id).to_owned(),
+                        crate::mail::RfcHit {
+                            message_id: message_id.map(str::to_owned),
+                            thread_id: "tid-0".to_owned(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Placeholders cover exactly the referenced ids no row maps: never the
+    /// message's own id, which gets a real alias instead.
+    #[test]
+    fn plan_insert_writes_placeholders_only_for_unmapped_references() {
+        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        let thread = new_thread(&msg);
+        let aliases = lookup(
+            &[
+                "mid-1@example.com",
+                "parent@example.com",
+                "root@example.com",
+            ],
+            &[("root@example.com", Some("mid-0"))],
+        );
+        let ops = plan_insert(&msg, None, &thread, &aliases).unwrap();
+
+        assert_eq!(
+            alias_writes(&ops),
+            vec![
+                (
+                    "RFC#support@example.com#mid-1@example.com".to_owned(),
+                    Some("mid-1".to_owned())
+                ),
+                (
+                    "RFC#support@example.com#parent@example.com".to_owned(),
+                    None
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_insert_claims_its_own_placeholder_but_not_another_messages_alias() {
+        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        let thread = new_thread(&msg);
+
+        let placeholder = lookup(&["mid-1@example.com"], &[("mid-1@example.com", None)]);
+        let ops = plan_insert(&msg, None, &thread, &placeholder).unwrap();
+        assert_eq!(
+            alias_writes(&ops),
+            vec![(
+                "RFC#support@example.com#mid-1@example.com".to_owned(),
+                Some("mid-1".to_owned())
+            )]
+        );
+
+        let taken = lookup(
+            &["mid-1@example.com"],
+            &[("mid-1@example.com", Some("mid-0"))],
+        );
+        let ops = plan_insert(&msg, None, &thread, &taken).unwrap();
+        assert_eq!(alias_writes(&ops), Vec::new());
+    }
+
+    #[test]
+    fn plan_insert_skips_an_oversized_placeholder() {
+        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        let thread = new_thread(&msg);
+        let oversized = format!("{}@example.com", "x".repeat(ALIAS_ID_MAX_BYTES));
+        let aliases = lookup(&[oversized.as_str()], &[]);
+        let ops = plan_insert(&msg, None, &thread, &aliases).unwrap();
+        assert_eq!(
+            alias_writes(&ops),
+            vec![(
+                "RFC#support@example.com#mid-1@example.com".to_owned(),
+                Some("mid-1".to_owned())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_points_at_the_messages_thread_and_expires_with_it() {
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
+        msg.expires_at = 1_900_000_000;
+        let thread = new_thread(&msg);
+        let aliases = lookup(&["parent@example.com"], &[]);
+        let ops = plan_insert(&msg, None, &thread, &aliases).unwrap();
+        let placeholder = ops
+            .iter()
+            .find_map(|o| match &o.op {
+                WriteOp::AliasFirstWriter {
+                    message_id: None,
+                    thread_id,
+                    expires_at,
+                    ..
+                } => Some((thread_id.as_str(), *expires_at)),
+                WriteOp::AliasFirstWriter { .. } | WriteOp::Put { .. } | WriteOp::Update { .. } => {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(placeholder, ("tid-1", msg.expires_at));
     }
 
     /// An alias or SES reference outliving its message would point a later
@@ -709,7 +870,7 @@ mod tests {
         let thread = new_thread(&msg);
         assert_eq!(thread.expires_at, msg.expires_at);
 
-        let ops = plan_insert(&msg, None, &thread).unwrap();
+        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
         let WriteOp::AliasFirstWriter { expires_at, .. } =
             &ops.iter().find(|o| o.role == OpRole::RfcAlias).unwrap().op
         else {
@@ -746,7 +907,9 @@ mod tests {
                     message_id,
                     expires_at,
                     ..
-                } if message_id == &outbound.message_id => Some((pk.as_str(), *expires_at)),
+                } if message_id.as_deref() == Some(outbound.message_id.as_str()) => {
+                    Some((pk.as_str(), *expires_at))
+                }
                 _ => None,
             })
             .collect();
@@ -792,7 +955,7 @@ mod tests {
         second.timestamp = "00000002-0000".to_owned();
         let after = apply_message(&before, &second);
 
-        let ops = plan_insert(&second, Some(&before), &after).unwrap();
+        let ops = plan_insert(&second, Some(&before), &after, &AliasLookup::default()).unwrap();
         let WriteOp::Put { cond, .. } = &ops.iter().find(|o| o.role == OpRole::Thread).unwrap().op
         else {
             panic!("expected a Put");
@@ -965,7 +1128,7 @@ mod tests {
             thread.labels.push(format!("label-{i:03}"));
         }
         thread.labels.sort();
-        assert!(plan_insert(&msg, None, &thread).is_ok());
+        assert!(plan_insert(&msg, None, &thread, &AliasLookup::default()).is_ok());
     }
 
     #[test]
@@ -1022,7 +1185,7 @@ mod tests {
         second.preview = "Second message body".to_owned();
         let after = apply_message(&before, &second);
 
-        let ops = plan_insert(&second, Some(&before), &after).unwrap();
+        let ops = plan_insert(&second, Some(&before), &after, &AliasLookup::default()).unwrap();
         let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::Message).unwrap().op
         else {
             panic!("expected a Put");
@@ -1048,7 +1211,7 @@ mod tests {
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
 
-        let ops = plan_insert(&msg, None, &thread).unwrap();
+        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
         let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::Message).unwrap().op
         else {
             panic!("expected a Put");
@@ -1062,7 +1225,7 @@ mod tests {
         let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
         msg.rfc_message_id = format!("<{}@example.com>", "x".repeat(ALIAS_ID_MAX_BYTES + 10));
         let thread = new_thread(&msg);
-        let ops = plan_insert(&msg, None, &thread).unwrap();
+        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
         assert!(ops.iter().all(|o| o.role != OpRole::RfcAlias));
     }
 
@@ -1081,7 +1244,7 @@ mod tests {
         msg.rfc_message_id = format!("<{id_body}>");
         assert_eq!(msg.rfc_message_id.len(), crate::mail::REFERENCES_MAX_BYTES);
         let thread = new_thread(&msg);
-        let ops = plan_insert(&msg, None, &thread).unwrap();
+        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
         assert!(
             ops.iter().all(|o| o.role != OpRole::RfcAlias),
             "an id at the REFERENCES_MAX_BYTES cap is still over ALIAS_ID_MAX_BYTES \
@@ -1129,7 +1292,7 @@ mod tests {
             after.timestamp = "00000002-0000".to_owned();
             after.version += 1;
 
-            let ops = plan_insert(&msg, Some(&before), &after).unwrap();
+            let ops = plan_insert(&msg, Some(&before), &after, &AliasLookup::default()).unwrap();
             prop_assert_eq!(ops.len(), 3);
         }
     }

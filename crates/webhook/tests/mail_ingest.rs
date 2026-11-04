@@ -15,6 +15,7 @@
 //! `ingest_inbound` with a short, precisely controlled `tokio::time::Instant`
 //! deadline.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1200,4 +1201,132 @@ async fn missing_every_timestamp_source_skips_rather_than_inventing_one() {
         0,
         "the message is skipped before ever fetching the raw object"
     );
+}
+
+/// A minimal inbound message with the given threading headers.
+fn threaded_eml(message_id: &str, in_reply_to: Option<&str>, references: &[&str]) -> Bytes {
+    let mut headers = format!(
+        "From: Alice Sender <alice@example.com>\r\nTo: support@example.com\r\n\
+         Subject: Threading\r\nDate: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+         Message-ID: <{message_id}>\r\n"
+    );
+    if let Some(parent) = in_reply_to {
+        let _ = write!(headers, "In-Reply-To: <{parent}>\r\n");
+    }
+    if !references.is_empty() {
+        let list: Vec<String> = references.iter().map(|id| format!("<{id}>")).collect();
+        let _ = write!(headers, "References: {}\r\n", list.join(" "));
+    }
+    Bytes::from(format!(
+        "{headers}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHi.\r\n"
+    ))
+}
+
+/// Delivers `raw` as the `n`th inbound message (its own SES id, object and
+/// minute) and returns the thread it was stored in.
+async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
+    let key = format!("inbound/thread-{n}");
+    let ses_id = format!("ses-thread-{n}");
+    let ts = format!("2026-01-01T00:{n:02}:00.000Z");
+    h.fake().objects.seed(&key, raw, "message/rfc822");
+    let body = wrapped(
+        h,
+        &ses_inbound_s3(
+            &ses_id,
+            &ts,
+            &["support@example.com"],
+            BUCKET,
+            &key,
+            "PASS",
+            "PASS",
+            "PASS",
+        ),
+    );
+    assert_eq!(
+        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        StatusCode::OK
+    );
+    let inbox = aws_messaging_webhook::mail::InboxId("support@example.com".to_owned());
+    h.fake()
+        .mail
+        .get_message(&inbox, &expected_message_id(&ses_id, &ts))
+        .await
+        .unwrap()
+        .unwrap()
+        .thread_id
+}
+
+#[tokio::test]
+async fn a_parent_arriving_after_its_reply_joins_the_replys_thread() {
+    let h = mail_harness().await;
+    let reply = deliver_and_thread(
+        &h,
+        1,
+        threaded_eml("b@example.com", Some("a@example.com"), &["a@example.com"]),
+    )
+    .await;
+    let parent = deliver_and_thread(&h, 2, threaded_eml("a@example.com", None, &[])).await;
+    assert_eq!(parent, reply);
+}
+
+#[tokio::test]
+async fn replies_to_a_parent_never_received_share_a_thread() {
+    let h = mail_harness().await;
+    let first = deliver_and_thread(
+        &h,
+        1,
+        threaded_eml("b@example.com", Some("a@example.com"), &["a@example.com"]),
+    )
+    .await;
+    let second = deliver_and_thread(
+        &h,
+        2,
+        threaded_eml("c@example.com", Some("a@example.com"), &["a@example.com"]),
+    )
+    .await;
+    assert_eq!(second, first);
+}
+
+/// A message joining an existing thread still leaves placeholders for the
+/// other ids it references, so those messages land there when they arrive.
+#[tokio::test]
+async fn a_reference_first_seen_inside_a_thread_pulls_its_message_in() {
+    let h = mail_harness().await;
+    let thread = deliver_and_thread(
+        &h,
+        1,
+        threaded_eml("b@example.com", Some("a@example.com"), &["a@example.com"]),
+    )
+    .await;
+    let reply = deliver_and_thread(
+        &h,
+        2,
+        threaded_eml(
+            "c@example.com",
+            Some("b@example.com"),
+            &["z@example.com", "b@example.com"],
+        ),
+    )
+    .await;
+    assert_eq!(reply, thread);
+    let late = deliver_and_thread(&h, 3, threaded_eml("z@example.com", None, &[])).await;
+    assert_eq!(late, thread);
+}
+
+#[tokio::test]
+async fn unrelated_messages_stay_in_separate_threads() {
+    let h = mail_harness().await;
+    let first = deliver_and_thread(
+        &h,
+        1,
+        threaded_eml("b@example.com", Some("a@example.com"), &["a@example.com"]),
+    )
+    .await;
+    let second = deliver_and_thread(
+        &h,
+        2,
+        threaded_eml("d@example.com", Some("x@example.com"), &["x@example.com"]),
+    )
+    .await;
+    assert_ne!(second, first);
 }
