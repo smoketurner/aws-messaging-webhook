@@ -4,11 +4,11 @@
 //! condition semantics and cancellation decoding, so
 //! higher-level tests exercise the real planner (`mail::plan::plan_insert`)
 //! and decoder (`mail::txn::decode_cancellation`) rather than a shortcut.
-//! Wired into `FakeServices` by delegation.
+//! The test backend's `Table`.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aws_messaging_webhook::mail::keys::{self, PageKey, TableKey};
 use aws_messaging_webhook::mail::mailbox::Mailbox;
@@ -59,12 +59,14 @@ struct Inner {
     resolve_failure: Option<ReadFailure>,
 }
 
-#[derive(Default)]
+/// Clones share one table, so the harness and the fakes that script its
+/// failures see the same rows.
+#[derive(Clone, Default)]
 pub struct MailMemoryStore {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     /// How many transactions have been attempted, so a test can tell a flow
     /// that gave up immediately from one that burned its retries.
-    attempts: std::sync::atomic::AtomicUsize,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A minimal inbound message, for tests that need one in the store without

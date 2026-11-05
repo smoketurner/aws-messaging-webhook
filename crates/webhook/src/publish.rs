@@ -73,7 +73,7 @@ pub(crate) fn detail_bytes(detail: &Value) -> usize {
 /// full payload always remains in the DynamoDB raw record.
 ///
 /// `event_source` is the configured `Source` field stamped on every
-/// `PutEventsRequestEntry` ([`AwsServices`](crate::aws::AwsServices) sets it
+/// `PutEventsRequestEntry` ([`EventBridgePublisher`](crate::aws::publisher::EventBridgePublisher) sets it
 /// from `Config::event_source`). It counts toward the same 256 KiB entry cap
 /// as `Detail` and `DetailType`, so Step 3 reserves it as envelope headroom.
 #[must_use]
@@ -202,12 +202,12 @@ mod tests {
     use crate::store::EventRecord;
 
     /// The default `Config::event_source`, mirroring `config.rs`'s fallback so
-    /// the entry-size assertions model the envelope `AwsServices::publish`
+    /// the entry-size assertions model the envelope `EventBridgePublisher::publish`
     /// actually stamps on the `PutEventsRequestEntry`.
     const DEFAULT_EVENT_SOURCE: &str = "aws-messaging-webhook";
 
     /// `PutEvents` entry size = `detail` + `detail_type` + `source` (the three
-    /// fields `AwsServices::publish` always sets on the builder), mirroring the
+    /// fields `EventBridgePublisher::publish` always sets on the builder), mirroring the
     /// 256 KiB *entry* cap rather than the `detail`-only size the old tests used.
     fn entry_bytes(detail: &Value, detail_type: &str, source: &str) -> usize {
         detail_bytes(detail) + detail_type.len() + source.len()

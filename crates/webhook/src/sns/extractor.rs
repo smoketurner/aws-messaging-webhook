@@ -5,7 +5,7 @@ use axum::extract::{FromRequest, Request};
 use sns_message_verifier::SnsEnvelope;
 
 use crate::error::AppError;
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// An SNS delivery that passed the topic allowlist and signature
 /// verification. Both ingress paths — this extractor on the HTTP routes and
@@ -27,8 +27,8 @@ impl VerifiedSns {
     ///
     /// Returns [`AppError`] when the body is not an envelope, the topic is
     /// not allowlisted, or the signature does not verify.
-    pub(crate) async fn verify<T: Services>(
-        state: &AppState<T>,
+    pub(crate) async fn verify<B: Backend>(
+        state: &AppState<B>,
         raw_body: Bytes,
     ) -> Result<Self, AppError> {
         let envelope: SnsEnvelope =
@@ -49,10 +49,10 @@ impl VerifiedSns {
     }
 }
 
-impl<T: Services> FromRequest<Arc<AppState<T>>> for VerifiedSns {
+impl<B: Backend> FromRequest<Arc<AppState<B>>> for VerifiedSns {
     type Rejection = AppError;
 
-    async fn from_request(req: Request, state: &Arc<AppState<T>>) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &Arc<AppState<B>>) -> Result<Self, Self::Rejection> {
         if req.headers().get("x-amz-sns-message-type").is_none() {
             return Err(AppError::MissingSnsHeader);
         }

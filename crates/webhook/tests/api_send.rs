@@ -59,7 +59,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     // The message is readable straight away, labelled queued.
     let message = h
         .state
-        .mailbox()
+        .mailbox
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -78,7 +78,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
 
     // The body is stored in the message's content document, and the item
     // carries a TTL.
-    let message_content = content::load(&h.state.services, &message).await.unwrap();
+    let message_content = content::load(&h.state.objects, &message).await.unwrap();
     assert_eq!(message_content.text.as_deref(), Some("the body"));
     assert!(message.expires_at > 0);
 }
@@ -102,7 +102,7 @@ async fn a_send_with_a_full_set_of_user_labels_and_a_system_toggle_is_queued() {
 
     let message = h
         .state
-        .mailbox()
+        .mailbox
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -125,8 +125,6 @@ async fn the_send_state_starts_queued_and_holds_the_envelope() {
     let message_id = body["message_id"].as_str().unwrap();
 
     let item = h
-        .state
-        .services
         .mail
         .raw_item(&TableKey {
             pk: format!("OUTBOX#{message_id}"),
@@ -181,7 +179,7 @@ async fn an_inline_attachment_is_uploaded_before_the_spec_names_it() {
     // The bytes are already in the outbox under the key the spec names.
     let key = attachment.object_key.as_deref().unwrap();
     assert_eq!(
-        h.state.services.objects.get(key).as_deref(),
+        h.state.objects.get(key).as_deref(),
         Some(&b"file bytes"[..])
     );
 }
@@ -280,9 +278,7 @@ async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
     // messages/, reclaimed by the bucket's expire-messages lifecycle rule, so
     // discard_uploads leaves it and keeps its deletes scoped to outbox/.
     let h = api_harness().await;
-    h.state
-        .services
-        .mail
+    h.mail
         .inject(webhook_test_support::mail_memory::Injected::Transient);
     let mut request = body();
     request["attachments"] = json!([{
@@ -294,7 +290,7 @@ async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
     let (status, _) = send_it(&h, &request, None).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    let objects = &h.state.services.objects;
+    let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
     assert_ne!(uploaded, [] as [String; 0]);
 
@@ -334,9 +330,7 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
     // overlap; the in-memory store can inject it so a sequential test can
     // exercise the loser's cleanup path.
     let h = api_harness().await;
-    h.state
-        .services
-        .mail
+    h.mail
         .inject(webhook_test_support::mail_memory::Injected::KeyExists);
     let mut request = body();
     request["attachments"] = json!([{
@@ -352,7 +346,7 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(response["name"], "ConflictError");
 
-    let objects = &h.state.services.objects;
+    let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
     assert_ne!(uploaded, [] as [String; 0]);
     for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
@@ -395,7 +389,7 @@ async fn a_content_store_failure_discards_the_outbox_uploads() {
     }]);
     // Fail the content-document put (the 3rd) — after the spec and part
     // already landed under outbox/.
-    h.state.services.objects.inject_nth_put_if_absent(3);
+    h.state.objects.inject_nth_put_if_absent(3);
 
     let (status, response) = send_it(&h, &request, None).await;
 
@@ -404,7 +398,7 @@ async fn a_content_store_failure_discards_the_outbox_uploads() {
     // promises; the body is the generic internal shape (no cause leaked).
     assert_eq!(response["name"], "InternalServerError");
 
-    let objects = &h.state.services.objects;
+    let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
     assert_ne!(uploaded, [] as [String; 0]);
 
@@ -464,14 +458,14 @@ async fn an_upload_spec_failure_partway_through_discards_the_uploaded_part() {
     }]);
     // Fail the spec write (the 2nd put) — after the inline part already
     // landed under outbox/.../parts/.
-    h.state.services.objects.inject_nth_put_if_absent(2);
+    h.state.objects.inject_nth_put_if_absent(2);
 
     let (status, response) = send_it(&h, &request, None).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(response["name"], "InternalServerError");
 
-    let objects = &h.state.services.objects;
+    let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
     assert!(uploaded.iter().any(|k| k.starts_with("outbox/")));
     // The part was attempted (and landed); the spec write was attempted but
@@ -517,13 +511,13 @@ async fn an_upload_spec_failure_partway_through_discards_the_uploaded_part() {
 async fn a_content_store_failure_discards_the_spec_when_there_are_no_parts() {
     let h = api_harness().await;
     // No attachments: the put sequence is spec(1), content-document(2).
-    h.state.services.objects.inject_nth_put_if_absent(2);
+    h.state.objects.inject_nth_put_if_absent(2);
 
     let (status, _) = send_it(&h, &body(), None).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
-    let objects = &h.state.services.objects;
+    let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
     assert!(uploaded.iter().any(|k| k.ends_with("/spec.json")));
     for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
@@ -615,7 +609,7 @@ async fn an_invalid_request_queues_nothing() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(response["name"], "ValidationError");
     // Nothing was uploaded on the way to the rejection.
-    assert_eq!(h.state.services.objects.calls(Op::Put), [] as [String; 0]);
+    assert_eq!(h.state.objects.calls(Op::Put), [] as [String; 0]);
 }
 
 #[tokio::test]
@@ -685,7 +679,7 @@ async fn an_html_only_send_gets_a_non_empty_preview_on_the_message_and_listing()
     // The stored message item carries a non-empty preview derived from HTML.
     let message = h
         .state
-        .mailbox()
+        .mailbox
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -751,7 +745,7 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
     // The send lands on the inbox ingest/reads know — the lowercased id.
     let message = h
         .state
-        .mailbox()
+        .mailbox
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -788,7 +782,7 @@ async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
         created_at: "2025-01-01T00:00:00.000Z".to_owned(),
         expires_at: 1, // long past the 24h lifetime; not yet reaped by DynamoDB
     };
-    h.state.services.mail.seed_send_key(&expired_key);
+    h.mail.seed_send_key(&expired_key);
 
     let (status, response) = send_it(&h, &body(), Some("key-1")).await;
 
@@ -837,7 +831,7 @@ async fn an_expired_key_reused_with_the_same_request_is_a_fresh_send() {
     let key_hash = format!("{:x}", Sha256::digest(b"key-1"));
     let mut existing = h
         .state
-        .mailbox()
+        .mailbox
         .get_send_key(&key_hash)
         .await
         .unwrap()
@@ -847,7 +841,7 @@ async fn an_expired_key_reused_with_the_same_request_is_a_fresh_send() {
         "a just-recorded key should be live, not expired"
     );
     existing.expires_at = 1; // simulate the 24h TTL having elapsed
-    h.state.services.mail.seed_send_key(&existing);
+    h.mail.seed_send_key(&existing);
 
     let (status, response) = send_it(&h, &body(), Some("key-1")).await;
 
@@ -900,7 +894,7 @@ async fn a_send_with_a_malformed_envelope_address_is_rejected_before_queueing() 
 
         // Nothing was uploaded on the way to the rejection.
         assert_eq!(
-            h.state.services.objects.calls(Op::Put),
+            h.state.objects.calls(Op::Put),
             [] as [String; 0],
             "{bad_to:?}: nothing should be uploaded for a rejected send"
         );
@@ -982,7 +976,7 @@ async fn a_non_ascii_local_part_is_rejected_before_queueing() {
         response["errors"][0]["message"],
         "`üser@example.com` has a non-ASCII local part, which SES cannot deliver to"
     );
-    assert_eq!(h.state.services.objects.calls(Op::Put), [] as [String; 0]);
+    assert_eq!(h.state.objects.calls(Op::Put), [] as [String; 0]);
 }
 
 /// A quoted local part is a mailbox RFC 5321 delivers to, sent with the

@@ -49,8 +49,9 @@ use crate::mail::{MailMessage, keys};
 use crate::metrics::names;
 use crate::model::ses_notification::SesNotification;
 use crate::model::{DomainEvent, Source};
+use crate::publish::PublishEvents as _;
 use crate::publish::{OutboundEvent, PublishError, SCHEMA_VERSION, build_outbound};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 use crate::store::EventRecord;
 
 /// Reads a DynamoDB `String` attribute from a stream image.
@@ -149,8 +150,8 @@ fn insert_opt(target: &mut Value, key: &str, value: Option<impl Into<Value>>) {
 /// Returns an error only if the payload is not a well-formed DynamoDB stream
 /// event; per-record faults are handled via the returned failure list or
 /// skipped.
-pub async fn handle_stream<T: Services>(
-    state: &AppState<T>,
+pub async fn handle_stream<B: Backend>(
+    state: &AppState<B>,
     payload: Value,
 ) -> Result<Value, lambda_http::Error> {
     let event: Event = serde_json::from_value(payload)
@@ -218,7 +219,7 @@ pub async fn handle_stream<T: Services>(
 /// transient publish failure; a deterministic reconstruction failure is logged
 /// and returns [`RelayOutcome::Settled`] so it is skipped rather than retried
 /// forever.
-async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
+async fn publish_record<B: Backend>(state: &AppState<B>, image: &Item) -> RelayOutcome {
     let Some(AttributeValue::B(raw_body)) = image.get("raw_body") else {
         tracing::error!(
             event = "stream_missing_raw_body",
@@ -316,8 +317,8 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
 /// belongs to, when it is for mail this mailbox sent. Most events on a
 /// shared configuration set are for other senders, so an unresolved id is
 /// `None`, not an error.
-async fn mailbox_ses_event<T: Services>(
-    state: &AppState<T>,
+async fn mailbox_ses_event<B: Backend>(
+    state: &AppState<B>,
     ses: &SesNotification,
     envelope: &SnsEnvelope,
 ) -> Result<Option<(MailMessage, MailEvent)>, MailStoreError> {
@@ -325,13 +326,13 @@ async fn mailbox_ses_event<T: Services>(
         return Ok(None);
     }
     let Some((inbox, message_id)) = state
-        .mailbox()
+        .mailbox
         .resolve_ses_message(&ses.mail.message_id)
         .await?
     else {
         return Ok(None);
     };
-    let Some(msg) = state.mailbox().get_message(&inbox, &message_id).await? else {
+    let Some(msg) = state.mailbox.get_message(&inbox, &message_id).await? else {
         return Ok(None);
     };
     Ok(
@@ -358,11 +359,11 @@ fn decode_mail_image(image: &Item) -> Option<MailMessage> {
 
 /// Publishes one event and counts the outcome; the caller logs it, since
 /// each kind of event identifies itself with different fields.
-async fn publish_one<T: Services>(
-    state: &AppState<T>,
+async fn publish_one<B: Backend>(
+    state: &AppState<B>,
     outbound: &OutboundEvent,
 ) -> Result<(), PublishError> {
-    let result = state.services.publish(outbound).await;
+    let result = state.publisher.publish(outbound).await;
     let counter = if result.is_ok() {
         names::EVENTS_PUBLISHED
     } else {
@@ -378,7 +379,7 @@ async fn publish_one<T: Services>(
 /// a deserialization failure is a deterministic bug (not a transient fault),
 /// so it is logged and returns [`RelayOutcome::Settled`] (an INSERT's absent
 /// or empty `OldImage` is never read here, so it can't cause this).
-async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
+async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> RelayOutcome {
     let Some(msg) = decode_mail_image(image) else {
         return RelayOutcome::Settled;
     };
@@ -389,7 +390,7 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
     if !crate::mail::labels::has(&msg.labels, SystemLabel::Received) {
         return RelayOutcome::Settled;
     }
-    let content = match content::load(&state.services, &msg).await {
+    let content = match content::load(&state.objects, &msg).await {
         Ok(content) => content,
         Err(ObjectError::Transient(error)) => {
             tracing::error!(
@@ -424,8 +425,8 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
 /// sender's `queued` → `sent` relabel. Any other write — a delivery label, a
 /// user's own label, a read receipt, a promotion repoint, a metadata write —
 /// publishes nothing. Same retry contract as [`publish_mail_record`].
-async fn publish_mail_sent<T: Services>(
-    state: &AppState<T>,
+async fn publish_mail_sent<B: Backend>(
+    state: &AppState<B>,
     new_image: &Item,
     old_image: &Item,
 ) -> RelayOutcome {
@@ -446,8 +447,8 @@ async fn publish_mail_sent<T: Services>(
 }
 
 /// Publishes already-built mail events, one `PutEvents` call each.
-async fn publish_mail_events<T: Services>(
-    state: &AppState<T>,
+async fn publish_mail_events<B: Backend>(
+    state: &AppState<B>,
     msg: &MailMessage,
     events: Vec<MailEvent>,
 ) -> RelayOutcome {
@@ -487,8 +488,8 @@ async fn publish_mail_events<T: Services>(
 /// untouched) produce no event. Carries the rolled-up snapshot so consumers get
 /// the authoritative status without re-deriving precedence. Same retry contract
 /// as `publish_record`: [`RelayOutcome::Retry`] on a transient publish failure.
-async fn publish_status_changed<T: Services>(
-    state: &AppState<T>,
+async fn publish_status_changed<B: Backend>(
+    state: &AppState<B>,
     new_image: &Item,
     old_image: &Item,
 ) -> RelayOutcome {

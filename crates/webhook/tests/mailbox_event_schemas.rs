@@ -237,7 +237,8 @@ fn assert_matches_schema(detail: &Value) {
 
 /// The `message.*` details published so far, in order.
 fn mailbox_details(h: &Harness) -> Vec<Value> {
-    h.fake()
+    h.state
+        .publisher
         .published
         .lock()
         .unwrap()
@@ -272,7 +273,7 @@ async fn sent_message(h: &Harness) -> MailMessage {
     .await
     .unwrap();
     h.state
-        .mailbox()
+        .mailbox
         .get_message(&InboxId::new(TEST_INBOX), message_id)
         .await
         .unwrap()
@@ -357,7 +358,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
 
 async fn publish_received(h: &Harness, msg: &MailMessage) {
     content::store(
-        h.fake(),
+        &h.state.objects,
         &msg.inbox_id,
         &msg.message_id,
         &MessageContent {
@@ -520,7 +521,7 @@ async fn ses_events_for_other_senders_publish_no_mailbox_event() {
     let h = api_harness().await;
     publish_ses_example(&h, "event-delivery.json", "ses-someone-else").await;
     assert_eq!(mailbox_details(&h), [] as [serde_json::Value; 0]);
-    assert_eq!(h.fake().published.lock().unwrap().len(), 1);
+    assert_eq!(h.state.publisher.published.lock().unwrap().len(), 1);
 }
 
 /// A transient failure resolving the SES message retries the record before
@@ -529,10 +530,7 @@ async fn ses_events_for_other_senders_publish_no_mailbox_event() {
 async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Transient);
+    h.mail.fail_next_resolve(ReadFailure::Transient);
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ses-events/event-delivery.json");
@@ -551,7 +549,7 @@ async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
         result,
         json!({ "batchItemFailures": [{ "itemIdentifier": "seq-retry" }] })
     );
-    assert!(h.fake().published.lock().unwrap().is_empty());
+    assert!(h.state.publisher.published.lock().unwrap().is_empty());
 }
 
 /// A lookup failure a retry can't fix still publishes the `ses.*` event;
@@ -560,14 +558,11 @@ async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
 async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Permanent);
+    h.mail.fail_next_resolve(ReadFailure::Permanent);
 
     publish_ses_example(&h, "event-delivery.json", &sent.ses_message_id.unwrap()).await;
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     let types: Vec<&str> = published
         .iter()
         .map(|event| event.detail_type.as_str())
@@ -588,10 +583,7 @@ async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
 async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Permanent); // permanent resolve_ses_message
+    h.mail.fail_next_resolve(ReadFailure::Permanent); // permanent resolve_ses_message
 
     let bounce = json!({
         "eventType": "Bounce",
@@ -603,7 +595,7 @@ async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
     let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    let calls = h.fake().calls();
+    let calls = h.calls();
     assert!(
         calls
             .iter()
@@ -618,10 +610,7 @@ async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
 async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Permanent);
+    h.mail.fail_next_resolve(ReadFailure::Permanent);
 
     let complaint = json!({
         "notificationType": "Complaint",
@@ -632,7 +621,7 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
     let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    let calls = h.fake().calls();
+    let calls = h.calls();
     assert!(
         calls
             .iter()
@@ -650,10 +639,7 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
 async fn transient_delivery_label_failure_suppresses_then_returns_500() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Transient);
+    h.mail.fail_next_resolve(ReadFailure::Transient);
 
     let bounce = json!({
         "eventType": "Bounce",
@@ -669,7 +655,7 @@ async fn transient_delivery_label_failure_suppresses_then_returns_500() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "a transient label failure must drive a 5xx so SNS redelivers"
     );
-    let calls = h.fake().calls();
+    let calls = h.calls();
     assert!(
         calls
             .iter()

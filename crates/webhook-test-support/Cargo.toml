@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared FakeServices harness for aws-messaging-webhook's integration test binaries"
+description = "Shared fakes and harness for aws-messaging-webhook's integration test binaries"
 publish = false
 
 [lib]

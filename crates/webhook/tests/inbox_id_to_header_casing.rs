@@ -44,7 +44,7 @@ async fn a_client_using_the_to_header_as_the_inbox_path_can_see_its_mail() {
     // the verbatim mixed-case header a client would copy.
     let mut msg = sample_message(TEST_INBOX, "mid-1", "mid-1");
     msg.to = vec!["Support@Example.com".to_owned()];
-    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 
     // The client copies the `To:` header verbatim into the path. Before the
     // fix: inbox 404, messages `count: 0`. After: both resolve.

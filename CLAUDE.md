@@ -43,8 +43,8 @@ Three workspace crates:
   only, no redirects followed, no CA-chain check — same model as AWS's own validators). The
   `test-fixtures` feature generates throwaway keys/certs so consumers can sign test envelopes.
 - **`crates/webhook`** (package `aws-messaging-webhook`) — the Lambda itself.
-- **`crates/webhook-test-support`** — test-only fakes (`FakeServices`, in-memory mail and
-  object stores) shared by the webhook crate's integration tests.
+- **`crates/webhook-test-support`** — test-only fakes (one per seam, including the in-memory
+  mail table and object store) shared by the webhook crate's integration tests.
 
 ### Request flow through the webhook crate
 
@@ -113,12 +113,14 @@ Three workspace crates:
   recovery) or that feeds a `VersionEquals` write does. Say why at each `consistent_read(true)`.
 - **Integration tests drive the real router against fakes.** `crates/webhook/tests/handlers.rs`
   sends properly signed SNS envelopes, and the `api_*`/`mail_*` suites exercise the mailbox,
-  all against fakes from `crates/webhook-test-support` implementing the `Services` trait
-  (`state.rs` — the single bound aggregating `EventStore`, `PublishEvents`, `SmsVoiceApi`,
-  `SesApi`, `Table`, `ObjectStore`, `AttachmentFetcher` and `ApiKeySource`). Mailbox reads and
-  writes are written once, in `mail/mailbox.rs`, on top of the `Table` seam (`mail/table.rs`)
-  that the DynamoDB store and the in-memory double implement. New downstream calls go
-  through those traits so tests stay AWS-free.
+  all against fakes from `crates/webhook-test-support`. `AppState<B: Backend>` (`state.rs`)
+  holds one component per external system — `Table`, `EventStore`, `PublishEvents`,
+  `SmsVoiceApi`, `SesApi`, `ObjectStore`, `AttachmentFetcher` and `ApiKeySource` — and
+  `Backend` names their types: `aws::Aws` in production (one small struct per client under
+  `aws/`), `webhook_test_support::Fakes` in tests. Mailbox reads and writes are written once,
+  in `mail/mailbox.rs`, on top of the `Table` seam (`mail/table.rs`) that the DynamoDB store and
+  the in-memory double implement. New downstream calls go through those traits so tests stay
+  AWS-free.
 - SNS topics and subscriptions deliberately live outside the SAM stack, except the two
   stack-owned mail topics (SES receipts and SES configuration-set events, created only when
   `pMailDomain` is set); `template.yaml` maps CloudFormation parameters to the env vars

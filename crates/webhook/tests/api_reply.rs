@@ -16,7 +16,7 @@ use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, api_harness};
 /// Stores the original message's content document, as ingest would have.
 async fn store_content(h: &Harness, message_id: &str, message_content: MessageContent) {
     content::store(
-        &h.state.services,
+        &h.state.objects,
         &InboxId::new(TEST_INBOX),
         message_id,
         &message_content,
@@ -37,7 +37,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     "Order 42".clone_into(&mut msg.subject);
     "<original@example.net>".clone_into(&mut msg.rfc_message_id);
     adjust(&mut msg);
-    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

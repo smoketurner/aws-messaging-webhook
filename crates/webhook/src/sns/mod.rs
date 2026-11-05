@@ -14,9 +14,11 @@ use crate::actions::{self, ActionErrorKind};
 use crate::error::AppError;
 use crate::metrics::names;
 use crate::model::{DomainEvent, Source};
+use crate::publish::PublishEvents as _;
 use crate::publish::{OutboundEvent, SCHEMA_VERSION};
 use crate::sns::extractor::VerifiedSns;
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
+use crate::store::EventStore as _;
 use crate::store::{EventRecord, PersistOutcome};
 
 /// How a message arrived: a webhook path (which names the event family the
@@ -45,8 +47,8 @@ impl Ingress {
 ///
 /// Returns [`AppError`] per the response policy: 4xx for rejected messages,
 /// 5xx to recruit SNS redelivery for transient downstream failures.
-pub async fn handle_sns<T: Services>(
-    state: &AppState<T>,
+pub async fn handle_sns<B: Backend>(
+    state: &AppState<B>,
     ingress: Ingress,
     verified: VerifiedSns,
     deadline: tokio::time::Instant,
@@ -64,8 +66,8 @@ pub async fn handle_sns<T: Services>(
     }
 }
 
-async fn confirm_subscription<T: Services>(
-    state: &AppState<T>,
+async fn confirm_subscription<B: Backend>(
+    state: &AppState<B>,
     ingress: Ingress,
     envelope: &SnsEnvelope,
 ) -> Result<Response, AppError> {
@@ -82,8 +84,8 @@ async fn confirm_subscription<T: Services>(
 
 /// Validates the envelope's `SubscribeURL` against the SNS host policy and
 /// visits it, which is how both confirming and re-subscribing take effect.
-async fn follow_subscribe_url<T: Services>(
-    state: &AppState<T>,
+async fn follow_subscribe_url<B: Backend>(
+    state: &AppState<B>,
     envelope: &SnsEnvelope,
 ) -> Result<(), AppError> {
     let subscribe_url = envelope
@@ -105,8 +107,8 @@ async fn follow_subscribe_url<T: Services>(
 /// `subscription.changed` event. Deliberate removal via the authenticated
 /// `Unsubscribe` API does not emit this message type, so operator intent is
 /// respected.
-async fn handle_unsubscribe<T: Services>(
-    state: &AppState<T>,
+async fn handle_unsubscribe<B: Backend>(
+    state: &AppState<B>,
     ingress: Ingress,
     envelope: &SnsEnvelope,
 ) -> Result<Response, AppError> {
@@ -145,14 +147,14 @@ async fn handle_unsubscribe<T: Services>(
             "timestamp": envelope.timestamp,
         }),
     };
-    if let Err(error) = state.services.publish(&notice).await {
+    if let Err(error) = state.publisher.publish(&notice).await {
         tracing::error!(error = ?error, "failed to publish subscription.changed event");
     }
     Ok(StatusCode::OK.into_response())
 }
 
-async fn process_notification<T: Services>(
-    state: &AppState<T>,
+async fn process_notification<B: Backend>(
+    state: &AppState<B>,
     ingress: Ingress,
     verified: &VerifiedSns,
     deadline: tokio::time::Instant,
@@ -203,7 +205,7 @@ async fn process_notification<T: Services>(
     )?;
 
     let outcome = state
-        .services
+        .events
         .persist_new(&record, &event)
         .await
         .context("failed to persist event")?;

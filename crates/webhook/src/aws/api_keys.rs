@@ -8,20 +8,32 @@
 use aws_sdk_ssm::error::ProvideErrorMetadata as _;
 
 use crate::api::keys::{ApiKeyError, ApiKeySource};
-use crate::aws::AwsServices;
+/// The SSM parameter holding the API key hashes.
+pub struct SsmKeys {
+    client: aws_sdk_ssm::Client,
+    /// `None` when mail is not configured.
+    parameter: Option<String>,
+}
 
-impl ApiKeySource for AwsServices {
+impl SsmKeys {
+    #[must_use]
+    pub fn new(client: aws_sdk_ssm::Client, parameter: Option<String>) -> Self {
+        Self { client, parameter }
+    }
+}
+
+impl ApiKeySource for SsmKeys {
     async fn fetch(&self) -> Result<String, ApiKeyError> {
-        let Some(mail) = self.mail_config() else {
+        let Some(parameter) = &self.parameter else {
             return Err(ApiKeyError::Fetch(anyhow::anyhow!(
                 "mail is not configured, so there is no API key parameter"
             )));
         };
 
         let response = self
-            .ssm
+            .client
             .get_parameter()
-            .name(&mail.api_keys_parameter)
+            .name(parameter)
             .with_decryption(true)
             .send()
             .await

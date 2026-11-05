@@ -26,7 +26,7 @@ async fn seeded() -> (Harness, String) {
     TEST_AT.clone_into(&mut msg.timestamp);
     TEST_AT.clone_into(&mut msg.created_at);
     TEST_AT.clone_into(&mut msg.updated_at);
-    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

@@ -14,7 +14,7 @@ use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest};
 use crate::api::send::{SendAccepted, enqueue};
 use crate::mail::address::same_mailbox;
 use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// The `References` chain for a reply: the original's own chain plus the
 /// message being replied to, capped so a long thread cannot grow the header
@@ -47,21 +47,21 @@ pub(super) fn threading_references(
 ///
 /// [`ApiError::NotFound`] when the inbox or the original message does not
 /// exist; otherwise as [`send`].
-pub async fn reply<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn reply<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, String)>,
     headers: HeaderMap,
     ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
     let original = state
-        .mailbox()
+        .mailbox
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     // A missing content document is not an error here: `content::load` logs
     // it and returns empty content, so a reply to a message whose body is
     // gone still goes out, without the original's references or reply-to.
-    let original_content = content::load(&state.services, &original).await?;
+    let original_content = content::load(&state.objects, &original).await?;
 
     let mut send = request.send;
     // Recipients default to whoever should receive a reply to the original,

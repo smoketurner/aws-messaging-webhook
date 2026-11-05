@@ -1,5 +1,5 @@
-//! [`Table`] for [`AwsServices`](crate::aws::AwsServices): the mail
-//! table's DynamoDB access.
+//! [`Table`] over `DynamoDB`: the mail table's `GetItem`, `BatchGetItem`,
+//! `Query`, conditional `PutItem` and `TransactWriteItems`.
 //!
 //! Every write goes through the transaction model
 //! ([`crate::mail::plan`]/[`crate::mail::txn`]): a planner builds
@@ -21,7 +21,7 @@ use aws_sdk_dynamodb::types::{
     AttributeValue as DynamoAv, KeysAndAttributes, Put, TransactWriteItem, Update,
 };
 
-use crate::aws::{AwsServices, FromSdkFailure};
+use crate::aws::FromSdkFailure;
 use crate::mail::PutOutcome;
 use crate::mail::keys::{PageKey, TableKey};
 use crate::mail::plan::{Check, Cond, PlannedOp, WriteOp};
@@ -324,14 +324,26 @@ fn alias_transact_item(
     Ok(TransactWriteItem::builder().put(put).build())
 }
 
-impl AwsServices {
+/// The mail table.
+pub struct DynamoTable {
+    client: aws_sdk_dynamodb::Client,
+    /// `None` when mail is not configured.
+    table_name: Option<String>,
+}
+
+impl DynamoTable {
+    #[must_use]
+    pub fn new(client: aws_sdk_dynamodb::Client, table_name: Option<String>) -> Self {
+        Self { client, table_name }
+    }
+
     /// The mail table name, or a permanent error when mail is disabled —
     /// every `Table` method is only ever called when it is enabled, but
     /// this keeps that assumption from becoming a panic if it's ever
     /// violated.
     fn mail_table_name(&self) -> Result<&str, MailStoreError> {
-        self.mail_config()
-            .map(|config| config.table_name.as_str())
+        self.table_name
+            .as_deref()
             .ok_or_else(|| MailStoreError::Permanent(anyhow!("mail is not configured")))
     }
 }
@@ -349,7 +361,7 @@ fn item_key(item: &HashMap<String, DynamoAv>) -> Option<TableKey> {
     })
 }
 
-impl Table for AwsServices {
+impl Table for DynamoTable {
     async fn get<T: serde::de::DeserializeOwned + Send>(
         &self,
         TableKey { pk, sk }: TableKey,
@@ -358,7 +370,7 @@ impl Table for AwsServices {
     ) -> Result<Option<T>, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let output = self
-            .dynamo
+            .client
             .get_item()
             .table_name(table_name)
             .key("pk", DynamoAv::S(pk))
@@ -418,7 +430,7 @@ impl Table for AwsServices {
                     MailStoreError::Permanent(anyhow!("building KeysAndAttributes: {e}"))
                 })?;
             let output = self
-                .dynamo
+                .client
                 .batch_get_item()
                 .request_items(table_name.clone(), request_items)
                 .send()
@@ -460,7 +472,7 @@ impl Table for AwsServices {
         let key = KeyCondition::new(pk_attr, sk_attr, query.partition, query.after, query.before);
 
         let mut request = self
-            .dynamo
+            .client
             .query()
             .table_name(&table_name)
             .index_name(index)
@@ -506,7 +518,7 @@ impl Table for AwsServices {
         context: &'static str,
     ) -> Result<PutOutcome, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
-        let mut builder = self.dynamo.put_item().table_name(table_name);
+        let mut builder = self.client.put_item().table_name(table_name);
         for (name, value) in item.into_inner() {
             builder = builder.item(name, value.into());
         }
@@ -527,7 +539,7 @@ impl Table for AwsServices {
 
     async fn transact(&self, ops: &[PlannedOp]) -> Result<TxnOutcome, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
-        let mut builder = self.dynamo.transact_write_items();
+        let mut builder = self.client.transact_write_items();
         for planned in ops {
             builder = builder.transact_items(to_transact_item(&table_name, &planned.op)?);
         }
@@ -730,45 +742,18 @@ mod tests {
         }
     }
 
-    /// Builds an `AwsServices` whose DynamoDB client records every `GetItem`
-    /// input it would send and short-circuits before transmission.
-    fn aws_with_capturing_dynamo(captured: Arc<Mutex<Vec<GetItemInput>>>) -> AwsServices {
+    /// Builds a `DynamoTable` whose client records every `GetItem` input it
+    /// would send and short-circuits before transmission.
+    fn aws_with_capturing_dynamo(captured: Arc<Mutex<Vec<GetItemInput>>>) -> DynamoTable {
         let dynamo_conf = aws_sdk_dynamodb::Config::builder()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
             .interceptor(CaptureGetItemInput(captured))
             .build();
-        let sdk = aws_config::SdkConfig::builder()
-            .behavior_version(aws_config::BehaviorVersion::latest())
-            .build();
-        let mut aws = AwsServices::new(
-            &sdk,
-            crate::config::Config {
-                table_name: "events".to_owned(),
-                event_bus_name: "bus".to_owned(),
-                event_source: "aws-messaging-webhook".to_owned(),
-                auto_resubscribe: false,
-                opt_out_list_name: None,
-                raw_event_retention_days: 30,
-                aggregate_retention_days: 365,
-                mode: crate::config::FunctionMode::Webhook,
-                mail: Some(crate::config::MailConfig {
-                    domain: "example.com".to_owned(),
-                    table_name: MAIL_TABLE_NAME.to_owned(),
-                    bucket: "mail-bucket".to_owned(),
-                    inbox: "support@example.com".to_owned(),
-                    configuration_set: "config-set".to_owned(),
-                    identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com"
-                        .to_owned(),
-                    api_keys_parameter: "/example/api-keys".to_owned(),
-                    attachment_url_ttl: std::time::Duration::from_secs(3600),
-                    region: "us-east-1".to_owned(),
-                    retention_days: 365,
-                }),
-            },
-        );
-        aws.dynamo = aws_sdk_dynamodb::Client::from_conf(dynamo_conf);
-        aws
+        DynamoTable::new(
+            aws_sdk_dynamodb::Client::from_conf(dynamo_conf),
+            Some(MAIL_TABLE_NAME.to_owned()),
+        )
     }
 
     /// Only the `ensure_inbox` recovery read pays for strong consistency.

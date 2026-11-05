@@ -23,10 +23,11 @@ use serde::Serialize;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
+use crate::mail::objects::ObjectStore;
 use crate::mail::send::{Envelope, SendKey, SendSpec, SendState};
 use crate::mail::store::EnqueueOutcome;
 use crate::mail::{InboxId, MailMessage, content, ids, keys, time};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 pub use reply::reply;
 pub use validate::{ReplyRequest, SendRequest};
@@ -54,8 +55,8 @@ pub struct SendAccepted {
 /// [`ApiError::NotFound`] when the inbox does not exist,
 /// [`ApiError::Conflict`] when an `Idempotency-Key` is reused with a
 /// different request, and a store or object failure otherwise.
-pub async fn send<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn send<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
     headers: HeaderMap,
     ApiJson(request): ApiJson<SendRequest>,
@@ -68,8 +69,8 @@ pub async fn send<T: Services>(
 /// `original`, when present, is the message being replied to, with its
 /// content document; together they give the new message its thread and its
 /// threading headers.
-async fn enqueue<T: Services>(
-    state: &AppState<T>,
+async fn enqueue<B: Backend>(
+    state: &AppState<B>,
     inbox: InboxId,
     request: SendRequest,
     headers: &HeaderMap,
@@ -83,7 +84,7 @@ async fn enqueue<T: Services>(
     };
     // An inbox that does not exist cannot send: the address would not be one
     // this domain owns.
-    if state.mailbox().get_inbox(&inbox).await?.is_none() {
+    if state.mailbox.get_inbox(&inbox).await?.is_none() {
         return Err(ApiError::NotFound);
     }
 
@@ -117,8 +118,8 @@ async fn enqueue<T: Services>(
     // Reclaim any `outbox/` uploads before the error escapes — a partial
     // `upload_spec` would otherwise orphan them, and `outbox/` has no
     // lifecycle rule.
-    if let Err(error) = upload_spec(&state.services, &spec, &validated).await {
-        return Err(discard_and_fail(&state.services, &spec, error).await);
+    if let Err(error) = upload_spec(&state.objects, &spec, &validated).await {
+        return Err(discard_and_fail(&state.objects, &spec, error).await);
     }
     let message_content = content::MessageContent {
         text: validated.text.clone(),
@@ -130,9 +131,9 @@ async fn enqueue<T: Services>(
     };
     // The spec and parts already landed under `outbox/`; reclaim them before
     // the error escapes. (`messages/` reclaims itself via its lifecycle rule.)
-    if let Err(error) = content::store(&state.services, &inbox, &message_id, &message_content).await
+    if let Err(error) = content::store(&state.objects, &inbox, &message_id, &message_content).await
     {
-        return Err(discard_and_fail(&state.services, &spec, error).await);
+        return Err(discard_and_fail(&state.objects, &spec, error).await);
     }
 
     let state_item = SendState::queued(
@@ -161,7 +162,7 @@ async fn enqueue<T: Services>(
     });
 
     let committed = state
-        .mailbox()
+        .mailbox
         .enqueue_send(&message, &state_item, key.as_ref(), now_ms / 1_000)
         .await;
     match committed {
@@ -173,7 +174,7 @@ async fn enqueue<T: Services>(
         // and this commit: answer the way that request would be answered on a
         // replay, and drop what this one uploaded.
         Ok(EnqueueOutcome::KeyExists) => {
-            discard_uploads(&state.services, &spec).await;
+            discard_uploads(&state.objects, &spec).await;
             let hash = key
                 .as_ref()
                 .map(|key| key.key_hash.as_str())
@@ -186,7 +187,7 @@ async fn enqueue<T: Services>(
                 )),
             }
         }
-        Err(error) => Err(discard_and_fail(&state.services, &spec, error).await),
+        Err(error) => Err(discard_and_fail(&state.objects, &spec, error).await),
     }
 }
 
@@ -195,10 +196,10 @@ async fn enqueue<T: Services>(
 /// commit. `outbox/` has no bucket lifecycle rule, so stranding the uploads
 /// would leak them forever; [`discard_uploads`] is best effort (a leftover
 /// object is harmless, and `delete_object` treats a missing key as success).
-async fn discard_and_fail<T: Services, E>(services: &T, spec: &SendSpec, error: E) -> ApiError
+async fn discard_and_fail<O: ObjectStore, E>(objects: &O, spec: &SendSpec, error: E) -> ApiError
 where
     ApiError: From<E>,
 {
-    discard_uploads(services, spec).await;
+    discard_uploads(objects, spec).await;
     ApiError::from(error)
 }

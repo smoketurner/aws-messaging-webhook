@@ -15,7 +15,7 @@
     clippy::must_use_candidate,
     reason = "test harness helpers: callers always use the return value directly"
 )]
-//! Shared handler-test infrastructure: `FakeServices`, the request
+//! Shared handler-test infrastructure: one fake per seam, the request
 //! harness, and the SNS-envelope / Lambda-invocation builders every handler
 //! test suite drives. A dev-dependency crate (not a `tests/support` module)
 //! so a test binary that doesn't use every helper isn't flagged for dead
@@ -27,7 +27,6 @@ pub mod api_keys;
 pub mod mail_memory;
 pub mod objects;
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,24 +39,20 @@ use aws_messaging_webhook::actions::{
     SuppressionReason,
 };
 use aws_messaging_webhook::allowlist::TopicAllowlist;
-use aws_messaging_webhook::api::keys::{ApiKeyError, ApiKeySource, KeyCache};
+use aws_messaging_webhook::api::keys::KeyCache;
 use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
-use aws_messaging_webhook::mail::keys::TableKey;
-use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
-use aws_messaging_webhook::mail::plan::PlannedOp;
+use aws_messaging_webhook::mail::mailbox::Mailbox;
 use aws_messaging_webhook::mail::send::SendSpec;
-use aws_messaging_webhook::mail::store::{MailStoreError, Page};
-use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
-use aws_messaging_webhook::mail::{InboxId, ObjectMeta, PutOutcome, object_keys};
+use aws_messaging_webhook::mail::{InboxId, object_keys};
 use aws_messaging_webhook::model::DomainEvent;
 use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
-use aws_messaging_webhook::state::AppState;
+use aws_messaging_webhook::state::{AppState, Backend};
 use aws_messaging_webhook::store::{EventRecord, EventStore, PersistOutcome, StoreError};
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lambda_http::{Context, LambdaEvent};
 use mail_memory::MailMemoryStore;
@@ -71,210 +66,65 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const ALLOWED_ACCOUNT: &str = "123456789012";
 
-#[derive(Default)]
-pub struct FakeServices {
-    pub calls: Mutex<Vec<String>>,
-    pub published: Mutex<Vec<OutboundEvent>>,
-    pub persist_outcome: Mutex<Option<PersistOutcome>>,
-    pub fail_persist: AtomicBool,
-    pub fail_publish: AtomicBool,
-    /// The 0-based publish attempt that fails, for a stream batch whose
-    /// middle record fails while the others would succeed. Every other
-    /// attempt follows `fail_publish`.
-    pub fail_publish_at: Mutex<Option<usize>>,
-    /// How many publishes have been attempted, failures included.
-    pub publish_attempts: AtomicUsize,
-    pub action_error: Mutex<Option<ActionErrorKind>>,
-    /// Email addresses whose suppression call fails with a permanent error,
-    /// simulating SES `BadRequestException` for a malformed recipient. Other
-    /// recipients still succeed — the action must continue past these.
-    pub permanent_suppression_failures: Mutex<Vec<String>>,
-    /// In-memory mail table; `Table` is delegated to it below.
-    pub mail: MailMemoryStore,
-    /// Fake object store; `ObjectStore` is delegated to it below.
-    pub objects: FakeObjectStore,
-    /// The bearer keys the `/v0` surface authenticates against;
-    /// `ApiKeySource` is delegated to it below. Unavailable until a test
-    /// calls `set_keys`.
-    pub api_keys: FakeApiKeys,
-    /// Every message handed to `send_raw`, in order.
-    pub sent: Mutex<Vec<SentMessage>>,
-    /// The outcome the next `send_raw` returns, consumed once. Defaults to a
-    /// successful send.
-    pub send_outcome: Mutex<Option<SendOutcome>>,
-    /// How many transient mail-store failures to inject as `send_raw`
-    /// returns, so a test can make recording an accepted send fail.
-    pub store_failures_after_send: Mutex<usize>,
-    /// URLs the fake fetcher serves, by URL string. A URL that is not here
-    /// fails the way an unreachable host would.
-    pub fetchable: Mutex<std::collections::HashMap<String, Vec<u8>>>,
-    /// Every URL `fetch` was asked for, in order.
-    pub fetched: Mutex<Vec<String>>,
+/// The test [`Backend`]: one in-process fake per seam.
+pub struct Fakes;
+
+impl Backend for Fakes {
+    type Table = MailMemoryStore;
+    type Events = FakeEvents;
+    type Publisher = FakePublisher;
+    type Sms = FakeSms;
+    type Ses = FakeSes;
+    type Objects = FakeObjectStore;
+    type Fetcher = FakeFetcher;
+    type Keys = FakeApiKeys;
 }
 
-impl AttachmentFetcher for FakeServices {
-    fn fetch(
-        &self,
-        url: &aws_messaging_webhook::mail::url_policy::AttachmentUrl,
-        max_bytes: u64,
-    ) -> impl Future<Output = Result<Fetched, FetchError>> + Send {
-        self.fetched.lock().unwrap().push(url.as_str().to_owned());
-        let result = match self.fetchable.lock().unwrap().get(url.as_str()).cloned() {
-            None => Err(FetchError::Rejected { status: 404 }),
-            Some(body) if body.len() as u64 > max_bytes => Err(FetchError::TooLarge),
-            Some(body) => Ok(Fetched { bytes: body }),
-        };
-        std::future::ready(result)
-    }
-}
+/// The calls the event, publish, SMS and SES fakes receive, in order. One log
+/// is shared by all four so a test can assert on how the calls interleave
+/// (persist before publish, say).
+#[derive(Debug, Clone, Default)]
+pub struct CallLog(Arc<Mutex<Vec<String>>>);
 
-impl FakeServices {
-    /// Makes `url` fetchable with `body`.
-    pub fn serve_url(&self, url: &str, body: &[u8]) {
-        self.fetchable
-            .lock()
-            .unwrap()
-            .insert(url.to_owned(), body.to_vec());
-    }
-}
-
-/// One call to [`SesApi::send_raw`], captured for assertions.
-#[derive(Debug, Clone)]
-pub struct SentMessage {
-    pub message_id: String,
-    pub raw: Vec<u8>,
-    pub to: Vec<String>,
-    pub cc: Vec<String>,
-    pub bcc: Vec<String>,
-    pub from: String,
-}
-
-impl SentMessage {
-    /// The assembled message as text, for asserting on headers and bodies.
-    #[must_use]
-    pub fn raw_text(&self) -> String {
-        String::from_utf8_lossy(&self.raw).into_owned()
-    }
-}
-
-impl ApiKeySource for FakeServices {
-    async fn fetch(&self) -> Result<String, ApiKeyError> {
-        self.api_keys.fetch().await
-    }
-}
-
-impl Table for FakeServices {
-    fn get<T: serde::de::DeserializeOwned + Send>(
-        &self,
-        key: TableKey,
-        read: Read,
-        context: &'static str,
-    ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
-        self.mail.get(key, read, context)
-    }
-
-    fn batch_get<T: serde::de::DeserializeOwned + Send>(
-        &self,
-        keys: Vec<TableKey>,
-        read: Read,
-        context: &'static str,
-    ) -> impl Future<Output = Result<HashMap<TableKey, T>, MailStoreError>> + Send {
-        self.mail.batch_get(keys, read, context)
-    }
-
-    fn query<T: serde::de::DeserializeOwned + Send>(
-        &self,
-        query: PageQuery<'_>,
-    ) -> impl Future<Output = Result<Page<T>, MailStoreError>> + Send {
-        self.mail.query(query)
-    }
-
-    fn put_if_absent(
-        &self,
-        item: serde_dynamo::Item,
-        context: &'static str,
-    ) -> impl Future<Output = Result<PutOutcome, MailStoreError>> + Send {
-        self.mail.put_if_absent(item, context)
-    }
-
-    fn transact(
-        &self,
-        ops: &[PlannedOp],
-    ) -> impl Future<Output = Result<TxnOutcome, MailStoreError>> + Send {
-        self.mail.transact(ops)
-    }
-
-    fn pause(&self, attempt: u32) -> impl Future<Output = ()> + Send {
-        self.mail.pause(attempt)
-    }
-}
-
-impl ObjectStore for FakeServices {
-    async fn get_object(&self, key: &str, max_bytes: u64) -> Result<Bytes, ObjectError> {
-        self.objects.get_object(key, max_bytes).await
-    }
-
-    async fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>, ObjectError> {
-        self.objects.head_object(key).await
-    }
-
-    async fn put_object_if_absent(
-        &self,
-        key: &str,
-        body: Bytes,
-        content_type: &str,
-    ) -> Result<PutOutcome, ObjectError> {
-        self.objects
-            .put_object_if_absent(key, body, content_type)
-            .await
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<(), ObjectError> {
-        self.objects.delete_object(key).await
-    }
-
-    async fn presign_get(
-        &self,
-        key: &str,
-        disposition: Option<&str>,
-        content_type: Option<&str>,
-        ttl: Duration,
-    ) -> Result<String, ObjectError> {
-        self.objects
-            .presign_get(key, disposition, content_type, ttl)
-            .await
-    }
-}
-
-impl FakeServices {
+impl CallLog {
     pub fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
+        self.0.lock().unwrap().clone()
     }
 
     fn record(&self, call: impl Into<String>) {
-        self.calls.lock().unwrap().push(call.into());
-    }
-
-    fn action_result(&self) -> Result<(), ActionError> {
-        match *self.action_error.lock().unwrap() {
-            Some(ActionErrorKind::Transient) => Err(ActionError::transient(anyhow!(
-                "simulated transient action failure"
-            ))),
-            Some(ActionErrorKind::Permanent) => Err(ActionError::permanent(anyhow!(
-                "simulated permanent action failure"
-            ))),
-            None => Ok(()),
-        }
+        self.0.lock().unwrap().push(call.into());
     }
 }
 
-impl EventStore for FakeServices {
+/// The scripted outcome of an SMS or SES action call.
+fn action_result(action_error: &Mutex<Option<ActionErrorKind>>) -> Result<(), ActionError> {
+    match *action_error.lock().unwrap() {
+        Some(ActionErrorKind::Transient) => Err(ActionError::transient(anyhow!(
+            "simulated transient action failure"
+        ))),
+        Some(ActionErrorKind::Permanent) => Err(ActionError::permanent(anyhow!(
+            "simulated permanent action failure"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The events table fake.
+#[derive(Default)]
+pub struct FakeEvents {
+    calls: CallLog,
+    pub persist_outcome: Mutex<Option<PersistOutcome>>,
+    pub fail_persist: AtomicBool,
+}
+
+impl EventStore for FakeEvents {
     fn persist_new(
         &self,
         record: &EventRecord,
         _event: &DomainEvent,
     ) -> impl Future<Output = Result<PersistOutcome, StoreError>> + Send {
-        self.record(format!("persist:{}", record.aggregate_id));
+        self.calls
+            .record(format!("persist:{}", record.aggregate_id));
         let result = if self.fail_persist.load(Ordering::SeqCst) {
             Err(StoreError(anyhow!("simulated persist failure")))
         } else {
@@ -288,12 +138,26 @@ impl EventStore for FakeServices {
     }
 }
 
-impl PublishEvents for FakeServices {
+/// The `EventBridge` fake.
+#[derive(Default)]
+pub struct FakePublisher {
+    calls: CallLog,
+    pub published: Mutex<Vec<OutboundEvent>>,
+    pub fail_publish: AtomicBool,
+    /// The 0-based publish attempt that fails, for a stream batch whose
+    /// middle record fails while the others would succeed. Every other
+    /// attempt follows `fail_publish`.
+    pub fail_publish_at: Mutex<Option<usize>>,
+    /// How many publishes have been attempted, failures included.
+    pub publish_attempts: AtomicUsize,
+}
+
+impl PublishEvents for FakePublisher {
     fn publish(
         &self,
         event: &OutboundEvent,
     ) -> impl Future<Output = Result<(), PublishError>> + Send {
-        self.record(format!("publish:{}", event.detail_type));
+        self.calls.record(format!("publish:{}", event.detail_type));
         let attempt = self.publish_attempts.fetch_add(1, Ordering::SeqCst);
         let fails_here = *self.fail_publish_at.lock().unwrap() == Some(attempt);
         let result = if fails_here || self.fail_publish.load(Ordering::SeqCst) {
@@ -306,14 +170,22 @@ impl PublishEvents for FakeServices {
     }
 }
 
-impl SmsVoiceApi for FakeServices {
+/// The End User Messaging SMS fake.
+#[derive(Default)]
+pub struct FakeSms {
+    calls: CallLog,
+    pub action_error: Mutex<Option<ActionErrorKind>>,
+}
+
+impl SmsVoiceApi for FakeSms {
     fn put_message_feedback(
         &self,
         message_id: &str,
         status: FeedbackStatus,
     ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("feedback:{message_id}:{status:?}"));
-        std::future::ready(self.action_result())
+        self.calls
+            .record(format!("feedback:{message_id}:{status:?}"));
+        std::future::ready(action_result(&self.action_error))
     }
 
     fn put_opted_out_number(
@@ -321,8 +193,8 @@ impl SmsVoiceApi for FakeServices {
         _opt_out_list_name: &str,
         phone_number: &str,
     ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("opt_out:{phone_number}"));
-        std::future::ready(self.action_result())
+        self.calls.record(format!("opt_out:{phone_number}"));
+        std::future::ready(action_result(&self.action_error))
     }
 
     fn delete_opted_out_number(
@@ -330,14 +202,36 @@ impl SmsVoiceApi for FakeServices {
         _opt_out_list_name: &str,
         phone_number: &str,
     ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("opt_in:{phone_number}"));
-        std::future::ready(self.action_result())
+        self.calls.record(format!("opt_in:{phone_number}"));
+        std::future::ready(action_result(&self.action_error))
     }
 }
 
-impl SesApi for FakeServices {
+/// The SES fake.
+#[derive(Default)]
+pub struct FakeSes {
+    calls: CallLog,
+    /// The mail table, so a test can make recording an accepted send fail.
+    mail: MailMemoryStore,
+    pub action_error: Mutex<Option<ActionErrorKind>>,
+    /// Email addresses whose suppression call fails with a permanent error,
+    /// simulating SES `BadRequestException` for a malformed recipient. Other
+    /// recipients still succeed — the action must continue past these.
+    pub permanent_suppression_failures: Mutex<Vec<String>>,
+    /// Every message handed to `send_raw`, in order.
+    pub sent: Mutex<Vec<SentMessage>>,
+    /// The outcome the next `send_raw` returns, consumed once. Defaults to a
+    /// successful send.
+    pub send_outcome: Mutex<Option<SendOutcome>>,
+    /// How many transient mail-store failures to inject as `send_raw`
+    /// returns, so a test can make recording an accepted send fail.
+    pub store_failures_after_send: Mutex<usize>,
+}
+
+impl SesApi for FakeSes {
     fn send_raw(&self, request: &RawSend<'_>) -> impl Future<Output = SendOutcome> + Send {
-        self.record(format!("send_raw:{}", request.message_id));
+        self.calls
+            .record(format!("send_raw:{}", request.message_id));
         for _ in 0..std::mem::take(&mut *self.store_failures_after_send.lock().unwrap()) {
             self.mail.inject(mail_memory::Injected::Transient);
         }
@@ -365,7 +259,8 @@ impl SesApi for FakeServices {
         email_address: &str,
         reason: SuppressionReason,
     ) -> impl Future<Output = Result<(), ActionError>> + Send {
-        self.record(format!("suppress:{email_address}:{reason:?}"));
+        self.calls
+            .record(format!("suppress:{email_address}:{reason:?}"));
         let result = if self
             .permanent_suppression_failures
             .lock()
@@ -377,34 +272,144 @@ impl SesApi for FakeServices {
                 "simulated permanent suppression failure for {email_address}"
             )))
         } else {
-            self.action_result()
+            action_result(&self.action_error)
+        };
+        std::future::ready(result)
+    }
+}
+
+/// One call to [`SesApi::send_raw`], captured for assertions.
+#[derive(Debug, Clone)]
+pub struct SentMessage {
+    pub message_id: String,
+    pub raw: Vec<u8>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub from: String,
+}
+
+impl SentMessage {
+    /// The assembled message as text, for asserting on headers and bodies.
+    #[must_use]
+    pub fn raw_text(&self) -> String {
+        String::from_utf8_lossy(&self.raw).into_owned()
+    }
+}
+
+/// The attachment-URL fetcher fake.
+#[derive(Default)]
+pub struct FakeFetcher {
+    /// URLs this fake serves, by URL string. A URL that is not here fails
+    /// the way an unreachable host would.
+    pub fetchable: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// Every URL `fetch` was asked for, in order.
+    pub fetched: Mutex<Vec<String>>,
+}
+
+impl FakeFetcher {
+    /// Makes `url` fetchable with `body`.
+    pub fn serve_url(&self, url: &str, body: &[u8]) {
+        self.fetchable
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), body.to_vec());
+    }
+}
+
+impl AttachmentFetcher for FakeFetcher {
+    fn fetch(
+        &self,
+        url: &aws_messaging_webhook::mail::url_policy::AttachmentUrl,
+        max_bytes: u64,
+    ) -> impl Future<Output = Result<Fetched, FetchError>> + Send {
+        self.fetched.lock().unwrap().push(url.as_str().to_owned());
+        let result = match self.fetchable.lock().unwrap().get(url.as_str()).cloned() {
+            None => Err(FetchError::Rejected { status: 404 }),
+            Some(body) if body.len() as u64 > max_bytes => Err(FetchError::TooLarge),
+            Some(body) => Ok(Fetched { bytes: body }),
         };
         std::future::ready(result)
     }
 }
 
 pub struct Harness {
-    pub state: Arc<AppState<FakeServices>>,
+    pub state: Arc<AppState<Fakes>>,
+    /// The log the event, publish, SMS and SES fakes record into.
+    pub call_log: CallLog,
+    /// The mail table behind `state.mailbox`, for seeding and inspecting
+    /// items directly and scripting its failures.
+    pub mail: MailMemoryStore,
     pub fixture: SnsFixture,
     pub cert_url: String,
     pub server: MockServer,
 }
 
 impl Harness {
-    pub fn fake(&self) -> &FakeServices {
-        &self.state.services
+    /// Every call the event, publish, SMS and SES fakes received, in order.
+    pub fn calls(&self) -> Vec<String> {
+        self.call_log.calls()
     }
 
     /// The stored spec the sender will build `message_id` from.
     pub fn send_spec(&self, message_id: &str) -> SendSpec {
         let bytes = self
             .state
-            .services
             .objects
             .get(&object_keys::spec(message_id))
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
+}
+
+/// A fresh state over new fakes, with the call log and mail table they
+/// share.
+pub fn fake_state(
+    config: Config,
+    verifier: SnsVerifier,
+    allowlist: TopicAllowlist,
+    dangerous_subscribe_url_prefix: Option<String>,
+) -> (AppState<Fakes>, CallLog, MailMemoryStore) {
+    let call_log = CallLog::default();
+    let mail = MailMemoryStore::default();
+    let state = AppState::<Fakes> {
+        mailbox: Mailbox::new(mail.clone()),
+        events: FakeEvents {
+            calls: call_log.clone(),
+            ..FakeEvents::default()
+        },
+        publisher: FakePublisher {
+            calls: call_log.clone(),
+            ..FakePublisher::default()
+        },
+        sms: FakeSms {
+            calls: call_log.clone(),
+            ..FakeSms::default()
+        },
+        ses: FakeSes {
+            calls: call_log.clone(),
+            mail: mail.clone(),
+            ..FakeSes::default()
+        },
+        objects: FakeObjectStore::default(),
+        fetcher: FakeFetcher::default(),
+        key_source: FakeApiKeys::default(),
+        api_keys: KeyCache::new(),
+        verifier,
+        allowlist,
+        http: reqwest::Client::new(),
+        config,
+        dangerous_subscribe_url_prefix,
+    };
+    (state, call_log, mail)
+}
+
+/// A verifier that trusts certificates `server` serves.
+pub fn test_verifier(server: &MockServer) -> SnsVerifier {
+    SnsVerifier::builder()
+        .dangerous_allow_cert_url_prefix(server.uri())
+        .build()
+        .unwrap()
 }
 
 pub struct HarnessOptions {
@@ -456,24 +461,20 @@ pub async fn harness_with(options: HarnessOptions) -> Harness {
     cert_mock.mount(&server).await;
     let cert_url = format!("{}/cert.pem", server.uri());
 
-    let state = Arc::new(AppState {
-        services: FakeServices::default(),
-        api_keys: KeyCache::new(),
-        verifier: SnsVerifier::builder()
-            .dangerous_allow_cert_url_prefix(server.uri())
-            .build()
-            .unwrap(),
-        allowlist: TopicAllowlist::parse(options.allowed_topics),
-        http: reqwest::Client::new(),
-        config: Config {
+    let (state, call_log, mail) = fake_state(
+        Config {
             auto_resubscribe: options.auto_resubscribe,
             opt_out_list_name: options.opt_out_list.then(|| "opt-out-list".to_owned()),
             ..test_config()
         },
-        dangerous_subscribe_url_prefix: Some(server.uri()),
-    });
+        test_verifier(&server),
+        TopicAllowlist::parse(options.allowed_topics),
+        Some(server.uri()),
+    );
     Harness {
-        state,
+        state: Arc::new(state),
+        call_log,
+        mail,
         fixture,
         cert_url,
         server,
@@ -512,22 +513,18 @@ pub fn test_mail_config() -> MailConfig {
 /// test needs this instead.
 pub async fn mail_harness() -> Harness {
     let mut harness = harness_with(HarnessOptions::default()).await;
-    let state = Arc::new(AppState {
-        services: FakeServices::default(),
-        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
-        verifier: SnsVerifier::builder()
-            .dangerous_allow_cert_url_prefix(harness.server.uri())
-            .build()
-            .unwrap(),
-        allowlist: TopicAllowlist::parse(ALLOWED_ACCOUNT),
-        http: reqwest::Client::new(),
-        config: Config {
+    let (state, call_log, mail) = fake_state(
+        Config {
             mail: Some(test_mail_config()),
             ..harness.state.config.clone()
         },
-        dangerous_subscribe_url_prefix: Some(harness.server.uri()),
-    });
-    harness.state = state;
+        test_verifier(&harness.server),
+        TopicAllowlist::parse(ALLOWED_ACCOUNT),
+        Some(harness.server.uri()),
+    );
+    harness.state = Arc::new(state);
+    harness.call_log = call_log;
+    harness.mail = mail;
     harness
 }
 
@@ -545,12 +542,9 @@ pub const TEST_INBOX_CREATED_AT: &str = "2026-01-01T00:00:00.000Z";
 
 /// Authorizes [`TEST_API_KEY`] on `h` and creates [`TEST_INBOX`].
 pub async fn grant_api_access(h: &Harness) {
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
     h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
-    h.state
-        .mailbox()
+        .mailbox
         .ensure_inbox(&InboxId::new(TEST_INBOX), TEST_INBOX_CREATED_AT)
         .await
         .unwrap();
@@ -564,7 +558,7 @@ pub async fn api_harness() -> Harness {
     h
 }
 
-pub async fn post(state: Arc<AppState<FakeServices>>, route: &str, body: &Value) -> StatusCode {
+pub async fn post(state: Arc<AppState<Fakes>>, route: &str, body: &Value) -> StatusCode {
     let request = Request::post(route)
         .header("x-amz-sns-message-type", "Notification")
         .body(Body::from(body.to_string()))
@@ -660,7 +654,7 @@ pub fn test_context() -> Context {
 
 /// Drives the single-binary entry point exactly as the Lambda runtime would.
 pub async fn invoke(
-    state: Arc<AppState<FakeServices>>,
+    state: Arc<AppState<Fakes>>,
     payload: Value,
 ) -> Result<Value, lambda_http::Error> {
     let router: Router = app(state.clone());

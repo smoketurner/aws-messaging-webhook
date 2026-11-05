@@ -12,7 +12,7 @@ use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// How an action failure affects the request, per the SNS retry contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,8 +223,8 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
 /// label is added, never removed: these events arrive out of order under
 /// at-least-once delivery, and a message that both bounced and was opened
 /// should say so.
-async fn apply_delivery_label<T: Services>(
-    state: &AppState<T>,
+async fn apply_delivery_label<B: Backend>(
+    state: &AppState<B>,
     event: &crate::model::ses_notification::SesNotification,
 ) -> Result<bool, ActionError> {
     let Some(label) = event.kind.mailbox_label() else {
@@ -236,7 +236,7 @@ async fn apply_delivery_label<T: Services>(
     }
 
     let resolved = state
-        .mailbox()
+        .mailbox
         .resolve_ses_message(&event.mail.message_id)
         .await
         .map_err(ActionError::from)?;
@@ -246,7 +246,7 @@ async fn apply_delivery_label<T: Services>(
 
     let now = crate::mail::time::format(crate::mail::time::now_ms());
     state
-        .mailbox()
+        .mailbox
         .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
         .await
         .map_err(ActionError::from)?;
@@ -269,14 +269,14 @@ async fn apply_delivery_label<T: Services>(
 /// every recipient; a permanent failure is logged and counted (per recipient,
 /// since these errors never reach the action-level handler that normally
 /// records `ActionFailures`) and the remaining recipients are still attempted.
-async fn suppress_recipients<T: Services>(
-    state: &AppState<T>,
+async fn suppress_recipients<B: Backend>(
+    state: &AppState<B>,
     recipients: &[SesRecipient],
     reason: SuppressionReason,
 ) -> Result<(), ActionError> {
     for recipient in recipients {
         match state
-            .services
+            .ses
             .put_suppressed_destination(&recipient.email_address, reason)
             .await
         {
@@ -336,8 +336,8 @@ impl ActionTaken {
 ///
 /// Propagates [`ActionError`] from the underlying API call; the caller maps
 /// `Transient` to a 5xx and logs-and-continues on `Permanent`.
-pub async fn run<T: Services>(
-    state: &AppState<T>,
+pub async fn run<B: Backend>(
+    state: &AppState<B>,
     event: &DomainEvent,
     // Threaded through for inbound-ingest time-boxing; only the
     // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
@@ -359,14 +359,14 @@ pub async fn run<T: Services>(
             match (intent, list) {
                 (KeywordIntent::OptOut, Some(list)) => {
                     state
-                        .services
+                        .sms
                         .put_opted_out_number(list, &event.origination_number)
                         .await?;
                     Ok(ActionTaken::OptOut)
                 }
                 (KeywordIntent::OptIn, Some(list)) => {
                     state
-                        .services
+                        .sms
                         .delete_opted_out_number(list, &event.origination_number)
                         .await?;
                     Ok(ActionTaken::OptIn)
@@ -392,7 +392,7 @@ pub async fn run<T: Services>(
                 FeedbackStatus::Failed
             };
             state
-                .services
+                .sms
                 .put_message_feedback(&event.message_id, status)
                 .await?;
             Ok(ActionTaken::Feedback)

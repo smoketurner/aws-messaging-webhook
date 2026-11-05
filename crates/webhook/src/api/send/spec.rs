@@ -8,9 +8,9 @@ use axum::body::Bytes;
 use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::labels::SystemLabel;
+use crate::mail::objects::ObjectStore;
 use crate::mail::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
 use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime, object_keys};
-use crate::state::Services;
 
 /// Builds the spec the sender will assemble the message from.
 pub(super) fn build_spec(
@@ -79,8 +79,8 @@ pub(super) fn build_spec(
 /// The spec goes last on purpose: the sender treats it as the signal that a
 /// send is ready to build, so it must never be visible before the parts it
 /// refers to.
-pub(super) async fn upload_spec<T: Services>(
-    services: &T,
+pub(super) async fn upload_spec<O: ObjectStore>(
+    objects: &O,
     spec: &SendSpec,
     send: &ValidatedSend,
 ) -> Result<(), ApiError> {
@@ -91,7 +91,7 @@ pub(super) async fn upload_spec<T: Services>(
         let Some(key) = &spec_attachment.object_key else {
             continue;
         };
-        services
+        objects
             .put_object_if_absent(
                 key,
                 Bytes::from(bytes.clone()),
@@ -102,7 +102,7 @@ pub(super) async fn upload_spec<T: Services>(
 
     let body = serde_json::to_vec(spec)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing the send spec: {e}")))?;
-    services
+    objects
         .put_object_if_absent(
             &object_keys::spec(&spec.message_id),
             Bytes::from(body),
@@ -186,7 +186,7 @@ pub(super) fn preview_of(send: &ValidatedSend) -> String {
 /// bucket's `expire-messages` lifecycle rule, so deleting it here would only
 /// add a no-op call (and a noisy warning under a narrower grant). Best effort:
 /// the request has already failed, and a leftover object is harmless.
-pub(super) async fn discard_uploads<T: Services>(services: &T, spec: &SendSpec) {
+pub(super) async fn discard_uploads<O: ObjectStore>(objects: &O, spec: &SendSpec) {
     let mut keys = vec![object_keys::spec(&spec.message_id)];
     keys.extend(
         spec.attachments
@@ -194,7 +194,7 @@ pub(super) async fn discard_uploads<T: Services>(services: &T, spec: &SendSpec) 
             .filter_map(|attachment| attachment.object_key.clone()),
     );
     for key in keys {
-        if let Err(error) = services.delete_object(&key).await {
+        if let Err(error) = objects.delete_object(&key).await {
             tracing::warn!(
                 message_id = %spec.message_id,
                 key,

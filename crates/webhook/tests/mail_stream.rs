@@ -23,9 +23,14 @@ use webhook_test_support::{Harness, harness, invoke};
 
 /// Stores a message's content document where the relay reads it.
 async fn store_content(h: &Harness, msg: &MailMessage, message_content: MessageContent) {
-    content::store(h.fake(), &msg.inbox_id, &msg.message_id, &message_content)
-        .await
-        .unwrap();
+    content::store(
+        &h.state.objects,
+        &msg.inbox_id,
+        &msg.message_id,
+        &message_content,
+    )
+    .await
+    .unwrap();
 }
 
 fn sample_message() -> MailMessage {
@@ -163,7 +168,7 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     let detail = &published[0].detail;
     assert_eq!(published[0].detail_type, "message.received");
@@ -181,10 +186,7 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
     assert_eq!(detail["message"]["text"], "Hello there");
     assert_eq!(detail["thread"]["thread_id"], "tid-1");
     assert_eq!(detail["thread"]["message_count"], 1);
-    assert_eq!(
-        h.fake().calls(),
-        vec!["publish:message.received".to_owned()]
-    );
+    assert_eq!(h.calls(), vec!["publish:message.received".to_owned()]);
 }
 
 /// The relay publishes the stored `thread_snapshot` verbatim, so a
@@ -219,7 +221,7 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
 
     invoke(h.state.clone(), event).await.unwrap();
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     let thread = &published[0].detail["thread"];
     assert_eq!(thread["message_count"], 2);
@@ -238,7 +240,7 @@ async fn insert_spam_publishes_the_spam_variant() {
 
     invoke(h.state.clone(), event).await.unwrap();
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].detail_type, "message.received.spam");
 }
@@ -252,7 +254,7 @@ async fn insert_unauthenticated_publishes_the_unauthenticated_variant() {
 
     invoke(h.state.clone(), event).await.unwrap();
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].detail_type, "message.received.unauthenticated");
 }
@@ -270,7 +272,7 @@ async fn spam_takes_precedence_over_unauthenticated_on_the_stream_path() {
 
     invoke(h.state.clone(), event).await.unwrap();
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published[0].detail_type, "message.received.spam");
 }
 
@@ -302,7 +304,7 @@ async fn modify_publishes_the_send_but_not_a_delivery_label() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     let types: Vec<&str> = published
         .iter()
         .map(|event| event.detail_type.as_str())
@@ -324,7 +326,7 @@ async fn modify_without_a_new_system_label_publishes_nothing() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    assert!(h.fake().published.lock().unwrap().is_empty());
+    assert!(h.state.publisher.published.lock().unwrap().is_empty());
 }
 
 /// Without an old image there is nothing to diff, so a MODIFY publishes
@@ -338,7 +340,7 @@ async fn modify_without_an_old_image_publishes_nothing() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    assert!(h.fake().published.lock().unwrap().is_empty());
+    assert!(h.state.publisher.published.lock().unwrap().is_empty());
 }
 
 /// A failed record ends the batch: the event-source mapping restarts from
@@ -359,7 +361,7 @@ async fn a_batch_stops_at_its_first_failed_record() {
         store_content(&h, msg, MessageContent::default()).await;
     }
     // The second record's publish fails; the first has already succeeded.
-    *h.fake().fail_publish_at.lock().unwrap() = Some(1);
+    *h.state.publisher.fail_publish_at.lock().unwrap() = Some(1);
 
     let result = invoke(h.state.clone(), mail_stream_batch(&messages))
         .await
@@ -369,7 +371,7 @@ async fn a_batch_stops_at_its_first_failed_record() {
         result,
         json!({ "batchItemFailures": [{ "itemIdentifier": "seq-2" }] })
     );
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     let ids: Vec<&str> = published
         .iter()
         .map(|event| event.detail["message"]["message_id"].as_str().unwrap())
@@ -396,7 +398,7 @@ async fn send_state_marker_ref_and_key_items_publish_nothing() {
             "sk={sk} should not fail"
         );
         assert!(
-            h.fake().published.lock().unwrap().is_empty(),
+            h.state.publisher.published.lock().unwrap().is_empty(),
             "sk={sk} should not publish"
         );
     }
@@ -412,7 +414,7 @@ async fn event_id_is_stable_across_a_replay_of_the_same_record() {
     let second = mail_stream_event("INSERT", &message_new_image(&msg), "seq-b");
     invoke(h.state.clone(), second).await.unwrap();
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 2);
     assert_eq!(
         published[0].detail["event_id"],
@@ -438,7 +440,7 @@ async fn oversized_html_is_dropped_before_falling_back() {
 
     invoke(h.state.clone(), event).await.unwrap();
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     assert!(published[0].detail["message"].get("html").is_none());
     assert_eq!(published[0].detail["message"]["text"], "Hello there");
@@ -447,7 +449,8 @@ async fn oversized_html_is_dropped_before_falling_back() {
 #[tokio::test]
 async fn a_transient_publish_failure_is_retried() {
     let h = harness().await;
-    h.fake()
+    h.state
+        .publisher
         .fail_publish
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let msg = sample_message();
@@ -476,7 +479,7 @@ async fn events_table_records_are_unaffected_by_the_mail_branch() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     assert_ne!(published[0].detail_type, "message.received");
 }
@@ -491,7 +494,7 @@ async fn aggregate_status_relay_is_unaffected_by_the_mail_branch() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].detail_type, "message.status.changed");
 }
@@ -512,5 +515,5 @@ async fn a_message_item_that_fails_to_deserialize_settles_without_retry() {
     let result = invoke(h.state.clone(), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
-    assert!(h.fake().published.lock().unwrap().is_empty());
+    assert!(h.state.publisher.published.lock().unwrap().is_empty());
 }

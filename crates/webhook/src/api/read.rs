@@ -20,11 +20,12 @@ use crate::api::pagination::ListRequest;
 use crate::config::Config;
 use crate::mail::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
 use crate::mail::objects;
+use crate::mail::objects::ObjectStore as _;
 use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
 use crate::mail::{InboxId, MailMessage, content, time};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// How many store round-trips one list request may spend filling a page.
 /// Without a bound, a filter matching nothing could walk an entire partition
@@ -110,14 +111,14 @@ fn cursor(
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
 /// for another request; a store failure mapped onto the API's retry contract.
-pub async fn list_inboxes<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn list_inboxes<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::InboxList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let start = cursor(&request, keys::INBOXES_PARTITION, UNSCOPED)?;
 
-    let page = state.mailbox().list_inboxes(request.limit, start).await?;
+    let page = state.mailbox.list_inboxes(request.limit, start).await?;
 
     let inboxes: Vec<wire::Inbox> = page.items.iter().map(wire::Inbox::from).collect();
     Ok(Json(wire::InboxList {
@@ -137,12 +138,12 @@ pub async fn list_inboxes<T: Services>(
 ///
 /// [`ApiError::NotFound`] when no such inbox exists; a store failure mapped
 /// onto the API's retry contract.
-pub async fn get_inbox<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn get_inbox<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
 ) -> Result<Json<wire::Inbox>, ApiError> {
     let inbox = state
-        .mailbox()
+        .mailbox
         .get_inbox(&inbox)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -155,8 +156,8 @@ pub async fn get_inbox<T: Services>(
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
 /// for another inbox; a store failure mapped onto the API's retry contract.
-pub async fn list_messages<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn list_messages<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::MessageList>, ApiError> {
@@ -174,7 +175,7 @@ pub async fn list_messages<T: Services>(
         ascending: request.ascending,
         start,
     };
-    let mailbox = &state.mailbox();
+    let mailbox = &state.mailbox;
     let (messages, next) = fill(
         &query,
         |msg: &MailMessage| request.filters.matches_message(msg),
@@ -207,16 +208,16 @@ pub async fn list_messages<T: Services>(
 /// [`ApiError::NotFound`] when the inbox holds no such message; a store
 /// failure or a content document read failure, mapped onto the API's retry
 /// contract.
-pub async fn get_message<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn get_message<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, String)>,
 ) -> Result<Json<wire::Message>, ApiError> {
     let message = state
-        .mailbox()
+        .mailbox
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let content = content::load(&state.services, &message).await?;
+    let content = content::load(&state.objects, &message).await?;
     Ok(Json(wire::Message::new(&message, &content)))
 }
 
@@ -230,12 +231,12 @@ pub async fn get_message<T: Services>(
 /// [`ApiError::NotFound`] when the inbox holds no such message, or the
 /// message predates retention and its raw object is gone; a store or object
 /// failure otherwise.
-pub async fn get_raw<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn get_raw<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
-        .mailbox()
+        .mailbox
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -244,7 +245,7 @@ pub async fn get_raw<T: Services>(
     let disposition = objects::attachment_disposition(Some(&format!("{message_id}.eml")));
     let ttl = download_ttl(&state.config);
     let url = state
-        .services
+        .objects
         .presign_get(key, Some(&disposition), Some("message/rfc822"), ttl)
         .await?;
 
@@ -267,12 +268,12 @@ pub async fn get_raw<T: Services>(
 ///
 /// [`ApiError::NotFound`] when the message, the attachment, or the stored
 /// object does not exist; a store or object failure otherwise.
-pub async fn get_attachment<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn get_attachment<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id, attachment_id)): Path<(InboxId, String, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
-        .mailbox()
+        .mailbox
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -289,7 +290,7 @@ pub async fn get_attachment<T: Services>(
     let disposition = objects::attachment_disposition(attachment.filename.as_deref());
     let ttl = download_ttl(&state.config);
     let url = state
-        .services
+        .objects
         .presign_get(key, Some(&disposition), Some(&attachment.content_type), ttl)
         .await?;
 
@@ -331,8 +332,8 @@ fn expires_at(ttl: Duration) -> String {
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
 /// for another inbox; a store failure mapped onto the API's retry contract.
-pub async fn list_threads<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn list_threads<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::ThreadList>, ApiError> {
@@ -350,7 +351,7 @@ pub async fn list_threads<T: Services>(
         ascending: request.ascending,
         start,
     };
-    let mailbox = &state.mailbox();
+    let mailbox = &state.mailbox;
     let (threads, next) = fill(
         &query,
         |thread: &ThreadState| request.filters.matches_thread(thread),
@@ -387,8 +388,8 @@ pub async fn list_threads<T: Services>(
 /// [`ApiError::Validation`] for a bad query parameter or page token;
 /// [`ApiError::NotFound`] when the inbox holds no such thread; a store
 /// failure mapped onto the API's retry contract.
-pub async fn get_thread<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn get_thread<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     Path((inbox, thread_id)): Path<(InboxId, String)>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::Thread>, ApiError> {
@@ -397,7 +398,7 @@ pub async fn get_thread<T: Services>(
     let start = cursor(&request, &partition, UNSCOPED)?;
 
     let view = state
-        .mailbox()
+        .mailbox
         .get_thread(&inbox, &thread_id, request.limit, start)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -406,7 +407,7 @@ pub async fn get_thread<T: Services>(
     // request limit.
     let mut messages = Vec::with_capacity(view.messages.items.len());
     for message in &view.messages.items {
-        let content = content::load(&state.services, message).await?;
+        let content = content::load(&state.objects, message).await?;
         messages.push(wire::Message::new(message, &content));
     }
     Ok(Json(wire::Thread::new(

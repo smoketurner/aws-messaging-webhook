@@ -14,7 +14,7 @@ use crate::api::send::SendAccepted;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::InboxId;
 use crate::mail::time;
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// How long an `Idempotency-Key` is remembered.
 pub(super) const KEY_TTL_SECONDS: u64 = 24 * 60 * 60;
@@ -103,12 +103,12 @@ pub(super) fn fingerprint(
 /// for such a row lets the request proceed to enqueue, where the write path's
 /// `NotExistsOrExpired` condition reclaims the slot — the same expiry
 /// semantics, applied symmetrically on the read.
-pub(super) async fn replay_key<T: Services>(
-    state: &AppState<T>,
+pub(super) async fn replay_key<B: Backend>(
+    state: &AppState<B>,
     key_hash: &str,
     request_hash: &str,
 ) -> Result<Option<SendAccepted>, ApiError> {
-    let Some(existing) = state.mailbox().get_send_key(key_hash).await? else {
+    let Some(existing) = state.mailbox.get_send_key(key_hash).await? else {
         return Ok(None);
     };
     // `expires_at` is epoch seconds; DynamoDB's TTL deletes expired rows
