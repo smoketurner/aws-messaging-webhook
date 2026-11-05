@@ -16,8 +16,8 @@ use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, SesSent};
 use crate::mail::thread::{AliasLookup, ThreadState};
 use crate::mail::{
-    Direction, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP, ThreadSnapshot, ids,
-    labels, strip_angle_brackets,
+    Direction, Inbox, InboxId, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP,
+    ThreadSnapshot, ids, labels, strip_angle_brackets,
 };
 
 /// Which role a planned op plays in its transaction — used by
@@ -91,42 +91,300 @@ pub struct PlannedOp {
     pub op: WriteOp,
 }
 
-/// Builds a `serde_dynamo::Item` from `value`, inserting `pk`/`sk` (and any
-/// index key attributes) alongside the serialized fields: the struct itself
-/// carries no key attributes, so every planner adds them here.
-fn item_with_keys<T: serde::Serialize>(
-    value: &T,
-    key: TableKey,
-    index_keys: impl IntoIterator<Item = (&'static str, AttributeValue)>,
-) -> Result<serde_dynamo::Item, MailStoreError> {
+/// An item type the mail table stores whole: where it lives and the index
+/// keys it carries. The struct itself holds no key attributes, so they are
+/// added beside its serialized fields.
+trait Keyed: serde::Serialize {
+    fn key(&self) -> TableKey;
+
+    fn index_keys(&self) -> Vec<(&'static str, AttributeValue)> {
+        Vec::new()
+    }
+}
+
+/// A stored item a transaction writes, and the role its write plays.
+trait StoredItem: Keyed {
+    const ROLE: OpRole;
+}
+
+/// The item for `value`: its serialized fields, then its table and index
+/// keys.
+fn to_item<I: Keyed>(value: &I) -> Result<serde_dynamo::Item, MailStoreError> {
     let mut item: serde_dynamo::Item = serde_dynamo::to_item(value)
         .map_err(|e| MailStoreError::Permanent(anyhow::anyhow!("serializing item: {e}")))?;
-    insert_table_key(&mut item, key);
-    for (name, value) in index_keys {
+    let TableKey { pk, sk } = value.key();
+    item.inner_mut()
+        .insert("pk".to_owned(), AttributeValue::S(pk));
+    item.inner_mut()
+        .insert("sk".to_owned(), AttributeValue::S(sk));
+    for (name, value) in value.index_keys() {
         item.inner_mut().insert(name.to_owned(), value);
     }
     Ok(item)
 }
 
-fn insert_table_key(item: &mut serde_dynamo::Item, TableKey { pk, sk }: TableKey) {
-    item.inner_mut()
-        .insert("pk".to_owned(), AttributeValue::S(pk));
-    item.inner_mut()
-        .insert("sk".to_owned(), AttributeValue::S(sk));
+/// The single `ByTime` partition every inbox shares, so `GET /v0/inboxes` is
+/// one query (there are few enough inboxes for that to stay cheap).
+impl Keyed for Inbox {
+    fn key(&self) -> TableKey {
+        keys::inbox(&self.inbox_id)
+    }
+
+    fn index_keys(&self) -> Vec<(&'static str, AttributeValue)> {
+        vec![
+            (
+                "gsi1pk",
+                AttributeValue::S(keys::INBOXES_PARTITION.to_owned()),
+            ),
+            (
+                "gsi1sk",
+                AttributeValue::S(self.inbox_id.as_str().to_owned()),
+            ),
+        ]
+    }
 }
 
-/// The inbox record and the item both stores write for it: its keys, and
-/// the single `ByTime` partition every inbox shares so `GET /v0/inboxes` is
-/// one query (there are few enough inboxes for that to stay cheap).
+impl StoredItem for MailMessage {
+    const ROLE: OpRole = OpRole::Message;
+}
+
+impl Keyed for MailMessage {
+    fn key(&self) -> TableKey {
+        keys::message(&self.inbox_id, &self.message_id)
+    }
+
+    fn index_keys(&self) -> Vec<(&'static str, AttributeValue)> {
+        vec![
+            (
+                "gsi1pk",
+                AttributeValue::S(keys::messages_partition(&self.inbox_id)),
+            ),
+            ("gsi1sk", AttributeValue::S(self.message_id.clone())),
+            (
+                "gsi2pk",
+                AttributeValue::S(keys::thread_messages_partition(
+                    &self.inbox_id,
+                    &self.thread_id,
+                )),
+            ),
+            ("gsi2sk", AttributeValue::S(self.message_id.clone())),
+        ]
+    }
+}
+
+impl StoredItem for ThreadState {
+    const ROLE: OpRole = OpRole::Thread;
+}
+
+impl Keyed for ThreadState {
+    fn key(&self) -> TableKey {
+        keys::thread(&self.inbox_id, &self.thread_id)
+    }
+
+    fn index_keys(&self) -> Vec<(&'static str, AttributeValue)> {
+        vec![
+            (
+                "gsi1pk",
+                AttributeValue::S(keys::threads_partition(&self.inbox_id)),
+            ),
+            (
+                "gsi1sk",
+                AttributeValue::S(keys::thread_time_sort(&self.timestamp, &self.thread_id)),
+            ),
+        ]
+    }
+}
+
+/// A settled send carries no `ByStatus` keys. The index exists for the
+/// sweep, which only ever queries `sending` and `unknown`; writing the keys
+/// for `sent` and `failed` too would pay an index write on the one
+/// transaction every send is guaranteed to make and then keep the whole
+/// item (the index projects ALL) in the index until its TTL. Since these
+/// are `Put`s, dropping the attributes on the settling write is what
+/// removes the entry.
+impl StoredItem for SendState {
+    const ROLE: OpRole = OpRole::SendState;
+}
+
+impl Keyed for SendState {
+    fn key(&self) -> TableKey {
+        keys::send_state(&self.message_id)
+    }
+
+    fn index_keys(&self) -> Vec<(&'static str, AttributeValue)> {
+        if !self.send_status.is_swept() {
+            return Vec::new();
+        }
+        vec![
+            (
+                "gsi3pk",
+                AttributeValue::S(keys::send_status_partition(self.send_status)),
+            ),
+            ("gsi3sk", AttributeValue::S(self.message_id.clone())),
+        ]
+    }
+}
+
+impl StoredItem for SendKey {
+    const ROLE: OpRole = OpRole::IdempotencyKey;
+}
+
+impl Keyed for SendKey {
+    fn key(&self) -> TableKey {
+        keys::send_key(&self.key_hash)
+    }
+}
+
+/// The item mapping an SES message id back to the message sent under it.
+#[derive(serde::Serialize)]
+struct SesRefItem<'a> {
+    #[serde(skip)]
+    ses_message_id: &'a str,
+    inbox_id: &'a InboxId,
+    message_id: &'a str,
+    expires_at: u64,
+}
+
+impl StoredItem for SesRefItem<'_> {
+    const ROLE: OpRole = OpRole::SesRef;
+}
+
+impl Keyed for SesRefItem<'_> {
+    fn key(&self) -> TableKey {
+        keys::ses_ref(self.ses_message_id)
+    }
+}
+
+/// Aliases skip ids over this many bytes, keeping the alias pk under
+/// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
+pub const ALIAS_ID_MAX_BYTES: usize = 900;
+
+/// One transaction's writes, in the order they are added.
+#[derive(Default)]
+struct Txn {
+    ops: Vec<PlannedOp>,
+}
+
+impl Txn {
+    /// Writes `item` under `cond`.
+    fn put<I: StoredItem>(&mut self, item: &I, cond: Cond) -> Result<(), MailStoreError> {
+        self.ops.push(PlannedOp {
+            role: I::ROLE,
+            op: WriteOp::Put {
+                item: to_item(item)?,
+                cond,
+            },
+        });
+        Ok(())
+    }
+
+    /// Writes `item` only where nothing exists yet.
+    fn put_new<I: StoredItem>(&mut self, item: &I) -> Result<(), MailStoreError> {
+        self.put(item, Cond::NotExists)
+    }
+
+    /// Writes `item` over the version that was read, or only where nothing
+    /// exists when nothing was read.
+    fn put_versioned<I: StoredItem>(
+        &mut self,
+        item: &I,
+        before: Option<u64>,
+    ) -> Result<(), MailStoreError> {
+        self.put(item, before.map_or(Cond::NotExists, Cond::VersionEquals))
+    }
+
+    /// Maps `rfc_id` to `msg`'s thread, skipping ids over
+    /// [`ALIAS_ID_MAX_BYTES`]. `message_id` is `msg`'s own id for an alias,
+    /// or `None` for a placeholder: an id `msg` references but this inbox
+    /// holds no message for, which expires with `msg`, the message whose
+    /// reference it records.
+    fn put_alias(&mut self, msg: &MailMessage, rfc_id: &str, message_id: Option<String>) {
+        let stripped = strip_angle_brackets(rfc_id);
+        if stripped.len() > ALIAS_ID_MAX_BYTES {
+            return;
+        }
+        let TableKey { pk, sk } = keys::rfc_alias(&msg.inbox_id, stripped);
+        self.ops.push(PlannedOp {
+            role: OpRole::RfcAlias,
+            op: WriteOp::AliasFirstWriter {
+                pk,
+                sk,
+                message_id,
+                thread_id: msg.thread_id.clone(),
+                expires_at: msg.expires_at,
+            },
+        });
+    }
+
+    /// Updates attributes of an existing item in place.
+    fn update(
+        &mut self,
+        role: OpRole,
+        TableKey { pk, sk }: TableKey,
+        set: Vec<(String, AttributeValue)>,
+        remove: Vec<String>,
+        cond: Cond,
+    ) {
+        self.ops.push(PlannedOp {
+            role,
+            op: WriteOp::Update {
+                pk,
+                sk,
+                set,
+                remove,
+                cond,
+            },
+        });
+    }
+
+    /// A message's new labels under the version that was read: a new
+    /// version, `updated_at`, and the labels — removed rather than written
+    /// empty, since DynamoDB has no empty string set — plus `extra` sets.
+    fn update_message_labels(
+        &mut self,
+        msg: &MailMessage,
+        new_labels: &[String],
+        now: &str,
+        extra: Vec<(String, AttributeValue)>,
+    ) {
+        let mut set = vec![
+            (
+                "version".to_owned(),
+                AttributeValue::N((msg.version + 1).to_string()),
+            ),
+            ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
+        ];
+        let mut remove = Vec::new();
+        if new_labels.is_empty() {
+            remove.push("labels".to_owned());
+        } else {
+            set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
+        }
+        set.extend(extra);
+        self.update(
+            OpRole::Message,
+            msg.key(),
+            set,
+            remove,
+            Cond::VersionEquals(msg.version),
+        );
+    }
+
+    fn finish(self) -> Vec<PlannedOp> {
+        self.ops
+    }
+}
+
+/// The inbox record and the item both stores write for it.
 ///
 /// # Errors
 ///
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
 pub fn inbox_item(
-    inbox: &crate::mail::InboxId,
+    inbox: &InboxId,
     now: &str,
-) -> Result<(crate::mail::Inbox, serde_dynamo::Item), MailStoreError> {
-    let record = crate::mail::Inbox {
+) -> Result<(Inbox, serde_dynamo::Item), MailStoreError> {
+    let record = Inbox {
         inbox_id: inbox.clone(),
         email: inbox.as_str().to_owned(),
         display_name: None,
@@ -134,66 +392,20 @@ pub fn inbox_item(
         created_at: now.to_owned(),
         updated_at: now.to_owned(),
     };
-    let item = item_with_keys(
-        &record,
-        keys::inbox(inbox),
-        [
-            (
-                "gsi1pk",
-                AttributeValue::S(keys::INBOXES_PARTITION.to_owned()),
-            ),
-            ("gsi1sk", AttributeValue::S(inbox.as_str().to_owned())),
-        ],
-    )?;
+    let item = to_item(&record)?;
     Ok((record, item))
 }
 
-/// The version bump and label rewrite every message update shares: a new
-/// version, `updated_at`, and the labels — removed rather than written empty,
-/// since DynamoDB has no empty string set.
-fn message_label_update(
-    msg: &MailMessage,
-    new_labels: &[String],
-    now: &str,
-) -> (Vec<(String, AttributeValue)>, Vec<String>) {
-    let mut set = vec![
-        (
-            "version".to_owned(),
-            AttributeValue::N((msg.version + 1).to_string()),
-        ),
-        ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
-    ];
-    let mut remove = Vec::new();
-    if new_labels.is_empty() {
-        remove.push("labels".to_owned());
-    } else {
-        set.push(("labels".to_owned(), AttributeValue::Ss(new_labels.to_vec())));
+/// The message as stored: for an inbound message the `thread_snapshot` is
+/// populated from `thread_after` — the caller-computed thread state that
+/// already includes this message — on a clone of `msg`.
+fn stored_message(msg: &MailMessage, thread_after: &ThreadState) -> MailMessage {
+    let mut stored = msg.clone();
+    if matches!(msg.direction, Direction::Inbound) {
+        stored.thread_snapshot = Some(ThreadSnapshot::from(thread_after));
     }
-    (set, remove)
+    stored
 }
-
-/// One planned op writing a message's new labels under its version.
-fn message_label_op(
-    msg: &MailMessage,
-    set: Vec<(String, AttributeValue)>,
-    remove: Vec<String>,
-) -> PlannedOp {
-    let TableKey { pk, sk } = keys::message(&msg.inbox_id, &msg.message_id);
-    PlannedOp {
-        role: OpRole::Message,
-        op: WriteOp::Update {
-            pk,
-            sk,
-            set,
-            remove,
-            cond: Cond::VersionEquals(msg.version),
-        },
-    }
-}
-
-/// Aliases skip ids over this many bytes, keeping the alias pk under
-/// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
-const ALIAS_ID_MAX_BYTES: usize = 900;
 
 /// Plans the ingest transaction: the message, its versioned thread, its
 /// `Message-ID` alias, and a placeholder alias for every candidate id in
@@ -231,26 +443,20 @@ pub fn plan_insert(
         "thread labels must be sorted and deduplicated before planning"
     );
 
-    let mut ops = Vec::with_capacity(3 + aliases.candidates.len());
-    ops.push(message_put(msg, thread_after)?);
-    ops.push(thread_put(thread_before, thread_after)?);
+    let mut txn = Txn::default();
+    txn.put_new(&stored_message(msg, thread_after))?;
+    txn.put_versioned(thread_after, thread_before.map(|before| before.version))?;
 
     let own_id = strip_angle_brackets(&msg.rfc_message_id);
     if !own_id.is_empty() && aliases.is_claimable(own_id) {
-        push_alias_row(
-            &mut ops,
-            msg,
-            &msg.rfc_message_id,
-            Some(msg.message_id.clone()),
-        );
+        txn.put_alias(msg, &msg.rfc_message_id, Some(msg.message_id.clone()));
     }
     for candidate in &aliases.candidates {
         if candidate != own_id && !aliases.found.contains_key(candidate) {
-            push_alias_row(&mut ops, msg, candidate, None);
+            txn.put_alias(msg, candidate, None);
         }
     }
-
-    Ok(ops)
+    Ok(txn.finish())
 }
 
 /// Plans the enqueue transaction: the idempotency key (when one was given),
@@ -275,81 +481,18 @@ pub fn plan_enqueue(
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
     check_user_labels(&msg.labels, thread_after)?;
 
-    let mut ops = Vec::with_capacity(5);
-
+    let mut txn = Txn::default();
     // First, so a cancellation names the key conflict before anything else.
     if let Some(key) = key {
-        ops.push(PlannedOp {
-            role: OpRole::IdempotencyKey,
-            op: WriteOp::Put {
-                item: item_with_keys(key, keys::send_key(&key.key_hash), [])?,
-                // An expired key is reusable; a live one is a replay, which
-                // the caller resolves by reading it back.
-                cond: Cond::NotExistsOrExpired { now_epoch },
-            },
-        });
+        // An expired key is reusable; a live one is a replay, which the
+        // caller resolves by reading it back.
+        txn.put(key, Cond::NotExistsOrExpired { now_epoch })?;
     }
-
-    ops.push(message_put(msg, thread_after)?);
-
-    ops.push(send_state_put(None, state)?);
-    ops.push(thread_put(thread_before, thread_after)?);
-    push_alias_row(
-        &mut ops,
-        msg,
-        &msg.rfc_message_id,
-        Some(msg.message_id.clone()),
-    );
-
-    Ok(ops)
-}
-
-/// The `Put` for a send-state item, version-conditioned on what was read.
-///
-/// The index keys move with the status, which is what keeps the sweep's view
-/// of "queued" and "sending" accurate without a second write, and leave the
-/// item on the write that settles it.
-fn send_state_put(
-    before: Option<&SendState>,
-    after: &SendState,
-) -> Result<PlannedOp, MailStoreError> {
-    send_state_op(
-        after,
-        version_or_absent(before.map(|before| before.version)),
-    )
-}
-
-/// The optimistic-concurrency condition for a write over what was read: the
-/// version it read, or that nothing exists when it read nothing.
-fn version_or_absent(version: Option<u64>) -> Cond {
-    version.map_or(Cond::NotExists, Cond::VersionEquals)
-}
-
-/// The send-state item with its keys, under an arbitrary condition.
-///
-/// A settled send carries no `ByStatus` keys. The index exists for the
-/// sweep, which only ever queries `sending` and `unknown`; writing the keys
-/// for `sent` and `failed` too would pay an index write on the one
-/// transaction every send is guaranteed to make and then keep the whole
-/// item (the index projects ALL) in the index until its TTL. Since these
-/// are `Put`s, dropping the attributes on the settling write is what
-/// removes the entry.
-fn send_state_op(state: &SendState, cond: Cond) -> Result<PlannedOp, MailStoreError> {
-    let mut index_keys = Vec::with_capacity(2);
-    if state.send_status.is_swept() {
-        index_keys.push((
-            "gsi3pk",
-            AttributeValue::S(keys::send_status_partition(state.send_status)),
-        ));
-        index_keys.push(("gsi3sk", AttributeValue::S(state.message_id.clone())));
-    }
-    Ok(PlannedOp {
-        role: OpRole::SendState,
-        op: WriteOp::Put {
-            item: item_with_keys(state, keys::send_state(&state.message_id), index_keys)?,
-            cond,
-        },
-    })
+    txn.put_new(&stored_message(msg, thread_after))?;
+    txn.put_new(state)?;
+    txn.put_versioned(thread_after, thread_before.map(|before| before.version))?;
+    txn.put_alias(msg, &msg.rfc_message_id, Some(msg.message_id.clone()));
+    Ok(txn.finish())
 }
 
 /// Plans a send-state transition conditioned on the item still being in
@@ -369,7 +512,8 @@ pub fn plan_state_cas(
     after: &SendState,
     expected: SendStatus,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
-    Ok(vec![send_state_op(
+    let mut txn = Txn::default();
+    txn.put(
         after,
         Cond::All(vec![
             Check::Eq(
@@ -378,7 +522,8 @@ pub fn plan_state_cas(
             ),
             Check::Eq("version", AttributeValue::N(before.version.to_string())),
         ]),
-    )?])
+    )?;
+    Ok(txn.finish())
 }
 
 /// Plans the end of a send: the new send state, the message's mirrored
@@ -407,28 +552,26 @@ pub fn plan_mark(
         "message labels must be sorted and deduplicated before planning"
     );
 
-    let mut ops = Vec::with_capacity(4);
-    ops.push(send_state_put(Some(state_before), state_after)?);
+    let mut txn = Txn::default();
+    txn.put_versioned(state_after, Some(state_before.version))?;
 
-    let (mut set, remove) = message_label_update(msg, new_labels, now);
-    set.push((
+    let mut extra = vec![(
         "send_status".to_owned(),
         AttributeValue::S(state_after.send_status.as_str().to_owned()),
-    ));
+    )];
     if let Some(ses) = ses {
-        set.push((
+        extra.push((
             "ses_message_id".to_owned(),
             AttributeValue::S(ses.message_id.to_owned()),
         ));
-        set.push(("sent_at".to_owned(), AttributeValue::S(now.to_owned())));
+        extra.push(("sent_at".to_owned(), AttributeValue::S(now.to_owned())));
     }
-
-    ops.push(message_label_op(msg, set, remove));
+    txn.update_message_labels(msg, new_labels, now, extra);
 
     // The thread's labels roll up its messages', so a status label that moves
     // on the message moves on the thread in the same transaction.
     if let Some((thread_before, thread_after)) = thread {
-        ops.push(thread_put(Some(thread_before), thread_after)?);
+        txn.put_versioned(thread_after, Some(thread_before.version))?;
     }
 
     if let Some(ses) = ses {
@@ -437,35 +580,23 @@ pub fn plan_mark(
         // forms. A redrive finds these already taken, which the caller
         // resolves by dropping them.
         for rfc_id in ids::ses_rfc_ids(ses.message_id, ses.region) {
-            push_alias_row(&mut ops, msg, &rfc_id, Some(msg.message_id.clone()));
+            txn.put_alias(msg, &rfc_id, Some(msg.message_id.clone()));
         }
 
         // Unconditioned: a redrive that marks the same send again should
         // rewrite this rather than cancel the whole transaction.
-        let mut item = serde_dynamo::Item::default();
-        insert_table_key(&mut item, keys::ses_ref(ses.message_id));
-        item.inner_mut().insert(
-            "inbox_id".to_owned(),
-            AttributeValue::S(msg.inbox_id.as_str().to_owned()),
-        );
-        item.inner_mut().insert(
-            "message_id".to_owned(),
-            AttributeValue::S(msg.message_id.clone()),
-        );
-        item.inner_mut().insert(
-            "expires_at".to_owned(),
-            AttributeValue::N(msg.expires_at.to_string()),
-        );
-        ops.push(PlannedOp {
-            role: OpRole::SesRef,
-            op: WriteOp::Put {
-                item,
-                cond: Cond::None,
+        txn.put(
+            &SesRefItem {
+                ses_message_id: ses.message_id,
+                inbox_id: &msg.inbox_id,
+                message_id: &msg.message_id,
+                expires_at: msg.expires_at,
             },
-        });
+            Cond::None,
+        )?;
     }
 
-    Ok(ops)
+    Ok(txn.finish())
 }
 
 /// Plans a label change: the message's new label set and its thread's
@@ -493,105 +624,10 @@ pub fn plan_patch(
         "message labels must be sorted and deduplicated before planning"
     );
 
-    let (set, remove) = message_label_update(msg, new_labels, now);
-
-    Ok(vec![
-        message_label_op(msg, set, remove),
-        thread_put(Some(thread_before), thread_after)?,
-    ])
-}
-
-/// Builds the message item's `Put`. For an inbound message the
-/// `thread_snapshot` is populated here from `thread_after` — the
-/// caller-computed thread state that already includes this message — on a
-/// clone of `msg`. `msg` itself, and every other planned op, is unaffected.
-fn message_put(msg: &MailMessage, thread_after: &ThreadState) -> Result<PlannedOp, MailStoreError> {
-    let mut item_source = msg.clone();
-    if matches!(msg.direction, Direction::Inbound) {
-        item_source.thread_snapshot = Some(ThreadSnapshot::from(thread_after));
-    }
-
-    let index_keys = [
-        (
-            "gsi1pk",
-            AttributeValue::S(keys::messages_partition(&item_source.inbox_id)),
-        ),
-        ("gsi1sk", AttributeValue::S(item_source.message_id.clone())),
-        (
-            "gsi2pk",
-            AttributeValue::S(keys::thread_messages_partition(
-                &item_source.inbox_id,
-                &item_source.thread_id,
-            )),
-        ),
-        ("gsi2sk", AttributeValue::S(item_source.message_id.clone())),
-    ];
-    let key = keys::message(&item_source.inbox_id, &item_source.message_id);
-    Ok(PlannedOp {
-        role: OpRole::Message,
-        op: WriteOp::Put {
-            item: item_with_keys(&item_source, key, index_keys)?,
-            cond: Cond::NotExists,
-        },
-    })
-}
-
-fn thread_put(
-    thread_before: Option<&ThreadState>,
-    thread_after: &ThreadState,
-) -> Result<PlannedOp, MailStoreError> {
-    let index_keys = [
-        (
-            "gsi1pk",
-            AttributeValue::S(keys::threads_partition(&thread_after.inbox_id)),
-        ),
-        (
-            "gsi1sk",
-            AttributeValue::S(keys::thread_time_sort(
-                &thread_after.timestamp,
-                &thread_after.thread_id,
-            )),
-        ),
-    ];
-    let cond = version_or_absent(thread_before.map(|before| before.version));
-    Ok(PlannedOp {
-        role: OpRole::Thread,
-        op: WriteOp::Put {
-            item: item_with_keys(
-                thread_after,
-                keys::thread(&thread_after.inbox_id, &thread_after.thread_id),
-                index_keys,
-            )?,
-            cond,
-        },
-    })
-}
-
-/// Pushes an alias op mapping `rfc_id` to `msg`'s thread, skipping ids over
-/// [`ALIAS_ID_MAX_BYTES`]. `message_id` is `msg`'s own id for an alias, or
-/// `None` for a placeholder: an id `msg` references but this inbox holds no
-/// message for, which expires with `msg`, the message whose reference it
-/// records.
-fn push_alias_row(
-    ops: &mut Vec<PlannedOp>,
-    msg: &MailMessage,
-    rfc_id: &str,
-    message_id: Option<String>,
-) {
-    let stripped = strip_angle_brackets(rfc_id);
-    if stripped.len() <= ALIAS_ID_MAX_BYTES {
-        let TableKey { pk, sk } = keys::rfc_alias(&msg.inbox_id, stripped);
-        ops.push(PlannedOp {
-            role: OpRole::RfcAlias,
-            op: WriteOp::AliasFirstWriter {
-                pk,
-                sk,
-                message_id,
-                thread_id: msg.thread_id.clone(),
-                expires_at: msg.expires_at,
-            },
-        });
-    }
+    let mut txn = Txn::default();
+    txn.update_message_labels(msg, new_labels, now, Vec::new());
+    txn.put_versioned(thread_after, Some(thread_before.version))?;
+    Ok(txn.finish())
 }
 
 /// Rejects a write that would leave the message or its thread with more
@@ -673,129 +709,6 @@ mod tests {
             panic!("expected a Put");
         };
         assert_eq!(*cond, Cond::NotExists);
-    }
-
-    fn alias_writes(ops: &[PlannedOp]) -> Vec<(String, Option<String>)> {
-        ops.iter()
-            .filter_map(|o| match &o.op {
-                WriteOp::AliasFirstWriter { pk, message_id, .. } => {
-                    Some((pk.clone(), message_id.clone()))
-                }
-                WriteOp::Put { .. } | WriteOp::Update { .. } => None,
-            })
-            .collect()
-    }
-
-    fn lookup(candidates: &[&str], found: &[(&str, Option<&str>)]) -> AliasLookup {
-        AliasLookup {
-            candidates: candidates.iter().map(|c| (*c).to_owned()).collect(),
-            found: found
-                .iter()
-                .map(|(id, message_id)| {
-                    (
-                        (*id).to_owned(),
-                        crate::mail::RfcHit {
-                            message_id: message_id.map(str::to_owned),
-                            thread_id: "tid-0".to_owned(),
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    /// Placeholders cover exactly the referenced ids no row maps: never the
-    /// message's own id, which gets a real alias instead.
-    #[test]
-    fn plan_insert_writes_placeholders_only_for_unmapped_references() {
-        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        let thread = new_thread(&msg);
-        let aliases = lookup(
-            &[
-                "mid-1@example.com",
-                "parent@example.com",
-                "root@example.com",
-            ],
-            &[("root@example.com", Some("mid-0"))],
-        );
-        let ops = plan_insert(&msg, None, &thread, &aliases).unwrap();
-
-        assert_eq!(
-            alias_writes(&ops),
-            vec![
-                (
-                    "RFC#support@example.com#mid-1@example.com".to_owned(),
-                    Some("mid-1".to_owned())
-                ),
-                (
-                    "RFC#support@example.com#parent@example.com".to_owned(),
-                    None
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_insert_claims_its_own_placeholder_but_not_another_messages_alias() {
-        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        let thread = new_thread(&msg);
-
-        let placeholder = lookup(&["mid-1@example.com"], &[("mid-1@example.com", None)]);
-        let ops = plan_insert(&msg, None, &thread, &placeholder).unwrap();
-        assert_eq!(
-            alias_writes(&ops),
-            vec![(
-                "RFC#support@example.com#mid-1@example.com".to_owned(),
-                Some("mid-1".to_owned())
-            )]
-        );
-
-        let taken = lookup(
-            &["mid-1@example.com"],
-            &[("mid-1@example.com", Some("mid-0"))],
-        );
-        let ops = plan_insert(&msg, None, &thread, &taken).unwrap();
-        assert_eq!(alias_writes(&ops), Vec::new());
-    }
-
-    #[test]
-    fn plan_insert_skips_an_oversized_placeholder() {
-        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        let thread = new_thread(&msg);
-        let oversized = format!("{}@example.com", "x".repeat(ALIAS_ID_MAX_BYTES));
-        let aliases = lookup(&[oversized.as_str()], &[]);
-        let ops = plan_insert(&msg, None, &thread, &aliases).unwrap();
-        assert_eq!(
-            alias_writes(&ops),
-            vec![(
-                "RFC#support@example.com#mid-1@example.com".to_owned(),
-                Some("mid-1".to_owned())
-            )]
-        );
-    }
-
-    #[test]
-    fn a_placeholder_points_at_the_messages_thread_and_expires_with_it() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        msg.expires_at = 1_900_000_000;
-        let thread = new_thread(&msg);
-        let aliases = lookup(&["parent@example.com"], &[]);
-        let ops = plan_insert(&msg, None, &thread, &aliases).unwrap();
-        let placeholder = ops
-            .iter()
-            .find_map(|o| match &o.op {
-                WriteOp::AliasFirstWriter {
-                    message_id: None,
-                    thread_id,
-                    expires_at,
-                    ..
-                } => Some((thread_id.as_str(), *expires_at)),
-                WriteOp::AliasFirstWriter { .. } | WriteOp::Put { .. } | WriteOp::Update { .. } => {
-                    None
-                }
-            })
-            .unwrap();
-        assert_eq!(placeholder, ("tid-1", msg.expires_at));
     }
 
     /// An alias or SES reference outliving its message would point a later
@@ -943,10 +856,7 @@ mod tests {
                 false,
             ),
         ] {
-            let op = send_state_op(&state, Cond::None).unwrap();
-            let WriteOp::Put { item, .. } = op.op else {
-                panic!("send state is written as a Put");
-            };
+            let item = to_item(&state).unwrap();
             assert_eq!(
                 item.inner().contains_key("gsi3pk"),
                 indexed,
@@ -959,35 +869,6 @@ mod tests {
                 "{}",
                 state.send_status.as_str()
             );
-        }
-    }
-
-    #[test]
-    fn plan_enqueue_commits_the_message_and_its_send_state_together() {
-        // A queued message without its state item would never be claimed, so
-        // both must be in the same transaction, and both must be new.
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
-        msg.direction = Direction::Outbound;
-        let thread = new_thread(&msg);
-        let state = queued_state(&msg, None);
-
-        let ops = plan_enqueue(&msg, &state, None, None, &thread, 1_800_000_000).unwrap();
-
-        let roles: Vec<OpRole> = ops.iter().map(|o| o.role).collect();
-        assert_eq!(
-            roles,
-            vec![
-                OpRole::Message,
-                OpRole::SendState,
-                OpRole::Thread,
-                OpRole::RfcAlias
-            ]
-        );
-        for role in [OpRole::Message, OpRole::SendState] {
-            let WriteOp::Put { cond, .. } = &ops.iter().find(|o| o.role == role).unwrap().op else {
-                panic!("expected a Put for {role:?}");
-            };
-            assert_eq!(*cond, Cond::NotExists, "{role:?} must be new");
         }
     }
 
@@ -1165,145 +1046,6 @@ mod tests {
                 ("gsi1pk", "INBOXES"),
                 ("gsi1sk", "support@example.com"),
             ])
-        );
-    }
-
-    /// A thread full of user labels must still take the system labels an
-    /// inbound reply needs, or the mail would be lost.
-    #[test]
-    fn plan_insert_accepts_a_thread_full_of_user_labels() {
-        let msg = message(
-            "support@example.com",
-            "tid-1",
-            "mid-1",
-            &["received", "spam", "unread"],
-        );
-        let mut thread = new_thread(&msg);
-        for i in 0..THREAD_USER_LABEL_CAP {
-            thread.labels.push(format!("label-{i:03}"));
-        }
-        thread.labels.sort();
-        assert!(plan_insert(&msg, None, &thread, &AliasLookup::default()).is_ok());
-    }
-
-    #[test]
-    fn plan_patch_rejects_user_labels_over_the_thread_cap() {
-        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        let before = new_thread(&msg);
-        let mut after = before.clone();
-        for i in 0..=THREAD_USER_LABEL_CAP {
-            after.labels.push(format!("label-{i:03}"));
-        }
-        after.labels.sort();
-        let err = plan_patch(&msg, &msg.labels, &before, &after, "now").unwrap_err();
-        assert!(matches!(err, MailStoreError::LabelLimit(_)));
-
-        // System labels do not count toward the cap.
-        after.labels.truncate(THREAD_USER_LABEL_CAP);
-        after
-            .labels
-            .extend(["received".to_owned(), "unread".to_owned()]);
-        after.labels.sort();
-        assert!(plan_patch(&msg, &msg.labels, &before, &after, "now").is_ok());
-    }
-
-    #[test]
-    fn plan_patch_rejects_user_labels_over_the_message_cap() {
-        let msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        let thread = new_thread(&msg);
-        let mut labels: Vec<String> = (0..=MESSAGE_USER_LABEL_CAP)
-            .map(|i| format!("label-{i:03}"))
-            .collect();
-        labels.push("received".to_owned());
-        labels.sort();
-        let err = plan_patch(&msg, &labels, &thread, &thread, "now").unwrap_err();
-        assert!(matches!(err, MailStoreError::LabelLimit(_)));
-    }
-
-    #[test]
-    fn plan_insert_populates_thread_snapshot_from_thread_after_for_inbound_messages() {
-        let first = message(
-            "support@example.com",
-            "tid-1",
-            "mid-1",
-            &["received", "unread"],
-        );
-        let before = new_thread(&first);
-        let mut second = message(
-            "support@example.com",
-            "tid-1",
-            "mid-2",
-            &["received", "unread"],
-        );
-        second.timestamp = "00000002-0000".to_owned();
-        second.from = "other@example.com".to_owned();
-        second.preview = "Second message body".to_owned();
-        let after = apply_message(&before, &second);
-
-        let ops = plan_insert(&second, Some(&before), &after, &AliasLookup::default()).unwrap();
-        let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::Message).unwrap().op
-        else {
-            panic!("expected a Put");
-        };
-        let stored: MailMessage = serde_dynamo::from_item(item.clone()).unwrap();
-        let snapshot = stored
-            .thread_snapshot
-            .expect("an inbound insert always carries a snapshot");
-        assert_eq!(snapshot.thread_id, "tid-1");
-        assert_eq!(snapshot.message_count, 2);
-        assert_eq!(snapshot.senders, after.senders);
-        assert_eq!(snapshot.recipients, after.recipients);
-        // The snapshot is built from `thread_after` (the apply_message result),
-        // so it carries the last-processed message's preview, not the first's.
-        assert_eq!(snapshot.preview, after.preview);
-        assert_eq!(snapshot.preview, "Second message body");
-        assert_eq!(snapshot.last_message_id, "mid-2");
-    }
-
-    #[test]
-    fn plan_insert_leaves_an_outbound_messages_thread_snapshot_untouched() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
-        msg.direction = Direction::Outbound;
-        let thread = new_thread(&msg);
-
-        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
-        let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == OpRole::Message).unwrap().op
-        else {
-            panic!("expected a Put");
-        };
-        let stored: MailMessage = serde_dynamo::from_item(item.clone()).unwrap();
-        assert!(stored.thread_snapshot.is_none());
-    }
-
-    #[test]
-    fn plan_insert_skips_an_oversized_rfc_alias() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        msg.rfc_message_id = format!("<{}@example.com>", "x".repeat(ALIAS_ID_MAX_BYTES + 10));
-        let thread = new_thread(&msg);
-        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
-        assert!(ops.iter().all(|o| o.role != OpRole::RfcAlias));
-    }
-
-    /// A `Message-ID` truncated to `REFERENCES_MAX_BYTES` by `mime::parse_inbound`
-    /// is still too long to carry an alias row: `strip_angle_brackets` yields
-    /// `REFERENCES_MAX_BYTES - 2` bytes, which exceeds `ALIAS_ID_MAX_BYTES`, so
-    /// `push_alias_row` skips it — exactly as before the cap, when the id was even
-    /// longer. The fix shrinks the DynamoDB attribute without changing
-    /// alias-join behavior.
-    #[test]
-    fn plan_insert_still_skips_an_alias_for_a_message_id_truncated_to_the_cap() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["received"]);
-        // Simulate what `mime::parse_inbound` now produces for an oversized id:
-        // a `rfc_message_id` of exactly `REFERENCES_MAX_BYTES` bytes (the cap).
-        let id_body = "a".repeat(crate::mail::REFERENCES_MAX_BYTES.saturating_sub(2));
-        msg.rfc_message_id = format!("<{id_body}>");
-        assert_eq!(msg.rfc_message_id.len(), crate::mail::REFERENCES_MAX_BYTES);
-        let thread = new_thread(&msg);
-        let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
-        assert!(
-            ops.iter().all(|o| o.role != OpRole::RfcAlias),
-            "an id at the REFERENCES_MAX_BYTES cap is still over ALIAS_ID_MAX_BYTES \
-             once stripped, so the alias must still be skipped"
         );
     }
 
