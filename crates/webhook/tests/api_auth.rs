@@ -1,5 +1,3 @@
-#![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
-
 //! Bearer auth on the `/v0` surface, driven through the real router.
 //!
 //! These tests pin the three rules an SDK client depends on: an unknown key
@@ -7,41 +5,19 @@
 //! rejection, and the webhook paths stay unauthenticated.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use serde_json::Value;
+use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt as _;
-use webhook_test_support::harness;
-
-const KEY: &str = "am_live_key";
-
-/// Sends a `/v0` request, optionally with an `Authorization` header.
-async fn get(
-    harness: &webhook_test_support::Harness,
-    path: &str,
-    bearer: Option<&str>,
-) -> (StatusCode, Value) {
-    let mut request = Request::get(path);
-    if let Some(bearer) = bearer {
-        request = request.header("authorization", format!("Bearer {bearer}"));
-    }
-    let response = aws_messaging_webhook::app::app(harness.state.clone())
-        .oneshot(request.body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
-}
+use webhook_test_support::{TEST_API_KEY, api, harness};
 
 #[tokio::test]
 async fn a_request_without_a_key_is_rejected() {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
 
-    let (status, body) = get(&h, "/v0/pods", None).await;
+    let (status, body) = api::call(&h, Method::GET, "/v0/pods", None, &[]).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["name"], "UnauthorizedError");
@@ -50,9 +26,19 @@ async fn a_request_without_a_key_is_rejected() {
 #[tokio::test]
 async fn an_unknown_key_is_rejected() {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
 
-    let (status, body) = get(&h, "/v0/pods", Some("am_wrong")).await;
+    let (status, body) = api::call(
+        &h,
+        Method::GET,
+        "/v0/pods",
+        None,
+        &[("authorization", "Bearer am_wrong")],
+    )
+    .await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["name"], "UnauthorizedError");
@@ -65,7 +51,7 @@ async fn a_cold_cache_that_cannot_load_answers_503_not_401() {
     let h = harness().await;
     h.state.services.api_keys.make_unavailable();
 
-    let (status, body) = get(&h, "/v0/pods", Some(KEY)).await;
+    let (status, body) = api::get(&h, "/v0/pods").await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["name"], "ServiceUnavailableError");
@@ -74,9 +60,12 @@ async fn a_cold_cache_that_cannot_load_answers_503_not_401() {
 #[tokio::test]
 async fn an_authenticated_call_to_an_unimplemented_route_answers_501() {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
 
-    let (status, body) = get(&h, "/v0/pods", Some(KEY)).await;
+    let (status, body) = api::get(&h, "/v0/pods").await;
 
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(body["name"], "NotImplementedError");
@@ -85,9 +74,12 @@ async fn an_authenticated_call_to_an_unimplemented_route_answers_501() {
 #[tokio::test]
 async fn an_unknown_v0_path_answers_the_contract_404_body() {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
 
-    let (status, body) = get(&h, "/v0/nope", Some(KEY)).await;
+    let (status, body) = api::get(&h, "/v0/nope").await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["name"], "NotFoundError");
@@ -97,10 +89,13 @@ async fn an_unknown_v0_path_answers_the_contract_404_body() {
 async fn auth_does_not_leak_which_v0_paths_exist() {
     // Without a key, a real path and a nonsense path must be indistinguishable.
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
 
-    let (real, _) = get(&h, "/v0/pods", None).await;
-    let (nonsense, _) = get(&h, "/v0/nope", None).await;
+    let (real, _) = api::call(&h, Method::GET, "/v0/pods", None, &[]).await;
+    let (nonsense, _) = api::call(&h, Method::GET, "/v0/nope", None, &[]).await;
 
     assert_eq!(real, StatusCode::UNAUTHORIZED);
     assert_eq!(nonsense, StatusCode::UNAUTHORIZED);

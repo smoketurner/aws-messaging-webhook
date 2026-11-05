@@ -397,26 +397,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mail::{Direction, InboxId};
+    use crate::mail::{InboxId, test_fixtures};
 
     fn sample_message() -> MailMessage {
         MailMessage {
-            inbox_id: InboxId("support@example.com".to_owned()),
-            thread_id: "tid-1".to_owned(),
-            message_id: "mid-1".to_owned(),
-            ses_message_id: Some("ses-1".to_owned()),
-            direction: Direction::Inbound,
-            rfc_message_id: "<mid-1@example.com>".to_owned(),
             in_reply_to: Some("<orig@example.com>".to_owned()),
-            labels: vec!["received".to_owned(), "unread".to_owned()],
-            timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
-            from: "sender@example.com".to_owned(),
-            to: vec!["support@example.com".to_owned()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Hello".to_owned(),
-            preview: "Hello there".to_owned(),
-            size: 1234,
             attachments: vec![AttachmentMeta {
                 attachment_id: "att-1".to_owned(),
                 object_key: Some("attachments/mid-1/att-1".to_owned()),
@@ -426,16 +411,7 @@ mod tests {
                 content_disposition: "attachment".to_owned(),
                 content_id: None,
             }],
-            attachments_truncated: false,
-            raw_s3_key: Some("inbound/x".to_owned()),
-            thread_snapshot: None,
-            delivery: BTreeMap::new(),
-            send_status: None,
-            sent_at: None,
-            version: 1,
-            created_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            expires_at: 0,
+            ..test_fixtures::message()
         }
     }
 

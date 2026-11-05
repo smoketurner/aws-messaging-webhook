@@ -22,6 +22,7 @@
 //! code — the per-binary dead-code lint doesn't apply to a library's public
 //! API. Depended on by every integration test binary in `crates/webhook`.
 
+pub mod api;
 pub mod api_keys;
 pub mod mail_memory;
 pub mod objects;
@@ -45,7 +46,7 @@ use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
-use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
+use aws_messaging_webhook::mail::send::{self, SendKey, SendSpec, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
     EnqueueOutcome, ListQuery, MarkOutcome, Page, ThreadView,
 };
@@ -481,6 +482,17 @@ impl Harness {
     pub fn fake(&self) -> &FakeServices {
         &self.state.services
     }
+
+    /// The stored spec the sender will build `message_id` from.
+    pub fn send_spec(&self, message_id: &str) -> SendSpec {
+        let bytes = self
+            .state
+            .services
+            .objects
+            .get(&send::spec_key(message_id))
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 }
 
 pub struct HarnessOptions {
@@ -499,6 +511,23 @@ impl Default for HarnessOptions {
             auto_resubscribe: true,
             opt_out_list: true,
         }
+    }
+}
+
+/// The `Config` [`harness`] runs against: webhook mode with an opt-out list
+/// and no mailbox.
+#[must_use]
+pub fn test_config() -> Config {
+    Config {
+        table_name: "events".to_owned(),
+        event_bus_name: "bus".to_owned(),
+        event_source: "aws-messaging-webhook".to_owned(),
+        auto_resubscribe: true,
+        opt_out_list_name: Some("opt-out-list".to_owned()),
+        raw_event_retention_days: 30,
+        aggregate_retention_days: 365,
+        mode: FunctionMode::Webhook,
+        mail: None,
     }
 }
 
@@ -525,15 +554,9 @@ pub async fn harness_with(options: HarnessOptions) -> Harness {
         allowlist: TopicAllowlist::parse(options.allowed_topics),
         http: reqwest::Client::new(),
         config: Config {
-            table_name: "events".to_owned(),
-            event_bus_name: "bus".to_owned(),
-            event_source: "aws-messaging-webhook".to_owned(),
             auto_resubscribe: options.auto_resubscribe,
             opt_out_list_name: options.opt_out_list.then(|| "opt-out-list".to_owned()),
-            raw_event_retention_days: 30,
-            aggregate_retention_days: 365,
-            mode: FunctionMode::Webhook,
-            mail: None,
+            ..test_config()
         },
         dangerous_subscribe_url_prefix: Some(server.uri()),
     });
@@ -562,7 +585,7 @@ pub fn test_mail_config() -> MailConfig {
         domain: MAIL_DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: MAIL_BUCKET.to_owned(),
-        inbox: "support@example.com".to_owned(),
+        inbox: TEST_INBOX.to_owned(),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),
@@ -594,6 +617,39 @@ pub async fn mail_harness() -> Harness {
     });
     harness.state = state;
     harness
+}
+
+/// The bearer key [`grant_api_access`] authorizes.
+pub const TEST_API_KEY: &str = "am_live_key";
+
+/// The configured inbox, which [`grant_api_access`] creates.
+pub const TEST_INBOX: &str = "support@example.com";
+
+/// A fixed timestamp for messages a test seeds.
+pub const TEST_AT: &str = "2026-01-01T09:00:00.000Z";
+
+/// When [`grant_api_access`] creates [`TEST_INBOX`].
+pub const TEST_INBOX_CREATED_AT: &str = "2026-01-01T00:00:00.000Z";
+
+/// Authorizes [`TEST_API_KEY`] on `h` and creates [`TEST_INBOX`].
+pub async fn grant_api_access(h: &Harness) {
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state
+        .services
+        .ensure_inbox(&InboxId(TEST_INBOX.to_owned()), TEST_INBOX_CREATED_AT)
+        .await
+        .unwrap();
+}
+
+/// A [`mail_harness`] with API access granted: an authorized key and an
+/// existing inbox.
+pub async fn api_harness() -> Harness {
+    let h = mail_harness().await;
+    grant_api_access(&h).await;
+    h
 }
 
 pub async fn post(state: Arc<AppState<FakeServices>>, route: &str, body: &Value) -> StatusCode {

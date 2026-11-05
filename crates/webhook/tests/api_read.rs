@@ -9,44 +9,14 @@ use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::{InboxId, ids, time};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use serde_json::Value;
-use tower::ServiceExt as _;
+use axum::http::{Method, StatusCode};
 use webhook_test_support::mail_memory::sample_message;
-use webhook_test_support::{Harness, harness};
-
-const KEY: &str = "am_live_key";
-const INBOX: &str = "support@example.com";
-
-async fn get(h: &Harness, path: &str) -> (StatusCode, Value) {
-    let request = Request::get(path)
-        .header("authorization", format!("Bearer {KEY}"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 /// A harness with an authenticated key and an existing inbox.
 async fn seeded() -> Harness {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
-    h.state
-        .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
-        .await
-        .unwrap();
+    grant_api_access(&h).await;
     h
 }
 
@@ -54,7 +24,7 @@ async fn seeded() -> Harness {
 async fn insert(h: &Harness, at: &str, thread: &str, adjust: impl FnOnce(&mut MailMessageOwned)) {
     let ms = time::parse(at).unwrap();
     let id = ids::inbound_message_id(&format!("ses-{at}-{thread}"), ms).to_string();
-    let mut msg = sample_message(INBOX, &id, thread);
+    let mut msg = sample_message(TEST_INBOX, &id, thread);
     msg.timestamp = at.to_owned();
     msg.created_at = at.to_owned();
     msg.updated_at = at.to_owned();
@@ -73,7 +43,7 @@ async fn listing_messages_returns_newest_first_by_default() {
     })
     .await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 2);
@@ -91,7 +61,11 @@ async fn ascending_reverses_the_order() {
     .await;
     insert(&h, "2026-01-01T10:00:00.000Z", "t2", |_| {}).await;
 
-    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?ascending=true")).await;
+    let (_, body) = api::get(
+        &h,
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?ascending=true"),
+    )
+    .await;
 
     assert_eq!(body["messages"][0]["subject"], "First");
 }
@@ -110,9 +84,9 @@ async fn a_page_token_walks_the_whole_list_without_gaps_or_repeats() {
     }
 
     let mut seen: Vec<String> = Vec::new();
-    let mut path = format!("/v0/inboxes/{INBOX}/messages?limit=2");
+    let mut path = format!("/v0/inboxes/{TEST_INBOX}/messages?limit=2");
     loop {
-        let (status, body) = get(&h, &path).await;
+        let (status, body) = api::get(&h, &path).await;
         assert_eq!(status, StatusCode::OK);
         for message in body["messages"].as_array().unwrap() {
             seen.push(message["message_id"].as_str().unwrap().to_owned());
@@ -120,7 +94,7 @@ async fn a_page_token_walks_the_whole_list_without_gaps_or_repeats() {
         let Some(token) = body["next_page_token"].as_str() else {
             break;
         };
-        path = format!("/v0/inboxes/{INBOX}/messages?limit=2&page_token={token}");
+        path = format!("/v0/inboxes/{TEST_INBOX}/messages?limit=2&page_token={token}");
     }
 
     assert_eq!(seen.len(), 5, "every message appears exactly once");
@@ -144,13 +118,13 @@ async fn a_page_token_reused_with_a_different_order_or_window_is_rejected() {
         )
         .await;
     }
-    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?limit=1")).await;
+    let (_, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages?limit=1")).await;
     let token = body["next_page_token"].as_str().unwrap().to_owned();
 
     for changed in ["ascending=true", "after=2026-01-01T10:00:00Z"] {
-        let (status, body) = get(
+        let (status, body) = api::get(
             &h,
-            &format!("/v0/inboxes/{INBOX}/messages?limit=1&{changed}&page_token={token}"),
+            &format!("/v0/inboxes/{TEST_INBOX}/messages?limit=1&{changed}&page_token={token}"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}");
@@ -158,9 +132,9 @@ async fn a_page_token_reused_with_a_different_order_or_window_is_rejected() {
     }
 
     // The same query shape still follows it.
-    let (status, _) = get(
+    let (status, _) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages?limit=1&page_token={token}"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?limit=1&page_token={token}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -189,10 +163,10 @@ async fn a_page_token_from_another_inbox_is_rejected() {
         .await;
     }
 
-    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?limit=1")).await;
+    let (_, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages?limit=1")).await;
     let token = body["next_page_token"].as_str().unwrap();
 
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
         &format!("/v0/inboxes/billing/messages?page_token={token}"),
     )
@@ -221,12 +195,12 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
     }
 
     // Issue a token from the lowercased path.
-    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?limit=1")).await;
+    let (_, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages?limit=1")).await;
     let token = body["next_page_token"].as_str().unwrap().to_owned();
 
     // Re-present it through a mixed-case path of the *same* inbox → 200, the
     // next page is served (the normalized partitions match).
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
         &format!("/v0/inboxes/Support@Example.com/messages?limit=1&page_token={token}"),
     )
@@ -247,7 +221,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
         )
         .await
         .unwrap();
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
         &format!("/v0/inboxes/billing@example.com/messages?page_token={token}"),
     )
@@ -268,13 +242,13 @@ async fn spam_and_trash_are_hidden_unless_asked_for() {
     })
     .await;
 
-    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages")).await;
+    let (_, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages")).await;
     assert_eq!(body["count"], 1);
     assert_eq!(body["messages"][0]["subject"], "Clean");
 
-    let (_, body) = get(
+    let (_, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages?include_spam=true"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?include_spam=true"),
     )
     .await;
     assert_eq!(body["count"], 2);
@@ -288,7 +262,11 @@ async fn asking_for_a_label_overrides_the_flag_that_would_hide_it() {
     })
     .await;
 
-    let (_, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?labels=trash")).await;
+    let (_, body) = api::get(
+        &h,
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?labels=trash"),
+    )
+    .await;
 
     assert_eq!(body["count"], 1);
 }
@@ -307,9 +285,9 @@ async fn substring_filters_are_case_insensitive_and_combine_across_fields() {
     })
     .await;
 
-    let (_, body) = get(
+    let (_, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages?from=alice&subject=invoice"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?from=alice&subject=invoice"),
     )
     .await;
     assert_eq!(body["count"], 1);
@@ -317,9 +295,9 @@ async fn substring_filters_are_case_insensitive_and_combine_across_fields() {
 
     // Both fields must match: a sender that matches with a subject that does
     // not returns nothing.
-    let (_, body) = get(
+    let (_, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages?from=alice&subject=receipt"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?from=alice&subject=receipt"),
     )
     .await;
     assert_eq!(body["count"], 0);
@@ -335,10 +313,10 @@ async fn time_bounds_select_a_half_open_window() {
         .await;
     }
 
-    let (_, body) = get(
+    let (_, body) = api::get(
         &h,
         &format!(
-            "/v0/inboxes/{INBOX}/messages?after=2026-01-01T10:00:00.000Z&before=2026-01-01T12:00:00.000Z&ascending=true"
+            "/v0/inboxes/{TEST_INBOX}/messages?after=2026-01-01T10:00:00.000Z&before=2026-01-01T12:00:00.000Z&ascending=true"
         ),
     )
     .await;
@@ -353,9 +331,9 @@ async fn time_bounds_select_a_half_open_window() {
 async fn a_bad_query_parameter_reports_every_problem_at_once() {
     let h = seeded().await;
 
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages?limit=500&ascending=maybe"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?limit=500&ascending=maybe"),
     )
     .await;
 
@@ -386,7 +364,8 @@ async fn invalid_calendar_dates_in_before_or_after_return_400() {
         ("after=2026-02-30T00:00:00Z", "after"),
         ("before=2026-04-31T00:00:00Z", "before"),
     ] {
-        let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages?{query}")).await;
+        let (status, body) =
+            api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
         assert_eq!(body["name"], "ValidationError", "{query}");
         let paths: Vec<&str> = body["errors"]
@@ -399,9 +378,9 @@ async fn invalid_calendar_dates_in_before_or_after_return_400() {
     }
 
     // A real Feb 29 in a leap year still yields 200 (no happy-path regression).
-    let (status, _) = get(
+    let (status, _) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages?after=2024-02-29T00:00:00.000Z"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?after=2024-02-29T00:00:00.000Z"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -412,11 +391,11 @@ async fn fetching_one_message_returns_the_body_a_list_omits() {
     let h = seeded().await;
     insert(&h, "2026-01-01T09:00:00.000Z", "t1", |_| {}).await;
 
-    let (_, list) = get(&h, &format!("/v0/inboxes/{INBOX}/messages")).await;
+    let (_, list) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages")).await;
     let id = list["messages"][0]["message_id"].as_str().unwrap();
     content::store(
         &h.state.services,
-        &InboxId(INBOX.to_owned()),
+        &InboxId(TEST_INBOX.to_owned()),
         id,
         &MessageContent {
             text: Some("the full body".to_owned()),
@@ -431,7 +410,7 @@ async fn fetching_one_message_returns_the_body_a_list_omits() {
         "list view omits text"
     );
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["text"], "the full body");
@@ -442,7 +421,7 @@ async fn fetching_one_message_returns_the_body_a_list_omits() {
 async fn an_unknown_message_is_not_found() {
     let h = seeded().await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/nope")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/nope")).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["name"], "NotFoundError");
@@ -460,7 +439,7 @@ async fn a_thread_embeds_its_messages_oldest_first() {
     })
     .await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads/t1")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads/t1")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 2);
@@ -495,7 +474,7 @@ async fn a_thread_preview_tracks_the_last_message_not_the_first() {
 
     // The list endpoint surfaces only the rolled-up state (no `messages[]`),
     // so `preview` is its sole source for the last message's text.
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 1);
     let thread = &body["threads"][0];
@@ -506,7 +485,7 @@ async fn a_thread_preview_tracks_the_last_message_not_the_first() {
     // The detail endpoint carries the same rolled-up `preview` alongside the
     // per-message `preview`s (oldest first), so the two must agree on the last
     // message.
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads/t1")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads/t1")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["preview"], "Second message body");
     assert_eq!(body["last_message_id"], second_id);
@@ -544,7 +523,7 @@ async fn a_late_older_message_does_not_rewind_the_thread() {
     })
     .await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 2);
     let thread = &body["threads"][0];
@@ -564,7 +543,7 @@ async fn listing_threads_orders_by_last_activity() {
     // A reply lifts the older thread back to the top.
     insert(&h, "2026-01-01T11:00:00.000Z", "t1", |_| {}).await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/threads")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 2);
@@ -576,7 +555,7 @@ async fn listing_threads_orders_by_last_activity() {
 async fn an_unknown_thread_is_not_found() {
     let h = seeded().await;
 
-    let (status, _) = get(&h, &format!("/v0/inboxes/{INBOX}/threads/nope")).await;
+    let (status, _) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads/nope")).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -585,22 +564,22 @@ async fn an_unknown_thread_is_not_found() {
 async fn inboxes_list_and_fetch() {
     let h = seeded().await;
 
-    let (status, body) = get(&h, "/v0/inboxes").await;
+    let (status, body) = api::get(&h, "/v0/inboxes").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 1);
-    assert_eq!(body["inboxes"][0]["inbox_id"], INBOX);
+    assert_eq!(body["inboxes"][0]["inbox_id"], TEST_INBOX);
     assert_eq!(body["inboxes"][0]["pod_id"], "pod_default");
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["inbox_id"], INBOX);
+    assert_eq!(body["inbox_id"], TEST_INBOX);
 }
 
 #[tokio::test]
 async fn an_unknown_inbox_is_not_found() {
     let h = seeded().await;
 
-    let (status, _) = get(&h, "/v0/inboxes/nope").await;
+    let (status, _) = api::get(&h, "/v0/inboxes/nope").await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -608,13 +587,14 @@ async fn an_unknown_inbox_is_not_found() {
 #[tokio::test]
 async fn reads_still_require_a_key() {
     let h = seeded().await;
-    let request = Request::get(format!("/v0/inboxes/{INBOX}/messages"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
+    let (status, _) = api::call(
+        &h,
+        Method::GET,
+        &format!("/v0/inboxes/{TEST_INBOX}/messages"),
+        None,
+        &[],
+    )
+    .await;
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

@@ -5,48 +5,16 @@
 
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, ids, time};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
-use tower::ServiceExt as _;
 use webhook_test_support::mail_memory::sample_message;
-use webhook_test_support::{Harness, harness};
-
-const KEY: &str = "am_live_key";
-const INBOX: &str = "support@example.com";
-
-async fn send(h: &Harness, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let mut request = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("authorization", format!("Bearer {KEY}"));
-    let body = match body {
-        Some(json) => {
-            request = request.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(&json).unwrap())
-        }
-        None => Body::empty(),
-    };
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request.body(body).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 async fn patch(h: &Harness, message_id: &str, body: Value) -> (StatusCode, Value) {
-    send(
+    api::patch(
         h,
-        "PATCH",
-        &format!("/v0/inboxes/{INBOX}/messages/{message_id}"),
-        Some(body),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{message_id}"),
+        &body,
     )
     .await
 }
@@ -55,19 +23,14 @@ async fn patch(h: &Harness, message_id: &str, body: Value) -> (StatusCode, Value
 /// inserted into `thread`, oldest first.
 async fn seeded(thread: &str, count: usize) -> (Harness, Vec<String>) {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
-    h.state
-        .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
-        .await
-        .unwrap();
+    grant_api_access(&h).await;
 
     let mut ids = Vec::new();
     for index in 0..count {
         let at = format!("2026-01-01T{:02}:00:00.000Z", 9 + index);
         let ms = time::parse(&at).unwrap();
         let id = ids::inbound_message_id(&format!("ses-{at}"), ms).to_string();
-        let mut msg = sample_message(INBOX, &id, thread);
+        let mut msg = sample_message(TEST_INBOX, &id, thread);
         msg.timestamp.clone_from(&at);
         msg.created_at.clone_from(&at);
         msg.updated_at.clone_from(&at);
@@ -88,13 +51,7 @@ async fn removing_unread_is_how_a_client_marks_mail_read() {
     assert_eq!(body["labels"], json!(["received"]));
 
     // The change is durable, not just reflected in the response.
-    let (_, message) = send(
-        &h,
-        "GET",
-        &format!("/v0/inboxes/{INBOX}/messages/{}", ids[0]),
-        None,
-    )
-    .await;
+    let (_, message) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{}", ids[0])).await;
     assert_eq!(message["labels"], json!(["received"]));
 }
 
@@ -124,7 +81,7 @@ async fn a_thread_keeps_a_label_until_its_last_carrier_gives_it_up() {
     let (h, ids) = seeded("t1", 2).await;
 
     patch(&h, &ids[0], json!({"remove_labels": ["unread"]})).await;
-    let (_, thread) = send(&h, "GET", &format!("/v0/inboxes/{INBOX}/threads/t1"), None).await;
+    let (_, thread) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads/t1")).await;
     assert!(
         thread["labels"]
             .as_array()
@@ -134,7 +91,7 @@ async fn a_thread_keeps_a_label_until_its_last_carrier_gives_it_up() {
     );
 
     patch(&h, &ids[1], json!({"remove_labels": ["unread"]})).await;
-    let (_, thread) = send(&h, "GET", &format!("/v0/inboxes/{INBOX}/threads/t1"), None).await;
+    let (_, thread) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads/t1")).await;
     assert!(
         !thread["labels"]
             .as_array()
@@ -152,7 +109,7 @@ async fn relabelling_does_not_move_the_thread_in_the_list() {
     let at = "2026-01-01T15:00:00.000Z";
     let ms = time::parse(at).unwrap();
     let id = ids::inbound_message_id("ses-later", ms).to_string();
-    let mut msg = sample_message(INBOX, &id, "t2");
+    let mut msg = sample_message(TEST_INBOX, &id, "t2");
     msg.timestamp = at.to_owned();
     msg.created_at = at.to_owned();
     msg.updated_at = at.to_owned();
@@ -160,7 +117,7 @@ async fn relabelling_does_not_move_the_thread_in_the_list() {
 
     patch(&h, &ids[0], json!({"add_labels": ["urgent"]})).await;
 
-    let (_, list) = send(&h, "GET", &format!("/v0/inboxes/{INBOX}/threads"), None).await;
+    let (_, list) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads")).await;
     assert_eq!(list["threads"][0]["thread_id"], "t2");
 }
 
@@ -169,11 +126,9 @@ async fn adding_a_label_makes_the_message_findable_by_it() {
     let (h, ids) = seeded("t1", 1).await;
     patch(&h, &ids[0], json!({"add_labels": ["invoices"]})).await;
 
-    let (_, list) = send(
+    let (_, list) = api::get(
         &h,
-        "GET",
-        &format!("/v0/inboxes/{INBOX}/messages?labels=invoices"),
-        None,
+        &format!("/v0/inboxes/{TEST_INBOX}/messages?labels=invoices"),
     )
     .await;
 
@@ -211,7 +166,7 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
         .state
         .services
         .update_labels(
-            &InboxId(INBOX.to_owned()),
+            &InboxId(TEST_INBOX.to_owned()),
             &ids[0],
             &["bounced".to_owned()],
             &[],
@@ -248,13 +203,7 @@ async fn a_full_set_of_user_labels_with_a_system_toggle_is_accepted() {
     assert!(stored.contains(&json!("u19")), "{body}");
 
     // The change is durable, not just reflected in the response.
-    let (_, message) = send(
-        &h,
-        "GET",
-        &format!("/v0/inboxes/{INBOX}/messages/{}", ids[0]),
-        None,
-    )
-    .await;
+    let (_, message) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{}", ids[0])).await;
     assert_eq!(message["labels"].as_array().unwrap().len(), 23);
 }
 
@@ -338,18 +287,16 @@ async fn patching_an_unknown_message_is_not_found() {
 #[tokio::test]
 async fn patching_requires_a_key() {
     let (h, ids) = seeded("t1", 1).await;
-    let request = Request::builder()
-        .method("PATCH")
-        .uri(format!("/v0/inboxes/{INBOX}/messages/{}", ids[0]))
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"add_labels":["urgent"]}"#))
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
+    let (status, _) = api::call(
+        &h,
+        Method::PATCH,
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{}", ids[0]),
+        Some(&json!({"add_labels": ["urgent"]})),
+        &[],
+    )
+    .await;
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// A patch addressed through a mixed-case `{inbox_id}` path still reaches the
@@ -359,11 +306,10 @@ async fn patching_requires_a_key() {
 async fn a_patch_addressing_a_mixed_case_inbox_path_updates_labels() {
     let (h, ids) = seeded("t1", 1).await;
 
-    let (status, body) = send(
+    let (status, body) = api::patch(
         &h,
-        "PATCH",
         &format!("/v0/inboxes/Support@Example.com/messages/{}", ids[0]),
-        Some(json!({"remove_labels": ["unread"]})),
+        &json!({"remove_labels": ["unread"]}),
     )
     .await;
 

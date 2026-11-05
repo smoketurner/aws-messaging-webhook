@@ -1,4 +1,3 @@
-#![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 //! The store-level mechanism behind the casing bug, and the `To:`-header
 //! client scenario it traps.
 //!
@@ -12,35 +11,10 @@
 //! `from_path` folds any casing to the stored key (so the API does).
 
 use aws_messaging_webhook::mail::keys;
-use aws_messaging_webhook::mail::{InboxId, store::MailStore as _};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use serde_json::Value;
-use tower::ServiceExt as _;
+use aws_messaging_webhook::mail::store::MailStore as _;
+use axum::http::StatusCode;
 use webhook_test_support::mail_memory::sample_message;
-use webhook_test_support::{Harness, harness};
-
-const KEY: &str = "am_live_key";
-const INBOX: &str = "support@example.com";
-
-async fn get(h: &Harness, path: &str) -> (StatusCode, Value) {
-    let request = Request::get(path)
-        .header("authorization", format!("Bearer {KEY}"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use webhook_test_support::{TEST_INBOX, api, grant_api_access, harness};
 
 /// DynamoDB string equality is case-sensitive, so the partition keys for two
 /// casings of the same address are different rows — not aliases. This is why
@@ -67,37 +41,32 @@ fn inbox_pk_does_not_fold_case_so_casing_is_significant_in_the_key() {
 #[tokio::test]
 async fn a_client_using_the_to_header_as_the_inbox_path_can_see_its_mail() {
     let h = harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
-    h.state
-        .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
-        .await
-        .unwrap();
+    grant_api_access(&h).await;
 
     // A message stored under the lowercased id, but whose `to` field carries
     // the verbatim mixed-case header a client would copy.
-    let mut msg = sample_message(INBOX, "mid-1", "mid-1");
+    let mut msg = sample_message(TEST_INBOX, "mid-1", "mid-1");
     msg.to = vec!["Support@Example.com".to_owned()];
     h.state.services.insert_message(&msg, &[]).await.unwrap();
 
     // The client copies the `To:` header verbatim into the path. Before the
     // fix: inbox 404, messages `count: 0`. After: both resolve.
-    let (status, body) = get(&h, "/v0/inboxes/Support@Example.com").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/Support@Example.com").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["inbox_id"], INBOX);
+    assert_eq!(body["inbox_id"], TEST_INBOX);
 
-    let (status, body) = get(&h, "/v0/inboxes/Support@Example.com/messages").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/Support@Example.com/messages").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 1);
     assert_eq!(body["messages"][0]["to"][0], "Support@Example.com");
-    assert_eq!(body["messages"][0]["inbox_id"], INBOX);
+    assert_eq!(body["messages"][0]["inbox_id"], TEST_INBOX);
 
     // And the single message fetch + thread follow the same normalization.
-    let (status, body) = get(&h, "/v0/inboxes/Support@Example.com/messages/mid-1").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/Support@Example.com/messages/mid-1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["message_id"], "mid-1");
 
-    let (status, body) = get(&h, "/v0/inboxes/Support@Example.com/threads/mid-1").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/Support@Example.com/threads/mid-1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 1);
     assert_eq!(body["messages"][0]["message_id"], "mid-1");
