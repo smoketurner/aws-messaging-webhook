@@ -298,10 +298,7 @@ pub async fn get_attachment<T: Services>(
         attachment_id: Some(attachment_id),
         filename: attachment.filename.clone(),
         content_type: Some(attachment.content_type.clone()),
-        content_disposition: Some(match attachment.content_disposition.as_str() {
-            "inline" => wire::ContentDisposition::Inline,
-            _ => wire::ContentDisposition::Attachment,
-        }),
+        content_disposition: Some(attachment.content_disposition),
         content_id: attachment.content_id.clone(),
     }))
 }

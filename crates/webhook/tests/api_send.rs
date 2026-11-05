@@ -65,7 +65,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
         .unwrap()
         .unwrap();
     assert_eq!(message.labels, vec!["queued"]);
-    assert_eq!(message.send_status.as_deref(), Some("queued"));
+    assert_eq!(message.send_status, Some(SendStatus::Queued));
     assert_eq!(message.to, vec!["recipient@example.com"]);
     assert_eq!(message.from, TEST_INBOX.to_owned());
     assert_eq!(message.thread_id, thread_id);

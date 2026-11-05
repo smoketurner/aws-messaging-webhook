@@ -91,7 +91,7 @@ fn ses_event_fixtures_parse() {
             "{name}: expected Ses, got {event:?}"
         );
         // Every documented kind has a detail-type mapping; `ses.unknown`
-        // appearing here means a kind slipped out of `detail_type_for`.
+        // appearing here means a kind slipped out of `SesEventKind::detail_type`.
         let detail_type = event.detail_type();
         assert!(
             detail_type.starts_with("ses.") && detail_type != "ses.unknown",

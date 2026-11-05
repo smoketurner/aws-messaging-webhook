@@ -29,7 +29,7 @@ use crate::config::{Config, MailConfig};
 use crate::mail::fetch::{AttachmentFetcher, FetchError, Fetched, HttpAttachmentFetcher};
 use crate::metrics::names;
 use crate::model::DomainEvent;
-use crate::model::ses_notification::{SesBounce, SesEngagement};
+use crate::model::ses_notification::{SesBounce, SesEngagement, SesEventKind};
 use crate::publish::{OutboundEvent, PublishError, PublishEvents};
 use crate::store::{EventRecord, EventStore, PersistOutcome, StoreError};
 
@@ -141,13 +141,53 @@ fn event_sort_key(record: &EventRecord) -> String {
     format!("EVT#{}#{}", record.event_timestamp, record.sns_message_id)
 }
 
-fn set_status(clauses: &mut Vec<&'static str>, status: &str, overwrite: bool) -> AttributeValue {
-    clauses.push(if overwrite {
-        "current_status = :status"
-    } else {
-        "current_status = if_not_exists(current_status, :status)"
-    });
-    AttributeValue::S(status.to_owned())
+/// The per-message aggregate's `current_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateStatus {
+    Received,
+    Sent,
+    Delivered,
+    Failed,
+    Bounced,
+    Complained,
+}
+
+impl AggregateStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Sent => "sent",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Bounced => "bounced",
+            Self::Complained => "complained",
+        }
+    }
+
+    /// The SES ladder (`sent` → `delivered` → `{complained}`): the statuses a
+    /// precedence-guarded [`status_transition`] to `self` may replace, besides
+    /// an unset one. `bounced` and `complained` are both terminal, so neither
+    /// appears in the other's priors: a stale `Delivery`/`Complaint` retry
+    /// arriving after either settles as a `ConditionalCheckFailed` no-op.
+    fn allowed_priors(self) -> &'static [Self] {
+        match self {
+            Self::Delivered => &[Self::Sent],
+            Self::Complained => &[Self::Sent, Self::Delivered],
+            Self::Received | Self::Sent | Self::Failed | Self::Bounced => &[],
+        }
+    }
+}
+
+/// An in-transaction clause setting `current_status` whatever it was.
+fn overwrite_status(clauses: &mut Vec<&'static str>, status: AggregateStatus) -> AttributeValue {
+    clauses.push("current_status = :status");
+    AttributeValue::S(status.as_str().to_owned())
+}
+
+/// An in-transaction clause setting `current_status` only when it is unset.
+fn status_if_unset(clauses: &mut Vec<&'static str>, status: AggregateStatus) -> AttributeValue {
+    clauses.push("current_status = if_not_exists(current_status, :status)");
+    AttributeValue::S(status.as_str().to_owned())
 }
 
 /// The aggregate projection applied atomically with the event put. The base
@@ -178,17 +218,18 @@ fn aggregate_update(
         );
 
     let status_value = match event {
-        DomainEvent::SmsInbound { .. } | DomainEvent::SesInbound { .. } => {
-            Some(set_status(&mut set_clauses, "received", true))
-        }
+        DomainEvent::SmsInbound { .. } | DomainEvent::SesInbound { .. } => Some(overwrite_status(
+            &mut set_clauses,
+            AggregateStatus::Received,
+        )),
         DomainEvent::SmsDelivery { event, .. } => {
             if event.is_final {
                 let status = if event.is_successful_delivery() {
-                    "delivered"
+                    AggregateStatus::Delivered
                 } else {
-                    "failed"
+                    AggregateStatus::Failed
                 };
-                Some(set_status(&mut set_clauses, status, true))
+                Some(overwrite_status(&mut set_clauses, status))
             } else {
                 None
             }
@@ -206,32 +247,32 @@ fn aggregate_update(
         //    already set (e.g. a `Delivery` retry overwriting `complained`),
         //    and a guard inside the `TransactWriteItems` would cancel the
         //    raw-event `Put` on failure and loop. So Delivery contributes
-        //    nothing to this aggregate (it falls through to the wildcard
-        //    below), and Complaint records only its idempotent timestamp here.
-        DomainEvent::Ses { event, .. } => match event.kind.as_str() {
-            "Send" => Some(set_status(&mut set_clauses, "sent", false)),
-            "Bounce" => {
+        //    nothing to this aggregate (it shares the no-status arm below),
+        //    and Complaint records only its idempotent timestamp here.
+        DomainEvent::Ses { event, .. } => match &event.kind {
+            SesEventKind::Send => Some(status_if_unset(&mut set_clauses, AggregateStatus::Sent)),
+            SesEventKind::Bounce => {
                 let permanent = event.bounce.as_ref().is_some_and(SesBounce::is_permanent);
                 if let Some(bounce) = &event.bounce {
                     set_clauses.push("bounce_type = :bounce_type");
                     builder = builder.expression_attribute_values(
                         ":bounce_type",
-                        AttributeValue::S(bounce.bounce_type.clone()),
+                        AttributeValue::S(bounce.bounce_type.as_str().to_owned()),
                     );
                 }
                 // Only a permanent bounce is terminal — matching the
                 // suppression action. A transient bounce is retryable, so it
                 // records bounce_type but must not clobber a delivered status.
-                permanent.then(|| set_status(&mut set_clauses, "bounced", true))
+                permanent.then(|| overwrite_status(&mut set_clauses, AggregateStatus::Bounced))
             }
-            "Complaint" => {
+            SesEventKind::Complaint => {
                 // `complained_at` is an idempotent timestamp — safe in the
                 // transaction. `current_status` moves to the post-transaction
                 // guarded update (see [`status_transition`]).
                 set_clauses.push("complained_at = :ts");
                 None
             }
-            "Open" => {
+            SesEventKind::Open => {
                 set_clauses.push("last_opened_at = :ts");
                 // SES's isBotEvent (Likely) routes automated opens to a
                 // separate counter so human engagement stays uncontaminated.
@@ -242,7 +283,7 @@ fn aggregate_update(
                 });
                 None
             }
-            "Click" => {
+            SesEventKind::Click => {
                 set_clauses.push("last_clicked_at = :ts");
                 add_clause = Some(if event.click.as_ref().is_some_and(SesEngagement::is_bot) {
                     "bot_click_count :one"
@@ -253,9 +294,14 @@ fn aggregate_update(
             }
             // Delivery (its `current_status` is applied post-transaction by
             // [`status_transition`]) and non-status SES kinds
-            // (Reject/DeliveryDelay/Subscription/…) set no in-transaction
+            // (Reject/DeliveryDelay/Subscription/unknown) set no in-transaction
             // current_status.
-            _ => None,
+            SesEventKind::Delivery
+            | SesEventKind::Reject
+            | SesEventKind::RenderingFailure
+            | SesEventKind::DeliveryDelay
+            | SesEventKind::Subscription
+            | SesEventKind::Other(_) => None,
         },
         DomainEvent::Unknown { .. } => None,
     };
@@ -306,16 +352,21 @@ fn status_transition(
     record: &EventRecord,
     event: &DomainEvent,
 ) -> Option<Update> {
-    // `bounced` and `complained` are both terminal, so neither appears in the
-    // other's allowed priors: a stale `Delivery`/`Complaint` retry arriving
-    // after either settles as a `ConditionalCheckFailed` no-op.
     let DomainEvent::Ses { event, .. } = event else {
         return None;
     };
-    let (status, priors): (&'static str, &'static [&'static str]) = match event.kind.as_str() {
-        "Delivery" => ("delivered", &["sent"]),
-        "Complaint" => ("complained", &["sent", "delivered"]),
-        _ => return None,
+    let status = match &event.kind {
+        SesEventKind::Delivery => AggregateStatus::Delivered,
+        SesEventKind::Complaint => AggregateStatus::Complained,
+        SesEventKind::Send
+        | SesEventKind::Bounce
+        | SesEventKind::Reject
+        | SesEventKind::Open
+        | SesEventKind::Click
+        | SesEventKind::RenderingFailure
+        | SesEventKind::DeliveryDelay
+        | SesEventKind::Subscription
+        | SesEventKind::Other(_) => return None,
     };
     let mut condition = "attribute_not_exists(current_status)".to_owned();
     let mut builder = Update::builder()
@@ -323,13 +374,13 @@ fn status_transition(
         .key("pk", AttributeValue::S(partition_key(record)))
         .key("sk", AttributeValue::S("AGG".to_owned()))
         .update_expression("SET current_status = :status")
-        .expression_attribute_values(":status", AttributeValue::S(status.to_owned()));
-    for (i, prior) in priors.iter().enumerate() {
+        .expression_attribute_values(":status", AttributeValue::S(status.as_str().to_owned()));
+    for (i, prior) in status.allowed_priors().iter().enumerate() {
         let placeholder = format!(":prev{i}");
         condition.push_str(" OR current_status = ");
         condition.push_str(&placeholder);
         builder = builder
-            .expression_attribute_values(placeholder, AttributeValue::S((*prior).to_owned()));
+            .expression_attribute_values(placeholder, AttributeValue::S(prior.as_str().to_owned()));
     }
     match builder.condition_expression(condition).build() {
         Ok(update) => Some(update),

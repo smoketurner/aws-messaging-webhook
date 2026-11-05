@@ -146,9 +146,7 @@ impl DomainEvent {
             // added a type we don't have a slug for), distinct from the
             // Unknown variant's unparseable junk — so downstream rules can
             // still filter it apart.
-            Self::Ses { event, .. } => {
-                ses_notification::detail_type_for(&event.kind).unwrap_or("ses.unknown")
-            }
+            Self::Ses { event, .. } => event.kind.detail_type().unwrap_or("ses.unknown"),
             Self::SesInbound { event, .. } => {
                 if event.receipt.is_quarantined() {
                     "ses.inbound.quarantined"

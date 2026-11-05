@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use crate::mail::content::MessageContent;
 use crate::mail::labels::SystemLabel;
 use crate::mail::{MailMessage, ids, labels, time, wire};
-use crate::model::ses_notification::SesNotification;
+use crate::model::ses_notification::{SesEventKind, SesNotification};
 use crate::publish::{PUT_EVENTS_ENTRY_CAP_BYTES, detail_bytes};
 
 /// One outbound mailbox event, before publishing.
@@ -83,21 +83,6 @@ fn received_event_type(labels: &[String]) -> &'static str {
         "message.received.unauthenticated"
     } else {
         "message.received"
-    }
-}
-
-/// The event type an SES event publishes for a mailbox message, if any.
-/// `Send` is absent because the sender's relabel publishes `message.sent`,
-/// and `Click` and the rest have no mailbox event.
-#[must_use]
-pub fn ses_event_type(kind: &str) -> Option<&'static str> {
-    match kind {
-        "Delivery" => Some("message.delivered"),
-        "Bounce" => Some("message.bounced"),
-        "Complaint" => Some("message.complained"),
-        "Reject" => Some("message.rejected"),
-        "Open" => Some("message.opened"),
-        _ => None,
     }
 }
 
@@ -231,9 +216,9 @@ pub fn build_ses_event(
     sns_message_id: &str,
     notified_at: &str,
 ) -> Option<MailEvent> {
-    let event_type = ses_event_type(&ses.kind)?;
-    let (key, event_timestamp, fields) = match ses.kind.as_str() {
-        "Delivery" => {
+    let event_type = ses.kind.mailbox_event_type()?;
+    let (key, event_timestamp, fields) = match &ses.kind {
+        SesEventKind::Delivery => {
             let delivery = ses.delivery.as_ref()?;
             (
                 "delivery",
@@ -241,7 +226,7 @@ pub fn build_ses_event(
                 json!({ "recipients": delivery.recipients }),
             )
         }
-        "Bounce" => {
+        SesEventKind::Bounce => {
             let bounce = ses.bounce.as_ref()?;
             let recipients: Vec<Value> = bounce
                 .bounced_recipients
@@ -257,13 +242,13 @@ pub fn build_ses_event(
                 "bounce",
                 bounce.timestamp.as_deref(),
                 json!({
-                    "type": bounce.bounce_type,
+                    "type": bounce.bounce_type.as_str(),
                     "sub_type": bounce.bounce_sub_type.as_deref().unwrap_or_default(),
                     "recipients": recipients,
                 }),
             )
         }
-        "Complaint" => {
+        SesEventKind::Complaint => {
             let complaint = ses.complaint.as_ref()?;
             let recipients: Vec<&str> = complaint
                 .complained_recipients
@@ -280,7 +265,7 @@ pub fn build_ses_event(
                 }),
             )
         }
-        "Reject" => {
+        SesEventKind::Reject => {
             let reject = ses.reject.as_ref()?;
             (
                 "reject",
@@ -288,11 +273,16 @@ pub fn build_ses_event(
                 json!({ "reason": reject.reason.as_deref().unwrap_or_default() }),
             )
         }
-        "Open" => {
+        SesEventKind::Open => {
             let open = ses.open.as_ref()?;
             ("open", open.timestamp.as_deref(), json!({}))
         }
-        _ => return None,
+        SesEventKind::Send
+        | SesEventKind::Click
+        | SesEventKind::RenderingFailure
+        | SesEventKind::DeliveryDelay
+        | SesEventKind::Subscription
+        | SesEventKind::Other(_) => return None,
     };
 
     let mut object = json!({
@@ -512,7 +502,7 @@ mod tests {
             size: 10,
             filename: Some("a.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: "attachment".to_owned(),
+            content_disposition: crate::mail::wire::ContentDisposition::Attachment,
             content_id: None,
         }];
         msg.thread_snapshot = Some(snapshot);
@@ -843,7 +833,7 @@ mod tests {
                 size: 100,
                 filename: Some("f".repeat(5_000)),
                 content_type: "text/plain".to_owned(),
-                content_disposition: "attachment".to_owned(),
+                content_disposition: crate::mail::wire::ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();

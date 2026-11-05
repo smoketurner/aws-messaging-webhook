@@ -19,6 +19,7 @@ use serde::Deserialize;
 use crate::api::error::{ApiError, FieldError};
 use crate::mail::address::envelope_address;
 use crate::mail::url_policy::{self, AttachmentUrl};
+use crate::mail::wire::ContentDisposition;
 use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, HEADER_NAME_MAX, HEADER_VALUE_MAX,
     HEADERS_BUDGET, MAX_OUTBOUND_DECODED_BYTES, OUTBOUND_RECIPIENTS_MAX, SUBJECT_MAX_BYTES,
@@ -141,7 +142,7 @@ pub struct ValidatedAttachment {
     pub source: AttachmentSource,
     pub filename: Option<String>,
     pub content_type: String,
-    pub content_disposition: String,
+    pub content_disposition: ContentDisposition,
     pub content_id: Option<String>,
 }
 
@@ -463,15 +464,17 @@ fn attachments(
             errors.push(FieldError::new(&path, "`content_type` is not a media type"));
         }
 
-        let disposition = attachment
-            .content_disposition
-            .unwrap_or_else(|| "attachment".to_owned());
-        if !matches!(disposition.as_str(), "inline" | "attachment") {
-            errors.push(FieldError::new(
-                &path,
-                "`content_disposition` must be `inline` or `attachment`",
-            ));
-        }
+        let disposition = match attachment.content_disposition.as_deref() {
+            None | Some("attachment") => Some(ContentDisposition::Attachment),
+            Some("inline") => Some(ContentDisposition::Inline),
+            Some(_) => {
+                errors.push(FieldError::new(
+                    &path,
+                    "`content_disposition` must be `inline` or `attachment`",
+                ));
+                None
+            }
+        };
 
         if let Some(content_id) = &attachment.content_id {
             let invalid = content_id.is_empty()
@@ -491,14 +494,14 @@ fn attachments(
                     "`content_id` is used by another attachment",
                 ));
             }
-        } else if disposition == "inline" {
+        } else if disposition == Some(ContentDisposition::Inline) {
             errors.push(FieldError::new(
                 &path,
                 "an `inline` attachment needs a `content_id` to reference it by",
             ));
         }
 
-        if let Some(source) = source {
+        if let (Some(source), Some(disposition)) = (source, disposition) {
             out.push(ValidatedAttachment {
                 source,
                 filename: attachment.filename,
@@ -885,7 +888,10 @@ mod tests {
             send.attachments[0].source,
             AttachmentSource::Inline(b"hello world".to_vec())
         );
-        assert_eq!(send.attachments[0].content_disposition, "attachment");
+        assert_eq!(
+            send.attachments[0].content_disposition,
+            ContentDisposition::Attachment
+        );
     }
 
     #[test]

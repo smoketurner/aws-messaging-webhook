@@ -41,9 +41,7 @@ use sns_message_verifier::SnsEnvelope;
 
 use crate::mail::MailMessage;
 use crate::mail::content;
-use crate::mail::events::{
-    MailEvent, build_received_event, build_sent_event, build_ses_event, ses_event_type,
-};
+use crate::mail::events::{MailEvent, build_received_event, build_sent_event, build_ses_event};
 use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
@@ -289,7 +287,7 @@ async fn mailbox_ses_event<T: Services>(
     ses: &SesNotification,
     envelope: &SnsEnvelope,
 ) -> Result<Option<(MailMessage, MailEvent)>, MailStoreError> {
-    if state.config.mail.is_none() || ses_event_type(&ses.kind).is_none() {
+    if state.config.mail.is_none() || ses.kind.mailbox_event_type().is_none() {
         return Ok(None);
     }
     let Some((inbox, message_id)) = state

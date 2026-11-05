@@ -8,76 +8,41 @@
 
 use std::fmt;
 
-/// A label the pipeline applies itself.
-///
-/// Deliberately not `Ord`: items store their labels sorted by the stored
-/// string, and ordering the variants would sort by declaration order
-/// instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SystemLabel {
-    /// Inbound mail, set by ingest.
-    Received,
-    /// The send reached SES.
-    Sent,
-    /// Accepted by the API, not yet sent.
-    Queued,
-    /// Nobody has read it.
-    Unread,
-    /// SES quarantined it, or a caller marked it spam.
-    Spam,
-    /// A caller trashed it.
-    Trash,
-    /// SPF, DKIM or DMARC failed.
-    Unauthenticated,
-    /// SES delivered it to the recipient's provider.
-    Delivered,
-    /// It bounced.
-    Bounced,
-    /// The recipient reported it as spam.
-    Complained,
-    /// SES refused it outright.
-    Rejected,
-    /// The recipient opened it.
-    Opened,
+string_enum! {
+    /// A label the pipeline applies itself.
+    ///
+    /// Deliberately not `Ord`: items store their labels sorted by the stored
+    /// string, and ordering the variants would sort by declaration order
+    /// instead.
+    pub enum SystemLabel {
+        /// Inbound mail, set by ingest.
+        Received = "received",
+        /// The send reached SES.
+        Sent = "sent",
+        /// Accepted by the API, not yet sent.
+        Queued = "queued",
+        /// Nobody has read it.
+        Unread = "unread",
+        /// SES quarantined it, or a caller marked it spam.
+        Spam = "spam",
+        /// A caller trashed it.
+        Trash = "trash",
+        /// SPF, DKIM or DMARC failed.
+        Unauthenticated = "unauthenticated",
+        /// SES delivered it to the recipient's provider.
+        Delivered = "delivered",
+        /// It bounced.
+        Bounced = "bounced",
+        /// The recipient reported it as spam.
+        Complained = "complained",
+        /// SES refused it outright.
+        Rejected = "rejected",
+        /// The recipient opened it.
+        Opened = "opened",
+    }
 }
 
 impl SystemLabel {
-    /// Every system label. The array is built from the variants, so adding
-    /// one to the enum adds it here.
-    pub const ALL: [Self; 12] = [
-        Self::Received,
-        Self::Sent,
-        Self::Queued,
-        Self::Unread,
-        Self::Spam,
-        Self::Trash,
-        Self::Unauthenticated,
-        Self::Delivered,
-        Self::Bounced,
-        Self::Complained,
-        Self::Rejected,
-        Self::Opened,
-    ];
-
-    /// The stored and published form.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Received => "received",
-            Self::Sent => "sent",
-            Self::Queued => "queued",
-            Self::Unread => "unread",
-            Self::Spam => "spam",
-            Self::Trash => "trash",
-            Self::Unauthenticated => "unauthenticated",
-            Self::Delivered => "delivered",
-            Self::Bounced => "bounced",
-            Self::Complained => "complained",
-            Self::Rejected => "rejected",
-            Self::Opened => "opened",
-        }
-    }
-
     /// The system label `label` names, or `None` for a caller's own label.
     #[must_use]
     pub fn parse(label: &str) -> Option<Self> {

@@ -43,7 +43,7 @@ pub(super) fn build_spec(
                 url,
                 filename: attachment.filename.clone(),
                 content_type: attachment.content_type.clone(),
-                content_disposition: attachment.content_disposition.clone(),
+                content_disposition: attachment.content_disposition,
                 content_id: attachment.content_id.clone(),
                 size,
             }
@@ -152,7 +152,7 @@ pub(super) fn queued_message(
                 size: attachment.size,
                 filename: attachment.filename.clone(),
                 content_type: attachment.content_type.clone(),
-                content_disposition: attachment.content_disposition.clone(),
+                content_disposition: attachment.content_disposition,
                 content_id: attachment.content_id.clone(),
             })
             .collect(),
@@ -160,7 +160,7 @@ pub(super) fn queued_message(
         raw_s3_key: None,
         thread_snapshot: None,
         delivery: BTreeMap::new(),
-        send_status: Some(SendStatus::Queued.as_str().to_owned()),
+        send_status: Some(SendStatus::Queued),
         sent_at: None,
         version: 0,
         created_at: now.to_owned(),

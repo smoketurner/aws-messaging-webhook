@@ -343,7 +343,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
             size: 10,
             filename: Some("notes.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: "inline".to_owned(),
+            content_disposition: aws_messaging_webhook::mail::wire::ContentDisposition::Inline,
             content_id: Some("<notes@example.net>".to_owned()),
         }],
         attachments_truncated: false,

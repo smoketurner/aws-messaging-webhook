@@ -22,37 +22,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::mail::InboxId;
 use crate::mail::labels::SystemLabel;
+use crate::mail::wire::ContentDisposition;
 
-/// Where a send has got to.
-///
-/// `sending` never reaches the message item's mirrored copy: it changes on
-/// every attempt, and mirroring it would make the relay publish an event for
-/// each one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SendStatus {
-    Queued,
-    Sending,
-    Sent,
-    Failed,
-    /// SES may have accepted the message, or may not: the call was made and
-    /// no usable answer came back. Never resent without an operator saying
-    /// so, because the alternative risks sending twice.
-    Unknown,
+string_enum! {
+    /// Where a send has got to.
+    ///
+    /// `sending` never reaches the message item's mirrored copy: it changes on
+    /// every attempt, and mirroring it would make the relay publish an event for
+    /// each one.
+    pub enum SendStatus {
+        Queued = "queued",
+        Sending = "sending",
+        Sent = "sent",
+        Failed = "failed",
+        /// SES may have accepted the message, or may not: the call was made and
+        /// no usable answer came back. Never resent without an operator saying
+        /// so, because the alternative risks sending twice.
+        Unknown = "unknown",
+    }
 }
 
 impl SendStatus {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Sending => "sending",
-            Self::Sent => "sent",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-        }
-    }
-
     /// Whether a send in this state belongs in the `ByStatus` index. The
     /// index serves the sweep alone, which looks for sends stuck `sending`
     /// and for the `unknown` ones awaiting an operator; `queued` is there
@@ -95,53 +85,35 @@ impl Envelope {
     }
 }
 
-/// Why a send stopped for good.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SendFailure {
-    /// The spec object is gone, so there is nothing to build from.
-    SendSpecMissing,
-    /// A URL-backed attachment could not be fetched, permanently.
-    AttachmentFetchFailed,
-    /// Repeated transient failures fetching an attachment.
-    AttachmentFetchUnavailable,
-    /// The object store refused the spec or a stored part (for example
-    /// access denied), or stayed unavailable across every attempt.
-    OutboxUnavailable,
-    /// The assembled message exceeds what SES accepts.
-    MessageTooLarge,
-    /// The message could not be assembled from its spec and parts.
-    BuildFailed,
-    /// SES refused it: a bad address, an unverified identity, a paused
-    /// account.
-    Rejected,
-    /// SES stayed unavailable across every attempt.
-    SesUnavailable,
-    /// An operator closed it by hand.
-    ClosedByOperator,
-    /// The send was claimed and abandoned by its sender too many times in a
-    /// row; it never reached SES. A sender that is killed before it records
-    /// `ses_call_at` leaves a stale claim the sweep releases, and after the
-    /// transient-failure cap is exceeded that release would loop forever, so
-    /// the sweep fails the send instead.
-    SenderAbandoned,
-}
-
-impl SendFailure {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SendSpecMissing => "send_spec_missing",
-            Self::AttachmentFetchFailed => "attachment_fetch_failed",
-            Self::AttachmentFetchUnavailable => "attachment_fetch_unavailable",
-            Self::OutboxUnavailable => "outbox_unavailable",
-            Self::MessageTooLarge => "message_too_large",
-            Self::BuildFailed => "build_failed",
-            Self::Rejected => "rejected",
-            Self::SesUnavailable => "ses_unavailable",
-            Self::ClosedByOperator => "closed_by_operator",
-            Self::SenderAbandoned => "sender_abandoned",
-        }
+string_enum! {
+    /// Why a send stopped for good.
+    pub enum SendFailure {
+        /// The spec object is gone, so there is nothing to build from.
+        SendSpecMissing = "send_spec_missing",
+        /// A URL-backed attachment could not be fetched, permanently.
+        AttachmentFetchFailed = "attachment_fetch_failed",
+        /// Repeated transient failures fetching an attachment.
+        AttachmentFetchUnavailable = "attachment_fetch_unavailable",
+        /// The object store refused the spec or a stored part (for example
+        /// access denied), or stayed unavailable across every attempt.
+        OutboxUnavailable = "outbox_unavailable",
+        /// The assembled message exceeds what SES accepts.
+        MessageTooLarge = "message_too_large",
+        /// The message could not be assembled from its spec and parts.
+        BuildFailed = "build_failed",
+        /// SES refused it: a bad address, an unverified identity, a paused
+        /// account.
+        Rejected = "rejected",
+        /// SES stayed unavailable across every attempt.
+        SesUnavailable = "ses_unavailable",
+        /// An operator closed it by hand.
+        ClosedByOperator = "closed_by_operator",
+        /// The send was claimed and abandoned by its sender too many times in a
+        /// row; it never reached SES. A sender that is killed before it records
+        /// `ses_call_at` leaves a stale claim the sweep releases, and after the
+        /// transient-failure cap is exceeded that release would loop forever, so
+        /// the sweep fails the send instead.
+        SenderAbandoned = "sender_abandoned",
     }
 }
 
@@ -272,7 +244,7 @@ pub struct SpecAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     pub content_type: String,
-    pub content_disposition: String,
+    pub content_disposition: ContentDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<String>,
     /// Zero until the bytes exist.
@@ -536,6 +508,33 @@ mod tests {
                 serde_json::to_string(&status).unwrap(),
                 format!("\"{expected}\"")
             );
+        }
+        assert_eq!(SendStatus::ALL.len(), 5);
+    }
+
+    #[test]
+    fn failures_round_trip_as_the_stored_strings() {
+        let expected = [
+            "send_spec_missing",
+            "attachment_fetch_failed",
+            "attachment_fetch_unavailable",
+            "outbox_unavailable",
+            "message_too_large",
+            "build_failed",
+            "rejected",
+            "ses_unavailable",
+            "closed_by_operator",
+            "sender_abandoned",
+        ];
+        assert_eq!(SendFailure::ALL.len(), expected.len());
+        for (failure, wire) in SendFailure::ALL.into_iter().zip(expected) {
+            assert_eq!(failure.as_str(), wire);
+            assert_eq!(
+                serde_json::to_value(failure).unwrap(),
+                serde_json::json!(wire)
+            );
+            let back: SendFailure = serde_json::from_value(serde_json::json!(wire)).unwrap();
+            assert_eq!(back, failure);
         }
     }
 

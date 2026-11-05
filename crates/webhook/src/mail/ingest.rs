@@ -26,6 +26,34 @@ use crate::state::{AppState, Services};
 /// bookkeeping and for tearing down in-flight uploads.
 const DEADLINE_MARGIN: Duration = Duration::from_secs(10);
 
+/// What an inbound ingest did, reported on the action outcome log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// Mail is not configured, so there is nowhere to ingest into.
+    MailDisabled,
+    /// Nothing to ingest: no usable S3 pointer, timestamp or inbox.
+    Skipped,
+    /// A permanent failure, already logged and counted.
+    Failed,
+    /// Every target inbox already holds the message.
+    Duplicate,
+    Ingested,
+}
+
+impl IngestOutcome {
+    /// The log form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MailDisabled => "none",
+            Self::Skipped => "ingest_skipped",
+            Self::Failed => "ingest_failed",
+            Self::Duplicate => "ingest_duplicate",
+            Self::Ingested => "ingested",
+        }
+    }
+}
+
 /// Runs the full ingest flow for one SES inbound receipt.
 ///
 /// # Errors
@@ -41,12 +69,12 @@ pub async fn ingest_inbound<T: Services>(
     event: &SesInboundNotification,
     deadline: tokio::time::Instant,
     envelope_ts_ms: Option<u64>,
-) -> Result<&'static str, ActionError> {
+) -> Result<IngestOutcome, ActionError> {
     let Some(mail_config) = state.config.mail.as_ref() else {
-        return Ok("none");
+        return Ok(IngestOutcome::MailDisabled);
     };
     let Some(key) = guarded_s3_pointer(event, mail_config) else {
-        return Ok("ingest_skipped");
+        return Ok(IngestOutcome::Skipped);
     };
     let Some(received_ms) = received_ms(event, envelope_ts_ms) else {
         metrics::counter!(names::INGEST_SKIPPED).increment(1);
@@ -57,7 +85,7 @@ pub async fn ingest_inbound<T: Services>(
              (wall-clock time is never a fallback: it would make the message id \
              differ across a redelivery)"
         );
-        return Ok("ingest_skipped");
+        return Ok(IngestOutcome::Skipped);
     };
 
     let mut resolution = InboxResolution::default();
@@ -69,7 +97,7 @@ pub async fn ingest_inbound<T: Services>(
             // Already logged and counted as a failure by
             // `record_resolution_error`: the message was addressed to an
             // inbox we serve but couldn't read, not to one we don't serve.
-            return finish(resolution.had_transient, "ingest_failed");
+            return finish(resolution.had_transient, IngestOutcome::Failed);
         }
         metrics::counter!(names::INGEST_SKIPPED).increment(1);
         tracing::info!(
@@ -77,7 +105,7 @@ pub async fn ingest_inbound<T: Services>(
             reason = "no_resolvable_inbox",
             "no recipient resolved to the configured inbox"
         );
-        return finish(resolution.had_transient, "ingest_skipped");
+        return finish(resolution.had_transient, IngestOutcome::Skipped);
     }
 
     let message_id = ids::inbound_message_id(&event.mail.message_id, received_ms);
@@ -87,9 +115,9 @@ pub async fn ingest_inbound<T: Services>(
     let targets = fresh_targets(state, inboxes, &message_id_str, &mut resolution).await;
     if targets.is_empty() {
         let outcome = if resolution.had_permanent {
-            "ingest_failed"
+            IngestOutcome::Failed
         } else {
-            "ingest_duplicate"
+            IngestOutcome::Duplicate
         };
         return finish(resolution.had_transient, outcome);
     }
@@ -198,7 +226,7 @@ fn record_ingest_error(error: ActionError, ses_message_id: &str, message_id: &st
 /// Combines the per-recipient resolution outcome with the fetch/parse/insert
 /// outcome: a transient failure anywhere in the action wins, even when every
 /// inbox that did complete succeeded.
-fn finish(had_transient: bool, outcome: &'static str) -> Result<&'static str, ActionError> {
+fn finish(had_transient: bool, outcome: IngestOutcome) -> Result<IngestOutcome, ActionError> {
     if had_transient {
         return Err(ActionError::transient(anyhow::anyhow!(
             "ingest failed transiently for at least one recipient inbox"
@@ -322,7 +350,7 @@ async fn ingest_into_targets<T: Services>(
     message_id: Uuid,
     message_id_str: &str,
     received_ms: u64,
-) -> Result<&'static str, ActionError> {
+) -> Result<IngestOutcome, ActionError> {
     let (mut parsed_message, mut parsed_content, attachment_metas) =
         fetch_parse_and_extract(state, key, message_id, message_id_str).await?;
 
@@ -353,7 +381,7 @@ async fn ingest_into_targets<T: Services>(
     .await?;
 
     if !inserted {
-        return Ok("ingest_failed");
+        return Ok(IngestOutcome::Failed);
     }
     metrics::counter!(names::MESSAGES_INGESTED).increment(1);
     tracing::info!(
@@ -361,7 +389,7 @@ async fn ingest_into_targets<T: Services>(
         message_id = %message_id_str,
         "ingested inbound message"
     );
-    Ok("ingested")
+    Ok(IngestOutcome::Ingested)
 }
 
 /// `GetObject`, then a `spawn_blocking` parse, then extraction of the kept
@@ -404,7 +432,7 @@ async fn fetch_parse_and_extract<T: Services>(
             size: u64::try_from(attachment.bytes.len()).unwrap_or(u64::MAX),
             filename: attachment.filename.clone(),
             content_type: attachment.content_type.clone(),
-            content_disposition: attachment.content_disposition.clone(),
+            content_disposition: attachment.content_disposition,
             content_id: attachment.content_id.clone(),
         })
         .collect();
@@ -574,14 +602,14 @@ fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<String> {
 
 /// Whether SPF, DKIM or DMARC returned `FAIL`.
 fn auth_failed(receipt: &SesReceipt) -> bool {
-    let failed = |verdict: &Option<Verdict>| verdict.as_ref().is_some_and(|v| v.status == "FAIL");
+    let failed = |verdict: &Option<Verdict>| verdict.as_ref().is_some_and(Verdict::failed);
     failed(&receipt.spf_verdict) || failed(&receipt.dkim_verdict) || failed(&receipt.dmarc_verdict)
 }
 
 /// A compact JSON summary of every verdict SES reported, stored in the
 /// message's content document.
 fn verdicts_json(receipt: &SesReceipt) -> serde_json::Value {
-    let status = |verdict: &Option<Verdict>| verdict.as_ref().map(|v| v.status.clone());
+    let status = |verdict: &Option<Verdict>| verdict.as_ref().map(|v| v.status.as_str().to_owned());
     serde_json::json!({
         "spam": status(&receipt.spam_verdict),
         "virus": status(&receipt.virus_verdict),

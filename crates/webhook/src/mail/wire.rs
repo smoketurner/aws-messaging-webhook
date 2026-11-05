@@ -43,10 +43,7 @@ impl From<&AttachmentMeta> for Attachment {
             size: meta.size,
             filename: meta.filename.clone(),
             content_type: Some(meta.content_type.clone()),
-            content_disposition: match meta.content_disposition.as_str() {
-                "inline" => Some(ContentDisposition::Inline),
-                _ => Some(ContentDisposition::Attachment),
-            },
+            content_disposition: Some(meta.content_disposition),
             content_id: meta.content_id.clone(),
         }
     }
@@ -408,7 +405,7 @@ mod tests {
                 size: 100,
                 filename: Some("file.txt".to_owned()),
                 content_type: "text/plain".to_owned(),
-                content_disposition: "attachment".to_owned(),
+                content_disposition: ContentDisposition::Attachment,
                 content_id: None,
             }],
             ..test_fixtures::message()
@@ -505,14 +502,14 @@ mod tests {
             size: 1,
             filename: None,
             content_type: "image/png".to_owned(),
-            content_disposition: "inline".to_owned(),
+            content_disposition: ContentDisposition::Inline,
             content_id: Some("cid-1".to_owned()),
         };
         assert_eq!(
             Attachment::from(&meta).content_disposition,
             Some(ContentDisposition::Inline)
         );
-        meta.content_disposition = "attachment".to_owned();
+        meta.content_disposition = ContentDisposition::Attachment;
         assert_eq!(
             Attachment::from(&meta).content_disposition,
             Some(ContentDisposition::Attachment)

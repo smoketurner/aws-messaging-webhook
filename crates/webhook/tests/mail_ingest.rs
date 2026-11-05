@@ -1096,7 +1096,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     let first = ingest::ingest_inbound(&state, &event, deadline, Some(envelope_ms)).await;
-    assert_eq!(first.unwrap(), "ingested");
+    assert_eq!(first.unwrap(), ingest::IngestOutcome::Ingested);
 
     let message_id = inbound_message_id("ses-1", envelope_ms);
     let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
@@ -1113,7 +1113,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     let second = ingest::ingest_inbound(&state, &event, deadline, Some(envelope_ms)).await;
     assert_eq!(
         second.unwrap(),
-        "ingest_duplicate",
+        ingest::IngestOutcome::Duplicate,
         "the same envelope timestamp must compute the same id on redelivery"
     );
 }
@@ -1129,7 +1129,7 @@ async fn missing_every_timestamp_source_skips_rather_than_inventing_one() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
-    assert_eq!(result.unwrap(), "ingest_skipped");
+    assert_eq!(result.unwrap(), ingest::IngestOutcome::Skipped);
     assert_eq!(
         state.services.objects.call_count(Op::Get, "inbound/no-ts"),
         0,

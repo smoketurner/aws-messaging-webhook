@@ -233,7 +233,7 @@ async fn process_notification<T: Services>(
                     event = "action_failure",
                     "permanent lifecycle action failure; continuing"
                 );
-                "failed"
+                actions::ActionTaken::Failed
             }
         },
     };
@@ -252,7 +252,7 @@ async fn process_notification<T: Services>(
             PersistOutcome::Fresh => "persisted",
             PersistOutcome::Duplicate => "duplicate",
         },
-        action,
+        action = action.as_str(),
         "event persisted"
     );
     Ok(StatusCode::OK.into_response())
