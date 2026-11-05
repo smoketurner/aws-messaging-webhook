@@ -32,6 +32,7 @@ mailbox = { workspace = true, features = ["test-fixtures"] }
 mailbox-store = { workspace = true, features = ["memory"] }
 proptest = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true

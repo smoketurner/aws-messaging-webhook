@@ -994,4 +994,1051 @@ mod tests {
             "a non-throttling 400 must remain permanent"
         );
     }
+
+    // --- DynamoTable against a stub DynamoDB endpoint -----------------------
+    //
+    // A real client pointed at wiremock: the request tests pin the exact JSON
+    // DynamoDB would receive, and the response tests feed back canned
+    // `application/x-amz-json-1.0` bodies, success and error alike, so every
+    // branch that reads a response runs against the wire format the SDK
+    // actually deserializes.
+    mod wire {
+        use serde_json::{Value, json};
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::keys::PageKey;
+        use crate::plan::OpRole;
+        use crate::table::MailIndex;
+
+        const TABLE: &str = "mail-table";
+
+        /// One row as the tests read it back.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Row {
+            pk: String,
+            sk: String,
+            n: u32,
+        }
+
+        fn row(pk: &str, sk: &str, n: u32) -> Value {
+            json!({"pk": {"S": pk}, "sk": {"S": sk}, "n": {"N": n.to_string()}})
+        }
+
+        fn key(pk: &str, sk: &str) -> TableKey {
+            TableKey {
+                pk: pk.to_owned(),
+                sk: sk.to_owned(),
+            }
+        }
+
+        fn ok(body: &Value) -> ResponseTemplate {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(body.to_string())
+        }
+
+        /// A DynamoDB error response. The `__type` value is the
+        /// `com.amazonaws.dynamodb.v20120810#<ExceptionName>` form shown in
+        /// "Error handling with DynamoDB" (Error components):
+        /// <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html>
+        fn dynamo_error(status: u16, kind: &str) -> ResponseTemplate {
+            ResponseTemplate::new(status)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(
+                    json!({
+                        "__type": format!("com.amazonaws.dynamodb.v20120810#{kind}"),
+                        "message": "stub",
+                    })
+                    .to_string(),
+                )
+        }
+
+        /// A `TransactionCanceledException` carrying one `CancellationReasons`
+        /// entry per transaction item, in item order, each with a `Code`; an
+        /// item with no error has the literal code `"None"`. Shape and codes
+        /// from the `TransactWriteItems` API reference (Errors,
+        /// `TransactionCanceledException`):
+        /// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html>
+        fn cancelled(codes: &[&str]) -> ResponseTemplate {
+            let reasons: Vec<Value> = codes.iter().map(|code| json!({"Code": code})).collect();
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(
+                    json!({
+                        "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+                        "Message": "Transaction cancelled",
+                        "CancellationReasons": reasons,
+                    })
+                    .to_string(),
+                )
+        }
+
+        fn target(operation: &str) -> String {
+            format!("DynamoDB_20120810.{operation}")
+        }
+
+        async fn mount(server: &MockServer, operation: &str, response: ResponseTemplate) {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", target(operation).as_str()))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+
+        /// Serves `response` to the next matching request only, so a sequence
+        /// of these answers successive calls in mount order.
+        async fn mount_once(server: &MockServer, operation: &str, response: ResponseTemplate) {
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", target(operation).as_str()))
+                .respond_with(response)
+                .up_to_n_times(1)
+                .mount(server)
+                .await;
+        }
+
+        fn client(server: &MockServer) -> aws_sdk_dynamodb::Client {
+            let conf = aws_sdk_dynamodb::Config::builder()
+                .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+                .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                    "AKID", "secret", None, None, "test",
+                ))
+                .endpoint_url(server.uri())
+                .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                .build();
+            aws_sdk_dynamodb::Client::from_conf(conf)
+        }
+
+        fn table(server: &MockServer) -> DynamoTable {
+            DynamoTable::new(client(server), Some(TABLE.to_owned()))
+        }
+
+        /// The JSON bodies of every request the stub saw for `operation`.
+        async fn bodies(server: &MockServer, operation: &str) -> Vec<Value> {
+            let target = target(operation);
+            let mut bodies = Vec::new();
+            for request in server.received_requests().await.unwrap_or_default() {
+                if request
+                    .headers
+                    .get("x-amz-target")
+                    .is_some_and(|value| value == target.as_str())
+                {
+                    bodies.push(serde_json::from_slice(&request.body).unwrap());
+                }
+            }
+            bodies
+        }
+
+        fn planned(role: OpRole, op: WriteOp) -> PlannedOp {
+            PlannedOp { role, op }
+        }
+
+        fn put(cond: Cond) -> WriteOp {
+            WriteOp::Put {
+                item: serde_dynamo::Item::from(HashMap::from([
+                    (
+                        "pk".to_owned(),
+                        serde_dynamo::AttributeValue::S("P".to_owned()),
+                    ),
+                    (
+                        "sk".to_owned(),
+                        serde_dynamo::AttributeValue::S("S".to_owned()),
+                    ),
+                ])),
+                cond,
+            }
+        }
+
+        fn error_text(error: &MailStoreError) -> String {
+            match error {
+                MailStoreError::Transient(source) | MailStoreError::Permanent(source) => {
+                    format!("{source:#}")
+                }
+                other => other.to_string(),
+            }
+        }
+
+        // --- TransactWriteItems --------------------------------------------
+
+        /// Runs `ops` as one committed transaction and returns the
+        /// `TransactItems` the stub received.
+        async fn sent_transact_items(ops: &[PlannedOp]) -> Value {
+            let server = MockServer::start().await;
+            mount(&server, "TransactWriteItems", ok(&json!({}))).await;
+            let outcome = table(&server).transact(ops).await.unwrap();
+            assert_eq!(outcome, TxnOutcome::Committed);
+            let mut sent = bodies(&server, "TransactWriteItems").await;
+            assert_eq!(sent.len(), 1);
+            let mut body = sent.remove(0);
+            // The SDK fills in a random idempotency token for every call.
+            let token = body
+                .as_object_mut()
+                .and_then(|body| body.remove("ClientRequestToken"));
+            assert!(token.is_some_and(|token| token.is_string()));
+            let mut keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+            keys.sort();
+            assert_eq!(keys, ["TransactItems"]);
+            body["TransactItems"].take()
+        }
+
+        /// Every `Cond` on a `Put`: the condition expression with exactly
+        /// the placeholder names and values it references.
+        #[tokio::test]
+        async fn put_conditions_render_with_their_placeholders() {
+            let ops = [
+                planned(OpRole::Message, put(Cond::None)),
+                planned(OpRole::Message, put(Cond::NotExists)),
+                planned(
+                    OpRole::SendState,
+                    put(Cond::NotExistsOrExpired { now_epoch: 42 }),
+                ),
+                planned(
+                    OpRole::SendState,
+                    put(Cond::All(vec![
+                        Check::Eq(
+                            "status",
+                            serde_dynamo::AttributeValue::S("queued".to_owned()),
+                        ),
+                        Check::Eq("version", serde_dynamo::AttributeValue::N("3".to_owned())),
+                    ])),
+                ),
+                planned(OpRole::Thread, put(Cond::VersionEquals(7))),
+            ];
+            let item = json!({"pk": {"S": "P"}, "sk": {"S": "S"}});
+            assert_eq!(
+                sent_transact_items(&ops).await,
+                json!([
+                    {"Put": {"TableName": TABLE, "Item": item}},
+                    {"Put": {
+                        "TableName": TABLE,
+                        "Item": item,
+                        "ConditionExpression": "attribute_not_exists(pk)",
+                    }},
+                    {"Put": {
+                        "TableName": TABLE,
+                        "Item": item,
+                        "ConditionExpression": "attribute_not_exists(pk) OR expires_at < :cond_now",
+                        "ExpressionAttributeValues": {":cond_now": {"N": "42"}},
+                    }},
+                    {"Put": {
+                        "TableName": TABLE,
+                        "Item": item,
+                        "ConditionExpression": "#c0 = :c0 AND #c1 = :c1",
+                        "ExpressionAttributeNames": {"#c0": "status", "#c1": "version"},
+                        "ExpressionAttributeValues": {":c0": {"S": "queued"}, ":c1": {"N": "3"}},
+                    }},
+                    {"Put": {
+                        "TableName": TABLE,
+                        "Item": item,
+                        "ConditionExpression": "version = :cond_version",
+                        "ExpressionAttributeValues": {":cond_version": {"N": "7"}},
+                    }},
+                ])
+            );
+        }
+
+        fn update(sk: &str, set: &[(&str, &str)], remove: &[&str], cond: Cond) -> PlannedOp {
+            let mut pairs = Vec::new();
+            for (name, value) in set {
+                pairs.push((
+                    (*name).to_owned(),
+                    serde_dynamo::AttributeValue::S((*value).to_owned()),
+                ));
+            }
+            planned(
+                OpRole::Thread,
+                WriteOp::Update {
+                    pk: "THR".to_owned(),
+                    sk: sk.to_owned(),
+                    set: pairs,
+                    remove: remove.iter().map(|name| (*name).to_owned()).collect(),
+                    cond,
+                },
+            )
+        }
+
+        /// An update's SET and REMOVE clauses, alone and together, each
+        /// with its own placeholders beside the condition's.
+        #[tokio::test]
+        async fn updates_render_set_and_remove_clauses() {
+            let ops = [
+                update(
+                    "T1",
+                    &[("subject", "hi"), ("note", "n")],
+                    &["draft", "stale"],
+                    Cond::VersionEquals(7),
+                ),
+                update("T2", &[("subject", "only-set")], &[], Cond::None),
+                update("T3", &[], &["draft"], Cond::None),
+            ];
+            assert_eq!(
+                sent_transact_items(&ops).await,
+                json!([
+                    {"Update": {
+                        "TableName": TABLE,
+                        "Key": {"pk": {"S": "THR"}, "sk": {"S": "T1"}},
+                        "UpdateExpression": "SET #s0 = :s0, #s1 = :s1 REMOVE #r0, #r1",
+                        "ConditionExpression": "version = :cond_version",
+                        "ExpressionAttributeNames": {
+                            "#s0": "subject", "#s1": "note", "#r0": "draft", "#r1": "stale",
+                        },
+                        "ExpressionAttributeValues": {
+                            ":cond_version": {"N": "7"}, ":s0": {"S": "hi"}, ":s1": {"S": "n"},
+                        },
+                    }},
+                    {"Update": {
+                        "TableName": TABLE,
+                        "Key": {"pk": {"S": "THR"}, "sk": {"S": "T2"}},
+                        "UpdateExpression": "SET #s0 = :s0",
+                        "ExpressionAttributeNames": {"#s0": "subject"},
+                        "ExpressionAttributeValues": {":s0": {"S": "only-set"}},
+                    }},
+                    {"Update": {
+                        "TableName": TABLE,
+                        "Key": {"pk": {"S": "THR"}, "sk": {"S": "T3"}},
+                        "UpdateExpression": "REMOVE #r0",
+                        "ExpressionAttributeNames": {"#r0": "draft"},
+                    }},
+                ])
+            );
+        }
+
+        fn alias(pk: &str, message_id: Option<&str>) -> PlannedOp {
+            planned(
+                OpRole::RfcAlias,
+                WriteOp::AliasFirstWriter {
+                    pk: pk.to_owned(),
+                    sk: "RFC".to_owned(),
+                    message_id: message_id.map(str::to_owned),
+                    thread_id: "tid-1".to_owned(),
+                    expires_at: 1_900_000_000,
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn alias_puts_render_their_item_and_first_writer_condition() {
+            let ops = [alias("RFC#a", Some("mid-1")), alias("RFC#b", None)];
+            assert_eq!(
+                sent_transact_items(&ops).await,
+                json!([
+                    {"Put": {
+                        "TableName": TABLE,
+                        "Item": {
+                            "pk": {"S": "RFC#a"},
+                            "sk": {"S": "RFC"},
+                            "thread_id": {"S": "tid-1"},
+                            "expires_at": {"N": "1900000000"},
+                            "message_id": {"S": "mid-1"},
+                        },
+                        "ConditionExpression":
+                            "attribute_not_exists(pk) OR attribute_not_exists(message_id)",
+                    }},
+                    {"Put": {
+                        "TableName": TABLE,
+                        "Item": {
+                            "pk": {"S": "RFC#b"},
+                            "sk": {"S": "RFC"},
+                            "thread_id": {"S": "tid-1"},
+                            "expires_at": {"N": "1900000000"},
+                        },
+                        "ConditionExpression": "attribute_not_exists(pk)",
+                    }},
+                ])
+            );
+        }
+
+        /// Each documented cancellation reason code maps to its own variant;
+        /// anything else, `"None"` included, is `None`. Codes from the
+        /// `TransactWriteItems` API reference (Errors,
+        /// `TransactionCanceledException`):
+        /// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html>
+        #[test]
+        fn every_documented_cancellation_code_maps_to_its_reason() {
+            let cases = [
+                (
+                    Some("ConditionalCheckFailed"),
+                    CancellationReason::ConditionalCheckFailed,
+                ),
+                (
+                    Some("TransactionConflict"),
+                    CancellationReason::TransactionConflict,
+                ),
+                (Some("ThrottlingError"), CancellationReason::ThrottlingError),
+                (
+                    Some("ProvisionedThroughputExceeded"),
+                    CancellationReason::ProvisionedThroughputExceeded,
+                ),
+                (
+                    Some("RequestLimitExceeded"),
+                    CancellationReason::RequestLimitExceeded,
+                ),
+                (
+                    Some("InternalServerError"),
+                    CancellationReason::InternalServerError,
+                ),
+                (Some("ValidationError"), CancellationReason::ValidationError),
+                (
+                    Some("ItemCollectionSizeLimitExceeded"),
+                    CancellationReason::ItemCollectionSizeLimitExceeded,
+                ),
+                (Some("None"), CancellationReason::None),
+                (Some("SomethingNew"), CancellationReason::None),
+                (None, CancellationReason::None),
+            ];
+            for (code, expected) in cases {
+                assert_eq!(map_cancellation_reason(code), expected, "{code:?}");
+            }
+        }
+
+        async fn transact_against(
+            response: ResponseTemplate,
+            ops: &[PlannedOp],
+        ) -> Result<TxnOutcome, MailStoreError> {
+            let server = MockServer::start().await;
+            mount(&server, "TransactWriteItems", response).await;
+            table(&server).transact(ops).await
+        }
+
+        /// The reasons on the wire reach `decode_cancellation` in item order:
+        /// the same failed check means a duplicate on a `NotExists` message
+        /// put and a version conflict on a versioned thread put.
+        #[tokio::test]
+        async fn cancellation_reasons_are_decoded_against_their_ops() {
+            let ops = [
+                planned(OpRole::Message, put(Cond::NotExists)),
+                planned(OpRole::Thread, put(Cond::VersionEquals(1))),
+            ];
+            let duplicate = transact_against(cancelled(&["ConditionalCheckFailed", "None"]), &ops)
+                .await
+                .unwrap();
+            assert_eq!(duplicate, TxnOutcome::Cancelled(TxnDecision::Duplicate));
+
+            let conflict = transact_against(cancelled(&["None", "ConditionalCheckFailed"]), &ops)
+                .await
+                .unwrap();
+            assert_eq!(
+                conflict,
+                TxnOutcome::Cancelled(TxnDecision::VersionConflict)
+            );
+
+            for retryable in ["TransactionConflict", "ThrottlingError"] {
+                let retry = transact_against(cancelled(&["None", retryable]), &ops)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    retry,
+                    TxnOutcome::Cancelled(TxnDecision::Retry),
+                    "{retryable}"
+                );
+            }
+        }
+
+        /// `TransactionInProgressException` (a request token already in
+        /// flight) is a retry, not an error. Listed in the `TransactWriteItems`
+        /// API reference (Errors):
+        /// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html>
+        #[tokio::test]
+        async fn a_transaction_in_progress_is_retried() {
+            let ops = [planned(OpRole::Message, put(Cond::NotExists))];
+            let outcome =
+                transact_against(dynamo_error(400, "TransactionInProgressException"), &ops)
+                    .await
+                    .unwrap();
+            assert_eq!(outcome, TxnOutcome::Cancelled(TxnDecision::Retry));
+        }
+
+        /// `IdempotentParameterMismatchException` (same token, different
+        /// payload) cannot succeed on retry. Listed in the `TransactWriteItems`
+        /// API reference (Errors):
+        /// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html>
+        #[tokio::test]
+        async fn an_idempotent_parameter_mismatch_is_permanent() {
+            let ops = [planned(OpRole::Message, put(Cond::NotExists))];
+            let error = transact_against(
+                dynamo_error(400, "IdempotentParameterMismatchException"),
+                &ops,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, MailStoreError::Permanent(_)), "{error:?}");
+            assert!(
+                error_text(&error).contains("idempotent parameter mismatch"),
+                "{error:?}"
+            );
+        }
+
+        /// Any other failure goes through the shared SDK classification: a
+        /// 5xx is transient, a validation error permanent.
+        #[tokio::test]
+        async fn other_transaction_failures_use_the_sdk_classification() {
+            let ops = [planned(OpRole::Message, put(Cond::NotExists))];
+            let transient = transact_against(dynamo_error(500, "InternalServerError"), &ops)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(transient, MailStoreError::Transient(_)),
+                "{transient:?}"
+            );
+            let permanent = transact_against(dynamo_error(400, "ValidationException"), &ops)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(permanent, MailStoreError::Permanent(_)),
+                "{permanent:?}"
+            );
+            assert!(
+                error_text(&permanent).contains("TransactWriteItems"),
+                "{permanent:?}"
+            );
+        }
+
+        // --- PutItem -------------------------------------------------------
+
+        #[tokio::test]
+        async fn put_if_absent_sends_the_item_under_a_not_exists_condition() {
+            let server = MockServer::start().await;
+            mount(&server, "PutItem", ok(&json!({}))).await;
+            let item = serde_dynamo::Item::from(HashMap::from([
+                (
+                    "pk".to_owned(),
+                    serde_dynamo::AttributeValue::S("INBOX#a".to_owned()),
+                ),
+                (
+                    "sk".to_owned(),
+                    serde_dynamo::AttributeValue::S("META".to_owned()),
+                ),
+            ]));
+            let outcome = table(&server)
+                .put_if_absent(item, "PutItem(inbox)")
+                .await
+                .unwrap();
+            assert_eq!(outcome, PutOutcome::Created);
+            assert_eq!(
+                bodies(&server, "PutItem").await,
+                vec![json!({
+                    "TableName": TABLE,
+                    "Item": {"pk": {"S": "INBOX#a"}, "sk": {"S": "META"}},
+                    "ConditionExpression": "attribute_not_exists(pk)",
+                })]
+            );
+        }
+
+        async fn put_against(response: ResponseTemplate) -> Result<PutOutcome, MailStoreError> {
+            let server = MockServer::start().await;
+            mount(&server, "PutItem", response).await;
+            table(&server)
+                .put_if_absent(serde_dynamo::Item::default(), "PutItem(inbox)")
+                .await
+        }
+
+        /// A failed condition is the item already existing, not an error;
+        /// `ConditionalCheckFailedException` is the `PutItem` error for it
+        /// ("Error handling with DynamoDB", HTTP status code 400):
+        /// <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.Errors.html>
+        #[tokio::test]
+        async fn a_failed_put_condition_means_the_item_already_exists() {
+            let outcome = put_against(dynamo_error(400, "ConditionalCheckFailedException"))
+                .await
+                .unwrap();
+            assert_eq!(outcome, PutOutcome::AlreadyExists);
+        }
+
+        #[tokio::test]
+        async fn other_put_failures_use_the_sdk_classification() {
+            let transient = put_against(dynamo_error(500, "InternalServerError"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(transient, MailStoreError::Transient(_)),
+                "{transient:?}"
+            );
+            let permanent = put_against(dynamo_error(400, "ValidationException"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(permanent, MailStoreError::Permanent(_)),
+                "{permanent:?}"
+            );
+            assert!(
+                error_text(&permanent).contains("PutItem(inbox)"),
+                "{permanent:?}"
+            );
+        }
+
+        // --- BatchGetItem --------------------------------------------------
+        //
+        // Response shape (`Responses` keyed by table name, `UnprocessedKeys`
+        // in the same form as `RequestItems`) from the `BatchGetItem` API
+        // reference (Response Syntax, Response Elements):
+        // https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchGetItem.html
+
+        #[tokio::test]
+        async fn a_batch_read_requests_every_key_with_its_consistency() {
+            for (read, consistent) in [(Read::Consistent, true), (Read::Eventual, false)] {
+                let server = MockServer::start().await;
+                mount(
+                    &server,
+                    "BatchGetItem",
+                    ok(&json!({"Responses": {TABLE: []}})),
+                )
+                .await;
+                let found = table(&server)
+                    .batch_get::<Row>(vec![key("A", "1"), key("B", "2")], read, "BatchGetItem")
+                    .await
+                    .unwrap();
+                assert!(found.is_empty());
+                assert_eq!(
+                    bodies(&server, "BatchGetItem").await,
+                    vec![json!({"RequestItems": {TABLE: {
+                        "Keys": [
+                            {"pk": {"S": "A"}, "sk": {"S": "1"}},
+                            {"pk": {"S": "B"}, "sk": {"S": "2"}},
+                        ],
+                        "ConsistentRead": consistent,
+                    }}})]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_empty_batch_sends_no_request() {
+            let server = MockServer::start().await;
+            let found = table(&server)
+                .batch_get::<Row>(Vec::new(), Read::Eventual, "BatchGetItem")
+                .await
+                .unwrap();
+            assert!(found.is_empty());
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+
+        /// Items map back to the key they carry, in whatever order DynamoDB
+        /// returns them; an item without a string `pk`/`sk` or one that does
+        /// not deserialize is left out rather than failing the batch.
+        #[tokio::test]
+        async fn batch_items_map_back_by_key_and_bad_rows_are_skipped() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "BatchGetItem",
+                ok(&json!({
+                    "Responses": {TABLE: [
+                        row("B", "2", 2),
+                        row("A", "1", 1),
+                        {"pk": {"S": "C"}, "sk": {"S": "3"}, "n": {"S": "not-a-number"}},
+                        {"pk": {"S": "D"}, "n": {"N": "4"}},
+                        {"pk": {"S": "E"}, "sk": {"N": "5"}, "n": {"N": "5"}},
+                    ]},
+                    "UnprocessedKeys": {},
+                })),
+            )
+            .await;
+            let found = table(&server)
+                .batch_get::<Row>(
+                    vec![key("A", "1"), key("B", "2"), key("C", "3"), key("D", "4")],
+                    Read::Eventual,
+                    "BatchGetItem",
+                )
+                .await
+                .unwrap();
+            let expected = HashMap::from([
+                (
+                    key("A", "1"),
+                    Row {
+                        pk: "A".to_owned(),
+                        sk: "1".to_owned(),
+                        n: 1,
+                    },
+                ),
+                (
+                    key("B", "2"),
+                    Row {
+                        pk: "B".to_owned(),
+                        sk: "2".to_owned(),
+                        n: 2,
+                    },
+                ),
+            ]);
+            assert_eq!(found, expected);
+        }
+
+        /// A response for some other table contributes nothing.
+        #[tokio::test]
+        async fn responses_for_another_table_are_ignored() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "BatchGetItem",
+                ok(&json!({"Responses": {"other-table": [row("A", "1", 1)]}})),
+            )
+            .await;
+            let found = table(&server)
+                .batch_get::<Row>(vec![key("A", "1")], Read::Eventual, "BatchGetItem")
+                .await
+                .unwrap();
+            assert!(found.is_empty());
+        }
+
+        /// Unprocessed keys are re-requested, and only they are; the
+        /// results of both rounds are merged.
+        #[tokio::test]
+        async fn unprocessed_keys_are_retried_until_drained() {
+            let server = MockServer::start().await;
+            mount_once(
+                &server,
+                "BatchGetItem",
+                ok(&json!({
+                    "Responses": {TABLE: [row("A", "1", 1)]},
+                    "UnprocessedKeys": {TABLE: {
+                        "Keys": [{"pk": {"S": "B"}, "sk": {"S": "2"}}],
+                        "ConsistentRead": true,
+                    }},
+                })),
+            )
+            .await;
+            mount_once(
+                &server,
+                "BatchGetItem",
+                ok(&json!({"Responses": {TABLE: [row("B", "2", 2)]}, "UnprocessedKeys": {}})),
+            )
+            .await;
+            let started = std::time::Instant::now();
+            let found = table(&server)
+                .batch_get::<Row>(
+                    vec![key("A", "1"), key("B", "2")],
+                    Read::Consistent,
+                    "BatchGetItem",
+                )
+                .await
+                .unwrap();
+            assert_eq!(found.len(), 2);
+            assert_eq!(found[&key("B", "2")].n, 2);
+            // One backoff of 50 ms before the second round.
+            assert!(started.elapsed() >= Duration::from_millis(50));
+            let sent = bodies(&server, "BatchGetItem").await;
+            assert_eq!(sent.len(), 2);
+            assert_eq!(
+                sent[1],
+                json!({"RequestItems": {TABLE: {
+                    "Keys": [{"pk": {"S": "B"}, "sk": {"S": "2"}}],
+                    "ConsistentRead": true,
+                }}})
+            );
+        }
+
+        /// Keys DynamoDB never processes surface as a transient error after
+        /// `MAX_BATCH_GET_ATTEMPTS` requests, with a growing backoff between
+        /// them, rather than looping forever.
+        #[tokio::test]
+        async fn keys_left_unprocessed_give_up_after_the_attempt_cap() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "BatchGetItem",
+                ok(&json!({
+                    "Responses": {TABLE: []},
+                    "UnprocessedKeys": {TABLE: {
+                        "Keys": [{"pk": {"S": "A"}, "sk": {"S": "1"}}],
+                    }},
+                })),
+            )
+            .await;
+            let started = std::time::Instant::now();
+            let error = table(&server)
+                .batch_get::<Row>(vec![key("A", "1")], Read::Eventual, "BatchGetItem")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, MailStoreError::Transient(_)), "{error:?}");
+            assert_eq!(
+                bodies(&server, "BatchGetItem").await.len(),
+                usize::try_from(MAX_BATCH_GET_ATTEMPTS).unwrap()
+            );
+            // 50 + 100 + 150 + 200 ms between the five attempts.
+            assert!(started.elapsed() >= Duration::from_millis(500));
+        }
+
+        #[tokio::test]
+        async fn a_failed_batch_read_uses_the_sdk_classification() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "BatchGetItem",
+                dynamo_error(400, "ProvisionedThroughputExceededException"),
+            )
+            .await;
+            let error = table(&server)
+                .batch_get::<Row>(vec![key("A", "1")], Read::Eventual, "BatchGetItem(x)")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, MailStoreError::Transient(_)), "{error:?}");
+            assert!(error_text(&error).contains("BatchGetItem(x)"), "{error:?}");
+        }
+
+        // --- GetItem -------------------------------------------------------
+
+        #[tokio::test]
+        async fn a_read_item_is_deserialized_and_a_bad_one_is_permanent() {
+            let server = MockServer::start().await;
+            mount_once(&server, "GetItem", ok(&json!({"Item": row("A", "1", 1)}))).await;
+            mount_once(&server, "GetItem", ok(&json!({}))).await;
+            mount_once(
+                &server,
+                "GetItem",
+                ok(&json!({"Item": {"pk": {"S": "A"}, "sk": {"S": "1"}, "n": {"S": "x"}}})),
+            )
+            .await;
+            let table = table(&server);
+            let found = table
+                .get::<Row>(key("A", "1"), Read::Eventual, "GetItem(x)")
+                .await
+                .unwrap();
+            assert_eq!(found.map(|row| row.n), Some(1));
+            let absent = table
+                .get::<Row>(key("A", "1"), Read::Eventual, "GetItem(x)")
+                .await
+                .unwrap();
+            assert!(absent.is_none());
+            let error = table
+                .get::<Row>(key("A", "1"), Read::Eventual, "GetItem(x)")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, MailStoreError::Permanent(_)), "{error:?}");
+            assert!(error_text(&error).contains("GetItem(x)"), "{error:?}");
+        }
+
+        // --- Query ---------------------------------------------------------
+
+        fn query_response(last_evaluated: Option<Value>) -> ResponseTemplate {
+            let mut body = json!({"Items": [row("A", "1", 1), row("B", "2", 2)], "Count": 2});
+            if let Some(last) = last_evaluated {
+                body["LastEvaluatedKey"] = last;
+            }
+            ok(&body)
+        }
+
+        #[tokio::test]
+        async fn a_query_sends_its_index_bounds_order_limit_and_start() {
+            let server = MockServer::start().await;
+            mount(&server, "Query", query_response(None)).await;
+            let start = PageKey {
+                partition: "INBOX#a#MSG".to_owned(),
+                sort: "2026-01-01".to_owned(),
+                table_pk: "INBOX#a".to_owned(),
+                table_sk: "MSG#m".to_owned(),
+            };
+            let query = PageQuery {
+                index: MailIndex::ByThread,
+                partition: "INBOX#a#MSG",
+                limit: 25,
+                before: Some("z"),
+                after: Some("a"),
+                ascending: false,
+                start: Some(&start),
+                context: "Query(x)",
+            };
+            let page = table(&server).query::<Row>(query).await.unwrap();
+            assert_eq!(page.items.len(), 2);
+            assert!(page.next.is_none());
+            assert_eq!(
+                bodies(&server, "Query").await,
+                vec![json!({
+                    "TableName": TABLE,
+                    "IndexName": "ByThread",
+                    "KeyConditionExpression": "#pk = :pk AND #sk > :after AND #sk < :before",
+                    "ExpressionAttributeNames": {"#pk": "gsi2pk", "#sk": "gsi2sk"},
+                    "ExpressionAttributeValues": {
+                        ":pk": {"S": "INBOX#a#MSG"},
+                        ":after": {"S": "a"},
+                        ":before": {"S": "z"},
+                    },
+                    "ScanIndexForward": false,
+                    "Limit": 25,
+                    "ExclusiveStartKey": {
+                        "pk": {"S": "INBOX#a"},
+                        "sk": {"S": "MSG#m"},
+                        "gsi2pk": {"S": "INBOX#a#MSG"},
+                        "gsi2sk": {"S": "2026-01-01"},
+                    },
+                })]
+            );
+        }
+
+        /// A first page carries no `ExclusiveStartKey`, and a limit beyond
+        /// `i32` saturates rather than wrapping.
+        #[tokio::test]
+        async fn a_first_page_has_no_start_key_and_a_huge_limit_saturates() {
+            let server = MockServer::start().await;
+            mount(&server, "Query", query_response(None)).await;
+            let query = PageQuery::unbounded(MailIndex::ByTime, "INBOXES", usize::MAX, None, "Q");
+            table(&server).query::<Row>(query).await.unwrap();
+            assert_eq!(
+                bodies(&server, "Query").await,
+                vec![json!({
+                    "TableName": TABLE,
+                    "IndexName": "ByTime",
+                    "KeyConditionExpression": "#pk = :pk",
+                    "ExpressionAttributeNames": {"#pk": "gsi1pk"},
+                    "ExpressionAttributeValues": {":pk": {"S": "INBOXES"}},
+                    "ScanIndexForward": true,
+                    "Limit": i32::MAX,
+                })]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_last_evaluated_key_becomes_the_next_page_key() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "Query",
+                query_response(Some(json!({
+                    "pk": {"S": "INBOX#a"},
+                    "sk": {"S": "MSG#b"},
+                    "gsi1pk": {"S": "INBOX#a#MSG"},
+                    "gsi1sk": {"S": "2026-01-02"},
+                }))),
+            )
+            .await;
+            let query = PageQuery::unbounded(MailIndex::ByTime, "INBOX#a#MSG", 2, None, "Q");
+            let page = table(&server).query::<Row>(query).await.unwrap();
+            assert_eq!(
+                page.next,
+                Some(PageKey {
+                    partition: "INBOX#a#MSG".to_owned(),
+                    sort: "2026-01-02".to_owned(),
+                    table_pk: "INBOX#a".to_owned(),
+                    table_sk: "MSG#b".to_owned(),
+                })
+            );
+            assert_eq!(
+                page.items,
+                vec![
+                    Row {
+                        pk: "A".to_owned(),
+                        sk: "1".to_owned(),
+                        n: 1,
+                    },
+                    Row {
+                        pk: "B".to_owned(),
+                        sk: "2".to_owned(),
+                        n: 2,
+                    },
+                ]
+            );
+        }
+
+        /// A `LastEvaluatedKey` missing an attribute, or holding a non-string
+        /// one, yields no continuation rather than an unusable one.
+        #[test]
+        fn an_incomplete_last_evaluated_key_gives_no_page_key() {
+            let full = HashMap::from([
+                ("pk".to_owned(), DynamoAv::S("P".to_owned())),
+                ("sk".to_owned(), DynamoAv::S("S".to_owned())),
+                ("gsi1pk".to_owned(), DynamoAv::S("IP".to_owned())),
+                ("gsi1sk".to_owned(), DynamoAv::S("IS".to_owned())),
+            ]);
+            assert!(page_key_from_last_evaluated(&full, "gsi1pk", "gsi1sk").is_some());
+            for name in ["pk", "sk", "gsi1pk", "gsi1sk"] {
+                let mut missing = full.clone();
+                missing.remove(name);
+                assert!(
+                    page_key_from_last_evaluated(&missing, "gsi1pk", "gsi1sk").is_none(),
+                    "{name} missing"
+                );
+                let mut wrong_type = full.clone();
+                wrong_type.insert(name.to_owned(), DynamoAv::N("1".to_owned()));
+                assert!(
+                    page_key_from_last_evaluated(&wrong_type, "gsi1pk", "gsi1sk").is_none(),
+                    "{name} not a string"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_query_item_that_does_not_deserialize_is_permanent() {
+            let server = MockServer::start().await;
+            mount(
+                &server,
+                "Query",
+                ok(&json!({"Items": [{"pk": {"S": "A"}, "sk": {"S": "1"}, "n": {"S": "x"}}]})),
+            )
+            .await;
+            let query = PageQuery::unbounded(MailIndex::ByTime, "INBOXES", 10, None, "Query(x)");
+            let error = table(&server).query::<Row>(query).await.unwrap_err();
+            assert!(matches!(error, MailStoreError::Permanent(_)), "{error:?}");
+            assert!(error_text(&error).contains("Query(x)"), "{error:?}");
+        }
+
+        #[tokio::test]
+        async fn a_failed_query_uses_the_sdk_classification() {
+            let server = MockServer::start().await;
+            mount(&server, "Query", dynamo_error(500, "InternalServerError")).await;
+            let query = PageQuery::unbounded(MailIndex::ByStatus, "STATUS#queued", 10, None, "Q");
+            let error = table(&server).query::<Row>(query).await.unwrap_err();
+            assert!(matches!(error, MailStoreError::Transient(_)), "{error:?}");
+        }
+
+        // --- mail disabled -------------------------------------------------
+
+        /// With no table name every call fails permanently before sending
+        /// anything, except an empty batch, which has nothing to read.
+        #[tokio::test]
+        async fn every_call_fails_permanently_when_mail_is_not_configured() {
+            let server = MockServer::start().await;
+            let table = DynamoTable::new(client(&server), None);
+            let permanent = |result: Result<(), MailStoreError>| {
+                assert!(
+                    matches!(result, Err(MailStoreError::Permanent(_))),
+                    "{result:?}"
+                );
+            };
+            permanent(
+                table
+                    .get::<Row>(key("A", "1"), Read::Eventual, "G")
+                    .await
+                    .map(drop),
+            );
+            permanent(
+                table
+                    .batch_get::<Row>(vec![key("A", "1")], Read::Eventual, "B")
+                    .await
+                    .map(drop),
+            );
+            permanent(
+                table
+                    .query::<Row>(PageQuery::unbounded(MailIndex::ByTime, "P", 1, None, "Q"))
+                    .await
+                    .map(drop),
+            );
+            permanent(
+                table
+                    .put_if_absent(serde_dynamo::Item::default(), "P")
+                    .await
+                    .map(drop),
+            );
+            permanent(table.transact(&[]).await.map(drop));
+            assert!(
+                table
+                    .batch_get::<Row>(Vec::new(), Read::Eventual, "B")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+    }
 }
