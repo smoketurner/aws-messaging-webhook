@@ -17,6 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 
 use crate::api::error::{ApiError, FieldError};
+use crate::api::json::OneOrMany;
 use crate::mail::address::envelope_address;
 use crate::mail::url_policy::{self, AttachmentUrl};
 use crate::mail::wire::ContentDisposition;
@@ -56,21 +57,7 @@ const CONTENT_TYPE_MAX_BYTES: usize = 127;
 
 /// One address, or several. The contract allows both spellings everywhere a
 /// list of addresses appears.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum Addresses {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Addresses {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::One(one) => vec![one],
-            Self::Many(many) => many,
-        }
-    }
-}
+pub type Addresses = OneOrMany<String>;
 
 /// An attachment as the request gives it: bytes inline, or a URL for the
 /// sender to fetch.

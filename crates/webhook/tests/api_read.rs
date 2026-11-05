@@ -4,6 +4,7 @@
 //! insert path: every fixture goes in through `insert_message`, so the items
 //! these reads return are the ones ingest would actually write.
 
+use aws_messaging_webhook::mail::MessageId;
 use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content::{self, MessageContent};
@@ -395,7 +396,7 @@ async fn fetching_one_message_returns_the_body_a_list_omits() {
     content::store(
         &h.state.objects,
         &InboxId::new(TEST_INBOX),
-        id,
+        &MessageId::new(id),
         &MessageContent {
             text: Some("the full body".to_owned()),
             headers: BTreeMap::from([("X-Custom".to_owned(), "yes".to_owned())]),

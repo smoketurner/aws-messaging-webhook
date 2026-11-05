@@ -124,6 +124,91 @@ impl std::fmt::Display for InboxId {
     }
 }
 
+/// A string id type: stored and serialized as its bare string, but not
+/// interchangeable with another kind of id.
+macro_rules! string_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(
+            Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            #[must_use]
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                &self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+    };
+}
+
+string_id! {
+    /// A mailbox message id: a hyphenated lowercase `UUIDv7` for every id
+    /// this service mints (`ids::inbound_message_id`,
+    /// `ids::outbound_message_id`).
+    MessageId
+}
+
+string_id! {
+    /// A thread id: the id of the message that started the thread.
+    ThreadId
+}
+
+string_id! {
+    /// The message id SES assigned to a send or a receipt.
+    SesMessageId
+}
+
+impl From<uuid::Uuid> for MessageId {
+    fn from(id: uuid::Uuid) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl From<&MessageId> for ThreadId {
+    /// The thread a message starts takes the message's id.
+    fn from(id: &MessageId) -> Self {
+        Self(id.0.clone())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -150,8 +235,8 @@ pub struct Inbox {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RfcHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-    pub thread_id: String,
+    pub message_id: Option<MessageId>,
+    pub thread_id: ThreadId,
 }
 
 /// One kept attachment's metadata on a message item.
@@ -181,7 +266,7 @@ pub struct AttachmentMeta {
 /// to 50 (`mail::thread::THREAD_ADDRESS_SET_CAP`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadSnapshot {
-    pub thread_id: String,
+    pub thread_id: ThreadId,
     pub subject: String,
     pub preview: String,
     pub message_count: u64,
@@ -196,7 +281,7 @@ pub struct ThreadSnapshot {
     pub updated_at: String,
     // Defaulted so a snapshot stored before these fields existed still reads.
     #[serde(default)]
-    pub last_message_id: String,
+    pub last_message_id: MessageId,
     #[serde(default)]
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,10 +300,10 @@ pub struct ThreadSnapshot {
 pub struct MailMessage {
     // Identity and threading.
     pub inbox_id: InboxId,
-    pub thread_id: String,
-    pub message_id: String,
+    pub thread_id: ThreadId,
+    pub message_id: MessageId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ses_message_id: Option<String>,
+    pub ses_message_id: Option<SesMessageId>,
     pub direction: Direction,
     pub rfc_message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

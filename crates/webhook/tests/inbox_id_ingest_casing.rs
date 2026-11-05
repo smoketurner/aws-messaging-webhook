@@ -9,6 +9,7 @@
 //! including `normalized_recipients` and `resolve_recipient`) and then the
 //! real axum router for both the lowercased and mixed-case path spellings.
 
+use aws_messaging_webhook::mail::MessageId;
 use aws_messaging_webhook::mail::{InboxId, content, ids, time};
 use axum::body::Bytes;
 use axum::http::StatusCode;
@@ -82,7 +83,7 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("message was stored under the lowercased id");

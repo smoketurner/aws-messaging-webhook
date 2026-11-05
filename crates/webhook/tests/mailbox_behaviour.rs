@@ -11,6 +11,7 @@ use aws_messaging_webhook::mail::{
     Direction, InboxId, InsertOutcome, MESSAGE_USER_LABEL_CAP, MailMessage, REFERENCES_MAX_BYTES,
     THREAD_USER_LABEL_CAP,
 };
+use aws_messaging_webhook::mail::{MessageId, ThreadId};
 use serde_dynamo::{AttributeValue, Item};
 use webhook_test_support::mail_memory::{MailMemoryStore, sample_message};
 
@@ -164,7 +165,7 @@ async fn an_inbound_reply_lands_in_a_thread_full_of_user_labels() {
     mailbox
         .update_labels(
             &inbox(),
-            "mid-1",
+            &MessageId::new("mid-1"),
             &user_labels(THREAD_USER_LABEL_CAP),
             &[],
             NOW,
@@ -199,7 +200,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
     mailbox
         .update_labels(
             &inbox(),
-            "mid-1",
+            &MessageId::new("mid-1"),
             &user_labels(THREAD_USER_LABEL_CAP),
             &[],
             NOW,
@@ -208,7 +209,13 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
         .unwrap();
 
     let err = mailbox
-        .update_labels(&inbox(), "mid-2", &["one-more".to_owned()], &[], NOW)
+        .update_labels(
+            &inbox(),
+            &MessageId::new("mid-2"),
+            &["one-more".to_owned()],
+            &[],
+            NOW,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MailStoreError::LabelLimit(_)));
@@ -216,7 +223,13 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
     // System labels do not count toward the cap.
     assert!(
         mailbox
-            .update_labels(&inbox(), "mid-2", &["spam".to_owned()], &[], NOW)
+            .update_labels(
+                &inbox(),
+                &MessageId::new("mid-2"),
+                &["spam".to_owned()],
+                &[],
+                NOW
+            )
             .await
             .is_ok()
     );
@@ -233,7 +246,7 @@ async fn a_label_patch_over_the_message_cap_is_refused() {
     let err = mailbox
         .update_labels(
             &inbox(),
-            "mid-1",
+            &MessageId::new("mid-1"),
             &user_labels(MESSAGE_USER_LABEL_CAP + 1),
             &[],
             NOW,
@@ -260,12 +273,12 @@ async fn an_inbound_message_stores_the_thread_snapshot_as_of_its_arrival() {
     mailbox.insert_message(&second, &[]).await.unwrap();
 
     let stored = mailbox
-        .get_message(&inbox(), "mid-2")
+        .get_message(&inbox(), &MessageId::new("mid-2"))
         .await
         .unwrap()
         .unwrap();
     let thread = mailbox
-        .get_thread(&inbox(), "tid-1", 10, None)
+        .get_thread(&inbox(), &ThreadId::new("tid-1"), 10, None)
         .await
         .unwrap()
         .unwrap()
@@ -312,7 +325,7 @@ async fn an_outbound_message_carries_no_thread_snapshot() {
         .await
         .unwrap();
     let stored = mailbox
-        .get_message(&inbox(), "mid-1")
+        .get_message(&inbox(), &MessageId::new("mid-1"))
         .await
         .unwrap()
         .unwrap();
@@ -336,12 +349,16 @@ async fn an_enqueue_commits_the_message_and_its_send_state_together() {
     );
     assert!(
         mailbox
-            .get_message(&inbox(), "mid-1")
+            .get_message(&inbox(), &MessageId::new("mid-1"))
             .await
             .unwrap()
             .is_some()
     );
-    let stored = mailbox.get_send_state("mid-1").await.unwrap().unwrap();
+    let stored = mailbox
+        .get_send_state(&MessageId::new("mid-1"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.send_status, SendStatus::Queued);
 
     assert_eq!(

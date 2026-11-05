@@ -16,8 +16,8 @@ use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, SesSent};
 use crate::mail::thread::{AliasLookup, ThreadState};
 use crate::mail::{
-    Direction, Inbox, InboxId, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP,
-    ThreadSnapshot, ids, labels, strip_angle_brackets,
+    Direction, Inbox, InboxId, MESSAGE_USER_LABEL_CAP, MailMessage, MessageId,
+    THREAD_USER_LABEL_CAP, ThreadSnapshot, ids, labels, strip_angle_brackets,
 };
 
 /// Which role a planned op plays in its transaction — used by
@@ -159,7 +159,7 @@ impl Keyed for MailMessage {
                 "gsi1pk",
                 AttributeValue::S(keys::messages_partition(&self.inbox_id)),
             ),
-            ("gsi1sk", AttributeValue::S(self.message_id.clone())),
+            ("gsi1sk", AttributeValue::S(self.message_id.to_string())),
             (
                 "gsi2pk",
                 AttributeValue::S(keys::thread_messages_partition(
@@ -167,7 +167,7 @@ impl Keyed for MailMessage {
                     &self.thread_id,
                 )),
             ),
-            ("gsi2sk", AttributeValue::S(self.message_id.clone())),
+            ("gsi2sk", AttributeValue::S(self.message_id.to_string())),
         ]
     }
 }
@@ -220,7 +220,7 @@ impl Keyed for SendState {
                 "gsi3pk",
                 AttributeValue::S(keys::send_status_partition(self.send_status)),
             ),
-            ("gsi3sk", AttributeValue::S(self.message_id.clone())),
+            ("gsi3sk", AttributeValue::S(self.message_id.to_string())),
         ]
     }
 }
@@ -241,7 +241,7 @@ struct SesRefItem<'a> {
     #[serde(skip)]
     ses_message_id: &'a str,
     inbox_id: &'a InboxId,
-    message_id: &'a str,
+    message_id: &'a MessageId,
     expires_at: u64,
 }
 
@@ -298,7 +298,7 @@ impl Txn {
     /// or `None` for a placeholder: an id `msg` references but this inbox
     /// holds no message for, which expires with `msg`, the message whose
     /// reference it records.
-    fn put_alias(&mut self, msg: &MailMessage, rfc_id: &str, message_id: Option<String>) {
+    fn put_alias(&mut self, msg: &MailMessage, rfc_id: &str, message_id: Option<&MessageId>) {
         let stripped = strip_angle_brackets(rfc_id);
         if stripped.len() > ALIAS_ID_MAX_BYTES {
             return;
@@ -309,8 +309,8 @@ impl Txn {
             op: WriteOp::AliasFirstWriter {
                 pk,
                 sk,
-                message_id,
-                thread_id: msg.thread_id.clone(),
+                message_id: message_id.map(ToString::to_string),
+                thread_id: msg.thread_id.to_string(),
                 expires_at: msg.expires_at,
             },
         });
@@ -449,7 +449,7 @@ pub fn plan_insert(
 
     let own_id = strip_angle_brackets(&msg.rfc_message_id);
     if !own_id.is_empty() && aliases.is_claimable(own_id) {
-        txn.put_alias(msg, &msg.rfc_message_id, Some(msg.message_id.clone()));
+        txn.put_alias(msg, &msg.rfc_message_id, Some(&msg.message_id));
     }
     for candidate in &aliases.candidates {
         if candidate != own_id && !aliases.found.contains_key(candidate) {
@@ -491,7 +491,7 @@ pub fn plan_enqueue(
     txn.put_new(&stored_message(msg, thread_after))?;
     txn.put_new(state)?;
     txn.put_versioned(thread_after, thread_before.map(|before| before.version))?;
-    txn.put_alias(msg, &msg.rfc_message_id, Some(msg.message_id.clone()));
+    txn.put_alias(msg, &msg.rfc_message_id, Some(&msg.message_id));
     Ok(txn.finish())
 }
 
@@ -580,7 +580,7 @@ pub fn plan_mark(
         // forms. A redrive finds these already taken, which the caller
         // resolves by dropping them.
         for rfc_id in ids::ses_rfc_ids(ses.message_id, ses.region) {
-            txn.put_alias(msg, &rfc_id, Some(msg.message_id.clone()));
+            txn.put_alias(msg, &rfc_id, Some(&msg.message_id));
         }
 
         // Unconditioned: a redrive that marks the same send again should
@@ -666,14 +666,15 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::mail::ThreadId;
     use crate::mail::thread::{apply_message, new_thread};
     use crate::mail::{Direction, InboxId, test_fixtures};
 
     fn message(inbox: &str, thread_id: &str, message_id: &str, labels: &[&str]) -> MailMessage {
         MailMessage {
             inbox_id: InboxId::new(inbox),
-            thread_id: thread_id.to_owned(),
-            message_id: message_id.to_owned(),
+            thread_id: ThreadId::new(thread_id),
+            message_id: MessageId::new(message_id),
             ses_message_id: None,
             rfc_message_id: format!("<{message_id}@example.com>"),
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),

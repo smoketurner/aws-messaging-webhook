@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Path, State};
 
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
@@ -25,6 +25,7 @@ use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
 use crate::mail::wire;
 use crate::mail::{InboxId, MailMessage, content, time};
+use crate::mail::{MessageId, ThreadId};
 use crate::state::{AppState, Backend};
 
 /// How many store round-trips one list request may spend filling a page.
@@ -113,9 +114,8 @@ fn cursor(
 /// for another request; a store failure mapped onto the API's retry contract.
 pub async fn list_inboxes<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    RawQuery(query): RawQuery,
+    request: ListRequest,
 ) -> Result<Json<wire::InboxList>, ApiError> {
-    let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let start = cursor(&request, keys::INBOXES_PARTITION, UNSCOPED)?;
 
     let page = state.mailbox.list_inboxes(request.limit, start).await?;
@@ -159,9 +159,8 @@ pub async fn get_inbox<B: Backend>(
 pub async fn list_messages<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
-    RawQuery(query): RawQuery,
+    request: ListRequest,
 ) -> Result<Json<wire::MessageList>, ApiError> {
-    let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let partition = keys::messages_partition(&inbox);
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
@@ -183,7 +182,7 @@ pub async fn list_messages<B: Backend>(
             let TableKey { pk, sk } = keys::message(&msg.inbox_id, &msg.message_id);
             PageKey {
                 partition: keys::messages_partition(&msg.inbox_id),
-                sort: msg.message_id.clone(),
+                sort: msg.message_id.to_string(),
                 table_pk: pk,
                 table_sk: sk,
             }
@@ -210,7 +209,7 @@ pub async fn list_messages<B: Backend>(
 /// contract.
 pub async fn get_message<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    Path((inbox, message_id)): Path<(InboxId, String)>,
+    Path((inbox, message_id)): Path<(InboxId, MessageId)>,
 ) -> Result<Json<wire::Message>, ApiError> {
     let message = state
         .mailbox
@@ -233,7 +232,7 @@ pub async fn get_message<B: Backend>(
 /// failure otherwise.
 pub async fn get_raw<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    Path((inbox, message_id)): Path<(InboxId, String)>,
+    Path((inbox, message_id)): Path<(InboxId, MessageId)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .mailbox
@@ -270,7 +269,7 @@ pub async fn get_raw<B: Backend>(
 /// object does not exist; a store or object failure otherwise.
 pub async fn get_attachment<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    Path((inbox, message_id, attachment_id)): Path<(InboxId, String, String)>,
+    Path((inbox, message_id, attachment_id)): Path<(InboxId, MessageId, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .mailbox
@@ -335,9 +334,8 @@ fn expires_at(ttl: Duration) -> String {
 pub async fn list_threads<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
-    RawQuery(query): RawQuery,
+    request: ListRequest,
 ) -> Result<Json<wire::ThreadList>, ApiError> {
-    let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let partition = keys::threads_partition(&inbox);
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
@@ -390,10 +388,9 @@ pub async fn list_threads<B: Backend>(
 /// failure mapped onto the API's retry contract.
 pub async fn get_thread<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    Path((inbox, thread_id)): Path<(InboxId, String)>,
-    RawQuery(query): RawQuery,
+    Path((inbox, thread_id)): Path<(InboxId, ThreadId)>,
+    request: ListRequest,
 ) -> Result<Json<wire::Thread>, ApiError> {
-    let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let partition = keys::thread_messages_partition(&inbox, &thread_id);
     let start = cursor(&request, &partition, UNSCOPED)?;
 

@@ -12,6 +12,7 @@
 //! `ingest_inbound` with a short, precisely controlled `tokio::time::Instant`
 //! deadline.
 
+use aws_messaging_webhook::mail::{MessageId, ThreadId};
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -96,7 +97,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("message was inserted");
@@ -137,7 +138,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
     let thread = h
         .mail
         .mailbox()
-        .get_thread(&inbox, &message_id, 1, None)
+        .get_thread(&inbox, &ThreadId::new(message_id.as_str()), 1, None)
         .await
         .unwrap()
         .unwrap()
@@ -189,7 +190,7 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("message was inserted");
@@ -285,7 +286,7 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("the message was inserted");
@@ -349,7 +350,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("the message was inserted, not silently dropped");
@@ -409,7 +410,7 @@ async fn direct_sns_invocation_also_ingests() {
     assert!(
         h.mail
             .mailbox()
-            .get_message(&inbox, &message_id)
+            .get_message(&inbox, &MessageId::new(message_id.as_str()))
             .await
             .unwrap()
             .is_some()
@@ -473,7 +474,7 @@ async fn reply_threads_under_its_parent() {
     let reply = h
         .mail
         .mailbox()
-        .get_message(&inbox, &reply_id)
+        .get_message(&inbox, &MessageId::new(reply_id.as_str()))
         .await
         .unwrap()
         .expect("reply was inserted");
@@ -514,7 +515,7 @@ async fn spam_message_gets_the_spam_label() {
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .unwrap();
@@ -553,7 +554,7 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
     let stored = h
         .mail
         .mailbox()
-        .get_message(&inbox, &message_id)
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .unwrap();
@@ -647,7 +648,7 @@ async fn wrong_bucket_is_a_permanent_skip() {
     assert!(
         h.mail
             .mailbox()
-            .get_message(&inbox, &message_id)
+            .get_message(&inbox, &MessageId::new(message_id.as_str()))
             .await
             .unwrap()
             .is_none()
@@ -681,7 +682,7 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
     assert!(
         h.mail
             .mailbox()
-            .get_message(&inbox, &message_id)
+            .get_message(&inbox, &MessageId::new(message_id.as_str()))
             .await
             .unwrap()
             .is_none()
@@ -779,7 +780,7 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
     let second = h
         .mail
         .mailbox()
-        .get_message(&inbox, &expected_message_id("ses-2", TS))
+        .get_message(&inbox, &MessageId::new(expected_message_id("ses-2", TS)))
         .await
         .unwrap()
         .expect("the second delivery was stored");
@@ -823,7 +824,7 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
         let message_id = message_id.clone();
         async move {
             mail.mailbox()
-                .get_message(&inbox, &message_id)
+                .get_message(&inbox, &MessageId::new(message_id.as_str()))
                 .await
                 .unwrap()
                 .is_some()
@@ -990,7 +991,7 @@ async fn resume_skips_an_already_present_part() {
     let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
     let stored = state
         .mailbox
-        .get_message(&inbox, &message_id.to_string())
+        .get_message(&inbox, &MessageId::new(message_id.to_string()))
         .await
         .unwrap()
         .expect("message was inserted");
@@ -1089,7 +1090,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     assert!(
         state
             .mailbox
-            .get_message(&inbox, &message_id.to_string())
+            .get_message(&inbox, &MessageId::new(message_id.to_string()))
             .await
             .unwrap()
             .is_some()
@@ -1168,11 +1169,12 @@ async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
     let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
     h.mail
         .mailbox()
-        .get_message(&inbox, &expected_message_id(&ses_id, &ts))
+        .get_message(&inbox, &MessageId::new(expected_message_id(&ses_id, &ts)))
         .await
         .unwrap()
         .unwrap()
         .thread_id
+        .to_string()
 }
 
 #[tokio::test]

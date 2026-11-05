@@ -12,6 +12,7 @@ use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
 use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest};
 use crate::api::send::{SendAccepted, enqueue};
+use crate::mail::MessageId;
 use crate::mail::address::same_mailbox;
 use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
 use crate::state::{AppState, Backend};
@@ -49,7 +50,7 @@ pub(super) fn threading_references(
 /// exist; otherwise as [`send`].
 pub async fn reply<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    Path((inbox, message_id)): Path<(InboxId, String)>,
+    Path((inbox, message_id)): Path<(InboxId, MessageId)>,
     headers: HeaderMap,
     ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {

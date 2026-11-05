@@ -188,11 +188,12 @@ mod tests {
     use super::*;
     use crate::mail::InboxId;
     use crate::mail::send::Envelope;
+    use crate::mail::{MessageId, ThreadId};
 
     fn spec() -> SendSpec {
         SendSpec {
-            message_id: "mid-1".to_owned(),
-            thread_id: "tid-1".to_owned(),
+            message_id: MessageId::new("mid-1"),
+            thread_id: ThreadId::new("tid-1"),
             inbox_id: InboxId::new("support@example.com"),
             from: "support@example.com".to_owned(),
             display_name: None,

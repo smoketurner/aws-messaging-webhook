@@ -3,6 +3,7 @@
 //! `PATCH …/messages/{id}`: label changes, and what they do to the message's
 //! thread.
 
+use aws_messaging_webhook::mail::MessageId;
 use aws_messaging_webhook::mail::{InboxId, ids, time};
 use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -166,7 +167,7 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
         .mailbox
         .update_labels(
             &InboxId::new(TEST_INBOX),
-            &ids[0],
+            &MessageId::new(ids[0].as_str()),
             &["bounced".to_owned()],
             &[],
             "2026-01-02T00:00:00.000Z",

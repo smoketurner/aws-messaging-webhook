@@ -80,11 +80,16 @@ pub enum ApiKeyError {
     Malformed(#[source] anyhow::Error),
 }
 
+/// The id of the key a request authenticated with, attached as a request
+/// extension. Ids are operator-facing labels, not secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyId(pub String);
+
 /// The outcome of checking a presented key.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Matched the key with this id.
-    Allowed(String),
+    Allowed(KeyId),
     /// No configured key matched.
     Denied,
     /// The cache has never loaded and the parameter store is unreachable, so
@@ -132,7 +137,7 @@ impl KeyCache {
         };
 
         if let Some(id) = match_key(&current, &digest) {
-            return Verdict::Allowed(id);
+            return Verdict::Allowed(KeyId(id));
         }
 
         // A miss may mean a key was just added. Refresh at most once per
@@ -141,7 +146,7 @@ impl KeyCache {
             && let Some(refreshed) = self.refresh(source, Some(current)).await
             && let Some(id) = match_key(&refreshed, &digest)
         {
-            return Verdict::Allowed(id);
+            return Verdict::Allowed(KeyId(id));
         }
         Verdict::Denied
     }
@@ -340,7 +345,7 @@ mod tests {
         let cache = KeyCache::new();
         assert_eq!(
             cache.verify(&source, KEY).await,
-            Verdict::Allowed("key_1".to_owned())
+            Verdict::Allowed(KeyId("key_1".to_owned()))
         );
     }
 
@@ -413,7 +418,7 @@ mod tests {
 
         assert_eq!(
             cache.verify(&source, KEY).await,
-            Verdict::Allowed("key_2".to_owned()),
+            Verdict::Allowed(KeyId("key_2".to_owned())),
             "a freshly added key should work without waiting for the scheduled refresh"
         );
     }

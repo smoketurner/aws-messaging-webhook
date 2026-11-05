@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
 use crate::events_keys;
+use crate::mail::SesMessageId;
 use crate::mail::content;
 use crate::mail::events::{MailEvent, build_received_event, build_sent_event, build_ses_event};
 use crate::mail::labels::SystemLabel;
@@ -327,7 +328,7 @@ async fn mailbox_ses_event<B: Backend>(
     }
     let Some((inbox, message_id)) = state
         .mailbox
-        .resolve_ses_message(&ses.mail.message_id)
+        .resolve_ses_message(&SesMessageId::new(ses.mail.message_id.as_str()))
         .await?
     else {
         return Ok(None);
@@ -395,7 +396,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
         Err(ObjectError::Transient(error)) => {
             tracing::error!(
                 ?error,
-                message_id = msg.message_id,
+                message_id = %msg.message_id,
                 event = "publish_failure",
                 "failed to read the message content document; will retry"
             );
@@ -407,7 +408,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
             // retrying a permanent failure, so publish what the item holds.
             tracing::error!(
                 ?error,
-                message_id = msg.message_id,
+                message_id = %msg.message_id,
                 event = "stream_bad_mail_content",
                 "message content document could not be read; publishing without it"
             );
@@ -462,7 +463,7 @@ async fn publish_mail_events<B: Backend>(
             Ok(()) => {
                 tracing::info!(
                     inbox_id = msg.inbox_id.as_str(),
-                    message_id = msg.message_id,
+                    message_id = %msg.message_id,
                     detail_type = outbound.detail_type,
                     outcome = "published",
                     "mail event published to EventBridge"
@@ -471,7 +472,7 @@ async fn publish_mail_events<B: Backend>(
             Err(error) => {
                 tracing::error!(
                     ?error,
-                    message_id = msg.message_id,
+                    message_id = %msg.message_id,
                     event = "publish_failure",
                     "failed to publish mail event to EventBridge; will retry"
                 );
@@ -555,7 +556,7 @@ async fn publish_status_changed<B: Backend>(
     match publish_one(state, &outbound).await {
         Ok(()) => {
             tracing::info!(
-                message_id,
+                %message_id,
                 current_status = current,
                 outcome = "status_published",
                 "published message.status.changed"
@@ -565,7 +566,7 @@ async fn publish_status_changed<B: Backend>(
         Err(error) => {
             tracing::error!(
                 ?error,
-                message_id,
+                %message_id,
                 event = "publish_failure",
                 "failed to publish status change; will retry"
             );

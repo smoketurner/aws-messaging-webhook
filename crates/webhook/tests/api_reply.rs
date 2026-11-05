@@ -3,6 +3,7 @@
 //! `POST …/messages/{id}/reply`: what a reply inherits from the message it
 //! answers.
 
+use aws_messaging_webhook::mail::MessageId;
 use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::mime::parse_inbound;
 use aws_messaging_webhook::mail::send::SendSpec;
@@ -18,7 +19,7 @@ async fn store_content(h: &Harness, message_id: &str, message_content: MessageCo
     content::store(
         &h.state.objects,
         &InboxId::new(TEST_INBOX),
-        message_id,
+        &MessageId::new(message_id),
         &message_content,
     )
     .await

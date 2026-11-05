@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mail::content::MessageContent;
 use crate::mail::{AttachmentMeta, MailMessage};
+use crate::mail::{MessageId, ThreadId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,8 +53,8 @@ impl From<&AttachmentMeta> for Attachment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub inbox_id: String,
-    pub thread_id: String,
-    pub message_id: String,
+    pub thread_id: ThreadId,
+    pub message_id: MessageId,
     pub labels: Vec<String>,
     pub timestamp: String,
     pub from: String,
@@ -129,8 +130,8 @@ impl Message {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageItem {
     pub inbox_id: String,
-    pub thread_id: String,
-    pub message_id: String,
+    pub thread_id: ThreadId,
+    pub message_id: MessageId,
     pub labels: Vec<String>,
     pub timestamp: String,
     pub from: String,
@@ -181,12 +182,12 @@ impl From<&MailMessage> for MessageItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     pub inbox_id: String,
-    pub thread_id: String,
+    pub thread_id: ThreadId,
     pub labels: Vec<String>,
     pub timestamp: String,
     pub senders: Vec<String>,
     pub recipients: Vec<String>,
-    pub last_message_id: String,
+    pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
     pub updated_at: String,
@@ -220,27 +221,45 @@ impl Thread {
         limit: usize,
         next_page_token: Option<String>,
     ) -> Self {
+        let ThreadItem {
+            inbox_id,
+            thread_id,
+            labels,
+            timestamp,
+            senders,
+            recipients,
+            last_message_id,
+            message_count,
+            size,
+            created_at,
+            updated_at,
+            received_timestamp,
+            sent_timestamp,
+            subject,
+            preview,
+            attachments,
+        } = ThreadItem::from(thread);
         Self {
-            inbox_id: thread.inbox_id.as_str().to_owned(),
-            thread_id: thread.thread_id.clone(),
-            labels: thread.labels.clone(),
-            timestamp: thread.timestamp.clone(),
-            senders: thread.senders.clone(),
-            recipients: thread.recipients.clone(),
-            last_message_id: thread.last_message_id.clone(),
-            message_count: thread.message_count,
-            size: thread.size,
-            updated_at: thread.updated_at.clone(),
-            created_at: thread.created_at.clone(),
+            inbox_id,
+            thread_id,
+            labels,
+            timestamp,
+            senders,
+            recipients,
+            last_message_id,
+            message_count,
+            size,
+            updated_at,
+            created_at,
             count: messages.len(),
             messages,
             limit,
             next_page_token,
-            received_timestamp: thread.received_timestamp.clone(),
-            sent_timestamp: thread.sent_timestamp.clone(),
-            subject: (!thread.subject.is_empty()).then(|| thread.subject.clone()),
-            preview: (!thread.preview.is_empty()).then(|| thread.preview.clone()),
-            attachments: thread.attachments.iter().map(Attachment::from).collect(),
+            received_timestamp,
+            sent_timestamp,
+            subject,
+            preview,
+            attachments,
         }
     }
 }
@@ -250,12 +269,12 @@ impl Thread {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadItem {
     pub inbox_id: String,
-    pub thread_id: String,
+    pub thread_id: ThreadId,
     pub labels: Vec<String>,
     pub timestamp: String,
     pub senders: Vec<String>,
     pub recipients: Vec<String>,
-    pub last_message_id: String,
+    pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
     pub created_at: String,
@@ -270,6 +289,35 @@ pub struct ThreadItem {
     pub preview: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+}
+
+/// The thread as of a message's arrival, from the snapshot stored on the
+/// message item.
+impl From<&MailMessage> for ThreadItem {
+    fn from(msg: &MailMessage) -> Self {
+        // A received message always carries a snapshot; an absent one falls
+        // back to its empty Default rather than failing the whole relay
+        // record over a data shape that shouldn't occur.
+        let snapshot = msg.thread_snapshot.clone().unwrap_or_default();
+        Self {
+            inbox_id: msg.inbox_id.as_str().to_owned(),
+            thread_id: msg.thread_id.clone(),
+            labels: snapshot.labels,
+            timestamp: snapshot.timestamp,
+            received_timestamp: snapshot.received_timestamp,
+            sent_timestamp: snapshot.sent_timestamp,
+            senders: snapshot.senders,
+            recipients: snapshot.recipients,
+            last_message_id: snapshot.last_message_id,
+            message_count: snapshot.message_count,
+            size: snapshot.size,
+            created_at: snapshot.created_at,
+            updated_at: snapshot.updated_at,
+            subject: (!snapshot.subject.is_empty()).then_some(snapshot.subject),
+            preview: (!snapshot.preview.is_empty()).then_some(snapshot.preview),
+            attachments: snapshot.attachments.iter().map(Attachment::from).collect(),
+        }
+    }
 }
 
 impl From<&crate::mail::thread::ThreadState> for ThreadItem {
@@ -367,7 +415,7 @@ pub struct Download {
     pub expires_at: String,
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
+    pub message_id: Option<MessageId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,7 +431,7 @@ pub struct Download {
 /// The `PATCH …/messages/{id}` response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageLabels {
-    pub message_id: String,
+    pub message_id: MessageId,
     pub labels: Vec<String>,
 }
 

@@ -105,6 +105,19 @@ fn any_contains(needles: &[String], haystacks: &[String]) -> bool {
     })
 }
 
+/// A list endpoint's query string, parsed; a bad parameter is the caller's
+/// 400 with per-field errors.
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ListRequest {
+    type Rejection = ApiError;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Self::parse(parts.uri.query().unwrap_or_default()))
+    }
+}
+
 impl ListRequest {
     /// The sort-key bounds for a message list.
     ///

@@ -6,6 +6,7 @@
 
 use std::future::Future;
 
+use crate::mail::SesMessageId;
 use crate::mail::ingest::IngestOutcome;
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
@@ -237,7 +238,7 @@ async fn apply_delivery_label<B: Backend>(
 
     let resolved = state
         .mailbox
-        .resolve_ses_message(&event.mail.message_id)
+        .resolve_ses_message(&SesMessageId::new(event.mail.message_id.as_str()))
         .await
         .map_err(ActionError::from)?;
     let Some((inbox, message_id)) = resolved else {
@@ -252,7 +253,7 @@ async fn apply_delivery_label<B: Backend>(
         .map_err(ActionError::from)?;
 
     tracing::info!(
-        message_id,
+        %message_id,
         inbox_id = %inbox.as_str(),
         label = label.as_str(),
         event = "delivery_label_applied",

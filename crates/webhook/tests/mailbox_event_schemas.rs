@@ -15,6 +15,7 @@
 //! checker does not implement, so a payload passes only if it is exactly the
 //! documented shape.
 
+use aws_messaging_webhook::mail::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -264,17 +265,20 @@ async fn sent_message(h: &Harness) -> MailMessage {
     let (status, sent) =
         api::post(h, &format!("/v0/inboxes/{TEST_INBOX}/messages/send"), &body).await;
     assert_eq!(status, StatusCode::OK);
-    let message_id = sent["message_id"].as_str().unwrap();
+    let message_id = MessageId::new(sent["message_id"].as_str().unwrap());
     handle_send(
         &h.state,
-        message_id,
+        &message_id,
         tokio::time::Instant::now() + std::time::Duration::from_secs(120),
     )
     .await
     .unwrap();
     h.state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap()
@@ -317,9 +321,9 @@ fn received_message(labels: &[&str]) -> MailMessage {
     let now = "2026-01-15T09:30:00.000Z".to_owned();
     let mut msg = MailMessage {
         inbox_id: InboxId::new(TEST_INBOX),
-        thread_id: "tid-1".to_owned(),
-        message_id: "mid-1".to_owned(),
-        ses_message_id: Some("ses-in-1".to_owned()),
+        thread_id: ThreadId::new("tid-1"),
+        message_id: MessageId::new("mid-1"),
+        ses_message_id: Some(SesMessageId::new("ses-in-1")),
         direction: Direction::Inbound,
         rfc_message_id: "<orig-1@example.net>".to_owned(),
         in_reply_to: Some("<earlier@example.net>".to_owned()),
@@ -500,7 +504,7 @@ async fn ses_driven_events_match_the_schema() {
         let sent = sent_message(&h).await;
         let ses_message_id = sent.ses_message_id.clone().unwrap();
 
-        publish_ses_example(&h, example, &ses_message_id).await;
+        publish_ses_example(&h, example, ses_message_id.as_str()).await;
 
         let details = mailbox_details(&h);
         match expected {
@@ -560,7 +564,12 @@ async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
     let sent = sent_message(&h).await;
     h.mail.fail_next_resolve(ReadFailure::Permanent);
 
-    publish_ses_example(&h, "event-delivery.json", &sent.ses_message_id.unwrap()).await;
+    publish_ses_example(
+        &h,
+        "event-delivery.json",
+        sent.ses_message_id.unwrap().as_str(),
+    )
+    .await;
 
     let published = h.state.publisher.published.lock().unwrap();
     let types: Vec<&str> = published

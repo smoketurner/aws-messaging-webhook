@@ -17,7 +17,7 @@ use aws_messaging_webhook::mail::send::SendKey;
 use aws_messaging_webhook::mail::store::{MailStoreError, Page};
 use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
 use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
-use aws_messaging_webhook::mail::{InboxId, MailMessage, PutOutcome};
+use aws_messaging_webhook::mail::{InboxId, MailMessage, MessageId, PutOutcome, ThreadId};
 use serde_dynamo::{AttributeValue, Item};
 
 /// A scripted failure [`MailMemoryStore::inject`] queues, consumed once on
@@ -76,8 +76,8 @@ pub struct MailMemoryStore {
 pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMessage {
     MailMessage {
         inbox_id: InboxId::new(inbox),
-        thread_id: thread_id.to_owned(),
-        message_id: message_id.to_owned(),
+        thread_id: ThreadId::new(thread_id),
+        message_id: MessageId::new(message_id),
         ses_message_id: None,
         direction: aws_messaging_webhook::mail::Direction::Inbound,
         rfc_message_id: format!("<{message_id}@example.com>"),
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(outcome, InsertOutcome::Fresh);
         assert!(
             Mailbox::new(&store)
-                .message_exists(&msg.inbox_id, "mid-1")
+                .message_exists(&msg.inbox_id, &MessageId::new("mid-1"))
                 .await
                 .unwrap()
         );
@@ -619,8 +619,8 @@ mod tests {
     fn alias_row(store: &MailMemoryStore, id: &str) -> Option<RfcHit> {
         let item = store.get_item(&keys::rfc_alias(&InboxId::new("support@example.com"), id))?;
         Some(RfcHit {
-            message_id: MailMemoryStore::string_attr(&item, "message_id"),
-            thread_id: MailMemoryStore::string_attr(&item, "thread_id")?,
+            message_id: MailMemoryStore::string_attr(&item, "message_id").map(MessageId::new),
+            thread_id: ThreadId::new(MailMemoryStore::string_attr(&item, "thread_id")?),
         })
     }
 
@@ -642,7 +642,7 @@ mod tests {
         assert_eq!(outcome, InsertOutcome::Fresh);
 
         let stored = Mailbox::new(&store)
-            .get_message(&second.inbox_id, "mid-2")
+            .get_message(&second.inbox_id, &MessageId::new("mid-2"))
             .await
             .unwrap()
             .unwrap();
@@ -662,14 +662,14 @@ mod tests {
             alias_row(&store, "parent@example.com"),
             Some(RfcHit {
                 message_id: None,
-                thread_id: "mid-2".to_owned(),
+                thread_id: ThreadId::new("mid-2"),
             })
         );
         assert_eq!(
             alias_row(&store, "mid-2@example.com"),
             Some(RfcHit {
-                message_id: Some("mid-2".to_owned()),
-                thread_id: "mid-2".to_owned(),
+                message_id: Some(MessageId::new("mid-2")),
+                thread_id: ThreadId::new("mid-2"),
             })
         );
     }
@@ -695,7 +695,7 @@ mod tests {
             .unwrap();
 
         let stored = Mailbox::new(&store)
-            .get_message(&parent.inbox_id, "mid-1")
+            .get_message(&parent.inbox_id, &MessageId::new("mid-1"))
             .await
             .unwrap()
             .unwrap();
@@ -703,8 +703,8 @@ mod tests {
         assert_eq!(
             alias_row(&store, "parent@example.com"),
             Some(RfcHit {
-                message_id: Some("mid-1".to_owned()),
-                thread_id: "mid-2".to_owned(),
+                message_id: Some(MessageId::new("mid-1")),
+                thread_id: ThreadId::new("mid-2"),
             })
         );
     }
@@ -729,8 +729,8 @@ mod tests {
         assert_eq!(
             alias_row(&store, "mid-1@example.com"),
             Some(RfcHit {
-                message_id: Some("mid-1".to_owned()),
-                thread_id: "mid-1".to_owned(),
+                message_id: Some(MessageId::new("mid-1")),
+                thread_id: ThreadId::new("mid-1"),
             })
         );
     }
@@ -836,7 +836,7 @@ mod tests {
 
         // Another sender claims it, moving the version on.
         Mailbox::new(&store)
-            .claim_send("mid-1", "2026-01-01T00:00:01.000Z")
+            .claim_send(&MessageId::new("mid-1"), "2026-01-01T00:00:01.000Z")
             .await
             .unwrap()
             .unwrap();
@@ -873,7 +873,7 @@ mod tests {
             .await
             .unwrap();
         let before = Mailbox::new(&store)
-            .get_message(&inbox, "mid-1")
+            .get_message(&inbox, &MessageId::new("mid-1"))
             .await
             .unwrap()
             .unwrap();
@@ -881,7 +881,7 @@ mod tests {
         let labels = Mailbox::new(&store)
             .update_labels(
                 &inbox,
-                "mid-1",
+                &MessageId::new("mid-1"),
                 &["unread".to_owned()],
                 &["spam".to_owned()],
                 "2026-01-01T00:00:05.000Z",
@@ -892,7 +892,7 @@ mod tests {
 
         assert_eq!(labels, before.labels);
         let after = Mailbox::new(&store)
-            .get_message(&inbox, "mid-1")
+            .get_message(&inbox, &MessageId::new("mid-1"))
             .await
             .unwrap()
             .unwrap();
@@ -980,8 +980,8 @@ mod tests {
         let key = SendKey {
             key_hash: "deadbeef".to_owned(),
             inbox_id: InboxId::new("support@example.com"),
-            message_id: "mid-1".to_owned(),
-            thread_id: "tid-1".to_owned(),
+            message_id: MessageId::new("mid-1"),
+            thread_id: ThreadId::new("tid-1"),
             request_hash: "abc".to_owned(),
             route: "send".to_owned(),
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),

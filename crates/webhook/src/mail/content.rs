@@ -16,7 +16,7 @@ use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::mail::objects::{ObjectError, ObjectStore};
-use crate::mail::{InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, object_keys};
+use crate::mail::{InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, MessageId, object_keys};
 
 /// The largest document [`store`] writes and [`load`] reads. Bodies come from
 /// a raw message of at most [`MAX_INBOUND_RAW_BYTES`] and JSON escaping grows
@@ -58,7 +58,7 @@ pub struct MessageContent {
 pub async fn store<S: ObjectStore>(
     objects: &S,
     inbox_id: &InboxId,
-    message_id: &str,
+    message_id: &MessageId,
     content: &MessageContent,
 ) -> Result<(), ObjectError> {
     let serialize_error =
@@ -68,7 +68,7 @@ pub async fn store<S: ObjectStore>(
     if fields_dropped {
         tracing::warn!(
             inbox_id = inbox_id.as_str(),
-            message_id,
+            %message_id,
             max_bytes = MAX_CONTENT_BYTES,
             event = "message_content_bodies_dropped",
             "message content exceeds the document cap once serialized; storing it without its bodies, and any further fields needed to fit, all of which remain in the raw message"
@@ -161,7 +161,7 @@ pub async fn load<S: ObjectStore>(
         Err(ObjectError::NotFound) => {
             tracing::warn!(
                 inbox_id = msg.inbox_id.as_str(),
-                message_id = msg.message_id,
+                message_id = %msg.message_id,
                 event = "message_content_missing",
                 "message content document is missing; returning the item alone"
             );

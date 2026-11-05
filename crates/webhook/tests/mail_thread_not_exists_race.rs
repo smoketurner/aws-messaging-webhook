@@ -14,6 +14,7 @@
 //! inbox never received, where the second loses the parent's placeholder and
 //! must join the first one's thread.
 
+use aws_messaging_webhook::mail::{MessageId, ThreadId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,13 +129,13 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
     // cost neither mail.
     assert!(
         Mailbox::new(&store_inner)
-            .message_exists(&r2.inbox_id, "mid-r2")
+            .message_exists(&r2.inbox_id, &MessageId::new("mid-r2"))
             .await
             .unwrap()
     );
     assert!(
         Mailbox::new(&store_inner)
-            .message_exists(&r1.inbox_id, "mid-r1")
+            .message_exists(&r1.inbox_id, &MessageId::new("mid-r1"))
             .await
             .unwrap()
     );
@@ -143,7 +144,7 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
     // `apply_message` past the resurrecting commit's 0), proving the retry
     // re-read and branched on the version rather than dropping the loser.
     let thread = Mailbox::new(&store_inner)
-        .get_thread(&r2.inbox_id, "shared-thread", 100, None)
+        .get_thread(&r2.inbox_id, &ThreadId::new("shared-thread"), 100, None)
         .await
         .unwrap()
         .unwrap();
@@ -193,13 +194,13 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
     assert_eq!(outcome, EnqueueOutcome::Committed);
     assert!(
         Mailbox::new(&store_inner)
-            .message_exists(&r2.inbox_id, "mid-r2")
+            .message_exists(&r2.inbox_id, &MessageId::new("mid-r2"))
             .await
             .unwrap()
     );
     assert!(
         Mailbox::new(&store_inner)
-            .message_exists(&r1.inbox_id, "mid-r1")
+            .message_exists(&r1.inbox_id, &MessageId::new("mid-r1"))
             .await
             .unwrap()
     );
@@ -237,21 +238,21 @@ async fn insert_message_joins_the_thread_of_a_sibling_that_won_the_placeholder()
     assert_eq!(outcome, InsertOutcome::Fresh);
 
     let stored = Mailbox::new(&store_inner)
-        .get_message(&r2.inbox_id, "mid-r2")
+        .get_message(&r2.inbox_id, &MessageId::new("mid-r2"))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(stored.thread_id, "mid-r1");
 
     let thread = Mailbox::new(&store_inner)
-        .get_thread(&r2.inbox_id, "mid-r1", 100, None)
+        .get_thread(&r2.inbox_id, &ThreadId::new("mid-r1"), 100, None)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(thread.messages.items.len(), 2);
     assert!(
         Mailbox::new(&store_inner)
-            .get_thread(&r2.inbox_id, "mid-r2", 100, None)
+            .get_thread(&r2.inbox_id, &ThreadId::new("mid-r2"), 100, None)
             .await
             .unwrap()
             .is_none(),

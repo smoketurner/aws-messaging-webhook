@@ -16,7 +16,7 @@
 use crate::mail::keys::PageKey;
 use crate::mail::send::SendFailure;
 use crate::mail::thread::ThreadState;
-use crate::mail::{InboxId, MailMessage};
+use crate::mail::{InboxId, MailMessage, MessageId};
 
 /// Default page size when the caller doesn't ask for one.
 pub const DEFAULT_LIMIT: usize = 20;
@@ -120,13 +120,13 @@ pub struct SesSent<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct SesRef {
     pub inbox_id: Option<InboxId>,
-    pub message_id: Option<String>,
+    pub message_id: Option<MessageId>,
 }
 
 impl SesRef {
     /// The inbox and message the row names, when it names both.
     #[must_use]
-    pub fn into_parts(self) -> Option<(InboxId, String)> {
+    pub fn into_parts(self) -> Option<(InboxId, MessageId)> {
         Some((self.inbox_id?, self.message_id?))
     }
 }

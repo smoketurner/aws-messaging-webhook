@@ -6,25 +6,37 @@ use crate::mail::InboxId;
 /// Where a message's content document lives: per inbox, because one inbound
 /// message delivered to two inboxes is two independent messages.
 #[must_use]
-pub fn content(inbox_id: &InboxId, message_id: &str) -> String {
+pub fn content(inbox_id: &InboxId, message_id: &(impl AsRef<str> + ?Sized)) -> String {
+    let message_id = message_id.as_ref();
     format!("messages/{}/{message_id}.json", inbox_id.as_str())
 }
 
 /// Where one kept inbound attachment lives.
 #[must_use]
-pub fn attachment(message_id: &str, attachment_id: &str) -> String {
+pub fn attachment(
+    message_id: &(impl AsRef<str> + ?Sized),
+    attachment_id: &(impl AsRef<str> + ?Sized),
+) -> String {
+    let message_id = message_id.as_ref();
+    let attachment_id = attachment_id.as_ref();
     format!("attachments/{message_id}/{attachment_id}")
 }
 
 /// Where the send spec for `message_id` lives.
 #[must_use]
-pub fn spec(message_id: &str) -> String {
+pub fn spec(message_id: &(impl AsRef<str> + ?Sized)) -> String {
+    let message_id = message_id.as_ref();
     format!("outbox/{message_id}/spec.json")
 }
 
 /// Where one outbound attachment's bytes live before the message is sent.
 #[must_use]
-pub fn part(message_id: &str, attachment_id: &str) -> String {
+pub fn part(
+    message_id: &(impl AsRef<str> + ?Sized),
+    attachment_id: &(impl AsRef<str> + ?Sized),
+) -> String {
+    let message_id = message_id.as_ref();
+    let attachment_id = attachment_id.as_ref();
     format!("outbox/{message_id}/parts/{attachment_id}")
 }
 

@@ -9,6 +9,7 @@
 use aws_messaging_webhook::mail::keys::TableKey;
 use aws_messaging_webhook::mail::send::{SendState, SendStatus};
 use aws_messaging_webhook::mail::{InboxId, MESSAGE_USER_LABEL_CAP, content, labels};
+use aws_messaging_webhook::mail::{MessageId, ThreadId};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use base64::Engine as _;
@@ -60,7 +61,10 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -103,7 +107,10 @@ async fn a_send_with_a_full_set_of_user_labels_and_a_system_toggle_is_queued() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -680,7 +687,10 @@ async fn an_html_only_send_gets_a_non_empty_preview_on_the_message_and_listing()
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -746,7 +756,10 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .expect("the queued send is stored under the lowercased id");
@@ -775,8 +788,8 @@ async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
     let expired_key = SendKey {
         key_hash: key_hash.clone(),
         inbox_id: InboxId::new(TEST_INBOX),
-        message_id: "old-message-id".to_owned(),
-        thread_id: "old-thread-id".to_owned(),
+        message_id: MessageId::new("old-message-id"),
+        thread_id: ThreadId::new("old-thread-id"),
         request_hash: "a-different-request-hash".to_owned(),
         route: "send".to_owned(),
         created_at: "2025-01-01T00:00:00.000Z".to_owned(),

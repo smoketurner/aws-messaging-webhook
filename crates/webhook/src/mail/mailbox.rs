@@ -21,7 +21,10 @@ use crate::mail::store::{
 use crate::mail::table::{MailIndex, PageQuery, Read, Table, TxnOutcome};
 use crate::mail::thread::{AliasLookup, ThreadState, apply_label_patch, apply_message, new_thread};
 use crate::mail::txn::{TxnDecision, drop_taken_aliases};
-use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, PutOutcome, RfcHit};
+use crate::mail::{
+    Inbox, InboxId, InsertOutcome, MailMessage, MessageId, PutOutcome, RfcHit, SesMessageId,
+    ThreadId,
+};
 
 /// How many times a cancelled transaction is replanned before the caller is
 /// told the write conflicted.
@@ -83,7 +86,7 @@ impl<T: Table> Mailbox<T> {
     pub async fn message_exists(
         &self,
         inbox: &InboxId,
-        message_id: &str,
+        message_id: &MessageId,
     ) -> Result<bool, MailStoreError> {
         let found: Option<serde::de::IgnoredAny> = self
             .table
@@ -102,7 +105,7 @@ impl<T: Table> Mailbox<T> {
     pub async fn get_message(
         &self,
         inbox: &InboxId,
-        message_id: &str,
+        message_id: &MessageId,
     ) -> Result<Option<MailMessage>, MailStoreError> {
         // Consistent: the version read here conditions the next write.
         self.table
@@ -140,8 +143,8 @@ impl<T: Table> Mailbox<T> {
     /// The store's error for a failed read.
     pub async fn resolve_ses_message(
         &self,
-        ses_message_id: &str,
-    ) -> Result<Option<(InboxId, String)>, MailStoreError> {
+        ses_message_id: &SesMessageId,
+    ) -> Result<Option<(InboxId, MessageId)>, MailStoreError> {
         let row: Option<SesRef> = self
             .table
             .get(
@@ -184,7 +187,7 @@ impl<T: Table> Mailbox<T> {
     /// The store's error for a failed read.
     pub async fn get_send_state(
         &self,
-        message_id: &str,
+        message_id: &MessageId,
     ) -> Result<Option<SendState>, MailStoreError> {
         // Consistent: the operator resolution this read feeds marks the send
         // under the version read here.
@@ -270,7 +273,7 @@ impl<T: Table> Mailbox<T> {
     pub async fn get_thread(
         &self,
         inbox: &InboxId,
-        thread_id: &str,
+        thread_id: &ThreadId,
         limit: usize,
         start: Option<PageKey>,
     ) -> Result<Option<ThreadView>, MailStoreError> {
@@ -299,7 +302,7 @@ impl<T: Table> Mailbox<T> {
     async fn read_message(
         &self,
         inbox: &InboxId,
-        message_id: &str,
+        message_id: &MessageId,
     ) -> Result<Option<MailMessage>, MailStoreError> {
         // Consistent: what is read here conditions the next write.
         self.table
@@ -315,7 +318,7 @@ impl<T: Table> Mailbox<T> {
     async fn read_thread(
         &self,
         inbox: &InboxId,
-        thread_id: &str,
+        thread_id: &ThreadId,
     ) -> Result<Option<ThreadState>, MailStoreError> {
         // Consistent: what is read here conditions the next write.
         self.table
@@ -324,7 +327,10 @@ impl<T: Table> Mailbox<T> {
     }
 
     /// Reads a send-state item for a write it conditions.
-    async fn read_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
+    async fn read_send_state(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<Option<SendState>, MailStoreError> {
         // Consistent: what is read here conditions the next write.
         self.table
             .get(keys::send_state(message_id), Read::Consistent, "GetItem")
@@ -384,7 +390,10 @@ impl<T: Table> Mailbox<T> {
                 candidates: candidates.to_vec(),
                 found: self.read_aliases(&msg.inbox_id, candidates).await?,
             };
-            msg.thread_id = aliases.thread_id().unwrap_or(&new_thread_id).to_owned();
+            msg.thread_id = aliases
+                .thread_id()
+                .cloned()
+                .unwrap_or_else(|| new_thread_id.clone());
 
             let thread_before = self.read_thread(&msg.inbox_id, &msg.thread_id).await?;
             let thread_after = thread_for(&msg, thread_before.as_ref());
@@ -474,7 +483,7 @@ impl<T: Table> Mailbox<T> {
     /// store's own error for a failed read.
     pub async fn claim_send(
         &self,
-        message_id: &str,
+        message_id: &MessageId,
         now: &str,
     ) -> Result<Option<SendState>, MailStoreError> {
         for attempt in 0..=MAX_TXN_RETRIES {
@@ -619,7 +628,7 @@ impl<T: Table> Mailbox<T> {
     pub async fn update_labels(
         &self,
         inbox: &InboxId,
-        message_id: &str,
+        message_id: &MessageId,
         add: &[String],
         remove: &[String],
         now: &str,

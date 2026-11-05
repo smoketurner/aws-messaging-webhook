@@ -498,7 +498,7 @@ pub fn test_mail_config() -> MailConfig {
         domain: MAIL_DOMAIN.to_owned(),
         table_name: "mail-table".to_owned(),
         bucket: MAIL_BUCKET.to_owned(),
-        inbox: TEST_INBOX.to_owned(),
+        inbox: InboxId::new(TEST_INBOX),
         configuration_set: "config-set".to_owned(),
         identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
         api_keys_parameter: "/example/api-keys".to_owned(),

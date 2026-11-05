@@ -49,7 +49,8 @@ pub fn inbox(inbox: &InboxId) -> TableKey {
 
 /// A message item's key, in its inbox's partition.
 #[must_use]
-pub fn message(inbox: &InboxId, message_id: &str) -> TableKey {
+pub fn message(inbox: &InboxId, message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
+    let message_id = message_id.as_ref();
     TableKey {
         pk: inbox_pk(inbox),
         sk: format!("{MESSAGE_SK_PREFIX}{message_id}"),
@@ -58,7 +59,8 @@ pub fn message(inbox: &InboxId, message_id: &str) -> TableKey {
 
 /// A thread item's key, in its inbox's partition.
 #[must_use]
-pub fn thread(inbox: &InboxId, thread_id: &str) -> TableKey {
+pub fn thread(inbox: &InboxId, thread_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
+    let thread_id = thread_id.as_ref();
     TableKey {
         pk: inbox_pk(inbox),
         sk: format!("THR#{thread_id}"),
@@ -68,7 +70,8 @@ pub fn thread(inbox: &InboxId, thread_id: &str) -> TableKey {
 /// The send-state item's key: a message's send state lives outside its
 /// inbox partition so the sender never needs the inbox id to find it.
 #[must_use]
-pub fn send_state(message_id: &str) -> TableKey {
+pub fn send_state(message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
+    let message_id = message_id.as_ref();
     TableKey {
         pk: format!("{OUTBOX_PK_PREFIX}{message_id}"),
         sk: SEND_STATE_SK.to_owned(),
@@ -93,7 +96,8 @@ pub fn rfc_alias(inbox: &InboxId, rfc_id: &str) -> TableKey {
 
 /// The item mapping an SES message id back to the message it sent.
 #[must_use]
-pub fn ses_ref(ses_message_id: &str) -> TableKey {
+pub fn ses_ref(ses_message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
+    let ses_message_id = ses_message_id.as_ref();
     TableKey {
         pk: format!("SESMSG#{ses_message_id}"),
         sk: SES_REF_SK.to_owned(),
@@ -132,14 +136,19 @@ pub fn threads_partition(inbox: &InboxId) -> String {
 /// The `ByThread` partition listing one thread's messages, sorted by
 /// message id.
 #[must_use]
-pub fn thread_messages_partition(inbox: &InboxId, thread_id: &str) -> String {
+pub fn thread_messages_partition(
+    inbox: &InboxId,
+    thread_id: &(impl AsRef<str> + ?Sized),
+) -> String {
+    let thread_id = thread_id.as_ref();
     format!("THREAD#{}#{thread_id}", inbox.as_str())
 }
 
 /// A thread's `ByTime` sort key: last activity, then id, so a thread list
 /// orders by most recent activity.
 #[must_use]
-pub fn thread_time_sort(timestamp: &str, thread_id: &str) -> String {
+pub fn thread_time_sort(timestamp: &str, thread_id: &(impl AsRef<str> + ?Sized)) -> String {
+    let thread_id = thread_id.as_ref();
     format!("{timestamp}#{thread_id}")
 }
 

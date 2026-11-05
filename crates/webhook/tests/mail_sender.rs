@@ -13,6 +13,7 @@ use aws_messaging_webhook::mail::sender::{
     Handled, Resolution, handle_send, resolve_unknown, sweep,
 };
 use aws_messaging_webhook::mail::{InboxId, ids, object_keys, time};
+use aws_messaging_webhook::mail::{MessageId, SesMessageId, ThreadId};
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -26,15 +27,15 @@ fn deadline() -> tokio::time::Instant {
 }
 
 /// Queues one send through the real API and returns its message id.
-async fn queued(h: &Harness, body: &Value) -> String {
+async fn queued(h: &Harness, body: &Value) -> MessageId {
     let (status, value) =
         api::post(h, &format!("/v0/inboxes/{TEST_INBOX}/messages/send"), body).await;
     assert_eq!(status, StatusCode::OK);
-    value["message_id"].as_str().unwrap().to_owned()
+    MessageId::new(value["message_id"].as_str().unwrap())
 }
 
 /// The labels on a thread, which roll up its messages' labels.
-async fn thread_labels(h: &Harness, thread_id: &str) -> Vec<String> {
+async fn thread_labels(h: &Harness, thread_id: &ThreadId) -> Vec<String> {
     h.state
         .mailbox
         .get_thread(&InboxId::new(TEST_INBOX), thread_id, 1, None)
@@ -53,7 +54,7 @@ fn body() -> Value {
     })
 }
 
-fn state_of(h: &Harness, message_id: &str) -> SendState {
+fn state_of(h: &Harness, message_id: &MessageId) -> SendState {
     let item = h
         .mail
         .raw_item(&TableKey {
@@ -86,7 +87,10 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -100,7 +104,7 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
     );
     assert_eq!(message.send_status, Some(SendStatus::Sent));
     assert_eq!(
-        message.ses_message_id.as_deref(),
+        message.ses_message_id.as_ref().map(SesMessageId::as_str),
         Some(format!("ses-{message_id}").as_str())
     );
     assert!(message.sent_at.is_some());
@@ -157,7 +161,10 @@ async fn an_ambiguous_outcome_is_never_resent() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -226,15 +233,23 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
     let copy = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &copy_id.to_string())
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(copy_id.to_string()),
+        )
         .await
         .unwrap()
         .expect("the copy was stored");
-    assert_eq!(copy.thread_id, message_id);
+    assert_eq!(copy.thread_id, ThreadId::from(&message_id));
     let thread = h
         .state
         .mailbox
-        .get_thread(&InboxId::new(TEST_INBOX), &message_id, 10, None)
+        .get_thread(
+            &InboxId::new(TEST_INBOX),
+            &ThreadId::new(message_id.as_str()),
+            10,
+            None,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -261,7 +276,10 @@ async fn a_refused_send_is_recorded_rejected_and_not_retried() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -531,7 +549,10 @@ async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
     let claimed = h
         .state
         .mailbox
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap()
         .unwrap();
@@ -558,7 +579,10 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
     for message_id in [&first, &second] {
         h.state
             .mailbox
-            .claim_send(message_id, "2020-01-01T00:00:00.000Z")
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
     }
@@ -692,7 +716,7 @@ async fn an_unfetchable_url_fails_the_send_rather_than_sending_without_it() {
 async fn an_unknown_message_is_skipped() {
     let h = api_harness().await;
 
-    let handled = handle_send(&h.state, "no-such-message", deadline())
+    let handled = handle_send(&h.state, &MessageId::new("no-such-message"), deadline())
         .await
         .unwrap();
 
@@ -724,7 +748,10 @@ async fn an_ses_delivery_event_labels_the_message_it_belongs_to() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -763,7 +790,10 @@ async fn later_events_add_labels_rather_than_replacing_them() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -779,7 +809,10 @@ async fn the_sweep_releases_a_claim_whose_sender_died() {
     let message_id = queued(&h, &body()).await;
     h.state
         .mailbox
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sending);
@@ -808,7 +841,10 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
     for _ in 0..(CAP + 2) {
         h.state
             .mailbox
-            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
         let report = sweep(&h.state).await.unwrap();
@@ -855,7 +891,10 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
     for attempt in 0..(CAP - 1) {
         h.state
             .mailbox
-            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
         let report = sweep(&h.state).await.unwrap();
@@ -872,7 +911,10 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
     // The fifth claim trips the cap and is failed rather than requeued.
     h.state
         .mailbox
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     let report = sweep(&h.state).await.unwrap();
@@ -892,7 +934,11 @@ async fn the_sweep_leaves_a_recent_claim_alone() {
     let message_id = queued(&h, &body()).await;
     let now =
         aws_messaging_webhook::mail::time::format(aws_messaging_webhook::mail::time::now_ms());
-    h.state.mailbox.claim_send(&message_id, &now).await.unwrap();
+    h.state
+        .mailbox
+        .claim_send(&MessageId::new(message_id.as_str()), &now)
+        .await
+        .unwrap();
 
     let report = sweep(&h.state).await.unwrap();
 
@@ -922,7 +968,7 @@ async fn the_sweep_reports_unknown_sends_without_touching_them() {
 }
 
 /// Drives a send to `unknown`, which is the only state an operator resolves.
-async fn stuck_unknown(h: &Harness) -> String {
+async fn stuck_unknown(h: &Harness) -> MessageId {
     let message_id = queued(h, &body()).await;
     *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
         reason: "connection reset".to_owned(),
@@ -974,7 +1020,10 @@ async fn an_operator_can_close_an_unknown_message_as_sent() {
     let message = h
         .state
         .mailbox
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1121,7 +1170,7 @@ async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
 
 /// Drives a send that carries an attachment to `unknown`, so a resolution can
 /// be checked against both outbox objects a send leaves behind.
-async fn stuck_unknown_with_attachment(h: &Harness) -> String {
+async fn stuck_unknown_with_attachment(h: &Harness) -> MessageId {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(h, &request).await;
@@ -1137,7 +1186,7 @@ async fn stuck_unknown_with_attachment(h: &Harness) -> String {
 }
 
 /// Asserts the send's spec and its attachment part are both gone.
-fn assert_outbox_cleared(h: &Harness, message_id: &str) {
+fn assert_outbox_cleared(h: &Harness, message_id: &MessageId) {
     assert!(
         !h.state.objects.contains(&object_keys::spec(message_id)),
         "the spec should be gone once the send has settled"
@@ -1217,7 +1266,10 @@ async fn a_send_the_sweep_abandons_clears_its_outbox() {
     for _ in 0..CAP {
         h.state
             .mailbox
-            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
         sweep(&h.state).await.unwrap();
@@ -1238,7 +1290,10 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
 
     h.state
         .mailbox
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     let report = sweep(&h.state).await.unwrap();
@@ -1267,7 +1322,10 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
     let claimed = h
         .state
         .mailbox
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap()
         .expect("the send was queued, so the claim wins");

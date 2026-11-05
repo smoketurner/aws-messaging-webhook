@@ -11,9 +11,9 @@ use mail_parser::{
 use crate::mail::content::MessageContent;
 use crate::mail::wire::ContentDisposition;
 use crate::mail::{
-    ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, Direction, HEADER_NAME_MAX,
-    HEADER_VALUE_MAX, HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, InboxId, MailMessage,
-    PREVIEW_CHARS, REFERENCES_MAX, REFERENCES_MAX_BYTES, SUBJECT_MAX_BYTES,
+    ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, HEADER_NAME_MAX, HEADER_VALUE_MAX,
+    HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, PREVIEW_CHARS, REFERENCES_MAX, REFERENCES_MAX_BYTES,
+    SUBJECT_MAX_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +47,24 @@ pub struct ParsedAttachment {
 /// by ingest from the SES receipt.
 #[derive(Debug, Clone)]
 pub struct ParsedInbound {
-    pub message: MailMessage,
+    pub message: ParsedMessage,
     pub content: MessageContent,
     pub attachments: Vec<ParsedAttachment>,
+}
+
+/// The fields of an inbound message that come from its MIME alone.
+#[derive(Debug, Clone)]
+pub struct ParsedMessage {
+    pub rfc_message_id: String,
+    pub in_reply_to: Option<String>,
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub preview: String,
+    pub size: u64,
+    pub attachments_truncated: bool,
 }
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -138,16 +153,9 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         .map(|part| build_attachment(&part))
         .collect();
 
-    let message = MailMessage {
-        inbox_id: InboxId::new(""),
-        thread_id: String::new(),
-        message_id: String::new(),
-        ses_message_id: None,
-        direction: Direction::Inbound,
+    let message = ParsedMessage {
         rfc_message_id,
         in_reply_to,
-        labels: Vec::new(),
-        timestamp: String::new(),
         from,
         to,
         cc,
@@ -155,17 +163,7 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         subject,
         preview,
         size: u64::try_from(raw.len()).unwrap_or(u64::MAX),
-        attachments: Vec::new(),
         attachments_truncated: attachment_count > ATTACHMENTS_MAX,
-        raw_s3_key: None,
-        thread_snapshot: None,
-        delivery: BTreeMap::new(),
-        send_status: None,
-        sent_at: None,
-        version: 0,
-        created_at: String::new(),
-        updated_at: String::new(),
-        expires_at: 0,
     };
 
     let content = MessageContent {

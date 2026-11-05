@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::mail::InboxId;
 use crate::mail::labels::SystemLabel;
 use crate::mail::wire::ContentDisposition;
+use crate::mail::{MessageId, ThreadId};
 
 string_enum! {
     /// Where a send has got to.
@@ -127,8 +128,8 @@ string_enum! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendState {
     pub inbox_id: InboxId,
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
     pub send_status: SendStatus,
     pub version: u64,
     pub envelope: Envelope,
@@ -173,8 +174,8 @@ impl SendState {
     #[must_use]
     pub fn queued(
         inbox_id: InboxId,
-        message_id: String,
-        thread_id: String,
+        message_id: MessageId,
+        thread_id: ThreadId,
         envelope: Envelope,
         idempotency_key_pk: Option<String>,
         now: &str,
@@ -217,8 +218,8 @@ pub struct SendKey {
     /// in the sense that it must not be guessable by another caller.
     pub key_hash: String,
     pub inbox_id: InboxId,
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
     /// A fingerprint of the request body, so the same key presented with a
     /// *different* request is refused instead of silently sending something
     /// the caller did not ask for.
@@ -257,8 +258,8 @@ pub struct SpecAttachment {
 /// message does not have to fit in a table row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendSpec {
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
     pub inbox_id: InboxId,
     pub from: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,8 +530,8 @@ mod tests {
     fn a_queued_state_starts_at_version_zero_with_no_claim() {
         let state = SendState::queued(
             InboxId::new("support@example.com"),
-            "mid-1".to_owned(),
-            "tid-1".to_owned(),
+            MessageId::new("mid-1"),
+            ThreadId::new("tid-1"),
             Envelope {
                 to: vec!["a@example.com".to_owned()],
                 ..Envelope::default()
@@ -549,8 +550,8 @@ mod tests {
     fn a_send_state_round_trips_through_the_item_encoding() {
         let state = SendState::queued(
             InboxId::new("support@example.com"),
-            "mid-1".to_owned(),
-            "tid-1".to_owned(),
+            MessageId::new("mid-1"),
+            ThreadId::new("tid-1"),
             Envelope {
                 to: vec!["a@example.com".to_owned()],
                 cc: vec!["b@example.com".to_owned()],

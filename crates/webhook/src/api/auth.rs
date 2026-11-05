@@ -22,11 +22,6 @@ use crate::api::error::ApiError;
 use crate::api::keys::Verdict;
 use crate::state::{AppState, Backend};
 
-/// The id of the key a request authenticated with, attached as a request
-/// extension. Ids are operator-facing labels, not secrets.
-#[derive(Debug, Clone)]
-pub struct KeyId(pub String);
-
 /// Rejects the request unless it carries a recognized bearer key.
 ///
 /// # Errors
@@ -50,8 +45,12 @@ pub async fn require_bearer<B: Backend>(
 
     match state.api_keys.verify(&state.key_source, presented).await {
         Verdict::Allowed(key_id) => {
-            tracing::debug!(key_id, event = "api_authenticated", "authenticated request");
-            request.extensions_mut().insert(KeyId(key_id));
+            tracing::debug!(
+                key_id = key_id.0.as_str(),
+                event = "api_authenticated",
+                "authenticated request"
+            );
+            request.extensions_mut().insert(key_id);
             Ok(next.run(request).await)
         }
         Verdict::Denied => Err(ApiError::Unauthorized),

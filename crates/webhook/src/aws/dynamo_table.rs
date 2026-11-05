@@ -593,6 +593,7 @@ mod tests {
     use crate::mail::keys;
     use crate::mail::mailbox::Mailbox;
     use crate::mail::{Inbox, InboxId};
+    use crate::mail::{MessageId, SesMessageId, ThreadId};
 
     fn alias_put(message_id: Option<&str>) -> aws_sdk_dynamodb::types::Put {
         let op = WriteOp::AliasFirstWriter {
@@ -810,14 +811,26 @@ mod tests {
         let inbox = InboxId::new("support@example.com");
 
         let mailbox = Mailbox::new(&aws);
-        let _ = mailbox.get_message(&inbox, "mid-1").await;
+        let _ = mailbox.get_message(&inbox, &MessageId::new("mid-1")).await;
         let _ = mailbox.get_send_key("keyhash").await;
-        let _ = mailbox.get_send_state("mid-1").await;
-        let _ = mailbox.resolve_ses_message("ses-1").await;
-        let _ = mailbox.get_thread(&inbox, "tid-1", 10, None).await;
-        let _ = mailbox.message_exists(&inbox, "mid-1").await;
+        let _ = mailbox.get_send_state(&MessageId::new("mid-1")).await;
         let _ = mailbox
-            .update_labels(&inbox, "mid-1", &[], &[], "2026-01-01T00:00:00.000Z")
+            .resolve_ses_message(&SesMessageId::new("ses-1"))
+            .await;
+        let _ = mailbox
+            .get_thread(&inbox, &ThreadId::new("tid-1"), 10, None)
+            .await;
+        let _ = mailbox
+            .message_exists(&inbox, &MessageId::new("mid-1"))
+            .await;
+        let _ = mailbox
+            .update_labels(
+                &inbox,
+                &MessageId::new("mid-1"),
+                &[],
+                &[],
+                "2026-01-01T00:00:00.000Z",
+            )
             .await;
 
         let requests: Vec<GetItemInput> = captured

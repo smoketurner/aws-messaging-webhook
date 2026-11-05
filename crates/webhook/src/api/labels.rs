@@ -15,26 +15,13 @@ use axum::extract::{Path, State};
 use serde::Deserialize;
 
 use crate::api::error::{ApiError, FieldError};
-use crate::api::json::ApiJson;
+use crate::api::json::{ApiJson, OneOrMany};
+use crate::mail::MessageId;
 use crate::mail::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
 use crate::state::{AppState, Backend};
 
 /// One label or a list of them.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Labels {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Labels {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::One(label) => vec![label],
-            Self::Many(labels) => labels,
-        }
-    }
-}
+type Labels = OneOrMany<String>;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateRequest {
@@ -113,7 +100,7 @@ pub(crate) fn normalize_labels(
 /// store failure otherwise.
 pub async fn update_labels<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
-    Path((inbox, message_id)): Path<(InboxId, String)>,
+    Path((inbox, message_id)): Path<(InboxId, MessageId)>,
     ApiJson(request): ApiJson<UpdateRequest>,
 ) -> Result<Json<wire::MessageLabels>, ApiError> {
     let mut errors = Vec::new();

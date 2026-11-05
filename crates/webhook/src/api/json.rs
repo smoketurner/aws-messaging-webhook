@@ -12,6 +12,24 @@ use serde::de::DeserializeOwned;
 
 use crate::api::error::ApiError;
 
+/// One value, or several: the contract allows both spellings for a list.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    #[must_use]
+    pub fn into_vec(self) -> Vec<T> {
+        match self {
+            Self::One(one) => vec![one],
+            Self::Many(many) => many,
+        }
+    }
+}
+
 /// A request body deserialized from JSON.
 pub struct ApiJson<T>(pub T);
 

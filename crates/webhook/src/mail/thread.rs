@@ -13,6 +13,7 @@ use crate::mail::{
     AttachmentMeta, Direction, InboxId, MailMessage, RfcHit, THREAD_ATTACHMENT_SUMMARIES,
     ThreadSnapshot,
 };
+use crate::mail::{MessageId, ThreadId};
 
 /// The maximum candidate ids [`candidate_ids`] returns.
 const CANDIDATE_ID_CAP: usize = 20;
@@ -36,7 +37,7 @@ const THREAD_SNAPSHOT_ADDRESS_CAP: usize = 20;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadState {
     pub inbox_id: InboxId,
-    pub thread_id: String,
+    pub thread_id: ThreadId,
     /// Fixed-width (`mail::time::format`) last-activity timestamp: the sort
     /// key component of the thread index, which is what orders a thread list
     /// by most recent activity.
@@ -63,7 +64,7 @@ pub struct ThreadState {
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub label_counts: BTreeMap<String, u64>,
-    pub last_message_id: String,
+    pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,11 +117,11 @@ impl AliasLookup {
     /// The thread the first candidate with a row belongs to. A placeholder
     /// counts: it records a thread that already referenced the id.
     #[must_use]
-    pub fn thread_id(&self) -> Option<&str> {
+    pub fn thread_id(&self) -> Option<&ThreadId> {
         self.candidates
             .iter()
             .find_map(|candidate| self.found.get(candidate))
-            .map(|hit| hit.thread_id.as_str())
+            .map(|hit| &hit.thread_id)
     }
 
     /// Whether a real alias for `id` may be written: no row maps it yet, or
@@ -364,8 +365,8 @@ mod tests {
 
     fn hit(message_id: Option<&str>, thread_id: &str) -> RfcHit {
         RfcHit {
-            message_id: message_id.map(str::to_owned),
-            thread_id: thread_id.to_owned(),
+            message_id: message_id.map(MessageId::new),
+            thread_id: ThreadId::new(thread_id),
         }
     }
 
@@ -378,7 +379,7 @@ mod tests {
                 ("root".to_owned(), hit(Some("m-root"), "t-root")),
             ]),
         };
-        assert_eq!(lookup.thread_id(), Some("t-parent"));
+        assert_eq!(lookup.thread_id(), Some(&ThreadId::new("t-parent")));
         assert_eq!(AliasLookup::default().thread_id(), None);
     }
 
@@ -441,7 +442,7 @@ mod tests {
         let first = message(Direction::Inbound, &["received", "unread"]);
         let before = new_thread(&first);
         let mut second = message(Direction::Inbound, &["received", "unread"]);
-        second.message_id = "mid-2".to_owned();
+        second.message_id = MessageId::new("mid-2");
         second.from = "other@example.com".to_owned();
         second.preview = "Second body".to_owned();
 
@@ -471,7 +472,7 @@ mod tests {
         assert_eq!(before.preview, "Hello there");
 
         let mut reply = message(Direction::Outbound, &["sent"]);
-        reply.message_id = "mid-reply".to_owned();
+        reply.message_id = MessageId::new("mid-reply");
         reply.preview = "Re: Hello, here is the answer".to_owned();
         let after = apply_message(&before, &reply);
 
@@ -490,7 +491,7 @@ mod tests {
         assert_eq!(before.subject, "Hello");
 
         let mut second = message(Direction::Inbound, &["received", "unread"]);
-        second.message_id = "mid-2".to_owned();
+        second.message_id = MessageId::new("mid-2");
         second.subject = "Re: Hello".to_owned();
         second.preview = "Second body".to_owned();
         let after = apply_message(&before, &second);
@@ -507,13 +508,13 @@ mod tests {
     #[test]
     fn apply_message_out_of_order_keeps_the_newest_message_as_last() {
         let mut newer = message(Direction::Inbound, &["received", "unread"]);
-        newer.message_id = "mid-newer".to_owned();
+        newer.message_id = MessageId::new("mid-newer");
         newer.timestamp = "00000002-0000".to_owned();
         newer.preview = "Newer body".to_owned();
         let before = new_thread(&newer);
 
         let mut older = message(Direction::Inbound, &["received", "unread"]);
-        older.message_id = "mid-older".to_owned();
+        older.message_id = MessageId::new("mid-older");
         older.from = "other@example.com".to_owned();
         older.timestamp = "00000001-0000".to_owned();
         older.preview = "Older body".to_owned();
@@ -538,26 +539,26 @@ mod tests {
         let thread = new_thread(&first);
 
         let mut reply = message(Direction::Outbound, &["sent"]);
-        reply.message_id = "mid-reply".to_owned();
+        reply.message_id = MessageId::new("mid-reply");
         reply.timestamp = "00000003-0000".to_owned();
         let thread = apply_message(&thread, &reply);
         assert_eq!(thread.received_timestamp.as_deref(), Some("00000001-0000"));
         assert_eq!(thread.sent_timestamp.as_deref(), Some("00000003-0000"));
 
         let mut second = message(Direction::Inbound, &["received"]);
-        second.message_id = "mid-2".to_owned();
+        second.message_id = MessageId::new("mid-2");
         second.timestamp = "00000004-0000".to_owned();
         let thread = apply_message(&thread, &second);
         assert_eq!(thread.received_timestamp.as_deref(), Some("00000004-0000"));
 
         let mut late_inbound = message(Direction::Inbound, &["received"]);
-        late_inbound.message_id = "mid-late-in".to_owned();
+        late_inbound.message_id = MessageId::new("mid-late-in");
         late_inbound.timestamp = "00000002-0000".to_owned();
         let thread = apply_message(&thread, &late_inbound);
         assert_eq!(thread.received_timestamp.as_deref(), Some("00000004-0000"));
 
         let mut late_outbound = message(Direction::Outbound, &["sent"]);
-        late_outbound.message_id = "mid-late-out".to_owned();
+        late_outbound.message_id = MessageId::new("mid-late-out");
         late_outbound.timestamp = "00000002-0000".to_owned();
         let thread = apply_message(&thread, &late_outbound);
         assert_eq!(thread.sent_timestamp.as_deref(), Some("00000003-0000"));
@@ -631,7 +632,7 @@ mod tests {
         assert_eq!(before.attachments.len(), THREAD_ATTACHMENT_SUMMARIES);
 
         let mut second = message(Direction::Inbound, &["received"]);
-        second.message_id = "mid-2".to_owned();
+        second.message_id = MessageId::new("mid-2");
         second.attachments = vec![AttachmentMeta {
             attachment_id: "att-new".to_owned(),
             object_key: None,
@@ -664,7 +665,7 @@ mod tests {
         let first = message(Direction::Inbound, &["received", "unread"]);
         let before = new_thread(&first);
         let mut second = message(Direction::Inbound, &["received", "unread"]);
-        second.message_id = "mid-2".to_owned();
+        second.message_id = MessageId::new("mid-2");
         second.from = "other@example.com".to_owned();
         second.preview = "Second body".to_owned();
         let after = apply_message(&before, &second);

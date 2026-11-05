@@ -13,6 +13,7 @@
 // doesn't extend to code outside that crate).
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
+use aws_messaging_webhook::mail::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content::{self, MessageContent};
@@ -36,9 +37,9 @@ async fn store_content(h: &Harness, msg: &MailMessage, message_content: MessageC
 fn sample_message() -> MailMessage {
     MailMessage {
         inbox_id: InboxId::new("support@example.com"),
-        thread_id: "tid-1".to_owned(),
-        message_id: "mid-1".to_owned(),
-        ses_message_id: Some("ses-1".to_owned()),
+        thread_id: ThreadId::new("tid-1"),
+        message_id: MessageId::new("mid-1"),
+        ses_message_id: Some(SesMessageId::new("ses-1")),
         direction: Direction::Inbound,
         rfc_message_id: "<mid-1@example.com>".to_owned(),
         in_reply_to: None,
@@ -55,7 +56,7 @@ fn sample_message() -> MailMessage {
         attachments_truncated: false,
         raw_s3_key: Some("inbound/x".to_owned()),
         thread_snapshot: Some(ThreadSnapshot {
-            thread_id: "tid-1".to_owned(),
+            thread_id: ThreadId::new("tid-1"),
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             message_count: 1,
@@ -65,7 +66,7 @@ fn sample_message() -> MailMessage {
             timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
             created_at: "2026-01-15T09:30:00.000Z".to_owned(),
             updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            last_message_id: "mid-1".to_owned(),
+            last_message_id: MessageId::new("mid-1"),
             size: 1234,
             received_timestamp: Some("2026-01-15T09:30:00.000Z".to_owned()),
             sent_timestamp: None,
@@ -196,9 +197,9 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
 async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
     let h = harness().await;
     let mut msg = sample_message();
-    msg.message_id = "mid-2".to_owned();
+    msg.message_id = MessageId::new("mid-2");
     msg.thread_snapshot = Some(ThreadSnapshot {
-        thread_id: "tid-1".to_owned(),
+        thread_id: ThreadId::new("tid-1"),
         subject: "Hello".to_owned(),
         preview: "Second message body".to_owned(),
         message_count: 2,
@@ -211,7 +212,7 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
         timestamp: "2026-01-15T09:31:00.000Z".to_owned(),
         created_at: "2026-01-15T09:30:00.000Z".to_owned(),
         updated_at: "2026-01-15T09:31:00.000Z".to_owned(),
-        last_message_id: "mid-2".to_owned(),
+        last_message_id: MessageId::new("mid-2"),
         size: 2468,
         received_timestamp: Some("2026-01-15T09:31:00.000Z".to_owned()),
         sent_timestamp: None,
@@ -353,7 +354,7 @@ async fn a_batch_stops_at_its_first_failed_record() {
         .iter()
         .map(|id| {
             let mut msg = sample_message();
-            msg.message_id = (*id).to_owned();
+            msg.message_id = MessageId::new(*id);
             msg
         })
         .collect();

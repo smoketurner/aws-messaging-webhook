@@ -11,16 +11,17 @@ use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectStore;
 use crate::mail::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
 use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime, object_keys};
+use crate::mail::{MessageId, ThreadId};
 
 /// Builds the spec the sender will assemble the message from.
 pub(super) fn build_spec(
     inbox: &InboxId,
     send: &ValidatedSend,
-    message_id: &str,
-    thread_id: &str,
+    uuid: uuid::Uuid,
+    thread_id: &ThreadId,
     now: &str,
 ) -> SendSpec {
-    let uuid = uuid::Uuid::parse_str(message_id).unwrap_or_else(|_| uuid::Uuid::nil());
+    let message_id = MessageId::from(uuid);
     let attachments = send
         .attachments
         .iter()
@@ -31,7 +32,7 @@ pub(super) fn build_spec(
                 // Inline bytes are uploaded under the id before the send is
                 // queued, so the sender finds them already there.
                 AttachmentSource::Inline(bytes) => (
-                    Some(object_keys::part(message_id, &attachment_id)),
+                    Some(object_keys::part(&message_id, &attachment_id)),
                     None,
                     bytes.len() as u64,
                 ),
@@ -51,8 +52,8 @@ pub(super) fn build_spec(
         .collect();
 
     SendSpec {
-        message_id: message_id.to_owned(),
-        thread_id: thread_id.to_owned(),
+        message_id: message_id.clone(),
+        thread_id: thread_id.clone(),
         inbox_id: inbox.clone(),
         from: inbox.as_str().to_owned(),
         display_name: None,
@@ -65,7 +66,7 @@ pub(super) fn build_spec(
         subject: send.subject.clone(),
         text: send.text.clone(),
         html: send.html.clone(),
-        rfc_message_id: ids::our_rfc_message_id(message_id, inbox.domain()),
+        rfc_message_id: ids::our_rfc_message_id(message_id.as_str(), inbox.domain()),
         in_reply_to: None,
         references: Vec::new(),
         headers: send.headers.clone(),

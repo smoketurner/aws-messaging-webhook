@@ -27,6 +27,7 @@ use crate::mail::objects::ObjectStore;
 use crate::mail::send::{Envelope, SendKey, SendSpec, SendState};
 use crate::mail::store::EnqueueOutcome;
 use crate::mail::{InboxId, MailMessage, content, ids, keys, time};
+use crate::mail::{MessageId, ThreadId};
 use crate::state::{AppState, Backend};
 
 pub use reply::reply;
@@ -39,8 +40,8 @@ use spec::{build_spec, discard_uploads, queued_message, upload_spec};
 /// The response both send routes return.
 #[derive(Debug, Serialize)]
 pub struct SendAccepted {
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
 }
 
 /// `POST /v0/inboxes/{inbox_id}/messages/send`
@@ -106,11 +107,13 @@ async fn enqueue<B: Backend>(
 
     let now_ms = time::now_ms();
     let now = time::format(now_ms);
-    let message_id = ids::outbound_message_id().to_string();
+    let uuid = ids::outbound_message_id();
+    let message_id = MessageId::from(uuid);
     // A reply joins the original's thread; anything else starts its own.
-    let thread_id = original.map_or_else(|| message_id.clone(), |(o, _)| o.thread_id.clone());
+    let thread_id =
+        original.map_or_else(|| ThreadId::from(&message_id), |(o, _)| o.thread_id.clone());
 
-    let mut spec = build_spec(&inbox, &validated, &message_id, &thread_id, &now);
+    let mut spec = build_spec(&inbox, &validated, uuid, &thread_id, &now);
     if let Some((original, original_content)) = original {
         spec.in_reply_to = Some(original.rfc_message_id.clone());
         spec.references = threading_references(original, &original_content.references);
