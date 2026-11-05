@@ -407,6 +407,47 @@ mod tests {
         assert_eq!(decode_cancellation(&ops, &reasons), TxnDecision::Permanent);
     }
 
+    /// A failed check on an op that carries no version or status condition
+    /// is not a version conflict: re-reading cannot change its outcome.
+    /// `NotExists` counts as one only on a `Put`.
+    #[test]
+    fn a_failed_check_without_a_version_condition_is_permanent() {
+        let unconditioned_update = op(
+            OpRole::Thread,
+            WriteOp::Update {
+                pk: "THR".to_owned(),
+                sk: "T".to_owned(),
+                set: Vec::new(),
+                remove: Vec::new(),
+                cond: Cond::None,
+            },
+        );
+        let not_exists_update = op(
+            OpRole::Thread,
+            WriteOp::Update {
+                pk: "THR".to_owned(),
+                sk: "T".to_owned(),
+                set: Vec::new(),
+                remove: Vec::new(),
+                cond: Cond::NotExists,
+            },
+        );
+        for planned in [
+            none_put(OpRole::Thread),
+            unconditioned_update,
+            not_exists_update,
+        ] {
+            assert_eq!(
+                decode_cancellation(
+                    std::slice::from_ref(&planned),
+                    &[CancellationReason::ConditionalCheckFailed]
+                ),
+                TxnDecision::Permanent,
+                "{planned:?}"
+            );
+        }
+    }
+
     #[test]
     fn permanent_when_nothing_matches() {
         let ops = vec![none_put(OpRole::SesRef)];

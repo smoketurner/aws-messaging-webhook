@@ -1094,4 +1094,17 @@ mod tests {
             prop_assert_eq!(ops.len(), 3);
         }
     }
+
+    /// The planners' debug assertion: label sets are strictly ascending, so a
+    /// duplicate or an out-of-order pair is refused.
+    #[test]
+    fn only_strictly_ascending_labels_are_sorted_and_deduped() {
+        let labels = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+        assert!(is_sorted_and_deduped(&[]));
+        assert!(is_sorted_and_deduped(&labels(&["a", "b", "c"])));
+        assert!(!is_sorted_and_deduped(&labels(&["a", "a"])));
+        assert!(!is_sorted_and_deduped(&labels(&["b", "a"])));
+    }
 }

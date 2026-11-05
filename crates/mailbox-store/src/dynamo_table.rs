@@ -1752,10 +1752,19 @@ mod tests {
             )
             .await;
             let started = std::time::Instant::now();
-            let error = table(&server)
-                .batch_get::<Row>(vec![key("A", "1")], Read::Eventual, "BatchGetItem")
-                .await
-                .unwrap_err();
+            // Bounded, so a loop that never counts its attempts fails the
+            // test instead of hanging it.
+            let error = tokio::time::timeout(
+                Duration::from_secs(10),
+                table(&server).batch_get::<Row>(
+                    vec![key("A", "1")],
+                    Read::Eventual,
+                    "BatchGetItem",
+                ),
+            )
+            .await
+            .expect("the attempt cap ends the loop")
+            .unwrap_err();
             assert!(matches!(error, MailStoreError::Transient(_)), "{error:?}");
             assert_eq!(
                 bodies(&server, "BatchGetItem").await.len(),
@@ -1984,6 +1993,35 @@ mod tests {
             let query = PageQuery::unbounded(MailIndex::ByStatus, "STATUS#queued", 10, None, "Q");
             let error = table(&server).query::<Row>(query).await.unwrap_err();
             assert!(matches!(error, MailStoreError::Transient(_)), "{error:?}");
+        }
+
+        // --- pause ---------------------------------------------------------
+
+        /// The wait between transaction attempts is at least the exponential
+        /// base (25 ms doubling, capped at 400 ms from the fifth attempt on)
+        /// and less than twice it, whatever the jitter.
+        #[tokio::test(start_paused = true)]
+        async fn the_retry_pause_is_its_base_plus_less_than_one_base_of_jitter() {
+            let server = MockServer::start().await;
+            let table = table(&server);
+            for (attempt, base_ms) in [
+                (0, 25),
+                (1, 50),
+                (2, 100),
+                (3, 200),
+                (4, 400),
+                (5, 400),
+                (10, 400),
+            ] {
+                let started = tokio::time::Instant::now();
+                table.pause(attempt).await;
+                let elapsed = started.elapsed();
+                let base = Duration::from_millis(base_ms);
+                assert!(
+                    elapsed >= base && elapsed < base * 2,
+                    "attempt {attempt}: waited {elapsed:?}"
+                );
+            }
         }
 
         // --- mail disabled -------------------------------------------------
