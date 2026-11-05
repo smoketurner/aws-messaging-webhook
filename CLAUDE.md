@@ -61,9 +61,12 @@ Five workspace crates; dependency direction is `aws-messaging-webhook` → `mail
   non-mail fakes (one per seam) shared by the webhook crate's integration tests.
 
 Tests live where the code they exercise lives: `mailbox` has inline unit tests only;
-`mailbox-store` keeps flow and read behaviour in `crates/mailbox-store/tests/` against
-`MailMemoryStore`, with the DynamoDB request-shape tests inline beside `DynamoTable`;
-`crates/webhook/tests/` only drives the router or the Lambda entry.
+`mailbox-store` tests behaviour through its public API in `crates/mailbox-store/tests/`
+against `MailMemoryStore`, keeps tests that need crate internals inline (alias rows, the
+thread race, planning), and pins the exact DynamoDB requests inline beside `DynamoTable`;
+`crates/webhook/tests/` only drives the router or the Lambda entry. Crates expose only what
+another crate uses: `unreachable_pub` is a workspace lint, so a test needing an internal item
+moves inline rather than making the item public.
 
 ### Request flow through the webhook crate
 
