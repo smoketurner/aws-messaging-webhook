@@ -7,14 +7,12 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::response::Response;
 use axum::routing::{get, post};
 use lambda_http::RequestExt as _;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::entry::context_deadline;
-use crate::error::AppError;
 use crate::model::Source;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
@@ -55,12 +53,20 @@ where
 }
 
 pub fn app<T: Services>(state: Arc<AppState<T>>) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/webhooks/sms/inbound", post(sms_inbound::<T>))
-        .route("/webhooks/sms/events", post(sms_events::<T>))
-        .route("/webhooks/ses/events", post(ses_events::<T>))
-        .route("/webhooks/ses/inbound", post(ses_inbound::<T>))
+    let mut router = Router::new().route("/healthz", get(healthz));
+    for source in Source::ALL {
+        router = router.route(
+            source.webhook_path(),
+            post(
+                move |State(state): State<Arc<AppState<T>>>,
+                      Deadline(deadline): Deadline,
+                      verified: VerifiedSns| async move {
+                    handle_sns(&state, Ingress::Http(source), verified, deadline).await
+                },
+            ),
+        );
+    }
+    router
         .with_state(Arc::clone(&state))
         .merge(Router::new().nest("/v0", crate::api::router(state)))
         .layer(TraceLayer::new_for_http())
@@ -72,48 +78,4 @@ pub fn app<T: Services>(state: Arc<AppState<T>>) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
-}
-
-async fn sms_inbound<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
-    Deadline(deadline): Deadline,
-    verified: VerifiedSns,
-) -> Result<Response, AppError> {
-    handle_sns(
-        &state,
-        Ingress::Http(Source::SmsInbound),
-        verified,
-        deadline,
-    )
-    .await
-}
-
-async fn sms_events<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
-    Deadline(deadline): Deadline,
-    verified: VerifiedSns,
-) -> Result<Response, AppError> {
-    handle_sns(&state, Ingress::Http(Source::SmsEvents), verified, deadline).await
-}
-
-async fn ses_events<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
-    Deadline(deadline): Deadline,
-    verified: VerifiedSns,
-) -> Result<Response, AppError> {
-    handle_sns(&state, Ingress::Http(Source::SesEvents), verified, deadline).await
-}
-
-async fn ses_inbound<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
-    Deadline(deadline): Deadline,
-    verified: VerifiedSns,
-) -> Result<Response, AppError> {
-    handle_sns(
-        &state,
-        Ingress::Http(Source::SesInbound),
-        verified,
-        deadline,
-    )
-    .await
 }

@@ -69,6 +69,23 @@ async fn confirm_subscription<T: Services>(
     ingress: Ingress,
     envelope: &SnsEnvelope,
 ) -> Result<Response, AppError> {
+    follow_subscribe_url(state, envelope).await?;
+    tracing::info!(
+        ingress = ingress.as_str(),
+        topic_arn = envelope.topic_arn,
+        sns_message_id = envelope.message_id,
+        outcome = "confirmed",
+        "confirmed SNS subscription"
+    );
+    Ok(StatusCode::OK.into_response())
+}
+
+/// Validates the envelope's `SubscribeURL` against the SNS host policy and
+/// visits it, which is how both confirming and re-subscribing take effect.
+async fn follow_subscribe_url<T: Services>(
+    state: &AppState<T>,
+    envelope: &SnsEnvelope,
+) -> Result<(), AppError> {
     let subscribe_url = envelope
         .subscribe_url
         .as_deref()
@@ -78,14 +95,7 @@ async fn confirm_subscription<T: Services>(
         state.dangerous_subscribe_url_prefix.as_deref(),
     )?;
     confirm::get_subscribe_url(&state.http, url).await?;
-    tracing::info!(
-        ingress = ingress.as_str(),
-        topic_arn = envelope.topic_arn,
-        sns_message_id = envelope.message_id,
-        outcome = "confirmed",
-        "confirmed SNS subscription"
-    );
-    Ok(StatusCode::OK.into_response())
+    Ok(())
 }
 
 /// The `UnsubscribeURL` in every delivered notification is unauthenticated
@@ -113,15 +123,7 @@ async fn handle_unsubscribe<T: Services>(
         return Ok(StatusCode::OK.into_response());
     }
 
-    let subscribe_url = envelope
-        .subscribe_url
-        .as_deref()
-        .ok_or(AppError::SubscribeUrlRejected)?;
-    let url = confirm::validate_subscribe_url(
-        subscribe_url,
-        state.dangerous_subscribe_url_prefix.as_deref(),
-    )?;
-    confirm::get_subscribe_url(&state.http, url).await?;
+    follow_subscribe_url(state, envelope).await?;
     metrics::counter!(names::RESUBSCRIBES).increment(1);
     tracing::warn!(
         ingress = ingress.as_str(),

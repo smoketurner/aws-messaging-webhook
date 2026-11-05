@@ -166,7 +166,7 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
         .state
         .services
         .update_labels(
-            &InboxId(TEST_INBOX.to_owned()),
+            &InboxId::new(TEST_INBOX),
             &ids[0],
             &["bounced".to_owned()],
             &[],

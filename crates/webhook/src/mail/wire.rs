@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn inbox_golden_shape() {
         let inbox = crate::mail::Inbox {
-            inbox_id: InboxId("support@example.com".to_owned()),
+            inbox_id: InboxId::new("support@example.com"),
             email: "support@example.com".to_owned(),
             display_name: Some("Support".to_owned()),
             metadata: None,

@@ -138,7 +138,7 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         .collect();
 
     let message = MailMessage {
-        inbox_id: InboxId(String::new()),
+        inbox_id: InboxId::new(""),
         thread_id: String::new(),
         message_id: String::new(),
         ses_message_id: None,

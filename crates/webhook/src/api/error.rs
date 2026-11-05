@@ -1,6 +1,6 @@
 //! Error responses for the `/v0` API.
 //!
-//! Two body shapes: `{name, message, code?, fix?, docs?}` for most failures,
+//! Two body shapes: `{name, message}` for most failures,
 //! and a validation variant carrying a per-field `errors` array. Clients
 //! match on `name`, so the names here are part of the wire contract and must
 //! not be renamed casually.
@@ -18,18 +18,11 @@ use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 
-/// The standard error body. `code`, `fix` and `docs` are omitted rather than
-/// serialized as null when absent, matching the wire contract.
+/// The standard error body.
 #[derive(Debug, Serialize)]
-pub struct ErrorBody {
-    pub name: &'static str,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub docs: Option<String>,
+struct ErrorBody {
+    name: &'static str,
+    message: String,
 }
 
 /// One field-level problem in a [`ValidationBody`].
@@ -39,15 +32,21 @@ pub struct FieldError {
     pub message: String,
 }
 
+impl FieldError {
+    pub fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// The validation error body: the standard shape plus `errors`.
 #[derive(Debug, Serialize)]
-pub struct ValidationBody {
-    pub name: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    pub errors: Vec<FieldError>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+struct ValidationBody {
+    name: &'static str,
+    message: String,
+    errors: Vec<FieldError>,
 }
 
 /// Every failure the `/v0` surface can return.
@@ -81,6 +80,10 @@ pub enum ApiError {
     #[error("not implemented")]
     NotImplemented,
 
+    /// A known path used with the wrong method.
+    #[error("method not allowed")]
+    MethodNotAllowed,
+
     /// The key cache has never loaded and the parameter store is unreachable.
     /// 503 rather than 401, because the SDKs retry 503 and do not retry 401:
     /// a transient SSM outage must not look like a bad key.
@@ -98,10 +101,7 @@ pub enum ApiError {
 impl ApiError {
     /// A single-field validation failure, the common case.
     pub fn field(path: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Validation(vec![FieldError {
-            path: path.into(),
-            message: message.into(),
-        }])
+        Self::Validation(vec![FieldError::new(path, message)])
     }
 }
 
@@ -151,6 +151,7 @@ impl ApiError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -167,6 +168,7 @@ impl ApiError {
             Self::Conflict(_) => "ConflictError",
             Self::TooLarge => "PayloadTooLargeError",
             Self::NotImplemented => "NotImplementedError",
+            Self::MethodNotAllowed => "MethodNotAllowedError",
             Self::Unavailable => "ServiceUnavailableError",
             Self::BadGateway(_) | Self::Internal(_) => "InternalServerError",
         }
@@ -182,6 +184,7 @@ impl ApiError {
             Self::NotFound => "Resource not found.".to_owned(),
             Self::TooLarge => "Request body is too large.".to_owned(),
             Self::NotImplemented => "This endpoint is not implemented.".to_owned(),
+            Self::MethodNotAllowed => "This method is not allowed on this endpoint.".to_owned(),
             Self::Unavailable => "API keys are temporarily unavailable; retry shortly.".to_owned(),
             Self::BadGateway(_) | Self::Internal(_) => "Internal server error.".to_owned(),
         }
@@ -193,26 +196,19 @@ impl IntoResponse for ApiError {
         let status = self.status();
         record(&self, status);
 
+        let name = self.name();
+        let message = self.public_message();
         let mut response = match self {
-            Self::Validation(errors) => {
-                let body = ValidationBody {
-                    name: "ValidationError",
-                    message: Some("Request validation failed.".to_owned()),
+            Self::Validation(errors) => (
+                status,
+                Json(ValidationBody {
+                    name,
+                    message,
                     errors,
-                    code: None,
-                };
-                (status, Json(body)).into_response()
-            }
-            ref other => {
-                let body = ErrorBody {
-                    name: other.name(),
-                    message: other.public_message(),
-                    code: None,
-                    fix: None,
-                    docs: None,
-                };
-                (status, Json(body)).into_response()
-            }
+                }),
+            )
+                .into_response(),
+            _ => (status, Json(ErrorBody { name, message })).into_response(),
         };
 
         // The SDKs honour Retry-After on 503; without it they back off blindly.
@@ -365,22 +361,6 @@ mod tests {
         assert_eq!(
             response.headers().get(header::RETRY_AFTER).unwrap(),
             HeaderValue::from_static("5")
-        );
-    }
-
-    #[test]
-    fn optional_fields_are_omitted_not_null() {
-        let body = ErrorBody {
-            name: "NotFoundError",
-            message: "Resource not found.".to_owned(),
-            code: None,
-            fix: None,
-            docs: None,
-        };
-        let json = serde_json::to_string(&body).unwrap();
-        assert_eq!(
-            json,
-            r#"{"name":"NotFoundError","message":"Resource not found."}"#
         );
     }
 }

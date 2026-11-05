@@ -8,7 +8,7 @@ use super::{Direction, InboxId, MailMessage};
 /// `support@example.com`. Tests shape it with struct-update syntax.
 pub(crate) fn message() -> MailMessage {
     MailMessage {
-        inbox_id: InboxId("support@example.com".to_owned()),
+        inbox_id: InboxId::new("support@example.com"),
         thread_id: "tid-1".to_owned(),
         message_id: "mid-1".to_owned(),
         ses_message_id: Some("ses-1".to_owned()),

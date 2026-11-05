@@ -58,28 +58,28 @@ pub(crate) fn normalize_labels(
     field: &'static str,
     errors: &mut Vec<FieldError>,
 ) -> Vec<String> {
-    let problem = |message: String| FieldError {
-        path: field.to_owned(),
-        message,
-    };
     let mut cleaned: Vec<String> = Vec::new();
     for label in labels_in {
         let label = label.trim().to_lowercase();
         if label.is_empty() {
-            errors.push(problem("a label cannot be empty".to_owned()));
+            errors.push(FieldError::new(field, "a label cannot be empty".to_owned()));
             continue;
         }
         if label.len() > LABEL_MAX_BYTES {
-            errors.push(problem(format!(
-                "`{label}` is longer than {LABEL_MAX_BYTES} bytes"
-            )));
+            errors.push(FieldError::new(
+                field,
+                format!("`{label}` is longer than {LABEL_MAX_BYTES} bytes"),
+            ));
             continue;
         }
         if labels::is_reserved(&label) {
-            errors.push(problem(format!(
-                "`{label}` is set by the service and cannot be changed; \
+            errors.push(FieldError::new(
+                field,
+                format!(
+                    "`{label}` is set by the service and cannot be changed; \
                  only `unread`, `spam`, `trash` and your own labels can"
-            )));
+                ),
+            ));
             continue;
         }
         if !cleaned.contains(&label) {
@@ -94,9 +94,10 @@ pub(crate) fn normalize_labels(
     // rejected here for naming a state toggle alongside a full set of user
     // labels.
     if labels::user_label_count(&cleaned) > MESSAGE_USER_LABEL_CAP {
-        errors.push(problem(format!(
-            "at most {MESSAGE_USER_LABEL_CAP} labels per request"
-        )));
+        errors.push(FieldError::new(
+            field,
+            format!("at most {MESSAGE_USER_LABEL_CAP} labels per request"),
+        ));
     }
     cleaned.sort();
     cleaned
@@ -112,7 +113,7 @@ pub(crate) fn normalize_labels(
 /// store failure otherwise.
 pub async fn update_labels<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path((inbox_id, message_id)): Path<(String, String)>,
+    Path((inbox, message_id)): Path<(InboxId, String)>,
     ApiJson(request): ApiJson<UpdateRequest>,
 ) -> Result<Json<wire::MessageLabels>, ApiError> {
     let mut errors = Vec::new();
@@ -134,10 +135,10 @@ pub async fn update_labels<T: Services>(
     // rejected rather than silently resolved one way.
     for label in &add {
         if remove.contains(label) {
-            errors.push(FieldError {
-                path: "add_labels".to_owned(),
-                message: format!("`{label}` is in both add_labels and remove_labels"),
-            });
+            errors.push(FieldError::new(
+                "add_labels",
+                format!("`{label}` is in both add_labels and remove_labels"),
+            ));
         }
     }
 
@@ -148,15 +149,8 @@ pub async fn update_labels<T: Services>(
     let now = time::format(time::now_ms());
     let labels = state
         .services
-        .update_labels(
-            &InboxId::from_path(&inbox_id),
-            &message_id,
-            &add,
-            &remove,
-            &now,
-        )
-        .await
-        .map_err(ApiError::from)?
+        .update_labels(&inbox, &message_id, &add, &remove, &now)
+        .await?
         .ok_or(ApiError::NotFound)?;
 
     Ok(Json(wire::MessageLabels { message_id, labels }))

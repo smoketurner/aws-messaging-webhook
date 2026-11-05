@@ -249,7 +249,7 @@ pub async fn claim_send<S: TxnStore>(
         }
 
         let after = before.claimed(now);
-        let ops = plan::plan_claim(&before, &after)?;
+        let ops = plan::plan_state_cas(&before, &after, SendStatus::Queued)?;
         match store.run_txn(&ops).await? {
             TxnOutcome::Committed => return Ok(Some(after)),
             // Lost the race: re-read, and the status check above settles it.
@@ -275,7 +275,7 @@ pub async fn note_ses_call<S: TxnStore>(
     now: &str,
 ) -> Result<Option<SendState>, MailStoreError> {
     let after = claimed.calling_ses(now);
-    let ops = plan::plan_ses_call(claimed, &after)?;
+    let ops = plan::plan_state_cas(claimed, &after, SendStatus::Sending)?;
     for attempt in 0..=MAX_TXN_RETRIES {
         match store.run_txn(&ops).await? {
             TxnOutcome::Committed => return Ok(Some(after)),

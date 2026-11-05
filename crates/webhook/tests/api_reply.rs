@@ -18,7 +18,7 @@ use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, api_harness};
 async fn store_content(h: &Harness, message_id: &str, message_content: MessageContent) {
     content::store(
         &h.state.services,
-        &InboxId(TEST_INBOX.to_owned()),
+        &InboxId::new(TEST_INBOX),
         message_id,
         &message_content,
     )

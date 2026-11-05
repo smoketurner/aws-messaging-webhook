@@ -64,7 +64,11 @@ pub mod names {
 pub fn init(namespace: String) -> Result<&'static Collector, metrics_cloudwatch_embedded::Error> {
     metrics_cloudwatch_embedded::Builder::new()
         .cloudwatch_namespace(namespace)
-        .with_dimension("function", function_name())
+        .with_dimension(
+            "function",
+            // "local" stands in when running outside Lambda.
+            std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_else(|_| "local".to_owned()),
+        )
         .init()
 }
 
@@ -96,12 +100,6 @@ pub fn emit_cold_start(emitted: &AtomicBool, collector: &Collector, writer: impl
     {
         tracing::error!(error = %error, "failed to write ColdStart metric");
     }
-}
-
-/// The Lambda function name from the environment, or a fallback for local
-/// development.
-fn function_name() -> String {
-    std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_else(|_| "local".to_owned())
 }
 
 #[cfg(test)]

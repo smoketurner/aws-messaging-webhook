@@ -16,7 +16,7 @@ use crate::mail::store::{MailStoreError, SesSent};
 use crate::mail::thread::{AliasLookup, ThreadState};
 use crate::mail::{
     Direction, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP, ThreadSnapshot, ids,
-    keys, labels,
+    keys, labels, strip_angle_brackets,
 };
 
 /// Which role a planned op plays in its transaction — used by
@@ -181,14 +181,6 @@ fn message_label_op(
     }
 }
 
-/// Strips a `Message-ID` header value's surrounding `<`/`>`, if present.
-fn strip_angle_brackets(rfc_id: &str) -> &str {
-    rfc_id
-        .strip_prefix('<')
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or(rfc_id)
-}
-
 /// Aliases skip ids over this many bytes, keeping the alias pk under
 /// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
 const ALIAS_ID_MAX_BYTES: usize = 900;
@@ -235,11 +227,16 @@ pub fn plan_insert(
 
     let own_id = strip_angle_brackets(&msg.rfc_message_id);
     if !own_id.is_empty() && aliases.is_claimable(own_id) {
-        push_rfc_alias_op(&mut ops, msg);
+        push_alias_row(
+            &mut ops,
+            msg,
+            &msg.rfc_message_id,
+            Some(msg.message_id.clone()),
+        );
     }
     for candidate in &aliases.candidates {
         if candidate != own_id && !aliases.found.contains_key(candidate) {
-            push_placeholder(&mut ops, msg, candidate);
+            push_alias_row(&mut ops, msg, candidate, None);
         }
     }
 
@@ -291,7 +288,12 @@ pub fn plan_enqueue(
 
     ops.push(send_state_put(None, state)?);
     ops.push(thread_put(thread_before, thread_after)?);
-    push_rfc_alias_op(&mut ops, msg);
+    push_alias_row(
+        &mut ops,
+        msg,
+        &msg.rfc_message_id,
+        Some(msg.message_id.clone()),
+    );
 
     Ok(ops)
 }
@@ -307,10 +309,14 @@ fn send_state_put(
 ) -> Result<PlannedOp, MailStoreError> {
     send_state_op(
         after,
-        before.map_or(Cond::NotExists, |before| {
-            Cond::VersionEquals(before.version)
-        }),
+        version_or_absent(before.map(|before| before.version)),
     )
+}
+
+/// The optimistic-concurrency condition for a write over what was read: the
+/// version it read, or that nothing exists when it read nothing.
+fn version_or_absent(version: Option<u64>) -> Cond {
+    version.map_or(Cond::NotExists, Cond::VersionEquals)
 }
 
 /// The send-state item with its keys, under an arbitrary condition.
@@ -343,45 +349,29 @@ fn send_state_op(state: &SendState, cond: Cond) -> Result<PlannedOp, MailStoreEr
     })
 }
 
-/// Plans the claim that hands one queued send to one sender.
+/// Plans a send-state transition conditioned on the item still being in
+/// `expected` status at the version `before` holds.
 ///
-/// The condition is on the status, not just the version: a record that is
-/// already `sending` must not be claimed again, however old its version
-/// looks, because that is exactly how the same message gets sent twice.
-///
-/// # Errors
-///
-/// Propagates a serialization failure as [`MailStoreError::Permanent`].
-pub fn plan_claim(before: &SendState, after: &SendState) -> Result<Vec<PlannedOp>, MailStoreError> {
-    Ok(vec![send_state_op(
-        after,
-        Cond::All(vec![
-            Check::Eq(
-                "send_status",
-                AttributeValue::S(SendStatus::Queued.as_str().to_owned()),
-            ),
-            Check::Eq("version", AttributeValue::N(before.version.to_string())),
-        ]),
-    )?])
-}
-
-/// Plans recording that the claimed send is about to call SES: the state
-/// alone, conditioned on still being `sending` at the version this sender
-/// holds, so a claim that was lost is never marked.
+/// The condition is on the status, not just the version. A claim
+/// (`expected` = `queued`) must not take a record that is already `sending`,
+/// however old its version looks, because that is exactly how the same
+/// message gets sent twice; recording the SES call (`expected` = `sending`)
+/// must never mark a claim that was lost.
 ///
 /// # Errors
 ///
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
-pub fn plan_ses_call(
+pub fn plan_state_cas(
     before: &SendState,
     after: &SendState,
+    expected: SendStatus,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
     Ok(vec![send_state_op(
         after,
         Cond::All(vec![
             Check::Eq(
                 "send_status",
-                AttributeValue::S(SendStatus::Sending.as_str().to_owned()),
+                AttributeValue::S(expected.as_str().to_owned()),
             ),
             Check::Eq("version", AttributeValue::N(before.version.to_string())),
         ]),
@@ -444,7 +434,7 @@ pub fn plan_mark(
         // forms. A redrive finds these already taken, which the caller
         // resolves by dropping them.
         for rfc_id in ids::ses_rfc_ids(ses.message_id, ses.region) {
-            push_alias(&mut ops, msg, &rfc_id);
+            push_alias_row(&mut ops, msg, &rfc_id, Some(msg.message_id.clone()));
         }
 
         // Unconditioned: a redrive that marks the same send again should
@@ -583,10 +573,7 @@ fn thread_put(
             )),
         ),
     ];
-    let cond = match thread_before {
-        Some(before) => Cond::VersionEquals(before.version),
-        None => Cond::NotExists,
-    };
+    let cond = version_or_absent(thread_before.map(|before| before.version));
     Ok(PlannedOp {
         role: OpRole::Thread,
         op: WriteOp::Put {
@@ -596,24 +583,11 @@ fn thread_put(
     })
 }
 
-/// Pushes the alias op for `msg`'s own `Message-ID`.
-fn push_rfc_alias_op(ops: &mut Vec<PlannedOp>, msg: &MailMessage) {
-    push_alias(ops, msg, &msg.rfc_message_id);
-}
-
-/// Pushes an alias op mapping `rfc_id` to `msg` and its thread, skipping ids
-/// over [`ALIAS_ID_MAX_BYTES`].
-fn push_alias(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
-    push_alias_row(ops, msg, rfc_id, Some(msg.message_id.clone()));
-}
-
-/// Pushes a placeholder alias mapping `rfc_id`, which `msg` references but
-/// this inbox holds no message for, to `msg`'s thread. It expires with `msg`,
-/// the message whose reference it records.
-fn push_placeholder(ops: &mut Vec<PlannedOp>, msg: &MailMessage, rfc_id: &str) {
-    push_alias_row(ops, msg, rfc_id, None);
-}
-
+/// Pushes an alias op mapping `rfc_id` to `msg`'s thread, skipping ids over
+/// [`ALIAS_ID_MAX_BYTES`]. `message_id` is `msg`'s own id for an alias, or
+/// `None` for a placeholder: an id `msg` references but this inbox holds no
+/// message for, which expires with `msg`, the message whose reference it
+/// records.
 fn push_alias_row(
     ops: &mut Vec<PlannedOp>,
     msg: &MailMessage,
@@ -676,7 +650,7 @@ mod tests {
 
     fn message(inbox: &str, thread_id: &str, message_id: &str, labels: &[&str]) -> MailMessage {
         MailMessage {
-            inbox_id: InboxId(inbox.to_owned()),
+            inbox_id: InboxId::new(inbox),
             thread_id: thread_id.to_owned(),
             message_id: message_id.to_owned(),
             ses_message_id: None,
@@ -1215,7 +1189,7 @@ mod tests {
     /// A `Message-ID` truncated to `REFERENCES_MAX_BYTES` by `mime::parse_inbound`
     /// is still too long to carry an alias row: `strip_angle_brackets` yields
     /// `REFERENCES_MAX_BYTES - 2` bytes, which exceeds `ALIAS_ID_MAX_BYTES`, so
-    /// `push_alias` skips it — exactly as before the cap, when the id was even
+    /// `push_alias_row` skips it — exactly as before the cap, when the id was even
     /// longer. The fix shrinks the DynamoDB attribute without changing
     /// alias-join behavior.
     #[test]

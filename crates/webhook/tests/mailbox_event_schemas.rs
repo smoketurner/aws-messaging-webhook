@@ -274,7 +274,7 @@ async fn sent_message(h: &Harness) -> MailMessage {
     .unwrap();
     h.state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), message_id)
+        .get_message(&InboxId::new(TEST_INBOX), message_id)
         .await
         .unwrap()
         .unwrap()
@@ -321,7 +321,7 @@ fn mail_record(event_name: &str, new_image: &Value, old_image: Option<&Value>) -
 fn received_message(labels: &[&str]) -> MailMessage {
     let now = "2026-01-15T09:30:00.000Z".to_owned();
     let mut msg = MailMessage {
-        inbox_id: InboxId(TEST_INBOX.to_owned()),
+        inbox_id: InboxId::new(TEST_INBOX),
         thread_id: "tid-1".to_owned(),
         message_id: "mid-1".to_owned(),
         ses_message_id: Some("ses-in-1".to_owned()),

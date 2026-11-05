@@ -5,10 +5,10 @@
 //! case, so `Support@Example.com` and `support@example.com` address different
 //! rows. The fix does not change the keys (it can't — case-sensitivity is
 //! DynamoDB's contract); it normalizes the path at the API boundary using
-//! `InboxId::from_path`, the same rule ingest uses, so the keys the API
+//! `InboxId::new`, the same rule ingest uses, so the keys the API
 //! builds always match the keys ingest wrote. This suite pins both halves:
 //! the keys still differ by casing (why the API must normalize), and
-//! `from_path` folds any casing to the stored key (so the API does).
+//! `InboxId::new` folds any casing to the stored key (so the API does).
 
 use aws_messaging_webhook::mail::keys;
 use aws_messaging_webhook::mail::store::MailStore as _;

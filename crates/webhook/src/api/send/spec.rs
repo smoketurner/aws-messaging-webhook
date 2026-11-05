@@ -97,8 +97,7 @@ pub(super) async fn upload_spec<T: Services>(
                 Bytes::from(bytes.clone()),
                 &spec_attachment.content_type,
             )
-            .await
-            .map_err(ApiError::from)?;
+            .await?;
     }
 
     let body = serde_json::to_vec(spec)
@@ -109,8 +108,7 @@ pub(super) async fn upload_spec<T: Services>(
             Bytes::from(body),
             "application/json",
         )
-        .await
-        .map_err(ApiError::from)?;
+        .await?;
     Ok(())
 }
 

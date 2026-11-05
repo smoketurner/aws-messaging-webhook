@@ -178,9 +178,12 @@ pub fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> {
 
     let recipients = to.len() + cc.len() + bcc.len();
     if recipients == 0 {
-        errors.push(field("to", "at least one of to, cc or bcc is required"));
+        errors.push(FieldError::new(
+            "to",
+            "at least one of to, cc or bcc is required",
+        ));
     } else if recipients > OUTBOUND_RECIPIENTS_MAX {
-        errors.push(field(
+        errors.push(FieldError::new(
             "to",
             format!("at most {OUTBOUND_RECIPIENTS_MAX} recipients across to, cc and bcc"),
         ));
@@ -188,19 +191,22 @@ pub fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> {
 
     let subject = request.subject.unwrap_or_default();
     if subject.len() > SUBJECT_MAX_BYTES {
-        errors.push(field(
+        errors.push(FieldError::new(
             "subject",
             format!("must be at most {SUBJECT_MAX_BYTES} bytes"),
         ));
     }
     if contains_newline(&subject) {
-        errors.push(field("subject", "must not contain a line break"));
+        errors.push(FieldError::new("subject", "must not contain a line break"));
     }
 
     let text = non_empty(request.text);
     let html = non_empty(request.html);
     if text.is_none() && html.is_none() {
-        errors.push(field("text", "at least one of text or html is required"));
+        errors.push(FieldError::new(
+            "text",
+            "at least one of text or html is required",
+        ));
     }
 
     let labels = crate::api::labels::normalize_labels(
@@ -229,13 +235,6 @@ pub fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> {
     }
 }
 
-fn field(path: impl Into<String>, message: impl Into<String>) -> FieldError {
-    FieldError {
-        path: path.into(),
-        message: message.into(),
-    }
-}
-
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
@@ -254,24 +253,27 @@ fn addresses(
     for address in input.map(Addresses::into_vec).unwrap_or_default() {
         let address = address.trim().to_owned();
         if address.is_empty() {
-            errors.push(field(path, "an address cannot be empty"));
+            errors.push(FieldError::new(path, "an address cannot be empty"));
             continue;
         }
         if address.len() > ADDRESS_MAX_BYTES {
-            errors.push(field(
+            errors.push(FieldError::new(
                 path,
                 format!("an address must be at most {ADDRESS_MAX_BYTES} bytes"),
             ));
             continue;
         }
         if contains_newline(&address) {
-            errors.push(field(path, "an address must not contain a line break"));
+            errors.push(FieldError::new(
+                path,
+                "an address must not contain a line break",
+            ));
             continue;
         }
         let address = match envelope_address(&address) {
             Ok(address) => address,
             Err(problem) => {
-                errors.push(field(path, format!("`{address}` {problem}")));
+                errors.push(FieldError::new(path, format!("`{address}` {problem}")));
                 continue;
             }
         };
@@ -301,11 +303,14 @@ fn headers(
     for (name, value) in input.unwrap_or_default() {
         let trimmed = name.trim();
         if !is_header_name(trimmed) {
-            errors.push(field("headers", format!("`{name}` is not a header name")));
+            errors.push(FieldError::new(
+                "headers",
+                format!("`{name}` is not a header name"),
+            ));
             continue;
         }
         if trimmed.len() > HEADER_NAME_MAX {
-            errors.push(field(
+            errors.push(FieldError::new(
                 "headers",
                 format!("`{trimmed}` is longer than {HEADER_NAME_MAX} bytes"),
             ));
@@ -314,21 +319,21 @@ fn headers(
         if CONTROLLED_HEADERS.contains(&trimmed.to_lowercase().as_str())
             || trimmed.to_lowercase().starts_with("content-")
         {
-            errors.push(field(
+            errors.push(FieldError::new(
                 "headers",
                 format!("`{trimmed}` is set by the service and cannot be overridden"),
             ));
             continue;
         }
         if value.len() > HEADER_VALUE_MAX {
-            errors.push(field(
+            errors.push(FieldError::new(
                 "headers",
                 format!("the value of `{trimmed}` is longer than {HEADER_VALUE_MAX} bytes"),
             ));
             continue;
         }
         if contains_newline(&value) {
-            errors.push(field(
+            errors.push(FieldError::new(
                 "headers",
                 format!("the value of `{trimmed}` must not contain a line break"),
             ));
@@ -339,7 +344,7 @@ fn headers(
     }
 
     if budget > HEADERS_BUDGET {
-        errors.push(field(
+        errors.push(FieldError::new(
             "headers",
             format!("all headers together must be at most {HEADERS_BUDGET} bytes"),
         ));
@@ -383,7 +388,7 @@ fn attachment_source(
                 .filter(|c| !c.is_ascii_whitespace())
                 .collect();
             let Ok(bytes) = STANDARD.decode(stripped.as_bytes()) else {
-                errors.push(field(path, "`content` is not valid base64"));
+                errors.push(FieldError::new(path, "`content` is not valid base64"));
                 return None;
             };
             Some(AttachmentSource::Inline(bytes))
@@ -394,12 +399,18 @@ fn attachment_source(
                 // The reason stays generic: a caller learns its URL was
                 // refused, not what the network behind this service looks
                 // like.
-                errors.push(field(path, format!("`url` was refused: {rejected}")));
+                errors.push(FieldError::new(
+                    path,
+                    format!("`url` was refused: {rejected}"),
+                ));
                 None
             }
         },
         (Some(_), Some(_)) | (None, None) => {
-            errors.push(field(path, "give exactly one of `content` or `url`"));
+            errors.push(FieldError::new(
+                path,
+                "give exactly one of `content` or `url`",
+            ));
             None
         }
     }
@@ -411,7 +422,7 @@ fn attachments(
 ) -> Vec<ValidatedAttachment> {
     let input = input.unwrap_or_default();
     if input.len() > ATTACHMENTS_MAX {
-        errors.push(field(
+        errors.push(FieldError::new(
             "attachments",
             format!("at most {ATTACHMENTS_MAX} attachments"),
         ));
@@ -432,13 +443,13 @@ fn attachments(
 
         if let Some(filename) = &attachment.filename {
             if filename.len() > ATTACHMENT_FIELD_MAX {
-                errors.push(field(
+                errors.push(FieldError::new(
                     &path,
                     format!("`filename` is longer than {ATTACHMENT_FIELD_MAX} bytes"),
                 ));
             }
             if filename.chars().any(char::is_control) {
-                errors.push(field(
+                errors.push(FieldError::new(
                     &path,
                     "`filename` must not contain control characters",
                 ));
@@ -449,14 +460,14 @@ fn attachments(
             .content_type
             .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned());
         if !is_content_type(&content_type) {
-            errors.push(field(&path, "`content_type` is not a media type"));
+            errors.push(FieldError::new(&path, "`content_type` is not a media type"));
         }
 
         let disposition = attachment
             .content_disposition
             .unwrap_or_else(|| "attachment".to_owned());
         if !matches!(disposition.as_str(), "inline" | "attachment") {
-            errors.push(field(
+            errors.push(FieldError::new(
                 &path,
                 "`content_disposition` must be `inline` or `attachment`",
             ));
@@ -469,16 +480,19 @@ fn attachments(
                     .bytes()
                     .any(|b| !b.is_ascii_graphic() || matches!(b, b'<' | b'>'));
             if invalid {
-                errors.push(field(
+                errors.push(FieldError::new(
                     &path,
                     "`content_id` must be printable ASCII without `<`, `>` or spaces",
                 ));
             } else if !content_ids.insert(content_id.clone()) {
                 // Two parts sharing a cid make an HTML reference ambiguous.
-                errors.push(field(&path, "`content_id` is used by another attachment"));
+                errors.push(FieldError::new(
+                    &path,
+                    "`content_id` is used by another attachment",
+                ));
             }
         } else if disposition == "inline" {
-            errors.push(field(
+            errors.push(FieldError::new(
                 &path,
                 "an `inline` attachment needs a `content_id` to reference it by",
             ));
@@ -496,7 +510,7 @@ fn attachments(
     }
 
     if decoded_bytes > MAX_OUTBOUND_DECODED_BYTES {
-        errors.push(field(
+        errors.push(FieldError::new(
             "attachments",
             format!("decoded attachments must total at most {MAX_OUTBOUND_DECODED_BYTES} bytes"),
         ));

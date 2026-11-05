@@ -60,7 +60,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -103,7 +103,7 @@ async fn a_send_with_a_full_set_of_user_labels_and_a_system_toggle_is_queued() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -683,7 +683,7 @@ async fn an_html_only_send_gets_a_non_empty_preview_on_the_message_and_listing()
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -749,11 +749,11 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .expect("the queued send is stored under the lowercased id");
-    assert_eq!(message.inbox_id, InboxId(TEST_INBOX.to_owned()));
+    assert_eq!(message.inbox_id, InboxId::new(TEST_INBOX));
 }
 
 /// An expired `Idempotency-Key` row that DynamoDB has not yet reaped is
@@ -777,7 +777,7 @@ async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
     let key_hash = format!("{:x}", Sha256::digest(b"key-1"));
     let expired_key = SendKey {
         key_hash: key_hash.clone(),
-        inbox_id: InboxId(TEST_INBOX.to_owned()),
+        inbox_id: InboxId::new(TEST_INBOX),
         message_id: "old-message-id".to_owned(),
         thread_id: "old-thread-id".to_owned(),
         request_hash: "a-different-request-hash".to_owned(),

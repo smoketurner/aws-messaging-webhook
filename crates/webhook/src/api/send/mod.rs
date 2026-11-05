@@ -56,19 +56,11 @@ pub struct SendAccepted {
 /// different request, and a store or object failure otherwise.
 pub async fn send<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path(inbox_id): Path<String>,
+    Path(inbox): Path<InboxId>,
     headers: HeaderMap,
     ApiJson(request): ApiJson<SendRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    enqueue(
-        &state,
-        InboxId::from_path(&inbox_id),
-        request,
-        &headers,
-        None,
-        "send",
-    )
-    .await
+    enqueue(&state, inbox, request, &headers, None, "send").await
 }
 
 /// Validates, uploads and commits one outbound message.
@@ -91,13 +83,7 @@ async fn enqueue<T: Services>(
     };
     // An inbox that does not exist cannot send: the address would not be one
     // this domain owns.
-    if state
-        .services
-        .get_inbox(&inbox)
-        .await
-        .map_err(ApiError::from)?
-        .is_none()
-    {
+    if state.services.get_inbox(&inbox).await?.is_none() {
         return Err(ApiError::NotFound);
     }
 

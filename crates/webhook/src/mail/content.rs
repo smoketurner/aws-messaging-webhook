@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn content_key_is_scoped_to_the_inbox() {
         assert_eq!(
-            content_key(&InboxId("support@example.com".to_owned()), "01a0-msg"),
+            content_key(&InboxId::new("support@example.com"), "01a0-msg"),
             "messages/support@example.com/01a0-msg.json"
         );
     }
