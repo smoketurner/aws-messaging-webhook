@@ -18,7 +18,7 @@ use axum::extract::{Path, RawQuery, State};
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
 use crate::config::Config;
-use crate::mail::keys::{self, PageKey, decode_page_token, encode_page_token};
+use crate::mail::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
 use crate::mail::objects;
 use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 use crate::mail::thread::ThreadState;
@@ -115,7 +115,7 @@ pub async fn list_inboxes<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::InboxList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let start = cursor(&request, keys::inboxes_partition(), UNSCOPED)?;
+    let start = cursor(&request, keys::INBOXES_PARTITION, UNSCOPED)?;
 
     let page = state.services.list_inboxes(request.limit, start).await?;
 
@@ -161,7 +161,7 @@ pub async fn list_messages<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::MessageList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let partition = keys::messages_partition(inbox.as_str());
+    let partition = keys::messages_partition(&inbox);
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
     let (before, after) = request.message_bounds();
@@ -178,11 +178,14 @@ pub async fn list_messages<T: Services>(
     let (messages, next) = fill(
         &query,
         |msg: &MailMessage| request.filters.matches_message(msg),
-        |msg: &MailMessage| PageKey {
-            partition: keys::messages_partition(msg.inbox_id.as_str()),
-            sort: msg.message_id.clone(),
-            table_pk: keys::inbox_pk(msg.inbox_id.as_str()),
-            table_sk: keys::message_sk(&msg.message_id),
+        |msg: &MailMessage| {
+            let TableKey { pk, sk } = keys::message(&msg.inbox_id, &msg.message_id);
+            PageKey {
+                partition: keys::messages_partition(&msg.inbox_id),
+                sort: msg.message_id.clone(),
+                table_pk: pk,
+                table_sk: sk,
+            }
         },
         |round| async move { services.list_messages(&round).await },
     )
@@ -334,7 +337,7 @@ pub async fn list_threads<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::ThreadList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let partition = keys::threads_partition(inbox.as_str());
+    let partition = keys::threads_partition(&inbox);
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
     let (before, after) = request.thread_bounds();
@@ -351,11 +354,14 @@ pub async fn list_threads<T: Services>(
     let (threads, next) = fill(
         &query,
         |thread: &ThreadState| request.filters.matches_thread(thread),
-        |thread: &ThreadState| PageKey {
-            partition: keys::threads_partition(thread.inbox_id.as_str()),
-            sort: keys::thread_time_sort(&thread.timestamp, &thread.thread_id),
-            table_pk: keys::inbox_pk(thread.inbox_id.as_str()),
-            table_sk: keys::thread_sk(&thread.thread_id),
+        |thread: &ThreadState| {
+            let TableKey { pk, sk } = keys::thread(&thread.inbox_id, &thread.thread_id);
+            PageKey {
+                partition: keys::threads_partition(&thread.inbox_id),
+                sort: keys::thread_time_sort(&thread.timestamp, &thread.thread_id),
+                table_pk: pk,
+                table_sk: sk,
+            }
         },
         |round| async move { services.list_threads(&round).await },
     )
@@ -387,7 +393,7 @@ pub async fn get_thread<T: Services>(
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::Thread>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let partition = keys::thread_messages_partition(inbox.as_str(), &thread_id);
+    let partition = keys::thread_messages_partition(&inbox, &thread_id);
     let start = cursor(&request, &partition, UNSCOPED)?;
 
     let view = state

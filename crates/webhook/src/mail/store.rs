@@ -113,6 +113,23 @@ pub struct SesSent<'a> {
     pub region: &'a str,
 }
 
+/// The SES reference row: which message an SES message id was sent as.
+/// Both fields are optional so a row missing either resolves to nothing
+/// rather than failing the read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SesRef {
+    pub inbox_id: Option<InboxId>,
+    pub message_id: Option<String>,
+}
+
+impl SesRef {
+    /// The inbox and message the row names, when it names both.
+    #[must_use]
+    pub fn into_parts(self) -> Option<(InboxId, String)> {
+        Some((self.inbox_id?, self.message_id?))
+    }
+}
+
 /// A thread plus one page of its messages, ascending.
 #[derive(Debug, Clone)]
 pub struct ThreadView {

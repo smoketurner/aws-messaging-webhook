@@ -12,6 +12,7 @@ pub mod aws;
 pub mod config;
 pub mod entry;
 pub mod error;
+pub mod events_keys;
 pub mod logging;
 pub mod mail;
 pub mod metrics;

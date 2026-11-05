@@ -6,6 +6,7 @@
 //! The response means the send is durably queued, not that SES has accepted
 //! it — the sender does that from the stream.
 
+use aws_messaging_webhook::mail::keys::TableKey;
 use aws_messaging_webhook::mail::send::{SendState, SendStatus};
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, MESSAGE_USER_LABEL_CAP, content, labels};
@@ -128,7 +129,10 @@ async fn the_send_state_starts_queued_and_holds_the_envelope() {
         .state
         .services
         .mail
-        .raw_item(&format!("OUTBOX#{message_id}"), "STATE")
+        .raw_item(&TableKey {
+            pk: format!("OUTBOX#{message_id}"),
+            sk: "STATE".to_owned(),
+        })
         .unwrap();
     let state: SendState = serde_dynamo::from_item(item).unwrap();
 

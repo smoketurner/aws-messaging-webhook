@@ -7,12 +7,13 @@
 //! most one SES call, whatever the sender is handed.
 
 use aws_messaging_webhook::actions::SendOutcome;
+use aws_messaging_webhook::mail::keys::TableKey;
 use aws_messaging_webhook::mail::send::{SendFailure, SendState, SendStatus};
 use aws_messaging_webhook::mail::sender::{
     Handled, Resolution, handle_send, resolve_unknown, sweep,
 };
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, ids, send, time};
+use aws_messaging_webhook::mail::{InboxId, ids, object_keys, time};
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -58,7 +59,10 @@ fn state_of(h: &Harness, message_id: &str) -> SendState {
         .state
         .services
         .mail
-        .raw_item(&format!("OUTBOX#{message_id}"), "STATE")
+        .raw_item(&TableKey {
+            pk: format!("OUTBOX#{message_id}"),
+            sk: "STATE".to_owned(),
+        })
         .unwrap();
     serde_dynamo::from_item(item).unwrap()
 }
@@ -330,7 +334,7 @@ async fn a_send_whose_spec_is_gone_fails_rather_than_looping() {
     h.state
         .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::NotFound);
+        .inject(object_keys::spec(&message_id), ObjectFailure::NotFound);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -352,7 +356,7 @@ async fn an_unreachable_object_store_hands_the_send_back() {
     h.state
         .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Transient);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Transient);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -365,7 +369,10 @@ async fn an_unreachable_object_store_hands_the_send_back() {
     assert!(state.requeued_at.is_some());
 
     // With the store back, the retry sends it.
-    h.state.services.objects.clear(&send::spec_key(&message_id));
+    h.state
+        .services
+        .objects
+        .clear(&object_keys::spec(&message_id));
     assert_eq!(
         handle_send(&h.state, &message_id, deadline())
             .await
@@ -381,7 +388,7 @@ async fn an_object_store_that_stays_unavailable_eventually_fails_the_send() {
     h.state
         .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Transient);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Transient);
 
     let mut attempts = 0;
     loop {
@@ -409,7 +416,7 @@ async fn an_object_store_refusal_fails_the_send_without_retrying() {
     h.state
         .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Permanent);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Permanent);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -443,7 +450,7 @@ async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id))
+            .contains(&object_keys::spec(&message_id))
     );
     let part_key = h
         .state
@@ -463,7 +470,7 @@ async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
     // spec. `load_spec` treats this as a permanent `SendSpecMissing` failure,
     // which settles and routes through `clear_outbox`.
     h.state.services.objects.seed(
-        send::spec_key(&message_id),
+        object_keys::spec(&message_id),
         axum::body::Bytes::from_static(b"not json"),
         "application/json",
     );
@@ -485,7 +492,7 @@ async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "the unparseable spec is the only record of which parts exist; it must be kept"
     );
     assert!(
@@ -507,7 +514,7 @@ async fn a_load_that_outlasts_the_deadline_hands_the_send_back_without_sending()
     h.state
         .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Hang);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Hang);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -1050,7 +1057,7 @@ async fn a_sent_message_leaves_no_outbox_objects_behind() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id))
+            .contains(&object_keys::spec(&message_id))
     );
 
     handle_send(&h.state, &message_id, deadline())
@@ -1061,7 +1068,7 @@ async fn a_sent_message_leaves_no_outbox_objects_behind() {
         !h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "the spec should be gone once the message has gone out"
     );
     let deleted = h.state.services.objects.calls(Op::Delete);
@@ -1081,7 +1088,7 @@ async fn a_failed_send_leaves_no_outbox_objects_behind() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id))
+            .contains(&object_keys::spec(&message_id))
     );
 
     *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
@@ -1096,7 +1103,7 @@ async fn a_failed_send_leaves_no_outbox_objects_behind() {
         !h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "the spec should be gone once the message has failed permanently"
     );
     let deleted = h.state.services.objects.calls(Op::Delete);
@@ -1116,7 +1123,7 @@ async fn a_send_abandoned_after_repeated_transient_failures_clears_its_outbox() 
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id))
+            .contains(&object_keys::spec(&message_id))
     );
 
     let mut attempts = 0;
@@ -1140,7 +1147,7 @@ async fn a_send_abandoned_after_repeated_transient_failures_clears_its_outbox() 
         !h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "the spec should be gone once the message has failed permanently"
     );
     let deleted = h.state.services.objects.calls(Op::Delete);
@@ -1160,7 +1167,7 @@ async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "an unresolved send must keep what it would be rebuilt from"
     );
 }
@@ -1175,7 +1182,7 @@ async fn stuck_unknown_with_attachment(h: &Harness) -> String {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id))
+            .contains(&object_keys::spec(&message_id))
     );
     *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
         reason: "connection reset".to_owned(),
@@ -1193,7 +1200,7 @@ fn assert_outbox_cleared(h: &Harness, message_id: &str) {
         !h.state
             .services
             .objects
-            .contains(&send::spec_key(message_id)),
+            .contains(&object_keys::spec(message_id)),
         "the spec should be gone once the send has settled"
     );
     let deleted = h.state.services.objects.calls(Op::Delete);
@@ -1249,7 +1256,7 @@ async fn an_operator_resending_an_unknown_send_keeps_its_outbox() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "a resumed send must keep what it will be rebuilt from"
     );
     assert_eq!(
@@ -1273,7 +1280,7 @@ async fn a_send_the_sweep_abandons_clears_its_outbox() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id))
+            .contains(&object_keys::spec(&message_id))
     );
 
     for _ in 0..CAP {
@@ -1311,7 +1318,7 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "a requeued send must keep what it will be rebuilt from"
     );
     assert!(
@@ -1349,7 +1356,7 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
         h.state
             .services
             .objects
-            .contains(&send::spec_key(&message_id)),
+            .contains(&object_keys::spec(&message_id)),
         "an unresolved send must keep what it would be rebuilt from"
     );
 }

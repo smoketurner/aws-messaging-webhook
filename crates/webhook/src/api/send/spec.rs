@@ -8,8 +8,8 @@ use axum::body::Bytes;
 use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::labels::SystemLabel;
-use crate::mail::send::{self as send_mod, Envelope, SendSpec, SendStatus, SpecAttachment};
-use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime};
+use crate::mail::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
+use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime, object_keys};
 use crate::state::Services;
 
 /// Builds the spec the sender will assemble the message from.
@@ -31,7 +31,7 @@ pub(super) fn build_spec(
                 // Inline bytes are uploaded under the id before the send is
                 // queued, so the sender finds them already there.
                 AttachmentSource::Inline(bytes) => (
-                    Some(send_mod::part_key(message_id, &attachment_id)),
+                    Some(object_keys::part(message_id, &attachment_id)),
                     None,
                     bytes.len() as u64,
                 ),
@@ -104,7 +104,7 @@ pub(super) async fn upload_spec<T: Services>(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing the send spec: {e}")))?;
     services
         .put_object_if_absent(
-            &send_mod::spec_key(&spec.message_id),
+            &object_keys::spec(&spec.message_id),
             Bytes::from(body),
             "application/json",
         )
@@ -187,7 +187,7 @@ pub(super) fn preview_of(send: &ValidatedSend) -> String {
 /// add a no-op call (and a noisy warning under a narrower grant). Best effort:
 /// the request has already failed, and a leftover object is harmless.
 pub(super) async fn discard_uploads<T: Services>(services: &T, spec: &SendSpec) {
-    let mut keys = vec![send_mod::spec_key(&spec.message_id)];
+    let mut keys = vec![object_keys::spec(&spec.message_id)];
     keys.extend(
         spec.attachments
             .iter()

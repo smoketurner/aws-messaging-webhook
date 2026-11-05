@@ -16,7 +16,7 @@ use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::mail::objects::{ObjectError, ObjectStore};
-use crate::mail::{InboxId, MAX_INBOUND_RAW_BYTES, MailMessage};
+use crate::mail::{InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, object_keys};
 
 /// The largest document [`store`] writes and [`load`] reads. Bodies come from
 /// a raw message of at most [`MAX_INBOUND_RAW_BYTES`] and JSON escaping grows
@@ -40,13 +40,6 @@ pub struct MessageContent {
     /// reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdicts: Option<serde_json::Value>,
-}
-
-/// Where a message's document lives: per inbox, because one inbound message
-/// delivered to two inboxes is two independent messages.
-#[must_use]
-pub fn content_key(inbox_id: &InboxId, message_id: &str) -> String {
-    format!("messages/{}/{message_id}.json", inbox_id.as_str())
 }
 
 /// Stores `content` for a message. A document already there is left alone:
@@ -83,7 +76,7 @@ pub async fn store<S: ObjectStore>(
     }
     objects
         .put_object_if_absent(
-            &content_key(inbox_id, message_id),
+            &object_keys::content(inbox_id, message_id),
             Bytes::from(body),
             "application/json",
         )
@@ -162,7 +155,7 @@ pub async fn load<S: ObjectStore>(
     objects: &S,
     msg: &MailMessage,
 ) -> Result<MessageContent, ObjectError> {
-    let key = content_key(&msg.inbox_id, &msg.message_id);
+    let key = object_keys::content(&msg.inbox_id, &msg.message_id);
     let body = match objects.get_object(&key, MAX_CONTENT_BYTES).await {
         Ok(body) => body,
         Err(ObjectError::NotFound) => {
@@ -302,14 +295,6 @@ mod tests {
         assert!(u64::try_from(body.len()).unwrap_or(u64::MAX) <= MAX_CONTENT_BYTES);
         let back: MessageContent = serde_json::from_slice(&body).unwrap();
         assert!(back.text.is_some_and(|t| t.contains("body")));
-    }
-
-    #[test]
-    fn content_key_is_scoped_to_the_inbox() {
-        assert_eq!(
-            content_key(&InboxId::new("support@example.com"), "01a0-msg"),
-            "messages/support@example.com/01a0-msg.json"
-        );
     }
 
     #[test]

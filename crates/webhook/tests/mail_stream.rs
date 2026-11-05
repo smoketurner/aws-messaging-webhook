@@ -83,14 +83,9 @@ fn sample_message() -> MailMessage {
 /// stream record carries.
 fn message_new_image(msg: &MailMessage) -> Value {
     let mut item: serde_dynamo::Item = serde_dynamo::to_item(msg).unwrap();
-    item.insert(
-        "pk".to_owned(),
-        AttributeValue::S(keys::inbox_pk(msg.inbox_id.as_str())),
-    );
-    item.insert(
-        "sk".to_owned(),
-        AttributeValue::S(keys::message_sk(&msg.message_id)),
-    );
+    let key = keys::message(&msg.inbox_id, &msg.message_id);
+    item.insert("pk".to_owned(), AttributeValue::S(key.pk));
+    item.insert("sk".to_owned(), AttributeValue::S(key.sk));
     serde_json::to_value(&item).unwrap()
 }
 

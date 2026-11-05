@@ -7,6 +7,8 @@
 use std::future::Future;
 
 use crate::mail::ingest::IngestOutcome;
+use crate::mail::objects::ObjectError;
+use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
@@ -46,6 +48,34 @@ impl ActionError {
         Self {
             kind: ActionErrorKind::Permanent,
             source,
+        }
+    }
+}
+
+/// A mail-store failure mapped onto the action retry contract: a throttled
+/// or unreachable table is worth a redelivery, and so is a version conflict,
+/// which a redelivery re-reads and applies onto the other writer's result.
+/// Anything else is logged and does not block the event from publishing.
+impl From<MailStoreError> for ActionError {
+    fn from(error: MailStoreError) -> Self {
+        match error {
+            MailStoreError::Transient(source) => Self::transient(source),
+            MailStoreError::Conflict => Self::transient(anyhow::anyhow!("mail store conflict")),
+            other @ (MailStoreError::NotFound
+            | MailStoreError::InvalidPageToken
+            | MailStoreError::LabelLimit(_)
+            | MailStoreError::Permanent(_)) => Self::permanent(anyhow::Error::from(other)),
+        }
+    }
+}
+
+impl From<ObjectError> for ActionError {
+    fn from(error: ObjectError) -> Self {
+        match error {
+            ObjectError::Transient(source) => Self::transient(source),
+            other @ (ObjectError::NotFound
+            | ObjectError::TooLarge { .. }
+            | ObjectError::Permanent(_)) => Self::permanent(anyhow::Error::from(other)),
         }
     }
 }
@@ -209,7 +239,7 @@ async fn apply_delivery_label<T: Services>(
         .services
         .resolve_ses_message(&event.mail.message_id)
         .await
-        .map_err(mail_store_error)?;
+        .map_err(ActionError::from)?;
     let Some((inbox, message_id)) = resolved else {
         return Ok(false);
     };
@@ -219,7 +249,7 @@ async fn apply_delivery_label<T: Services>(
         .services
         .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
         .await
-        .map_err(mail_store_error)?;
+        .map_err(ActionError::from)?;
 
     tracing::info!(
         message_id,
@@ -229,20 +259,6 @@ async fn apply_delivery_label<T: Services>(
         "labelled a sent message from its SES event"
     );
     Ok(true)
-}
-
-/// A mail-store failure during the delivery join, mapped onto the action
-/// retry contract: a throttled or unreachable table is worth a redelivery,
-/// anything else is logged and does not block the event from publishing.
-fn mail_store_error(error: crate::mail::store::MailStoreError) -> ActionError {
-    use crate::mail::store::MailStoreError;
-    match error {
-        MailStoreError::Transient(source) => ActionError::transient(source),
-        // A version conflict means someone else was writing the same message;
-        // a redelivery re-reads and applies the label onto their result.
-        MailStoreError::Conflict => ActionError::transient(anyhow::anyhow!("mail store conflict")),
-        other => ActionError::permanent(anyhow::Error::from(other)),
-    }
 }
 
 /// Suppresses each recipient independently. `PutSuppressedDestination` is
@@ -447,6 +463,34 @@ pub async fn run<T: Services>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mail_store_error_maps_onto_the_retry_contract() {
+        assert_eq!(
+            ActionError::from(MailStoreError::Transient(anyhow::anyhow!("x"))).kind,
+            ActionErrorKind::Transient
+        );
+        assert_eq!(
+            ActionError::from(MailStoreError::Conflict).kind,
+            ActionErrorKind::Transient
+        );
+        assert_eq!(
+            ActionError::from(MailStoreError::NotFound).kind,
+            ActionErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn an_object_error_maps_onto_the_retry_contract() {
+        assert_eq!(
+            ActionError::from(ObjectError::Transient(anyhow::anyhow!("x"))).kind,
+            ActionErrorKind::Transient
+        );
+        assert_eq!(
+            ActionError::from(ObjectError::NotFound).kind,
+            ActionErrorKind::Permanent
+        );
+    }
 
     /// The outcome log line's `action` field values are what dashboards
     /// and log queries match on.

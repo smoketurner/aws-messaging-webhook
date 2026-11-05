@@ -478,18 +478,6 @@ pub fn mark_transition<'a>(
     }
 }
 
-/// Where the spec for `message_id` lives.
-#[must_use]
-pub fn spec_key(message_id: &str) -> String {
-    format!("outbox/{message_id}/spec.json")
-}
-
-/// Where one attachment's bytes live before the message is sent.
-#[must_use]
-pub fn part_key(message_id: &str, attachment_id: &str) -> String {
-    format!("outbox/{message_id}/parts/{attachment_id}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,16 +575,5 @@ mod tests {
         assert_eq!(envelope.recipient_count(), 4);
         assert!(!envelope.is_empty());
         assert!(Envelope::default().is_empty());
-    }
-
-    #[test]
-    fn outbox_keys_all_sit_under_one_prefix() {
-        // Retention and cleanup both work by prefix, so every object for a
-        // message must be under it.
-        let prefix = "outbox/mid-1/";
-        assert!(spec_key("mid-1").starts_with(prefix));
-        assert!(part_key("mid-1", "att_1").starts_with(prefix));
-        assert_eq!(spec_key("mid-1"), "outbox/mid-1/spec.json");
-        assert_eq!(part_key("mid-1", "att_1"), "outbox/mid-1/parts/att_1");
     }
 }

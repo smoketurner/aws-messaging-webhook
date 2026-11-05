@@ -18,12 +18,13 @@ use std::future::Future;
 
 use serde::de::DeserializeOwned;
 
+use crate::mail::keys::{self, TableKey};
 use crate::mail::plan::{self, PlannedOp};
 use crate::mail::send::{SendKey, SendState, SendStatus, label_changes};
 use crate::mail::store::{EnqueueOutcome, MailStoreError, MarkOutcome};
 use crate::mail::thread::{AliasLookup, ThreadState, apply_label_patch, apply_message, new_thread};
 use crate::mail::txn::{TxnDecision, drop_taken_aliases};
-use crate::mail::{InboxId, InsertOutcome, MailMessage, RfcHit, keys};
+use crate::mail::{InboxId, InsertOutcome, MailMessage, RfcHit};
 
 /// How many times a cancelled transaction is replanned before the caller is
 /// told the write conflicted.
@@ -50,8 +51,7 @@ pub trait TxnStore {
     /// not deserialize.
     fn read_item<T: DeserializeOwned + Send>(
         &self,
-        pk: &str,
-        sk: &str,
+        key: TableKey,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send;
 
     /// Reads the RFC alias rows for `ids` (angle brackets already
@@ -88,12 +88,7 @@ async fn read_message<S: TxnStore>(
     inbox: &InboxId,
     message_id: &str,
 ) -> Result<Option<MailMessage>, MailStoreError> {
-    store
-        .read_item(
-            &keys::inbox_pk(inbox.as_str()),
-            &keys::message_sk(message_id),
-        )
-        .await
+    store.read_item(keys::message(inbox, message_id)).await
 }
 
 /// Reads a thread item.
@@ -102,9 +97,7 @@ async fn read_thread<S: TxnStore>(
     inbox: &InboxId,
     thread_id: &str,
 ) -> Result<Option<ThreadState>, MailStoreError> {
-    store
-        .read_item(&keys::inbox_pk(inbox.as_str()), &keys::thread_sk(thread_id))
-        .await
+    store.read_item(keys::thread(inbox, thread_id)).await
 }
 
 /// Reads a send-state item.
@@ -112,9 +105,7 @@ async fn read_send_state<S: TxnStore>(
     store: &S,
     message_id: &str,
 ) -> Result<Option<SendState>, MailStoreError> {
-    store
-        .read_item(&keys::outbox_pk(message_id), keys::outbox_sk())
-        .await
+    store.read_item(keys::send_state(message_id)).await
 }
 
 /// The thread this message lands in, before and after: `None` before means a

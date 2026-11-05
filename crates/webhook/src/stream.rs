@@ -39,12 +39,13 @@ use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
-use crate::mail::MailMessage;
+use crate::events_keys;
 use crate::mail::content;
 use crate::mail::events::{MailEvent, build_received_event, build_sent_event, build_ses_event};
 use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
+use crate::mail::{MailMessage, keys};
 use crate::metrics::names;
 use crate::model::ses_notification::SesNotification;
 use crate::model::{DomainEvent, Source};
@@ -101,6 +102,36 @@ enum RelayOutcome {
     Retry,
 }
 
+/// Which kind of item a stream record carries, told apart by `sk` alone: the
+/// relay consumes both the events table and the mail table, and their `sk`
+/// shapes do not overlap. (`MSG#` is the events table's `pk` prefix too,
+/// which is why classification never looks at `pk`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamItem {
+    /// An events-table event item.
+    Event,
+    /// An events-table per-message aggregate.
+    Aggregate,
+    /// A mail-table message item.
+    MailMessage,
+    /// Any other mail-table item, which never publishes.
+    Other,
+}
+
+impl StreamItem {
+    fn classify(sk: &str) -> Self {
+        if sk.starts_with(events_keys::EVENT_SK_PREFIX) {
+            Self::Event
+        } else if sk == events_keys::AGGREGATE_SK {
+            Self::Aggregate
+        } else if sk.starts_with(keys::MESSAGE_SK_PREFIX) {
+            Self::MailMessage
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Inserts `key: value` into a JSON object only when the value is present,
 /// keeping the status snapshot free of null fields.
 fn insert_opt(target: &mut Value, key: &str, value: Option<impl Into<Value>>) {
@@ -132,30 +163,33 @@ pub async fn handle_stream<T: Services>(
         let Some(sk) = image_str(new_image, "sk") else {
             continue;
         };
-        let published = if sk.starts_with("EVT#") {
-            // Event items are write-once, so only their INSERT publishes.
-            if record.event_name != "INSERT" {
-                continue;
+        let published = match StreamItem::classify(sk) {
+            StreamItem::Event => {
+                // Event items are write-once, so only their INSERT publishes.
+                if record.event_name != "INSERT" {
+                    continue;
+                }
+                publish_record(state, new_image).await
             }
-            publish_record(state, new_image).await
-        } else if sk == "AGG" {
-            // The per-message aggregate: publish a status delta when
-            // current_status transitions (INSERT of the first status, or a
-            // MODIFY that changes it) — not on count-only bumps.
-            publish_status_changed(state, new_image, &record.change.old_image).await
-        } else if sk.starts_with("MSG#") {
-            // Mail-table message item: an INSERT publishes the arrival of
-            // received mail, a MODIFY the send when it is the sent relabel.
-            if record.event_name == "INSERT" {
-                publish_mail_record(state, new_image).await
-            } else {
-                publish_mail_sent(state, new_image, &record.change.old_image).await
+            StreamItem::Aggregate => {
+                // The per-message aggregate: publish a status delta when
+                // current_status transitions (INSERT of the first status, or a
+                // MODIFY that changes it) — not on count-only bumps.
+                publish_status_changed(state, new_image, &record.change.old_image).await
             }
-        } else {
+            StreamItem::MailMessage => {
+                // Mail-table message item: an INSERT publishes the arrival of
+                // received mail, a MODIFY the send when it is the sent relabel.
+                if record.event_name == "INSERT" {
+                    publish_mail_record(state, new_image).await
+                } else {
+                    publish_mail_sent(state, new_image, &record.change.old_image).await
+                }
+            }
             // Every other mail-table item (STATE, META, THR#…, MSGAT#…,
             // THRAT#…, RFC, SESMSG#…, SENDKEY#…, SESCALL#…) never matches the
             // relay filter in production and never publishes here.
-            continue;
+            StreamItem::Other => continue,
         };
         // Reconstruction / no-op cases settle without a retry; only a
         // transient publish failure recruits redelivery of this record.
@@ -464,7 +498,7 @@ async fn publish_status_changed<T: Services>(
     if image_str(old_image, "current_status") == Some(current) {
         return RelayOutcome::Settled; // not a status transition — count-only change
     }
-    let Some(message_id) = image_str(new_image, "pk").and_then(|pk| pk.strip_prefix("MSG#")) else {
+    let Some(message_id) = image_str(new_image, "pk").and_then(events_keys::parse_partition) else {
         tracing::error!(
             event = "stream_agg_missing_pk",
             "aggregate item has no MSG# pk"
@@ -535,6 +569,43 @@ async fn publish_status_changed<T: Services>(
                 "failed to publish status change; will retry"
             );
             RelayOutcome::Retry
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MSG#` is an events-table `pk` and a mail-table `sk`: only the `sk`
+    /// decides, so an events-table record is never mistaken for mail.
+    #[test]
+    fn records_classify_by_sk_across_both_tables() {
+        let event_sk = events_keys::event_sk("2026-01-01T00:00:00.000Z", "sns-1");
+        let message = keys::message(&crate::mail::InboxId::new("support@example.com"), "mid-1");
+        assert_eq!(StreamItem::classify(&event_sk), StreamItem::Event);
+        assert_eq!(
+            StreamItem::classify(events_keys::AGGREGATE_SK),
+            StreamItem::Aggregate
+        );
+        assert_eq!(StreamItem::classify(&message.sk), StreamItem::MailMessage);
+        assert_eq!(
+            StreamItem::classify(&events_keys::partition("mid-1")),
+            StreamItem::MailMessage,
+            "an sk shaped like an events-table pk is a mail-table message sk"
+        );
+        for sk in [
+            keys::SEND_STATE_SK,
+            keys::INBOX_SK,
+            keys::RFC_ALIAS_SK,
+            keys::SES_REF_SK,
+            keys::SEND_KEY_SK,
+            "THR#tid-1",
+            "MSGAT#x",
+            "THRAT#x",
+            "SESCALL#x",
+        ] {
+            assert_eq!(StreamItem::classify(sk), StreamItem::Other, "{sk}");
         }
     }
 }

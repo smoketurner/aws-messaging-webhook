@@ -5,93 +5,99 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-/// Builds the `pk` for an inbox-scoped item.
-#[must_use]
-pub fn inbox_pk(inbox_id: &str) -> String {
-    format!("INBOX#{inbox_id}")
+use crate::mail::InboxId;
+use crate::mail::send::SendStatus;
+
+/// A mail-table item's primary key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableKey {
+    pub pk: String,
+    pub sk: String,
 }
 
-#[must_use]
-pub fn inbox_sk() -> &'static str {
-    "META"
-}
+pub const INBOX_SK: &str = "META";
 
 /// The index partition holding every inbox, so listing them is one query
 /// rather than a table scan.
-#[must_use]
-pub fn inboxes_partition() -> &'static str {
-    "INBOXES"
+pub const INBOXES_PARTITION: &str = "INBOXES";
+
+pub const SEND_STATE_SK: &str = "STATE";
+
+pub const RFC_ALIAS_SK: &str = "RFC";
+
+pub const SES_REF_SK: &str = "REF";
+
+pub const SEND_KEY_SK: &str = "KEY";
+
+/// The prefix of a message item's `sk`.
+pub const MESSAGE_SK_PREFIX: &str = "MSG#";
+
+const OUTBOX_PK_PREFIX: &str = "OUTBOX#";
+
+fn inbox_pk(inbox: &InboxId) -> String {
+    format!("INBOX#{}", inbox.as_str())
 }
 
-/// The `ByTime` partition listing an inbox's messages, sorted by message id.
+/// The inbox item's key.
 #[must_use]
-pub fn messages_partition(inbox_id: &str) -> String {
-    format!("INBOX#{inbox_id}#MSG")
+pub fn inbox(inbox: &InboxId) -> TableKey {
+    TableKey {
+        pk: inbox_pk(inbox),
+        sk: INBOX_SK.to_owned(),
+    }
 }
 
-/// The `ByTime` partition listing an inbox's threads, sorted by
-/// [`thread_time_sort`].
+/// A message item's key, in its inbox's partition.
 #[must_use]
-pub fn threads_partition(inbox_id: &str) -> String {
-    format!("INBOX#{inbox_id}#THR")
+pub fn message(inbox: &InboxId, message_id: &str) -> TableKey {
+    TableKey {
+        pk: inbox_pk(inbox),
+        sk: format!("{MESSAGE_SK_PREFIX}{message_id}"),
+    }
 }
 
-/// The `ByThread` partition listing one thread's messages, sorted by
-/// message id.
+/// A thread item's key, in its inbox's partition.
 #[must_use]
-pub fn thread_messages_partition(inbox_id: &str, thread_id: &str) -> String {
-    format!("THREAD#{inbox_id}#{thread_id}")
+pub fn thread(inbox: &InboxId, thread_id: &str) -> TableKey {
+    TableKey {
+        pk: inbox_pk(inbox),
+        sk: format!("THR#{thread_id}"),
+    }
 }
 
-/// A thread's `ByTime` sort key: last activity, then id, so a thread list
-/// orders by most recent activity.
-#[must_use]
-pub fn thread_time_sort(timestamp: &str, thread_id: &str) -> String {
-    format!("{timestamp}#{thread_id}")
-}
-
-#[must_use]
-pub fn message_sk(message_id: &str) -> String {
-    format!("MSG#{message_id}")
-}
-
-/// The send-state item's `pk`: a message's send state lives outside its
+/// The send-state item's key: a message's send state lives outside its
 /// inbox partition so the sender never needs the inbox id to find it.
 #[must_use]
-pub fn outbox_pk(message_id: &str) -> String {
-    format!("OUTBOX#{message_id}")
+pub fn send_state(message_id: &str) -> TableKey {
+    TableKey {
+        pk: format!("{OUTBOX_PK_PREFIX}{message_id}"),
+        sk: SEND_STATE_SK.to_owned(),
+    }
 }
 
+/// The message id a send-state item's `pk` names; `None` for any other `pk`.
 #[must_use]
-pub fn outbox_sk() -> &'static str {
-    "STATE"
+pub fn parse_outbox_pk(pk: &str) -> Option<&str> {
+    pk.strip_prefix(OUTBOX_PK_PREFIX)
 }
 
-#[must_use]
-pub fn thread_sk(thread_id: &str) -> String {
-    format!("THR#{thread_id}")
-}
-
-/// The RFC alias item's `pk`: `rfc_id` is the `Message-ID` value with the
+/// The RFC alias item's key: `rfc_id` is the `Message-ID` value with the
 /// surrounding `<`/`>` stripped.
 #[must_use]
-pub fn rfc_alias_pk(inbox_id: &str, rfc_id: &str) -> String {
-    format!("RFC#{inbox_id}#{rfc_id}")
+pub fn rfc_alias(inbox: &InboxId, rfc_id: &str) -> TableKey {
+    TableKey {
+        pk: format!("RFC#{}#{rfc_id}", inbox.as_str()),
+        sk: RFC_ALIAS_SK.to_owned(),
+    }
 }
 
+/// The item mapping an SES message id back to the message it sent.
 #[must_use]
-pub fn rfc_alias_sk() -> &'static str {
-    "RFC"
-}
-
-#[must_use]
-pub fn ses_ref_pk(ses_message_id: &str) -> String {
-    format!("SESMSG#{ses_message_id}")
-}
-
-#[must_use]
-pub fn ses_ref_sk() -> &'static str {
-    "REF"
+pub fn ses_ref(ses_message_id: &str) -> TableKey {
+    TableKey {
+        pk: format!("SESMSG#{ses_message_id}"),
+        sk: SES_REF_SK.to_owned(),
+    }
 }
 
 /// The `Idempotency-Key` item's `pk`: `key_hash` is the lowercase hex
@@ -101,9 +107,46 @@ pub fn send_key_pk(key_hash: &str) -> String {
     format!("SENDKEY#{key_hash}")
 }
 
+/// The `Idempotency-Key` item's key.
 #[must_use]
-pub fn send_key_sk() -> &'static str {
-    "KEY"
+pub fn send_key(key_hash: &str) -> TableKey {
+    TableKey {
+        pk: send_key_pk(key_hash),
+        sk: SEND_KEY_SK.to_owned(),
+    }
+}
+
+/// The `ByTime` partition listing an inbox's messages, sorted by message id.
+#[must_use]
+pub fn messages_partition(inbox: &InboxId) -> String {
+    format!("INBOX#{}#MSG", inbox.as_str())
+}
+
+/// The `ByTime` partition listing an inbox's threads, sorted by
+/// [`thread_time_sort`].
+#[must_use]
+pub fn threads_partition(inbox: &InboxId) -> String {
+    format!("INBOX#{}#THR", inbox.as_str())
+}
+
+/// The `ByThread` partition listing one thread's messages, sorted by
+/// message id.
+#[must_use]
+pub fn thread_messages_partition(inbox: &InboxId, thread_id: &str) -> String {
+    format!("THREAD#{}#{thread_id}", inbox.as_str())
+}
+
+/// A thread's `ByTime` sort key: last activity, then id, so a thread list
+/// orders by most recent activity.
+#[must_use]
+pub fn thread_time_sort(timestamp: &str, thread_id: &str) -> String {
+    format!("{timestamp}#{thread_id}")
+}
+
+/// The `ByStatus` partition listing the sends in `status`.
+#[must_use]
+pub fn send_status_partition(status: SendStatus) -> String {
+    format!("SENDSTATUS#{}", status.as_str())
 }
 
 /// A decoded page-token key: where in an index to resume.
@@ -190,15 +233,73 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn key(pk: &str, sk: &str) -> TableKey {
+        TableKey {
+            pk: pk.to_owned(),
+            sk: sk.to_owned(),
+        }
+    }
+
+    /// Every key is a storage format: these are the exact strings items
+    /// already in the table were written under.
     #[test]
-    fn key_builders_match_the_documented_shapes() {
-        assert_eq!(inbox_pk("support"), "INBOX#support");
-        assert_eq!(message_sk("mid-1"), "MSG#mid-1");
-        assert_eq!(outbox_pk("mid-1"), "OUTBOX#mid-1");
-        assert_eq!(thread_sk("tid-1"), "THR#tid-1");
-        assert_eq!(rfc_alias_pk("support", "abc@x"), "RFC#support#abc@x");
-        assert_eq!(ses_ref_pk("ses-1"), "SESMSG#ses-1");
+    fn key_builders_match_the_stored_shapes() {
+        let inbox_id = InboxId::new("support@example.com");
+        assert_eq!(inbox(&inbox_id), key("INBOX#support@example.com", "META"));
+        assert_eq!(
+            message(&inbox_id, "mid-1"),
+            key("INBOX#support@example.com", "MSG#mid-1")
+        );
+        assert_eq!(
+            thread(&inbox_id, "tid-1"),
+            key("INBOX#support@example.com", "THR#tid-1")
+        );
+        assert_eq!(send_state("mid-1"), key("OUTBOX#mid-1", "STATE"));
+        assert_eq!(
+            rfc_alias(&inbox_id, "abc@x"),
+            key("RFC#support@example.com#abc@x", "RFC")
+        );
+        assert_eq!(ses_ref("ses-1"), key("SESMSG#ses-1", "REF"));
+        assert_eq!(send_key("deadbeef"), key("SENDKEY#deadbeef", "KEY"));
         assert_eq!(send_key_pk("deadbeef"), "SENDKEY#deadbeef");
+    }
+
+    #[test]
+    fn index_keys_match_the_stored_shapes() {
+        let inbox_id = InboxId::new("support@example.com");
+        assert_eq!(INBOXES_PARTITION, "INBOXES");
+        assert_eq!(
+            messages_partition(&inbox_id),
+            "INBOX#support@example.com#MSG"
+        );
+        assert_eq!(
+            threads_partition(&inbox_id),
+            "INBOX#support@example.com#THR"
+        );
+        assert_eq!(
+            thread_messages_partition(&inbox_id, "tid-1"),
+            "THREAD#support@example.com#tid-1"
+        );
+        assert_eq!(
+            thread_time_sort("2026-01-01T00:00:00.000Z", "tid-1"),
+            "2026-01-01T00:00:00.000Z#tid-1"
+        );
+        for (status, partition) in [
+            (SendStatus::Queued, "SENDSTATUS#queued"),
+            (SendStatus::Sending, "SENDSTATUS#sending"),
+            (SendStatus::Sent, "SENDSTATUS#sent"),
+            (SendStatus::Failed, "SENDSTATUS#failed"),
+            (SendStatus::Unknown, "SENDSTATUS#unknown"),
+        ] {
+            assert_eq!(send_status_partition(status), partition);
+        }
+    }
+
+    #[test]
+    fn an_outbox_pk_parses_back_to_its_message_id() {
+        assert_eq!(parse_outbox_pk(&send_state("mid-1").pk), Some("mid-1"));
+        assert_eq!(parse_outbox_pk("INBOX#support@example.com"), None);
+        assert_eq!(parse_outbox_pk("OUTBOX#"), Some(""));
     }
 
     /// Tokens are handed to callers, so their JSON is a wire format: the

@@ -11,12 +11,13 @@
 
 use serde_dynamo::AttributeValue;
 
+use crate::mail::keys::{self, TableKey};
 use crate::mail::send::{SendKey, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, SesSent};
 use crate::mail::thread::{AliasLookup, ThreadState};
 use crate::mail::{
     Direction, MESSAGE_USER_LABEL_CAP, MailMessage, THREAD_USER_LABEL_CAP, ThreadSnapshot, ids,
-    keys, labels, strip_angle_brackets,
+    labels, strip_angle_brackets,
 };
 
 /// Which role a planned op plays in its transaction — used by
@@ -91,18 +92,27 @@ pub struct PlannedOp {
 }
 
 /// Builds a `serde_dynamo::Item` from `value`, inserting `pk`/`sk` (and any
-/// extra key attributes) alongside the serialized fields: the struct itself
+/// index key attributes) alongside the serialized fields: the struct itself
 /// carries no key attributes, so every planner adds them here.
 fn item_with_keys<T: serde::Serialize>(
     value: &T,
-    keys: impl IntoIterator<Item = (&'static str, AttributeValue)>,
+    key: TableKey,
+    index_keys: impl IntoIterator<Item = (&'static str, AttributeValue)>,
 ) -> Result<serde_dynamo::Item, MailStoreError> {
     let mut item: serde_dynamo::Item = serde_dynamo::to_item(value)
         .map_err(|e| MailStoreError::Permanent(anyhow::anyhow!("serializing item: {e}")))?;
-    for (name, value) in keys {
+    insert_table_key(&mut item, key);
+    for (name, value) in index_keys {
         item.inner_mut().insert(name.to_owned(), value);
     }
     Ok(item)
+}
+
+fn insert_table_key(item: &mut serde_dynamo::Item, TableKey { pk, sk }: TableKey) {
+    item.inner_mut()
+        .insert("pk".to_owned(), AttributeValue::S(pk));
+    item.inner_mut()
+        .insert("sk".to_owned(), AttributeValue::S(sk));
 }
 
 /// The inbox record and the item both stores write for it: its keys, and
@@ -126,12 +136,11 @@ pub fn inbox_item(
     };
     let item = item_with_keys(
         &record,
+        keys::inbox(inbox),
         [
-            ("pk", AttributeValue::S(keys::inbox_pk(inbox.as_str()))),
-            ("sk", AttributeValue::S(keys::inbox_sk().to_owned())),
             (
                 "gsi1pk",
-                AttributeValue::S(keys::inboxes_partition().to_owned()),
+                AttributeValue::S(keys::INBOXES_PARTITION.to_owned()),
             ),
             ("gsi1sk", AttributeValue::S(inbox.as_str().to_owned())),
         ],
@@ -169,11 +178,12 @@ fn message_label_op(
     set: Vec<(String, AttributeValue)>,
     remove: Vec<String>,
 ) -> PlannedOp {
+    let TableKey { pk, sk } = keys::message(&msg.inbox_id, &msg.message_id);
     PlannedOp {
         role: OpRole::Message,
         op: WriteOp::Update {
-            pk: keys::inbox_pk(msg.inbox_id.as_str()),
-            sk: keys::message_sk(&msg.message_id),
+            pk,
+            sk,
             set,
             remove,
             cond: Cond::VersionEquals(msg.version),
@@ -269,14 +279,10 @@ pub fn plan_enqueue(
 
     // First, so a cancellation names the key conflict before anything else.
     if let Some(key) = key {
-        let key_keys = [
-            ("pk", AttributeValue::S(keys::send_key_pk(&key.key_hash))),
-            ("sk", AttributeValue::S(keys::send_key_sk().to_owned())),
-        ];
         ops.push(PlannedOp {
             role: OpRole::IdempotencyKey,
             op: WriteOp::Put {
-                item: item_with_keys(key, key_keys)?,
+                item: item_with_keys(key, keys::send_key(&key.key_hash), [])?,
                 // An expired key is reusable; a live one is a replay, which
                 // the caller resolves by reading it back.
                 cond: Cond::NotExistsOrExpired { now_epoch },
@@ -329,21 +335,18 @@ fn version_or_absent(version: Option<u64>) -> Cond {
 /// are `Put`s, dropping the attributes on the settling write is what
 /// removes the entry.
 fn send_state_op(state: &SendState, cond: Cond) -> Result<PlannedOp, MailStoreError> {
-    let mut state_keys = vec![
-        ("pk", AttributeValue::S(keys::outbox_pk(&state.message_id))),
-        ("sk", AttributeValue::S(keys::outbox_sk().to_owned())),
-    ];
+    let mut index_keys = Vec::with_capacity(2);
     if state.send_status.is_swept() {
-        state_keys.push((
+        index_keys.push((
             "gsi3pk",
-            AttributeValue::S(format!("SENDSTATUS#{}", state.send_status.as_str())),
+            AttributeValue::S(keys::send_status_partition(state.send_status)),
         ));
-        state_keys.push(("gsi3sk", AttributeValue::S(state.message_id.clone())));
+        index_keys.push(("gsi3sk", AttributeValue::S(state.message_id.clone())));
     }
     Ok(PlannedOp {
         role: OpRole::SendState,
         op: WriteOp::Put {
-            item: item_with_keys(state, state_keys)?,
+            item: item_with_keys(state, keys::send_state(&state.message_id), index_keys)?,
             cond,
         },
     })
@@ -440,14 +443,7 @@ pub fn plan_mark(
         // Unconditioned: a redrive that marks the same send again should
         // rewrite this rather than cancel the whole transaction.
         let mut item = serde_dynamo::Item::default();
-        item.inner_mut().insert(
-            "pk".to_owned(),
-            AttributeValue::S(keys::ses_ref_pk(ses.message_id)),
-        );
-        item.inner_mut().insert(
-            "sk".to_owned(),
-            AttributeValue::S(keys::ses_ref_sk().to_owned()),
-        );
+        insert_table_key(&mut item, keys::ses_ref(ses.message_id));
         item.inner_mut().insert(
             "inbox_id".to_owned(),
             AttributeValue::S(msg.inbox_id.as_str().to_owned()),
@@ -515,34 +511,26 @@ fn message_put(msg: &MailMessage, thread_after: &ThreadState) -> Result<PlannedO
         item_source.thread_snapshot = Some(ThreadSnapshot::from(thread_after));
     }
 
-    let message_keys = [
-        (
-            "pk",
-            AttributeValue::S(keys::inbox_pk(item_source.inbox_id.as_str())),
-        ),
-        (
-            "sk",
-            AttributeValue::S(keys::message_sk(&item_source.message_id)),
-        ),
+    let index_keys = [
         (
             "gsi1pk",
-            AttributeValue::S(keys::messages_partition(item_source.inbox_id.as_str())),
+            AttributeValue::S(keys::messages_partition(&item_source.inbox_id)),
         ),
         ("gsi1sk", AttributeValue::S(item_source.message_id.clone())),
         (
             "gsi2pk",
-            AttributeValue::S(format!(
-                "THREAD#{}#{}",
-                item_source.inbox_id.as_str(),
-                item_source.thread_id
+            AttributeValue::S(keys::thread_messages_partition(
+                &item_source.inbox_id,
+                &item_source.thread_id,
             )),
         ),
         ("gsi2sk", AttributeValue::S(item_source.message_id.clone())),
     ];
+    let key = keys::message(&item_source.inbox_id, &item_source.message_id);
     Ok(PlannedOp {
         role: OpRole::Message,
         op: WriteOp::Put {
-            item: item_with_keys(&item_source, message_keys)?,
+            item: item_with_keys(&item_source, key, index_keys)?,
             cond: Cond::NotExists,
         },
     })
@@ -552,18 +540,10 @@ fn thread_put(
     thread_before: Option<&ThreadState>,
     thread_after: &ThreadState,
 ) -> Result<PlannedOp, MailStoreError> {
-    let thread_keys = [
-        (
-            "pk",
-            AttributeValue::S(keys::inbox_pk(thread_after.inbox_id.as_str())),
-        ),
-        (
-            "sk",
-            AttributeValue::S(keys::thread_sk(&thread_after.thread_id)),
-        ),
+    let index_keys = [
         (
             "gsi1pk",
-            AttributeValue::S(keys::threads_partition(thread_after.inbox_id.as_str())),
+            AttributeValue::S(keys::threads_partition(&thread_after.inbox_id)),
         ),
         (
             "gsi1sk",
@@ -577,7 +557,11 @@ fn thread_put(
     Ok(PlannedOp {
         role: OpRole::Thread,
         op: WriteOp::Put {
-            item: item_with_keys(thread_after, thread_keys)?,
+            item: item_with_keys(
+                thread_after,
+                keys::thread(&thread_after.inbox_id, &thread_after.thread_id),
+                index_keys,
+            )?,
             cond,
         },
     })
@@ -596,11 +580,12 @@ fn push_alias_row(
 ) {
     let stripped = strip_angle_brackets(rfc_id);
     if stripped.len() <= ALIAS_ID_MAX_BYTES {
+        let TableKey { pk, sk } = keys::rfc_alias(&msg.inbox_id, stripped);
         ops.push(PlannedOp {
             role: OpRole::RfcAlias,
             op: WriteOp::AliasFirstWriter {
-                pk: keys::rfc_alias_pk(msg.inbox_id.as_str(), stripped),
-                sk: keys::rfc_alias_sk().to_owned(),
+                pk,
+                sk,
                 message_id,
                 thread_id: msg.thread_id.clone(),
                 expires_at: msg.expires_at,
@@ -892,6 +877,10 @@ mod tests {
             item.inner().get("expires_at"),
             Some(&AttributeValue::N(msg.expires_at.to_string()))
         );
+        assert_eq!(
+            key_attributes(item),
+            pairs(&[("pk", "SESMSG#ses-1"), ("sk", "REF")])
+        );
     }
 
     #[test]
@@ -1068,6 +1057,115 @@ mod tests {
         // The envelope rides on the state item, not the message.
         let stored: SendState = serde_dynamo::from_item(item.clone()).unwrap();
         assert_eq!(stored.envelope.to, vec!["recipient@example.com"]);
+    }
+
+    /// The key and index attributes of a planned item, as stored.
+    fn key_attributes(item: &serde_dynamo::Item) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for (name, value) in item.inner() {
+            if (name == "pk" || name == "sk" || name.starts_with("gsi"))
+                && let AttributeValue::S(value) = value
+            {
+                found.push((name.clone(), value.clone()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = expected
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// Every item's key and index attributes are a storage format: these
+    /// are the exact names and values the table already holds.
+    #[test]
+    fn planned_items_carry_the_stored_key_attributes() {
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
+        msg.direction = Direction::Outbound;
+        let thread = new_thread(&msg);
+        let state = queued_state(&msg, None);
+        let key = crate::mail::send::SendKey {
+            key_hash: "keyhash".to_owned(),
+            inbox_id: msg.inbox_id.clone(),
+            message_id: msg.message_id.clone(),
+            thread_id: msg.thread_id.clone(),
+            request_hash: "abc".to_owned(),
+            route: "send".to_owned(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            expires_at: 1_800_000_000,
+        };
+        let ops = plan_enqueue(&msg, &state, Some(&key), None, &thread, 1_700_000_000).unwrap();
+
+        let thread_sort = format!("{}#tid-1", thread.timestamp);
+        let expected = [
+            (
+                OpRole::IdempotencyKey,
+                pairs(&[("pk", "SENDKEY#keyhash"), ("sk", "KEY")]),
+            ),
+            (
+                OpRole::Message,
+                pairs(&[
+                    ("pk", "INBOX#support@example.com"),
+                    ("sk", "MSG#mid-1"),
+                    ("gsi1pk", "INBOX#support@example.com#MSG"),
+                    ("gsi1sk", "mid-1"),
+                    ("gsi2pk", "THREAD#support@example.com#tid-1"),
+                    ("gsi2sk", "mid-1"),
+                ]),
+            ),
+            (
+                OpRole::SendState,
+                pairs(&[
+                    ("pk", "OUTBOX#mid-1"),
+                    ("sk", "STATE"),
+                    ("gsi3pk", "SENDSTATUS#queued"),
+                    ("gsi3sk", "mid-1"),
+                ]),
+            ),
+            (
+                OpRole::Thread,
+                pairs(&[
+                    ("pk", "INBOX#support@example.com"),
+                    ("sk", "THR#tid-1"),
+                    ("gsi1pk", "INBOX#support@example.com#THR"),
+                    ("gsi1sk", &thread_sort),
+                ]),
+            ),
+        ];
+        for (role, attributes) in expected {
+            let WriteOp::Put { item, .. } = &ops.iter().find(|o| o.role == role).unwrap().op else {
+                panic!("expected a Put for {role:?}");
+            };
+            assert_eq!(key_attributes(item), attributes, "{role:?}");
+        }
+        let WriteOp::AliasFirstWriter { pk, sk, .. } =
+            &ops.iter().find(|o| o.role == OpRole::RfcAlias).unwrap().op
+        else {
+            panic!("expected an alias");
+        };
+        assert_eq!(pk, "RFC#support@example.com#mid-1@example.com");
+        assert_eq!(sk, "RFC");
+
+        let (_, inbox) = inbox_item(
+            &InboxId::new("support@example.com"),
+            "2026-01-01T00:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            key_attributes(&inbox),
+            pairs(&[
+                ("pk", "INBOX#support@example.com"),
+                ("sk", "META"),
+                ("gsi1pk", "INBOXES"),
+                ("gsi1sk", "support@example.com"),
+            ])
+        );
     }
 
     /// A thread full of user labels must still take the system labels an

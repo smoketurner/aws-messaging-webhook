@@ -11,11 +11,11 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use aws_messaging_webhook::mail::flows;
-use aws_messaging_webhook::mail::keys::PageKey;
+use aws_messaging_webhook::mail::keys::{self, PageKey, TableKey};
 use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, WriteOp};
 use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
-    EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
+    EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, SesRef, ThreadView,
 };
 use aws_messaging_webhook::mail::thread::ThreadState;
 use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
@@ -135,11 +135,11 @@ impl MailMemoryStore {
         self.attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The raw item at `pk`/`sk`, for tests asserting on an item the
+    /// The raw item at `key`, for tests asserting on an item the
     /// `MailStore` trait has no reader for.
     #[must_use]
-    pub fn raw_item(&self, pk: &str, sk: &str) -> Option<Item> {
-        self.get_item(pk, sk)
+    pub fn raw_item(&self, key: &TableKey) -> Option<Item> {
+        self.get_item(key)
     }
 
     /// Seeds a `SendKey` item directly, bypassing the transaction path, so a
@@ -148,28 +148,21 @@ impl MailMemoryStore {
     /// `replay_key` — DynamoDB reaps expired rows lazily, so an expired row
     /// that is still present is exactly the case the read path must handle.
     pub fn seed_send_key(&self, key: &SendKey) {
-        use aws_messaging_webhook::mail::keys;
         #[expect(
             clippy::unwrap_used,
             reason = "test double: SendKey is always serializable; a poisoned lock is a test bug"
         )]
         let mut item: Item = serde_dynamo::to_item(key).unwrap();
-        item.inner_mut().insert(
-            "pk".to_owned(),
-            AttributeValue::S(keys::send_key_pk(&key.key_hash)),
-        );
-        item.inner_mut().insert(
-            "sk".to_owned(),
-            AttributeValue::S(keys::send_key_sk().to_owned()),
-        );
+        let TableKey { pk, sk } = keys::send_key(&key.key_hash);
+        item.inner_mut()
+            .insert("pk".to_owned(), AttributeValue::S(pk.clone()));
+        item.inner_mut()
+            .insert("sk".to_owned(), AttributeValue::S(sk.clone()));
         #[expect(
             clippy::unwrap_used,
             reason = "test double: a poisoned lock is a test bug"
         )]
-        self.inner.lock().unwrap().items.insert(
-            Self::key(&keys::send_key_pk(&key.key_hash), keys::send_key_sk()),
-            item,
-        );
+        self.inner.lock().unwrap().items.insert((pk, sk), item);
     }
 
     fn string_attr(item: &Item, name: &str) -> Option<String> {
@@ -430,7 +423,7 @@ impl MailMemoryStore {
         })
     }
 
-    fn get_item(&self, pk: &str, sk: &str) -> Option<Item> {
+    fn get_item(&self, key: &TableKey) -> Option<Item> {
         #[expect(
             clippy::unwrap_used,
             reason = "test double: a poisoned lock is a test bug"
@@ -439,26 +432,31 @@ impl MailMemoryStore {
             .lock()
             .unwrap()
             .items
-            .get(&Self::key(pk, sk))
+            .get(&Self::key(&key.pk, &key.sk))
             .cloned()
+    }
+
+    /// Reads one item by key, deserialized into `T`; `None` when absent.
+    fn read<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &TableKey,
+        context: &'static str,
+    ) -> Result<Option<T>, MailStoreError> {
+        self.get_item(key)
+            .map(|item| {
+                serde_dynamo::from_item(item)
+                    .map_err(|e| MailStoreError::Permanent(anyhow::anyhow!("{context}: {e}")))
+            })
+            .transpose()
     }
 }
 
 impl flows::TxnStore for MailMemoryStore {
     fn read_item<T: serde::de::DeserializeOwned + Send>(
         &self,
-        pk: &str,
-        sk: &str,
+        key: TableKey,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
-        let result = self
-            .get_item(pk, sk)
-            .map(|item| {
-                serde_dynamo::from_item(item).map_err(|e| {
-                    MailStoreError::Permanent(anyhow::anyhow!("deserializing item: {e}"))
-                })
-            })
-            .transpose();
-        std::future::ready(result)
+        std::future::ready(self.read(&key, "GetItem"))
     }
 
     fn read_aliases(
@@ -466,25 +464,16 @@ impl flows::TxnStore for MailMemoryStore {
         inbox: &InboxId,
         ids: &[String],
     ) -> impl Future<Output = Result<HashMap<String, RfcHit>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
         let mut found = HashMap::new();
         for id in ids {
-            let Some(item) = self.get_item(
-                &keys::rfc_alias_pk(inbox.as_str(), id),
-                keys::rfc_alias_sk(),
-            ) else {
+            let Some(item) = self.get_item(&keys::rfc_alias(inbox, id)) else {
                 continue;
             };
-            let Some(thread_id) = Self::string_attr(&item, "thread_id") else {
+            // A row without the alias shape maps nothing.
+            let Ok(hit) = serde_dynamo::from_item::<_, RfcHit>(item) else {
                 continue;
             };
-            found.insert(
-                id.clone(),
-                RfcHit {
-                    message_id: Self::string_attr(&item, "message_id"),
-                    thread_id,
-                },
-            );
+            found.insert(id.clone(), hit);
         }
         std::future::ready(Ok(found))
     }
@@ -508,14 +497,7 @@ impl MailStore for MailMemoryStore {
         &self,
         inbox: &InboxId,
     ) -> impl Future<Output = Result<Option<Inbox>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let item = self.get_item(&keys::inbox_pk(inbox.as_str()), keys::inbox_sk());
-        std::future::ready(match item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item).map(Some).map_err(|e| {
-                MailStoreError::Permanent(anyhow::anyhow!("deserializing inbox: {e}"))
-            }),
-        })
+        std::future::ready(self.read(&keys::inbox(inbox), "GetItem(inbox)"))
     }
 
     fn ensure_inbox(
@@ -523,13 +505,13 @@ impl MailStore for MailMemoryStore {
         inbox: &InboxId,
         now: &str,
     ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
         #[expect(
             clippy::unwrap_used,
             reason = "test double: a poisoned lock is a test bug"
         )]
         let mut guard = self.inner.lock().unwrap();
-        let key = Self::key(&keys::inbox_pk(inbox.as_str()), keys::inbox_sk());
+        let TableKey { pk, sk } = keys::inbox(inbox);
+        let key = Self::key(&pk, &sk);
         if let Some(existing) = guard.items.get(&key) {
             let result = serde_dynamo::from_item(existing.clone()).map_err(|e| {
                 MailStoreError::Permanent(anyhow::anyhow!("deserializing inbox: {e}"))
@@ -549,13 +531,7 @@ impl MailStore for MailMemoryStore {
         inbox: &InboxId,
         message_id: &str,
     ) -> impl Future<Output = Result<bool, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let exists = self
-            .get_item(
-                &keys::inbox_pk(inbox.as_str()),
-                &keys::message_sk(message_id),
-            )
-            .is_some();
+        let exists = self.get_item(&keys::message(inbox, message_id)).is_some();
         std::future::ready(Ok(exists))
     }
 
@@ -571,16 +547,7 @@ impl MailStore for MailMemoryStore {
         &self,
         key_hash: &str,
     ) -> impl Future<Output = Result<Option<SendKey>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let result = self
-            .get_item(&keys::send_key_pk(key_hash), keys::send_key_sk())
-            .map(|item| {
-                serde_dynamo::from_item(item).map_err(|e| {
-                    MailStoreError::Permanent(anyhow::anyhow!("deserializing send key: {e}"))
-                })
-            })
-            .transpose();
-        std::future::ready(result)
+        std::future::ready(self.read(&keys::send_key(key_hash), "GetItem(send key)"))
     }
 
     fn enqueue_send(
@@ -597,7 +564,6 @@ impl MailStore for MailMemoryStore {
         &self,
         ses_message_id: &str,
     ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
         #[expect(
             clippy::unwrap_used,
             reason = "test double: a poisoned lock is a test bug"
@@ -616,14 +582,9 @@ impl MailStore for MailMemoryStore {
             }
             None => {}
         }
-        let resolved = self
-            .get_item(&keys::ses_ref_pk(ses_message_id), keys::ses_ref_sk())
-            .and_then(|item| {
-                let inbox = Self::string_attr(&item, "inbox_id")?;
-                let message_id = Self::string_attr(&item, "message_id")?;
-                Some((InboxId::new(&inbox), message_id))
-            });
-        std::future::ready(Ok(resolved))
+        let row: Result<Option<SesRef>, MailStoreError> =
+            self.read(&keys::ses_ref(ses_message_id), "GetItem(ses ref)");
+        std::future::ready(row.map(|row| row.and_then(SesRef::into_parts)))
     }
 
     fn list_by_status(
@@ -643,7 +604,7 @@ impl MailStore for MailMemoryStore {
             start: None,
         };
         let page = self.query_page(
-            &format!("SENDSTATUS#{}", status.as_str()),
+            &keys::send_status_partition(status),
             "gsi3pk",
             "gsi3sk",
             &query,
@@ -655,16 +616,7 @@ impl MailStore for MailMemoryStore {
         &self,
         message_id: &str,
     ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let result = self
-            .get_item(&keys::outbox_pk(message_id), keys::outbox_sk())
-            .map(|item| {
-                serde_dynamo::from_item(item).map_err(|e| {
-                    MailStoreError::Permanent(anyhow::anyhow!("deserializing send state: {e}"))
-                })
-            })
-            .transpose();
-        std::future::ready(result)
+        std::future::ready(self.read(&keys::send_state(message_id), "GetItem(send state)"))
     }
 
     fn claim_send(
@@ -708,17 +660,7 @@ impl MailStore for MailMemoryStore {
         inbox: &InboxId,
         message_id: &str,
     ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let item = self.get_item(
-            &keys::inbox_pk(inbox.as_str()),
-            &keys::message_sk(message_id),
-        );
-        std::future::ready(match item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item).map(Some).map_err(|e| {
-                MailStoreError::Permanent(anyhow::anyhow!("deserializing message: {e}"))
-            }),
-        })
+        std::future::ready(self.read(&keys::message(inbox, message_id), "GetItem(message)"))
     }
 
     fn list_inboxes(
@@ -726,7 +668,6 @@ impl MailStore for MailMemoryStore {
         limit: usize,
         start: Option<PageKey>,
     ) -> impl Future<Output = Result<Page<Inbox>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
         let query = ListQuery {
             inbox: InboxId::new(""),
             limit,
@@ -735,14 +676,14 @@ impl MailStore for MailMemoryStore {
             ascending: true,
             start,
         };
-        std::future::ready(self.query_page(keys::inboxes_partition(), "gsi1pk", "gsi1sk", &query))
+        std::future::ready(self.query_page(keys::INBOXES_PARTITION, "gsi1pk", "gsi1sk", &query))
     }
 
     fn list_messages(
         &self,
         query: &ListQuery,
     ) -> impl Future<Output = Result<Page<MailMessage>, MailStoreError>> + Send {
-        let partition = aws_messaging_webhook::mail::keys::messages_partition(query.inbox.as_str());
+        let partition = keys::messages_partition(&query.inbox);
         std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
     }
 
@@ -750,7 +691,7 @@ impl MailStore for MailMemoryStore {
         &self,
         query: &ListQuery,
     ) -> impl Future<Output = Result<Page<ThreadState>, MailStoreError>> + Send {
-        let partition = aws_messaging_webhook::mail::keys::threads_partition(query.inbox.as_str());
+        let partition = keys::threads_partition(&query.inbox);
         std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
     }
 
@@ -761,21 +702,14 @@ impl MailStore for MailMemoryStore {
         limit: usize,
         start: Option<PageKey>,
     ) -> impl Future<Output = Result<Option<ThreadView>, MailStoreError>> + Send {
-        use aws_messaging_webhook::mail::keys;
-        let thread = self.get_item(&keys::inbox_pk(inbox.as_str()), &keys::thread_sk(thread_id));
-        let Some(thread) = thread else {
-            return std::future::ready(Ok(None));
-        };
-        let thread: ThreadState = match serde_dynamo::from_item(thread) {
-            Ok(thread) => thread,
-            Err(e) => {
-                return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
-                    "deserializing thread: {e}"
-                ))));
-            }
-        };
+        let thread: ThreadState =
+            match self.read(&keys::thread(inbox, thread_id), "GetItem(thread)") {
+                Ok(Some(thread)) => thread,
+                Ok(None) => return std::future::ready(Ok(None)),
+                Err(error) => return std::future::ready(Err(error)),
+            };
         let messages = self.query_page(
-            &keys::thread_messages_partition(inbox.as_str(), thread_id),
+            &keys::thread_messages_partition(inbox, thread_id),
             "gsi2pk",
             "gsi2sk",
             &ListQuery {
@@ -838,11 +772,7 @@ mod tests {
     }
 
     fn alias_row(store: &MailMemoryStore, id: &str) -> Option<RfcHit> {
-        use aws_messaging_webhook::mail::keys;
-        let item = store.get_item(
-            &keys::rfc_alias_pk("support@example.com", id),
-            keys::rfc_alias_sk(),
-        )?;
+        let item = store.get_item(&keys::rfc_alias(&InboxId::new("support@example.com"), id))?;
         Some(RfcHit {
             message_id: MailMemoryStore::string_attr(&item, "message_id"),
             thread_id: MailMemoryStore::string_attr(&item, "thread_id")?,
@@ -961,13 +891,12 @@ mod tests {
     }
 
     fn alias_op(id: &str, message_id: Option<&str>, thread_id: &str) -> PlannedOp {
-        use aws_messaging_webhook::mail::keys;
         use aws_messaging_webhook::mail::plan::OpRole;
         PlannedOp {
             role: OpRole::RfcAlias,
             op: WriteOp::AliasFirstWriter {
-                pk: keys::rfc_alias_pk("support@example.com", id),
-                sk: keys::rfc_alias_sk().to_owned(),
+                pk: keys::rfc_alias(&InboxId::new("support@example.com"), id).pk,
+                sk: keys::RFC_ALIAS_SK.to_owned(),
                 message_id: message_id.map(str::to_owned),
                 thread_id: thread_id.to_owned(),
                 expires_at: 0,

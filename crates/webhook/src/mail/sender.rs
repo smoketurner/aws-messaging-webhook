@@ -28,10 +28,10 @@ use crate::actions::{RawSend, SendOutcome};
 use crate::mail::build::{BuildError, BuiltPart, build_outbound};
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
 use crate::mail::objects::ObjectError;
-use crate::mail::send::{self, SendFailure, SendSpec, SendState, SendStatus};
+use crate::mail::send::{SendFailure, SendSpec, SendState, SendStatus};
 use crate::mail::store::{MailStoreError, MarkOutcome, SesSent};
 use crate::mail::url_policy;
-use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
+use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, keys, object_keys, time};
 use crate::metrics::names;
 use crate::state::{AppState, Services};
 
@@ -106,16 +106,14 @@ pub async fn handle_sender_stream<T: Services>(
 /// The message id a record is asking to be sent, if it is asking at all.
 fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<String> {
     let new_image = &record.change.new_image;
-    if crate::stream::image_str(new_image, "sk")? != "STATE" {
+    if crate::stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
         return None;
     }
     if crate::stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
         return None;
     }
 
-    let message_id = crate::stream::image_str(new_image, "pk")?
-        .strip_prefix("OUTBOX#")?
-        .to_owned();
+    let message_id = keys::parse_outbox_pk(crate::stream::image_str(new_image, "pk")?)?.to_owned();
 
     match record.event_name.as_str() {
         "INSERT" => Some(message_id),
@@ -731,7 +729,7 @@ async fn record<T: Services>(
 /// out.
 async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     let message_id = &finished.message_id;
-    let mut keys = vec![send::spec_key(message_id)];
+    let mut keys = vec![object_keys::spec(message_id)];
 
     // The spec names the parts, so it is read before it is removed. When that
     // read fails for any reason but absence — including bytes that are present
@@ -740,7 +738,7 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     // find them.
     match state
         .services
-        .get_object(&send::spec_key(message_id), MAX_OUTBOUND_RAW_BYTES)
+        .get_object(&object_keys::spec(message_id), MAX_OUTBOUND_RAW_BYTES)
         .await
     {
         Ok(bytes) => {
@@ -757,7 +755,7 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
                 }
             };
             for attachment in &spec.attachments {
-                keys.push(send::part_key(message_id, &attachment.attachment_id));
+                keys.push(object_keys::part(message_id, &attachment.attachment_id));
             }
         }
         Err(ObjectError::NotFound) => {}
@@ -840,7 +838,7 @@ async fn load_spec<T: Services>(
     state: &AppState<T>,
     message_id: &str,
 ) -> Result<SendSpec, LoadError> {
-    let key = send::spec_key(message_id);
+    let key = object_keys::spec(message_id);
     let bytes = state
         .services
         .get_object(&key, MAX_OUTBOUND_RAW_BYTES)
@@ -895,7 +893,7 @@ async fn load_parts<T: Services>(
         // An earlier attempt may already have fetched and stored it. The
         // spec is written once at enqueue and never rewritten, so the stored
         // object is the only record that the fetch happened.
-        let stored_key = send::part_key(message_id, &attachment.attachment_id);
+        let stored_key = object_keys::part(message_id, &attachment.attachment_id);
         match state
             .services
             .get_object(&stored_key, MAX_OUTBOUND_RAW_BYTES)

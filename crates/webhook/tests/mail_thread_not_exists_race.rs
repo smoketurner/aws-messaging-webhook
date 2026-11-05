@@ -22,6 +22,7 @@ use serde::de::DeserializeOwned;
 use webhook_test_support::mail_memory::{MailMemoryStore, sample_message};
 
 use aws_messaging_webhook::mail::flows::{self, TxnOutcome, TxnStore};
+use aws_messaging_webhook::mail::keys::TableKey;
 use aws_messaging_webhook::mail::plan::{self, PlannedOp};
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
 use aws_messaging_webhook::mail::thread::{AliasLookup, new_thread};
@@ -42,10 +43,9 @@ struct ConcurrentThreadWinner<'s> {
 impl TxnStore for ConcurrentThreadWinner<'_> {
     fn read_item<T: DeserializeOwned + Send>(
         &self,
-        pk: &str,
-        sk: &str,
+        key: TableKey,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
-        self.inner.read_item::<T>(pk, sk)
+        self.inner.read_item::<T>(key)
     }
 
     fn read_aliases(

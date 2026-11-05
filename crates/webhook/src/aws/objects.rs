@@ -13,7 +13,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use axum::body::Bytes;
 
-use crate::aws::{self, AwsServices};
+use crate::aws::{AwsServices, FromSdkFailure};
 use crate::mail::ObjectMeta;
 use crate::mail::PutOutcome;
 use crate::mail::objects::{ObjectError, ObjectStore};
@@ -33,9 +33,8 @@ fn timeout_override() -> S3ConfigBuilder {
 /// `s3:ListBucket` grant is what makes this a real 404 rather than a 403) is
 /// [`ObjectError::NotFound`]; a 403 is [`ObjectError::Permanent`]; timeouts,
 /// dispatch/response failures, throttling and 5xx are
-/// [`ObjectError::Transient`]; everything else is permanent. Shares its
-/// transient/permanent classification with `aws.rs`'s
-/// `classify_action_error` via `aws::sdk_error_is_transient`.
+/// [`ObjectError::Transient`]; everything else is permanent. The
+/// transient/permanent split is the shared [`FromSdkFailure::from_sdk`].
 fn classify_object_error<E>(context: &'static str, error: &SdkError<E>) -> ObjectError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
@@ -52,11 +51,16 @@ where
             _ => {}
         }
     }
-    let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if aws::sdk_error_is_transient(error) {
-        ObjectError::Transient(source)
-    } else {
-        ObjectError::Permanent(source)
+    ObjectError::from_sdk(context, error)
+}
+
+impl FromSdkFailure for ObjectError {
+    fn transient(source: anyhow::Error) -> Self {
+        Self::Transient(source)
+    }
+
+    fn permanent(source: anyhow::Error) -> Self {
+        Self::Permanent(source)
     }
 }
 

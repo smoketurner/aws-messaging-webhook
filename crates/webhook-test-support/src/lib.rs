@@ -46,14 +46,14 @@ use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
 use aws_messaging_webhook::mail::keys::PageKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
-use aws_messaging_webhook::mail::send::{self, SendKey, SendSpec, SendState, SendStatus};
+use aws_messaging_webhook::mail::send::{SendKey, SendSpec, SendState, SendStatus};
 use aws_messaging_webhook::mail::store::{
     EnqueueOutcome, ListQuery, MarkOutcome, Page, ThreadView,
 };
 use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
 use aws_messaging_webhook::mail::thread::ThreadState;
 use aws_messaging_webhook::mail::{
-    Inbox, InboxId, InsertOutcome, MailMessage, ObjectMeta, PutOutcome,
+    Inbox, InboxId, InsertOutcome, MailMessage, ObjectMeta, PutOutcome, object_keys,
 };
 use aws_messaging_webhook::model::DomainEvent;
 use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
@@ -489,7 +489,7 @@ impl Harness {
             .state
             .services
             .objects
-            .get(&send::spec_key(message_id))
+            .get(&object_keys::spec(message_id))
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }

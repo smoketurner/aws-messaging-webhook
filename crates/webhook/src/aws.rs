@@ -23,9 +23,11 @@ use aws_smithy_types::Blob;
 use aws_smithy_types::error::display::DisplayErrorContext;
 
 use crate::actions::{
-    ActionError, FeedbackStatus, RawSend, SendOutcome, SesApi, SmsVoiceApi, SuppressionReason,
+    ActionError, ActionErrorKind, FeedbackStatus, RawSend, SendOutcome, SesApi, SmsVoiceApi,
+    SuppressionReason,
 };
 use crate::config::{Config, MailConfig};
+use crate::events_keys;
 use crate::mail::fetch::{AttachmentFetcher, FetchError, Fetched, HttpAttachmentFetcher};
 use crate::metrics::names;
 use crate::model::DomainEvent;
@@ -133,14 +135,6 @@ impl AwsServices {
     }
 }
 
-fn partition_key(record: &EventRecord) -> String {
-    format!("MSG#{}", record.aggregate_id)
-}
-
-fn event_sort_key(record: &EventRecord) -> String {
-    format!("EVT#{}#{}", record.event_timestamp, record.sns_message_id)
-}
-
 /// The per-message aggregate's `current_status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregateStatus {
@@ -207,8 +201,14 @@ fn aggregate_update(
     let mut add_clause = None;
     let mut builder = Update::builder()
         .table_name(table_name)
-        .key("pk", AttributeValue::S(partition_key(record)))
-        .key("sk", AttributeValue::S("AGG".to_owned()))
+        .key(
+            "pk",
+            AttributeValue::S(events_keys::partition(&record.aggregate_id)),
+        )
+        .key(
+            "sk",
+            AttributeValue::S(events_keys::AGGREGATE_SK.to_owned()),
+        )
         .expression_attribute_names("#source", "source")
         .expression_attribute_values(":source", AttributeValue::S(record.source_label().into()))
         .expression_attribute_values(":ts", AttributeValue::S(record.event_timestamp.clone()))
@@ -371,8 +371,14 @@ fn status_transition(
     let mut condition = "attribute_not_exists(current_status)".to_owned();
     let mut builder = Update::builder()
         .table_name(table_name)
-        .key("pk", AttributeValue::S(partition_key(record)))
-        .key("sk", AttributeValue::S("AGG".to_owned()))
+        .key(
+            "pk",
+            AttributeValue::S(events_keys::partition(&record.aggregate_id)),
+        )
+        .key(
+            "sk",
+            AttributeValue::S(events_keys::AGGREGATE_SK.to_owned()),
+        )
         .update_expression("SET current_status = :status")
         .expression_attribute_values(":status", AttributeValue::S(status.as_str().to_owned()));
     for (i, prior) in status.allowed_priors().iter().enumerate() {
@@ -403,8 +409,17 @@ impl EventStore for AwsServices {
     ) -> Result<PersistOutcome, StoreError> {
         let put = Put::builder()
             .table_name(&self.config.table_name)
-            .item("pk", AttributeValue::S(partition_key(record)))
-            .item("sk", AttributeValue::S(event_sort_key(record)))
+            .item(
+                "pk",
+                AttributeValue::S(events_keys::partition(&record.aggregate_id)),
+            )
+            .item(
+                "sk",
+                AttributeValue::S(events_keys::event_sk(
+                    &record.event_timestamp,
+                    &record.sns_message_id,
+                )),
+            )
             .item(
                 "raw_body",
                 AttributeValue::B(Blob::new(record.raw_body.to_vec())),
@@ -576,19 +591,45 @@ where
     }
 }
 
-/// Maps an SDK failure onto the action retry policy: network faults,
-/// timeouts, throttling, and 5xx are transient (worth an SNS redelivery);
-/// everything else — validation, access denied, bad configuration — is
-/// permanent (log and move on).
-fn classify_action_error<E>(context: &'static str, error: &SdkError<E>) -> ActionError
-where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-{
-    let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if sdk_error_is_transient(error) {
-        ActionError::transient(source)
-    } else {
-        ActionError::permanent(source)
+/// An error type with a transient and a permanent case, which an SDK failure
+/// maps onto through [`sdk_error_is_transient`].
+pub(crate) trait FromSdkFailure: Sized {
+    fn transient(source: anyhow::Error) -> Self;
+
+    fn permanent(source: anyhow::Error) -> Self;
+
+    /// Maps an SDK failure onto the shared retry policy: network faults,
+    /// timeouts, throttling, and 5xx are transient (worth a retry);
+    /// everything else — validation, access denied, bad configuration — is
+    /// permanent.
+    fn from_sdk<E>(context: &'static str, error: &SdkError<E>) -> Self
+    where
+        E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    {
+        let source = anyhow!("{context}: {}", DisplayErrorContext(error));
+        if sdk_error_is_transient(error) {
+            Self::transient(source)
+        } else {
+            Self::permanent(source)
+        }
+    }
+}
+
+/// A transient action failure is worth an SNS redelivery; a permanent one is
+/// logged and the event still publishes.
+impl FromSdkFailure for ActionError {
+    fn transient(source: anyhow::Error) -> Self {
+        Self {
+            kind: ActionErrorKind::Transient,
+            source,
+        }
+    }
+
+    fn permanent(source: anyhow::Error) -> Self {
+        Self {
+            kind: ActionErrorKind::Permanent,
+            source,
+        }
     }
 }
 
@@ -618,7 +659,7 @@ impl SmsVoiceApi for AwsServices {
                 tracing::debug!(message_id, "message has no feedback record; skipping");
                 Ok(())
             }
-            Err(error) => Err(classify_action_error("PutMessageFeedback", &error)),
+            Err(error) => Err(ActionError::from_sdk("PutMessageFeedback", &error)),
         }
     }
 
@@ -633,7 +674,7 @@ impl SmsVoiceApi for AwsServices {
             .opted_out_number(phone_number)
             .send()
             .await
-            .map_err(|e| classify_action_error("PutOptedOutNumber", &e))?;
+            .map_err(|e| ActionError::from_sdk("PutOptedOutNumber", &e))?;
         Ok(())
     }
 
@@ -655,7 +696,7 @@ impl SmsVoiceApi for AwsServices {
             Err(SdkError::ServiceError(ctx)) if ctx.err().is_resource_not_found_exception() => {
                 Ok(())
             }
-            Err(error) => Err(classify_action_error("DeleteOptedOutNumber", &error)),
+            Err(error) => Err(ActionError::from_sdk("DeleteOptedOutNumber", &error)),
         }
     }
 }
@@ -676,7 +717,7 @@ impl SesApi for AwsServices {
             .reason(reason)
             .send()
             .await
-            .map_err(|e| classify_action_error("PutSuppressedDestination", &e))?;
+            .map_err(|e| ActionError::from_sdk("PutSuppressedDestination", &e))?;
         Ok(())
     }
 
