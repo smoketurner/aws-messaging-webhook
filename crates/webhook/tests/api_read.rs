@@ -148,7 +148,7 @@ async fn a_page_token_from_another_inbox_is_rejected() {
     h.state
         .services
         .ensure_inbox(
-            &InboxId("billing@example.com".to_owned()),
+            &InboxId::new("billing@example.com"),
             "2026-01-01T00:00:00.000Z",
         )
         .await
@@ -216,7 +216,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
     h.state
         .services
         .ensure_inbox(
-            &InboxId("billing@example.com".to_owned()),
+            &InboxId::new("billing@example.com"),
             "2026-01-01T00:00:00.000Z",
         )
         .await
@@ -395,7 +395,7 @@ async fn fetching_one_message_returns_the_body_a_list_omits() {
     let id = list["messages"][0]["message_id"].as_str().unwrap();
     content::store(
         &h.state.services,
-        &InboxId(TEST_INBOX.to_owned()),
+        &InboxId::new(TEST_INBOX),
         id,
         &MessageContent {
             text: Some("the full body".to_owned()),

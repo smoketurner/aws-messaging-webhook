@@ -168,22 +168,22 @@ impl ListRequest {
             match key.as_ref() {
                 "limit" => match value.parse::<usize>() {
                     Ok(limit) if (1..=MAX_LIMIT).contains(&limit) => request.limit = limit,
-                    _ => errors.push(field(
+                    _ => errors.push(FieldError::new(
                         "limit",
                         format!("must be a whole number from 1 to {MAX_LIMIT}"),
                     )),
                 },
                 "ascending" => match parse_bool(&value) {
                     Some(ascending) => request.ascending = ascending,
-                    None => errors.push(field("ascending", "must be true or false")),
+                    None => errors.push(FieldError::new("ascending", "must be true or false")),
                 },
                 "before" => match parse_instant(&value) {
                     Some(ms) => request.before_ms = Some(ms),
-                    None => errors.push(field("before", TIMESTAMP_HELP)),
+                    None => errors.push(FieldError::new("before", TIMESTAMP_HELP)),
                 },
                 "after" => match parse_instant(&value) {
                     Some(ms) => request.after_ms = Some(ms),
-                    None => errors.push(field("after", TIMESTAMP_HELP)),
+                    None => errors.push(FieldError::new("after", TIMESTAMP_HELP)),
                 },
                 "page_token" => {
                     if !value.is_empty() {
@@ -198,7 +198,8 @@ impl ListRequest {
                     if let Some(index) = INCLUDE_FLAGS.iter().position(|(flag, _)| *flag == other) {
                         match parse_bool(&value) {
                             Some(on) => include[index] = on,
-                            None => errors.push(field(other.to_owned(), "must be true or false")),
+                            None => errors
+                                .push(FieldError::new(other.to_owned(), "must be true or false")),
                         }
                     }
                     // Unrecognized parameters are ignored: a client sending a
@@ -211,7 +212,7 @@ impl ListRequest {
         if let (Some(after), Some(before)) = (request.after_ms, request.before_ms)
             && after >= before
         {
-            errors.push(field("after", "must be earlier than `before`"));
+            errors.push(FieldError::new("after", "must be earlier than `before`"));
         }
 
         for (index, (_, label)) in INCLUDE_FLAGS.iter().enumerate() {
@@ -235,13 +236,6 @@ impl ListRequest {
 }
 
 const TIMESTAMP_HELP: &str = "must be a UTC timestamp, for example 2026-01-15T09:30:00.000Z";
-
-fn field(path: impl Into<String>, message: impl Into<String>) -> FieldError {
-    FieldError {
-        path: path.into(),
-        message: message.into(),
-    }
-}
 
 fn push_non_empty(values: &mut Vec<String>, value: String) {
     if !value.is_empty() {

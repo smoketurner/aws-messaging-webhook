@@ -30,7 +30,7 @@ async fn store_content(h: &Harness, msg: &MailMessage, message_content: MessageC
 
 fn sample_message() -> MailMessage {
     MailMessage {
-        inbox_id: InboxId("support@example.com".to_owned()),
+        inbox_id: InboxId::new("support@example.com"),
         thread_id: "tid-1".to_owned(),
         message_id: "mid-1".to_owned(),
         ses_message_id: Some("ses-1".to_owned()),

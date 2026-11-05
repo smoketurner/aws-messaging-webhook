@@ -8,11 +8,7 @@
 
 use std::future::{Ready, ready};
 
-use axum::Json;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-
-use crate::api::error::{ApiError, ErrorBody};
+use crate::api::error::ApiError;
 
 /// A route the API contract defines that this service does not implement:
 /// drafts, labels, pods, domains, webhooks, and the inbox-management and
@@ -26,24 +22,16 @@ pub fn unknown_route() -> Ready<ApiError> {
     ready(ApiError::NotFound)
 }
 
-/// Fallback for a known `/v0` path used with the wrong method. Built inline
-/// rather than as an [`ApiError`] variant because 405 is the only status the
-/// router raises on the caller's behalf, and it carries no detail beyond the
-/// name.
-pub fn method_not_allowed() -> Ready<Response> {
-    let body = ErrorBody {
-        name: "MethodNotAllowedError",
-        message: "This method is not allowed on this endpoint.".to_owned(),
-        code: None,
-        fix: None,
-        docs: None,
-    };
-    ready((StatusCode::METHOD_NOT_ALLOWED, Json(body)).into_response())
+/// Fallback for a known `/v0` path used with the wrong method.
+pub fn method_not_allowed() -> Ready<ApiError> {
+    ready(ApiError::MethodNotAllowed)
 }
 
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
     use serde_json::{Value, json};
 
     use super::*;
@@ -76,8 +64,14 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_method_answers_405_with_a_parseable_body() {
-        let (status, body) = json_of(method_not_allowed().await).await;
+        let (status, body) = json_of(method_not_allowed().await.into_response()).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(body["name"], "MethodNotAllowedError");
+        assert_eq!(
+            body,
+            json!({
+                "name": "MethodNotAllowedError",
+                "message": "This method is not allowed on this endpoint.",
+            })
+        );
     }
 }

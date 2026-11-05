@@ -37,7 +37,7 @@ async fn queued(h: &Harness, body: &Value) -> String {
 async fn thread_labels(h: &Harness, thread_id: &str) -> Vec<String> {
     h.state
         .services
-        .get_thread(&InboxId(TEST_INBOX.to_owned()), thread_id, 1, None)
+        .get_thread(&InboxId::new(TEST_INBOX), thread_id, 1, None)
         .await
         .unwrap()
         .unwrap()
@@ -85,7 +85,7 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -156,7 +156,7 @@ async fn an_ambiguous_outcome_is_never_resent() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -225,7 +225,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
     let copy = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &copy_id.to_string())
+        .get_message(&InboxId::new(TEST_INBOX), &copy_id.to_string())
         .await
         .unwrap()
         .expect("the copy was stored");
@@ -233,7 +233,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
     let thread = h
         .state
         .services
-        .get_thread(&InboxId(TEST_INBOX.to_owned()), &message_id, 10, None)
+        .get_thread(&InboxId::new(TEST_INBOX), &message_id, 10, None)
         .await
         .unwrap()
         .unwrap();
@@ -260,7 +260,7 @@ async fn a_refused_send_is_recorded_rejected_and_not_retried() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -739,7 +739,7 @@ async fn an_ses_delivery_event_labels_the_message_it_belongs_to() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -778,7 +778,7 @@ async fn later_events_add_labels_rather_than_replacing_them() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();
@@ -993,7 +993,7 @@ async fn an_operator_can_close_an_unknown_message_as_sent() {
     let message = h
         .state
         .services
-        .get_message(&InboxId(TEST_INBOX.to_owned()), &message_id)
+        .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
         .unwrap();

@@ -67,6 +67,24 @@ async fn every_casing_variant_resolves_to_the_lowercased_inbox() {
     assert_eq!(body["inbox_id"], TEST_INBOX);
 }
 
+/// The tuple extractors on the nested routes normalize the inbox segment
+/// just as the single-segment route does.
+#[tokio::test]
+async fn every_casing_variant_resolves_a_message_path() {
+    let (h, id) = seeded().await;
+
+    for variant in CASING_VARIANTS {
+        let (status, body) = api::get(&h, &format!("/v0/inboxes/{variant}/messages/{id}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "`{variant}` should resolve the message (not 404)"
+        );
+        assert_eq!(body["inbox_id"], TEST_INBOX);
+        assert_eq!(body["message_id"], id.as_str());
+    }
+}
+
 #[tokio::test]
 async fn a_genuinely_unknown_inbox_is_still_not_found() {
     // Normalization must not paper over an id the service never stored.

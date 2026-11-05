@@ -75,7 +75,7 @@ pub struct MailMemoryStore {
 #[must_use]
 pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMessage {
     MailMessage {
-        inbox_id: InboxId(inbox.to_owned()),
+        inbox_id: InboxId::new(inbox),
         thread_id: thread_id.to_owned(),
         message_id: message_id.to_owned(),
         ses_message_id: None,
@@ -621,7 +621,7 @@ impl MailStore for MailMemoryStore {
             .and_then(|item| {
                 let inbox = Self::string_attr(&item, "inbox_id")?;
                 let message_id = Self::string_attr(&item, "message_id")?;
-                Some((InboxId(inbox), message_id))
+                Some((InboxId::new(&inbox), message_id))
             });
         std::future::ready(Ok(resolved))
     }
@@ -635,7 +635,7 @@ impl MailStore for MailMemoryStore {
         // the status index's own attributes, so this double cannot quietly
         // disagree with the real store about which index serves a query.
         let query = ListQuery {
-            inbox: InboxId(String::new()),
+            inbox: InboxId::new(""),
             limit,
             before: None,
             after: None,
@@ -728,7 +728,7 @@ impl MailStore for MailMemoryStore {
     ) -> impl Future<Output = Result<Page<Inbox>, MailStoreError>> + Send {
         use aws_messaging_webhook::mail::keys;
         let query = ListQuery {
-            inbox: InboxId(String::new()),
+            inbox: InboxId::new(""),
             limit,
             before: None,
             after: None,
@@ -802,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_inbox_creates_then_returns_the_same_inbox() {
         let store = MailMemoryStore::default();
-        let inbox = InboxId("support@example.com".to_owned());
+        let inbox = InboxId::new("support@example.com");
         let created = store
             .ensure_inbox(&inbox, "2026-01-01T00:00:00.000Z")
             .await
@@ -1117,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_page_carries_a_token_that_leads_to_an_empty_page() {
         let store = MailMemoryStore::default();
-        let inbox = InboxId("support@example.com".to_owned());
+        let inbox = InboxId::new("support@example.com");
         for id in ["mid-1", "mid-2"] {
             store.insert_message(&message(id, id), &[]).await.unwrap();
         }
@@ -1155,7 +1155,7 @@ mod tests {
     async fn read_aliases_omits_unknown_ids() {
         use aws_messaging_webhook::mail::flows::TxnStore;
         let store = MailMemoryStore::default();
-        let inbox = InboxId("support@example.com".to_owned());
+        let inbox = InboxId::new("support@example.com");
         let found = store
             .read_aliases(&inbox, &ids(&["nope@example.com"]))
             .await
@@ -1173,7 +1173,7 @@ mod tests {
         let store = MailMemoryStore::default();
         let key = SendKey {
             key_hash: "deadbeef".to_owned(),
-            inbox_id: InboxId("support@example.com".to_owned()),
+            inbox_id: InboxId::new("support@example.com"),
             message_id: "mid-1".to_owned(),
             thread_id: "tid-1".to_owned(),
             request_hash: "abc".to_owned(),

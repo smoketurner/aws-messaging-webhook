@@ -134,13 +134,7 @@ pub async fn dispatch<T: Services>(
             return Ok(serde_json::json!({ "ok": true }));
         }
         let report = crate::mail::sender::sweep(&state).await?;
-        return Ok(serde_json::json!({
-            "released": report.released,
-            "markedUnknown": report.marked_unknown,
-            "stillWorking": report.still_working,
-            "errors": report.errors,
-            "unknown": report.unknown,
-        }));
+        return Ok(serde_json::to_value(report)?);
     }
 
     if payload.get("Records").is_some() {

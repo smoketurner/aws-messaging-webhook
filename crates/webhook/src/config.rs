@@ -108,15 +108,8 @@ impl Config {
         // `u32` (via `parse_positive_u32`, like `MAIL_RETENTION_DAYS`) caps
         // the value at `u32::MAX`, so the `days × 86_400` TTL multiply in
         // `store.rs` cannot overflow `u64` and wrap in release builds.
-        let raw_event_retention_days = parse_positive_u32(
-            "RAW_EVENT_RETENTION_DAYS",
-            &optional("RAW_EVENT_RETENTION_DAYS").unwrap_or_else(|| "30".to_owned()),
-        )?;
-
-        let aggregate_retention_days = parse_positive_u32(
-            "AGGREGATE_RETENTION_DAYS",
-            &optional("AGGREGATE_RETENTION_DAYS").unwrap_or_else(|| "365".to_owned()),
-        )?;
+        let raw_event_retention_days = positive_u32_or("RAW_EVENT_RETENTION_DAYS", 30)?;
+        let aggregate_retention_days = positive_u32_or("AGGREGATE_RETENTION_DAYS", 365)?;
 
         let mail = MailConfig::from_env()?;
 
@@ -257,8 +250,17 @@ fn parse_positive_u32(name: &str, raw: &str) -> anyhow::Result<u32> {
     Ok(value)
 }
 
+/// Reads an optional positive `u32` variable, `default` when unset.
+fn positive_u32_or(name: &str, default: u32) -> anyhow::Result<u32> {
+    optional(name).map_or(Ok(default), |raw| parse_positive_u32(name, &raw))
+}
+
 fn require(name: &str) -> anyhow::Result<String> {
-    optional(name).with_context(|| format!("required environment variable {name} is not set"))
+    required(name, optional(name))
+}
+
+fn required(name: &str, value: Option<String>) -> anyhow::Result<String> {
+    value.with_context(|| format!("required environment variable {name} is not set"))
 }
 
 /// The events table and bus, read through `lookup`.
@@ -271,9 +273,7 @@ fn events_targets(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<(String, String)> {
     let read = |name: &str| match mode {
-        FunctionMode::Webhook => {
-            lookup(name).with_context(|| format!("required environment variable {name} is not set"))
-        }
+        FunctionMode::Webhook => required(name, lookup(name)),
         FunctionMode::Sender => Ok(lookup(name).unwrap_or_default()),
     };
     Ok((read("TABLE_NAME")?, read("EVENT_BUS_NAME")?))

@@ -50,7 +50,7 @@ use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 use crate::model::ses_notification::SesNotification;
 use crate::model::{DomainEvent, Source};
-use crate::publish::{OutboundEvent, SCHEMA_VERSION, build_outbound};
+use crate::publish::{OutboundEvent, PublishError, SCHEMA_VERSION, build_outbound};
 use crate::state::{AppState, Services};
 use crate::store::EventRecord;
 
@@ -253,9 +253,8 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
     };
 
     let outbound = build_outbound(&record, &event, &state.config.event_source);
-    match state.services.publish(&outbound).await {
+    match publish_one(state, &outbound).await {
         Ok(()) => {
-            metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
             tracing::info!(
                 source = record.source_label(),
                 sns_message_id = record.sns_message_id,
@@ -265,7 +264,6 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
             );
         }
         Err(error) => {
-            metrics::counter!(names::PUBLISH_FAILURES).increment(1);
             tracing::error!(
                 ?error,
                 sns_message_id = record.sns_message_id,
@@ -310,6 +308,38 @@ async fn mailbox_ses_event<T: Services>(
     )
 }
 
+/// Decodes a `MSG#` mail-table image. A failure is a deterministic bug, not a
+/// transient fault, so it is logged here and the caller settles the record.
+fn decode_mail_image(image: &Item) -> Option<MailMessage> {
+    match serde_dynamo::from_item(image.clone()) {
+        Ok(msg) => Some(msg),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                event = "stream_bad_mail_image",
+                "mail-table MSG# image did not deserialize into MailMessage"
+            );
+            None
+        }
+    }
+}
+
+/// Publishes one event and counts the outcome; the caller logs it, since
+/// each kind of event identifies itself with different fields.
+async fn publish_one<T: Services>(
+    state: &AppState<T>,
+    outbound: &OutboundEvent,
+) -> Result<(), PublishError> {
+    let result = state.services.publish(outbound).await;
+    let counter = if result.is_ok() {
+        names::EVENTS_PUBLISHED
+    } else {
+        names::PUBLISH_FAILURES
+    };
+    metrics::counter!(counter).increment(1);
+    result
+}
+
 /// Publishes the `message.received*` event for one `MSG#` mail-table INSERT
 /// image, with the message's content document read back from S3. Returns
 /// [`RelayOutcome::Retry`] on a transient publish or document read failure;
@@ -317,16 +347,8 @@ async fn mailbox_ses_event<T: Services>(
 /// so it is logged and returns [`RelayOutcome::Settled`] (an INSERT's absent
 /// or empty `OldImage` is never read here, so it can't cause this).
 async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
-    let msg: MailMessage = match serde_dynamo::from_item(image.clone()) {
-        Ok(msg) => msg,
-        Err(error) => {
-            tracing::error!(
-                ?error,
-                event = "stream_bad_mail_image",
-                "mail-table MSG# image did not deserialize into MailMessage"
-            );
-            return RelayOutcome::Settled;
-        }
+    let Some(msg) = decode_mail_image(image) else {
+        return RelayOutcome::Settled;
     };
 
     // A queued send's INSERT publishes nothing (its lifecycle starts at the
@@ -375,16 +397,8 @@ async fn publish_mail_sent<T: Services>(
     new_image: &Item,
     old_image: &Item,
 ) -> RelayOutcome {
-    let msg: MailMessage = match serde_dynamo::from_item(new_image.clone()) {
-        Ok(msg) => msg,
-        Err(error) => {
-            tracing::error!(
-                ?error,
-                event = "stream_bad_mail_image",
-                "mail-table MSG# image did not deserialize into MailMessage"
-            );
-            return RelayOutcome::Settled;
-        }
+    let Some(msg) = decode_mail_image(new_image) else {
+        return RelayOutcome::Settled;
     };
 
     // An old image without readable labels (a stream configured for new
@@ -411,9 +425,8 @@ async fn publish_mail_events<T: Services>(
             detail_type: event.detail_type.to_owned(),
             detail: event.detail,
         };
-        match state.services.publish(&outbound).await {
+        match publish_one(state, &outbound).await {
             Ok(()) => {
-                metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
                 tracing::info!(
                     inbox_id = msg.inbox_id.as_str(),
                     message_id = msg.message_id,
@@ -423,7 +436,6 @@ async fn publish_mail_events<T: Services>(
                 );
             }
             Err(error) => {
-                metrics::counter!(names::PUBLISH_FAILURES).increment(1);
                 tracing::error!(
                     ?error,
                     message_id = msg.message_id,
@@ -507,9 +519,8 @@ async fn publish_status_changed<T: Services>(
         detail_type: "message.status.changed".to_owned(),
         detail,
     };
-    match state.services.publish(&outbound).await {
+    match publish_one(state, &outbound).await {
         Ok(()) => {
-            metrics::counter!(names::EVENTS_PUBLISHED).increment(1);
             tracing::info!(
                 message_id,
                 current_status = current,
@@ -519,7 +530,6 @@ async fn publish_status_changed<T: Services>(
             RelayOutcome::Settled
         }
         Err(error) => {
-            metrics::counter!(names::PUBLISH_FAILURES).increment(1);
             tracing::error!(
                 ?error,
                 message_id,

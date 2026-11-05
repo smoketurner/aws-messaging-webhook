@@ -82,7 +82,7 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     );
 
     let message_id = ids::inbound_message_id(SES_ID, time::parse(TS).unwrap()).to_string();
-    let inbox = InboxId("support@example.com".to_owned());
+    let inbox = InboxId::new("support@example.com");
     let stored = h
         .fake()
         .mail

@@ -138,32 +138,10 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<S
 /// account-scoped, so `lambda:InvokeFunction` is a better gate than a bearer
 /// key, and the public API surface stays the contract it mirrors.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum Command {
-    /// Send an `unknown` message again.
-    Resend { message_id: String },
-    /// Record an `unknown` message as having gone out.
-    CloseSent { message_id: String },
-    /// Record an `unknown` message as not having gone out.
-    CloseFailed { message_id: String },
-}
-
-impl Command {
-    fn message_id(&self) -> &str {
-        match self {
-            Self::Resend { message_id }
-            | Self::CloseSent { message_id }
-            | Self::CloseFailed { message_id } => message_id,
-        }
-    }
-
-    fn resolution(&self) -> Resolution {
-        match self {
-            Self::Resend { .. } => Resolution::Resend,
-            Self::CloseSent { .. } => Resolution::CloseSent,
-            Self::CloseFailed { .. } => Resolution::CloseFailed,
-        }
-    }
+pub struct Command {
+    #[serde(rename = "command")]
+    pub resolution: Resolution,
+    pub message_id: String,
 }
 
 /// Runs one operator instruction.
@@ -176,11 +154,12 @@ pub async fn handle_command<T: Services>(
     state: &AppState<T>,
     command: &Command,
 ) -> Result<(), SenderError> {
-    resolve_unknown(state, command.message_id(), command.resolution()).await
+    resolve_unknown(state, &command.message_id, command.resolution).await
 }
 
 /// What an operator decided about a send whose outcome SES never confirmed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Resolution {
     /// Send it again, accepting that SES may already have it.
     Resend,
@@ -269,7 +248,8 @@ const MAX_TRANSIENT_FAILURES: u32 = 5;
 const MARK_SENT_ATTEMPTS: u32 = 3;
 
 /// What one sweep did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SweepReport {
     /// Claims released because the sender holding them appears to be gone
     /// before it called SES, and the transient-failure cap was not yet
@@ -522,7 +502,13 @@ fn build(spec: &SendSpec, parts: &[LoadedPart]) -> Result<Vec<u8>, SendFailure> 
     let message_id = spec.message_id.as_str();
     build_outbound(
         spec,
-        &parts.iter().map(part_ref).collect::<Vec<_>>(),
+        &parts
+            .iter()
+            .map(|part| BuiltPart {
+                spec: &part.spec,
+                bytes: &part.bytes,
+            })
+            .collect::<Vec<_>>(),
         MAX_OUTBOUND_RAW_BYTES,
     )
     .map_err(|error| match error {
@@ -876,13 +862,6 @@ struct LoadedPart {
     bytes: Vec<u8>,
 }
 
-fn part_ref(part: &LoadedPart) -> BuiltPart<'_> {
-    BuiltPart {
-        spec: &part.spec,
-        bytes: &part.bytes,
-    }
-}
-
 /// Reads every attachment named by the spec: bytes already in the outbox, or
 /// a URL fetched once and stored so a retry reuses it.
 async fn load_parts<T: Services>(
@@ -1042,4 +1021,58 @@ async fn fail<T: Services>(
 
 fn store_error(error: MailStoreError) -> SenderError {
     SenderError::Store(anyhow::Error::new(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_report_serializes_every_count() {
+        let report = SweepReport {
+            released: 1,
+            abandoned: 2,
+            marked_unknown: 3,
+            still_working: 4,
+            errors: 5,
+            unknown: 6,
+        };
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "released": 1,
+                "abandoned": 2,
+                "markedUnknown": 3,
+                "stillWorking": 4,
+                "errors": 5,
+                "unknown": 6,
+            })
+        );
+    }
+
+    #[test]
+    fn command_reads_each_operator_instruction() {
+        for (name, resolution) in [
+            ("resend", Resolution::Resend),
+            ("close_sent", Resolution::CloseSent),
+            ("close_failed", Resolution::CloseFailed),
+        ] {
+            let command: Command = serde_json::from_value(serde_json::json!({
+                "command": name,
+                "message_id": "m-1",
+            }))
+            .unwrap();
+            assert_eq!(command.resolution, resolution);
+            assert_eq!(command.message_id, "m-1");
+        }
+    }
+
+    #[test]
+    fn command_rejects_an_unknown_instruction() {
+        let result: Result<Command, _> = serde_json::from_value(serde_json::json!({
+            "command": "delete",
+            "message_id": "m-1",
+        }));
+        assert!(result.is_err());
+    }
 }

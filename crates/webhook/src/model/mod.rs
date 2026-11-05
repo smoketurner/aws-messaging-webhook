@@ -23,6 +23,13 @@ pub enum Source {
 }
 
 impl Source {
+    pub const ALL: [Self; 4] = [
+        Self::SmsInbound,
+        Self::SmsEvents,
+        Self::SesEvents,
+        Self::SesInbound,
+    ];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

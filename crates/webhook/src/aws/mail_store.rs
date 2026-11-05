@@ -34,28 +34,11 @@ use crate::mail::thread::ThreadState;
 use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
 
-/// Waits before retrying a cancelled transaction: exponential from 25 ms,
-/// with jitter so writers that collided do not collide again in step.
-async fn backoff(attempt: u32) {
-    let base_ms = 25_u64 << attempt.min(4);
-    let jitter_ms = u64::from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos(),
-    ) % base_ms;
-    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
-}
-
 /// `BatchGetItem` loops on `UnprocessedKeys` at most this many times before
 /// surfacing a transient error.
 const MAX_BATCH_GET_ATTEMPTS: u32 = 5;
 
 impl AwsServices {
-    /// The mail table name, or a permanent error when mail is disabled —
-    /// every `MailStore` method is only ever called when it is enabled, but
-    /// this keeps that assumption from becoming a panic if it's ever
-    /// violated.
     /// One page of a time-ordered index partition, deserialized into `T`.
     ///
     /// Both list indexes are keyed the same way — a partition string plus a
@@ -116,6 +99,10 @@ impl AwsServices {
         Ok(Page { items, next })
     }
 
+    /// The mail table name, or a permanent error when mail is disabled —
+    /// every `MailStore` method is only ever called when it is enabled, but
+    /// this keeps that assumption from becoming a panic if it's ever
+    /// violated.
     fn mail_table_name(&self) -> Result<&str, MailStoreError> {
         self.mail_config()
             .map(|config| config.table_name.as_str())
@@ -488,49 +475,6 @@ fn alias_transact_item(
     Ok(TransactWriteItem::builder().put(put).build())
 }
 
-impl AwsServices {
-    async fn attempt_transaction(
-        &self,
-        ops: &[PlannedOp],
-    ) -> Result<flows::TxnOutcome, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let mut builder = self.dynamo.transact_write_items();
-        for planned in ops {
-            builder = builder.transact_items(to_transact_item(&table_name, &planned.op)?);
-        }
-
-        match builder.send().await {
-            Ok(_) => Ok(flows::TxnOutcome::Committed),
-            Err(error) => {
-                if let SdkError::ServiceError(ctx) = &error {
-                    match ctx.err() {
-                        TransactWriteItemsError::TransactionCanceledException(cancelled) => {
-                            let reasons: Vec<CancellationReason> = cancelled
-                                .cancellation_reasons()
-                                .iter()
-                                .map(|reason| map_cancellation_reason(reason.code()))
-                                .collect();
-                            return Ok(flows::TxnOutcome::Cancelled(decode_cancellation(
-                                ops, &reasons,
-                            )));
-                        }
-                        TransactWriteItemsError::TransactionInProgressException(_) => {
-                            return Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry));
-                        }
-                        TransactWriteItemsError::IdempotentParameterMismatchException(_) => {
-                            return Err(MailStoreError::Permanent(anyhow!(
-                                "transact_write_items: idempotent parameter mismatch"
-                            )));
-                        }
-                        _ => {}
-                    }
-                }
-                Err(store_error_from_sdk("TransactWriteItems", &error))
-            }
-        }
-    }
-}
-
 fn item_attribute_string(item: &HashMap<String, DynamoAv>, name: &str) -> Option<String> {
     match item.get(name) {
         Some(DynamoAv::S(value)) => Some(value.clone()),
@@ -660,11 +604,54 @@ impl flows::TxnStore for AwsServices {
     }
 
     async fn run_txn(&self, ops: &[PlannedOp]) -> Result<flows::TxnOutcome, MailStoreError> {
-        self.attempt_transaction(ops).await
+        let table_name = self.mail_table_name()?.to_owned();
+        let mut builder = self.dynamo.transact_write_items();
+        for planned in ops {
+            builder = builder.transact_items(to_transact_item(&table_name, &planned.op)?);
+        }
+
+        match builder.send().await {
+            Ok(_) => Ok(flows::TxnOutcome::Committed),
+            Err(error) => {
+                if let SdkError::ServiceError(ctx) = &error {
+                    match ctx.err() {
+                        TransactWriteItemsError::TransactionCanceledException(cancelled) => {
+                            let reasons: Vec<CancellationReason> = cancelled
+                                .cancellation_reasons()
+                                .iter()
+                                .map(|reason| map_cancellation_reason(reason.code()))
+                                .collect();
+                            return Ok(flows::TxnOutcome::Cancelled(decode_cancellation(
+                                ops, &reasons,
+                            )));
+                        }
+                        TransactWriteItemsError::TransactionInProgressException(_) => {
+                            return Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry));
+                        }
+                        TransactWriteItemsError::IdempotentParameterMismatchException(_) => {
+                            return Err(MailStoreError::Permanent(anyhow!(
+                                "transact_write_items: idempotent parameter mismatch"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(store_error_from_sdk("TransactWriteItems", &error))
+            }
+        }
     }
 
+    /// Waits before retrying a cancelled transaction: exponential from 25 ms,
+    /// with jitter so writers that collided do not collide again in step.
     async fn pause(&self, attempt: u32) {
-        backoff(attempt).await;
+        let base_ms = 25_u64 << attempt.min(4);
+        let jitter_ms = u64::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        ) % base_ms;
+        tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
     }
 }
 
@@ -843,7 +830,7 @@ impl MailStore for AwsServices {
             Some(DynamoAv::S(value)) => value.clone(),
             _ => return Ok(None),
         };
-        Ok(Some((InboxId(inbox), message_id)))
+        Ok(Some((InboxId::new(&inbox), message_id)))
     }
 
     async fn list_by_status(
@@ -1270,7 +1257,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::<GetItemInput>::new()));
         let aws = aws_with_capturing_dynamo(Arc::clone(&captured));
 
-        let inbox = InboxId("support@example.com".to_owned());
+        let inbox = InboxId::new("support@example.com");
         // The interceptor short-circuits every request with an error; only
         // the emitted requests are asserted on.
         let _ = MailStore::get_inbox(&aws, &inbox).await;
@@ -1310,7 +1297,7 @@ mod tests {
     // only one that can catch them. These tests pin both legs of
     // `apply_delivery_label`: the `GetItem` read (`resolve_ses_message`) and
     // the top-level `TransactWriteItems` write (`RequestLimitExceeded` falls
-    // through `attempt_transaction`'s explicit variant arms to
+    // through `run_txn`'s explicit variant arms to
     // `store_error_from_sdk`).
 
     use aws_sdk_dynamodb::config::http::HttpResponse;
@@ -1348,7 +1335,7 @@ mod tests {
     /// The account-level `RequestLimitExceeded` as a top-level
     /// `TransactWriteItems` error: the realistic write-leg trigger, surfaced
     /// on the request itself (not as a cancellation reason) and so falling
-    /// through `attempt_transaction`'s explicit variant arms to
+    /// through `run_txn`'s explicit variant arms to
     /// `store_error_from_sdk`.
     fn transact_write_request_limit_exceeded(status: u16) -> SdkError<TransactWriteItemsError> {
         let meta = ErrorMetadata::builder()

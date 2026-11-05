@@ -18,6 +18,7 @@ use mail_builder::headers::content_type::ContentType;
 use mail_builder::mime::MimePart;
 
 use crate::mail::send::{SendSpec, SpecAttachment};
+use crate::mail::strip_angle_brackets;
 
 /// One attachment's bytes, paired with the spec entry describing it.
 pub struct BuiltPart<'a> {
@@ -177,14 +178,6 @@ fn addresses(list: &[String]) -> Address<'_> {
     )
 }
 
-/// `mail-builder` adds the angle brackets itself, so a stored id keeps only
-/// its inner value here.
-fn strip_angle_brackets(id: &str) -> &str {
-    id.strip_prefix('<')
-        .and_then(|rest| rest.strip_suffix('>'))
-        .unwrap_or(id)
-}
-
 #[cfg(test)]
 mod tests {
     use mail_parser::MessageParser;
@@ -199,7 +192,7 @@ mod tests {
         SendSpec {
             message_id: "mid-1".to_owned(),
             thread_id: "tid-1".to_owned(),
-            inbox_id: InboxId("support@example.com".to_owned()),
+            inbox_id: InboxId::new("support@example.com"),
             from: "support@example.com".to_owned(),
             display_name: None,
             envelope: Envelope {

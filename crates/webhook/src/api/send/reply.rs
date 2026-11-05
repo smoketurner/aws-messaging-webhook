@@ -49,23 +49,19 @@ pub(super) fn threading_references(
 /// exist; otherwise as [`send`].
 pub async fn reply<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path((inbox_id, message_id)): Path<(String, String)>,
+    Path((inbox, message_id)): Path<(InboxId, String)>,
     headers: HeaderMap,
     ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    let inbox = InboxId::from_path(&inbox_id);
     let original = state
         .services
         .get_message(&inbox, &message_id)
-        .await
-        .map_err(ApiError::from)?
+        .await?
         .ok_or(ApiError::NotFound)?;
     // A missing content document is not an error here: `content::load` logs
     // it and returns empty content, so a reply to a message whose body is
     // gone still goes out, without the original's references or reply-to.
-    let original_content = content::load(&state.services, &original)
-        .await
-        .map_err(ApiError::from)?;
+    let original_content = content::load(&state.services, &original).await?;
 
     let mut send = request.send;
     // Recipients default to whoever should receive a reply to the original,

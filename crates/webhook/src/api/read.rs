@@ -117,11 +117,7 @@ pub async fn list_inboxes<T: Services>(
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let start = cursor(&request, keys::inboxes_partition(), UNSCOPED)?;
 
-    let page = state
-        .services
-        .list_inboxes(request.limit, start)
-        .await
-        .map_err(ApiError::from)?;
+    let page = state.services.list_inboxes(request.limit, start).await?;
 
     let inboxes: Vec<wire::Inbox> = page.items.iter().map(wire::Inbox::from).collect();
     Ok(Json(wire::InboxList {
@@ -143,13 +139,12 @@ pub async fn list_inboxes<T: Services>(
 /// onto the API's retry contract.
 pub async fn get_inbox<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path(inbox_id): Path<String>,
+    Path(inbox): Path<InboxId>,
 ) -> Result<Json<wire::Inbox>, ApiError> {
     let inbox = state
         .services
-        .get_inbox(&InboxId::from_path(&inbox_id))
-        .await
-        .map_err(ApiError::from)?
+        .get_inbox(&inbox)
+        .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(wire::Inbox::from(&inbox)))
 }
@@ -162,11 +157,10 @@ pub async fn get_inbox<T: Services>(
 /// for another inbox; a store failure mapped onto the API's retry contract.
 pub async fn list_messages<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path(inbox_id): Path<String>,
+    Path(inbox): Path<InboxId>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::MessageList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let inbox = InboxId::from_path(&inbox_id);
     let partition = keys::messages_partition(inbox.as_str());
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
@@ -192,8 +186,7 @@ pub async fn list_messages<T: Services>(
         },
         |round| async move { services.list_messages(&round).await },
     )
-    .await
-    .map_err(ApiError::from)?;
+    .await?;
 
     let messages: Vec<wire::MessageItem> = messages.iter().map(wire::MessageItem::from).collect();
     Ok(Json(wire::MessageList {
@@ -213,17 +206,14 @@ pub async fn list_messages<T: Services>(
 /// contract.
 pub async fn get_message<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path((inbox_id, message_id)): Path<(String, String)>,
+    Path((inbox, message_id)): Path<(InboxId, String)>,
 ) -> Result<Json<wire::Message>, ApiError> {
     let message = state
         .services
-        .get_message(&InboxId::from_path(&inbox_id), &message_id)
-        .await
-        .map_err(ApiError::from)?
+        .get_message(&inbox, &message_id)
+        .await?
         .ok_or(ApiError::NotFound)?;
-    let content = content::load(&state.services, &message)
-        .await
-        .map_err(ApiError::from)?;
+    let content = content::load(&state.services, &message).await?;
     Ok(Json(wire::Message::new(&message, &content)))
 }
 
@@ -239,13 +229,12 @@ pub async fn get_message<T: Services>(
 /// failure otherwise.
 pub async fn get_raw<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path((inbox_id, message_id)): Path<(String, String)>,
+    Path((inbox, message_id)): Path<(InboxId, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .services
-        .get_message(&InboxId::from_path(&inbox_id), &message_id)
-        .await
-        .map_err(ApiError::from)?
+        .get_message(&inbox, &message_id)
+        .await?
         .ok_or(ApiError::NotFound)?;
     let key = message.raw_s3_key.as_deref().ok_or(ApiError::NotFound)?;
 
@@ -254,8 +243,7 @@ pub async fn get_raw<T: Services>(
     let url = state
         .services
         .presign_get(key, Some(&disposition), Some("message/rfc822"), ttl)
-        .await
-        .map_err(ApiError::from)?;
+        .await?;
 
     Ok(Json(wire::Download {
         download_url: url,
@@ -278,13 +266,12 @@ pub async fn get_raw<T: Services>(
 /// object does not exist; a store or object failure otherwise.
 pub async fn get_attachment<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path((inbox_id, message_id, attachment_id)): Path<(String, String, String)>,
+    Path((inbox, message_id, attachment_id)): Path<(InboxId, String, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .services
-        .get_message(&InboxId::from_path(&inbox_id), &message_id)
-        .await
-        .map_err(ApiError::from)?
+        .get_message(&inbox, &message_id)
+        .await?
         .ok_or(ApiError::NotFound)?;
 
     let attachment = message
@@ -301,8 +288,7 @@ pub async fn get_attachment<T: Services>(
     let url = state
         .services
         .presign_get(key, Some(&disposition), Some(&attachment.content_type), ttl)
-        .await
-        .map_err(ApiError::from)?;
+        .await?;
 
     Ok(Json(wire::Download {
         download_url: url,
@@ -347,11 +333,10 @@ fn expires_at(ttl: Duration) -> String {
 /// for another inbox; a store failure mapped onto the API's retry contract.
 pub async fn list_threads<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path(inbox_id): Path<String>,
+    Path(inbox): Path<InboxId>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::ThreadList>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let inbox = InboxId::from_path(&inbox_id);
     let partition = keys::threads_partition(inbox.as_str());
     let scope = request.token_scope();
     let start = cursor(&request, &partition, &scope)?;
@@ -377,8 +362,7 @@ pub async fn list_threads<T: Services>(
         },
         |round| async move { services.list_threads(&round).await },
     )
-    .await
-    .map_err(ApiError::from)?;
+    .await?;
 
     let threads: Vec<wire::ThreadItem> = threads.iter().map(wire::ThreadItem::from).collect();
     Ok(Json(wire::ThreadList {
@@ -402,28 +386,24 @@ pub async fn list_threads<T: Services>(
 /// failure mapped onto the API's retry contract.
 pub async fn get_thread<T: Services>(
     State(state): State<Arc<AppState<T>>>,
-    Path((inbox_id, thread_id)): Path<(String, String)>,
+    Path((inbox, thread_id)): Path<(InboxId, String)>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<wire::Thread>, ApiError> {
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
-    let inbox = InboxId::from_path(&inbox_id);
     let partition = keys::thread_messages_partition(inbox.as_str(), &thread_id);
     let start = cursor(&request, &partition, UNSCOPED)?;
 
     let view = state
         .services
         .get_thread(&inbox, &thread_id, request.limit, start)
-        .await
-        .map_err(ApiError::from)?
+        .await?
         .ok_or(ApiError::NotFound)?;
 
     // One document read per message on the page; a page is bounded by the
     // request limit.
     let mut messages = Vec::with_capacity(view.messages.items.len());
     for message in &view.messages.items {
-        let content = content::load(&state.services, message)
-            .await
-            .map_err(ApiError::from)?;
+        let content = content::load(&state.services, message).await?;
         messages.push(wire::Message::new(message, &content));
     }
     Ok(Json(wire::Thread::new(
@@ -469,7 +449,7 @@ mod tests {
 
     fn query(limit: usize, start: Option<PageKey>) -> ListQuery {
         ListQuery {
-            inbox: InboxId("support@example.com".to_owned()),
+            inbox: InboxId::new("support@example.com"),
             limit,
             before: None,
             after: None,

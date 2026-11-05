@@ -639,7 +639,7 @@ pub async fn grant_api_access(h: &Harness) {
         .set_keys(&[(TEST_API_KEY, "key_1")]);
     h.state
         .services
-        .ensure_inbox(&InboxId(TEST_INBOX.to_owned()), TEST_INBOX_CREATED_AT)
+        .ensure_inbox(&InboxId::new(TEST_INBOX), TEST_INBOX_CREATED_AT)
         .await
         .unwrap();
 }

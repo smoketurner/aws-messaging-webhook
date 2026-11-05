@@ -108,12 +108,7 @@ pub(super) async fn replay_key<T: Services>(
     key_hash: &str,
     request_hash: &str,
 ) -> Result<Option<SendAccepted>, ApiError> {
-    let Some(existing) = state
-        .services
-        .get_send_key(key_hash)
-        .await
-        .map_err(ApiError::from)?
-    else {
+    let Some(existing) = state.services.get_send_key(key_hash).await? else {
         return Ok(None);
     };
     // `expires_at` is epoch seconds; DynamoDB's TTL deletes expired rows

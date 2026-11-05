@@ -79,8 +79,16 @@ pub const THREAD_ATTACHMENT_SUMMARIES: usize = 20;
 /// An inbox identifier: the inbox's full address (e.g.
 /// `support@example.com`). Keeping the domain in the
 /// id keeps stored keys and API paths independent of any one mail domain.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct InboxId(pub String);
+///
+/// Every constructor, deserialization included, applies the same
+/// canonicalization the ingest path applies to envelope recipients
+/// (`ingest::normalized_recipients`: `trim().to_ascii_lowercase()`).
+/// DynamoDB partition keys are case-sensitive strings, and ingest stores
+/// every message under the lowercased recipient, so an id from a request
+/// whose casing or surrounding whitespace differs from the stored id would
+/// otherwise address a non-existent row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct InboxId(String);
 
 impl InboxId {
     #[must_use]
@@ -94,30 +102,21 @@ impl InboxId {
         self.0.split_once('@').map_or("", |(_, domain)| domain)
     }
 
-    /// Builds an [`InboxId`] from a client-supplied path segment, applying the
-    /// same canonicalization the ingest path applies to envelope recipients
-    /// (`ingest::normalized_recipients`: `trim().to_ascii_lowercase()`).
-    ///
-    /// DynamoDB partition keys are case-sensitive strings, and ingest stores
-    /// every message under the lowercased recipient, so a `{inbox_id}` path
-    /// whose casing or surrounding whitespace differs from the stored id must
-    /// be normalized the same way before it is used as a key — otherwise the
-    /// read addresses a non-existent row.
     #[must_use]
-    pub fn from_path(segment: &str) -> Self {
-        Self(segment.trim().to_ascii_lowercase())
+    pub fn new(value: &str) -> Self {
+        Self(value.trim().to_ascii_lowercase())
+    }
+}
+
+impl<'de> Deserialize<'de> for InboxId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self::new(&value))
     }
 }
 
 impl std::fmt::Display for InboxId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl From<String> for InboxId {
-    fn from(value: String) -> Self {
-        Self(value)
     }
 }
 
@@ -304,9 +303,27 @@ pub(crate) fn is_valid_local_part(part: &str) -> bool {
         })
 }
 
+/// Strips a `Message-ID` header value's surrounding `<`/`>`, if present.
+/// Stored ids and RFC alias keys hold the inner value; `mail-builder` adds
+/// the brackets back itself.
+#[must_use]
+pub(crate) fn strip_angle_brackets(rfc_id: &str) -> &str {
+    rfc_id
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(rfc_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_angle_brackets_removes_a_matched_pair_only() {
+        assert_eq!(strip_angle_brackets("<id@example.com>"), "id@example.com");
+        assert_eq!(strip_angle_brackets("id@example.com"), "id@example.com");
+        assert_eq!(strip_angle_brackets("<id@example.com"), "<id@example.com");
+    }
 
     #[test]
     fn is_valid_local_part_accepts_the_full_character_class() {
@@ -325,26 +342,28 @@ mod tests {
         assert!(!is_valid_local_part(&"a".repeat(65)));
     }
 
-    /// `from_path` must fold a mixed-case or padded path segment down to the
-    /// same id ingest stores under, mirroring `normalized_recipients`.
+    /// `new` must fold a mixed-case or padded value down to the same id
+    /// ingest stores under, mirroring `normalized_recipients`.
     #[test]
-    fn from_path_trims_and_ascii_lowercases_like_ingest() {
+    fn new_trims_and_ascii_lowercases_like_ingest() {
+        for value in [
+            "Support@Example.com",
+            "  Support@Example.com  ",
+            "SUPPORT@EXAMPLE.COM",
+            "support@example.com",
+        ] {
+            assert_eq!(InboxId::new(value).as_str(), "support@example.com");
+        }
+    }
+
+    #[test]
+    fn deserialize_normalizes_and_serialize_stays_a_plain_string() {
+        let id: InboxId =
+            serde_json::from_value(serde_json::json!(" Support@Example.com ")).unwrap();
+        assert_eq!(id.as_str(), "support@example.com");
         assert_eq!(
-            InboxId::from_path("Support@Example.com"),
-            InboxId("support@example.com".to_owned())
-        );
-        assert_eq!(
-            InboxId::from_path("  Support@Example.com  "),
-            InboxId("support@example.com".to_owned())
-        );
-        assert_eq!(
-            InboxId::from_path("SUPPORT@EXAMPLE.COM"),
-            InboxId("support@example.com".to_owned())
-        );
-        // The already-canonical form is a fixed point.
-        assert_eq!(
-            InboxId::from_path("support@example.com"),
-            InboxId("support@example.com".to_owned())
+            serde_json::to_value(&id).unwrap(),
+            serde_json::json!("support@example.com")
         );
     }
 }

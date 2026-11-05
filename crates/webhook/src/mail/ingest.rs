@@ -14,7 +14,8 @@ use crate::mail::mime::{ParseError, ParsedAttachment, parse_inbound};
 use crate::mail::objects::ObjectError;
 use crate::mail::store::MailStoreError;
 use crate::mail::{
-    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, content, ids, labels, thread, time,
+    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, content, ids, labels,
+    strip_angle_brackets, thread, time,
 };
 use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
@@ -248,7 +249,7 @@ async fn resolve_recipient<T: Services>(
         );
         return;
     }
-    let inbox_id = InboxId(address.to_owned());
+    let inbox_id = InboxId::new(address);
 
     match state.services.get_inbox(&inbox_id).await {
         Ok(Some(_)) => {
@@ -591,16 +592,6 @@ fn verdicts_json(receipt: &SesReceipt) -> serde_json::Value {
     })
 }
 
-/// Strips a `Message-ID`-shaped header value's surrounding `<`/`>`, if
-/// present — mirrors the private helper of the same name in `mail/plan.rs`,
-/// which is what the RFC alias key is actually keyed on.
-fn strip_angle_brackets(rfc_id: &str) -> &str {
-    rfc_id
-        .strip_prefix('<')
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or(rfc_id)
-}
-
 fn object_key(message_id: &str, attachment_id: &str) -> String {
     format!("attachments/{message_id}/{attachment_id}")
 }
@@ -779,13 +770,6 @@ mod tests {
             verdict_labels(InboundVerdict::Unauthenticated),
             vec!["received", "unauthenticated", "unread"]
         );
-    }
-
-    #[test]
-    fn strip_angle_brackets_removes_a_matched_pair_only() {
-        assert_eq!(strip_angle_brackets("<id@example.com>"), "id@example.com");
-        assert_eq!(strip_angle_brackets("id@example.com"), "id@example.com");
-        assert_eq!(strip_angle_brackets("<id@example.com"), "<id@example.com");
     }
 
     #[test]
