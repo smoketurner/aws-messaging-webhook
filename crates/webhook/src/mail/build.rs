@@ -244,7 +244,13 @@ mod tests {
         let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
 
         assert_eq!(parsed.subject(), Some("Hello"));
-        assert_eq!(parsed.text_body_count(), 1);
+        assert_eq!(
+            parsed
+                .parts()
+                .filter(mail_parser::MessagePart::in_text_body)
+                .count(),
+            1
+        );
         assert!(
             !raw.contains("multipart/"),
             "a single body needs no wrapper: {raw}"
@@ -290,7 +296,7 @@ mod tests {
         let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
 
         assert!(raw.contains("multipart/mixed"), "{raw}");
-        assert_eq!(parsed.attachment_count(), 1);
+        assert_eq!(parsed.attachments().len(), 1);
         assert!(raw.contains("att_1.bin"), "{raw}");
     }
 
@@ -321,7 +327,7 @@ mod tests {
             "one disposition header per part: {raw}"
         );
         assert_eq!(
-            parsed.attachment_count(),
+            parsed.attachments().len(),
             1,
             "the part must parse as an attachment: {raw}"
         );
@@ -412,7 +418,10 @@ mod tests {
         let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
 
         assert!(!raw.contains("<<"), "brackets must not be doubled: {raw}");
-        assert_eq!(parsed.in_reply_to().as_text(), Some("original@example.net"));
+        assert_eq!(
+            parsed.in_reply_to().and_then(|ids| ids.first()),
+            Some("original@example.net")
+        );
         assert_eq!(parsed.message_id(), Some("mid-1@example.com"));
     }
 
@@ -426,7 +435,10 @@ mod tests {
         let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
 
         assert_eq!(
-            parsed.header("X-Campaign").and_then(|h| h.as_text()),
+            parsed
+                .headers()
+                .value("X-Campaign")
+                .and_then(|h| h.as_text()),
             Some("spring")
         );
     }

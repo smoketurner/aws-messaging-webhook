@@ -3,10 +3,9 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
-use mail_parser::parsers::preview::{preview_html, preview_text};
 use mail_parser::{
-    Addr, Address, ContentType, HeaderValue, Message as MimeMessage, MessageParser, MessagePart,
-    MimeHeaders,
+    AddressList, ContentType, Mailbox, Message as MimeMessage, MessageParser, MessagePart,
+    MessageRef, PartKind, PartRole, TextList, preview_html, preview_text,
 };
 
 use crate::mail::content::MessageContent;
@@ -105,15 +104,13 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
 
     let subject = truncate_bytes(parsed.subject().unwrap_or_default(), SUBJECT_MAX_BYTES);
 
-    // `mail-parser`'s `text_bodies()`/`html_bodies()` each fall back to the
-    // other kind when a message has only one, as a convenience for callers
-    // that want "the body" in either form, and `text_bodies()` also lists
-    // inline non-text parts (an inline `image/svg+xml` in `multipart/mixed`),
-    // whose bytes `text_contents` returns whenever they are valid UTF-8. A5
-    // wants only genuine parts of each kind, so each iterator is filtered to
-    // its real `PartType`, and the preview is derived from the filtered
-    // bodies rather than `body_preview`, which reads the unfiltered first
-    // part and comes back empty when an inline image precedes the text.
+    // `mail-parser`'s RFC 8621 body lists copy a lone body part into the
+    // other list (`PartRole::CopiedBody`), as a convenience for callers that
+    // want "the body" in either form, and `text_body()` also lists inline
+    // media parts (an inline `image/svg+xml` in `multipart/mixed`). A5 wants
+    // only genuine parts of each kind, so each list is filtered to its real
+    // `PartKind`, and the preview is derived from the filtered bodies rather
+    // than `body_preview`, which reads the unfiltered first part.
     #[expect(
         clippy::disallowed_methods,
         reason = "the one place the unfiltered body lists are read, filtered here"
@@ -121,20 +118,23 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     let (text, html) = (
         join_body_parts(
             parsed
-                .text_bodies()
-                .filter(|part| part.is_text() && !part.is_text_html()),
+                .text_body()
+                .filter(|part| matches!(part.kind(), PartKind::Text)),
         ),
-        join_body_parts(parsed.html_bodies().filter(|part| part.is_text_html())),
+        join_body_parts(
+            parsed
+                .html_body()
+                .filter(|part| matches!(part.kind(), PartKind::Html)),
+        ),
     );
     let preview = preview(text.as_deref(), html.as_deref());
 
     let headers = collect_headers(&parsed);
 
-    let attachment_count = parsed.attachment_count();
-    let attachments = parsed
-        .attachments()
+    let attachment_count = attachment_parts(&parsed).count();
+    let attachments = attachment_parts(&parsed)
         .take(ATTACHMENTS_MAX)
-        .map(build_attachment)
+        .map(|part| build_attachment(&part))
         .collect();
 
     let message = MailMessage {
@@ -202,12 +202,11 @@ fn truncate_bytes(input: &str, max_bytes: usize) -> String {
 /// decoded from a quoted string or an encoded word is written back as an
 /// RFC 5322 phrase (section 3.2.5): quoted when it holds a special, with
 /// control characters (a decoded `=0A`) folded to spaces.
-fn format_addr(addr: &Addr<'_>) -> Option<String> {
-    let address = addr.address.as_deref()?;
+fn format_addr(addr: &Mailbox<'_>) -> Option<String> {
+    let address = addr.address()?;
     let framing = " <".len() + address.len() + ">".len();
     let name = addr
-        .name
-        .as_deref()
+        .name()
         .zip(ADDRESS_MAX_BYTES.checked_sub(framing))
         .and_then(|(name, budget)| display_name(name, budget));
     Some(match name {
@@ -253,20 +252,13 @@ fn display_name(name: &str, budget: usize) -> Option<String> {
 /// Flattens an address header (a plain list, or a group — whose member
 /// addresses are flattened without the group name) into display strings,
 /// capped at `cap` entries (`INBOUND_ADDRESS_LIST_MAX`).
-fn flatten_addresses(address: Option<&Address<'_>>, cap: usize) -> Vec<String> {
+fn flatten_addresses(address: Option<AddressList<'_>>, cap: usize) -> Vec<String> {
     let Some(address) = address else {
         return Vec::new();
     };
-    let addrs: Vec<&Addr<'_>> = match address {
-        Address::List(list) => list.iter().collect(),
-        Address::Group(groups) => groups
-            .iter()
-            .flat_map(|group| group.addresses.iter())
-            .collect(),
-    };
-    addrs
-        .into_iter()
-        .filter_map(format_addr)
+    address
+        .mailboxes()
+        .filter_map(|mailbox| format_addr(&mailbox))
         .take(cap)
         .collect()
 }
@@ -288,12 +280,10 @@ fn wrap_id(id: &str) -> String {
 
 /// Every id in an `In-Reply-To`/`References` header, each through
 /// [`wrap_id`].
-fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
-    match value {
-        HeaderValue::Text(id) => vec![wrap_id(id)],
-        HeaderValue::TextList(ids) => ids.iter().map(|id| wrap_id(id)).collect(),
-        _ => Vec::new(),
-    }
+fn id_list(value: Option<TextList<'_>>) -> Vec<String> {
+    value
+        .map(|ids| ids.iter().map(wrap_id).collect())
+        .unwrap_or_default()
 }
 
 /// A message's listing snippet: `preview_text` over the text body, else
@@ -301,38 +291,38 @@ fn id_list(value: &HeaderValue<'_>) -> Vec<String> {
 /// here, so the same body lists the same way whichever way it travelled.
 #[must_use]
 pub fn preview(text: Option<&str>, html: Option<&str>) -> String {
-    let preview = match text {
-        Some(text) => preview_text(text.into(), PREVIEW_CHARS),
+    match text {
+        Some(text) => preview_text(text, PREVIEW_CHARS).into_owned(),
         None => html
-            .map(|html| preview_html(html.into(), PREVIEW_CHARS))
+            .map(|html| preview_html(html, PREVIEW_CHARS))
             .unwrap_or_default(),
-    };
-    preview.into_owned()
+    }
 }
 
 /// Concatenates every part's text with `\n` (A5); `None` when there are no
 /// parts of this kind.
-fn join_body_parts<'a>(parts: impl Iterator<Item = &'a MessagePart<'a>>) -> Option<String> {
+fn join_body_parts<'a>(parts: impl Iterator<Item = MessagePart<'a>>) -> Option<String> {
     let joined = parts
-        .filter_map(MessagePart::text_contents)
+        .filter_map(|part| part.text())
         .collect::<Vec<_>>()
         .join("\n");
     (!joined.is_empty()).then_some(joined)
 }
 
 /// Builds the message-level `headers` map from the raw header text
-/// (`headers_raw`, so values keep their original encoding rather than
+/// (`raw_name`/`raw_value`, so values keep their original encoding rather than
 /// `mail-parser`'s structured decode), truncating each name/value to its cap
 /// and stopping once `HEADERS_BUDGET` is reached. Later headers with the
 /// same name overwrite earlier ones.
 fn collect_headers(message: &MimeMessage<'_>) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
     let mut budget = 0usize;
-    for (name, value) in message.headers_raw() {
+    for header in message.headers() {
         if budget >= HEADERS_BUDGET {
             break;
         }
-        let name = truncate_bytes(name.trim(), HEADER_NAME_MAX);
+        let name = truncate_bytes(header.raw_name().trim(), HEADER_NAME_MAX);
+        let value = String::from_utf8_lossy(header.raw_value());
         let value = truncate_bytes(value.trim(), HEADER_VALUE_MAX);
         budget += name.len() + value.len();
         headers.insert(name, value);
@@ -345,13 +335,13 @@ fn collect_headers(message: &MimeMessage<'_>) -> BTreeMap<String, String> {
 /// missing, oversized, or containing whitespace/control characters — so a
 /// hostile inbound content type can never make a later `PutObject` fail to
 /// build.
-fn normalize_content_type(content_type: Option<&ContentType<'_>>) -> String {
+fn normalize_content_type(content_type: Option<ContentType<'_>>) -> String {
     let Some(content_type) = content_type else {
         return DEFAULT_CONTENT_TYPE.to_owned();
     };
-    let mut value = content_type.c_subtype.as_deref().map_or_else(
-        || content_type.c_type.to_string(),
-        |subtype| format!("{}/{}", content_type.c_type, subtype),
+    let mut value = content_type.subtype().map_or_else(
+        || content_type.ctype().to_owned(),
+        |subtype| format!("{}/{}", content_type.ctype(), subtype),
     );
     value.make_ascii_lowercase();
     let valid = value.len() <= NORMALIZED_CONTENT_TYPE_MAX_BYTES
@@ -369,7 +359,7 @@ fn normalize_content_type(content_type: Option<&ContentType<'_>>) -> String {
 fn normalized_disposition(part: &MessagePart<'_>) -> String {
     let is_inline = part
         .content_disposition()
-        .is_some_and(|cd| cd.c_type.eq_ignore_ascii_case("inline"));
+        .is_some_and(|cd| cd.ctype().eq_ignore_ascii_case("inline"));
     if is_inline { "inline" } else { "attachment" }.to_owned()
 }
 
@@ -377,9 +367,9 @@ fn normalized_disposition(part: &MessagePart<'_>) -> String {
 /// message's own subject, sanitized to strip control characters and capped
 /// at `ATTACHMENT_FIELD_MAX` bytes (leaving room for the `.eml` suffix),
 /// else `"message"` when the inner subject is absent or blank.
-fn nested_message_filename(inner: Option<&MimeMessage<'_>>) -> String {
+fn nested_message_filename(inner: Option<MessageRef<'_>>) -> String {
     let subject = inner
-        .and_then(MimeMessage::subject)
+        .and_then(|inner| inner.subject())
         .map(str::trim)
         .filter(|subject| !subject.is_empty())
         .unwrap_or("message");
@@ -390,6 +380,19 @@ fn nested_message_filename(inner: Option<&MimeMessage<'_>>) -> String {
     )
 }
 
+/// The top-level message's attachment parts, in document order: every part
+/// `mail-parser` lists as an attachment, plus inline media shown in a body
+/// (`PartRole::MediaBody`). RFC 8621 leaves inline media shown in both
+/// bodies out of `attachments()`, but its bytes are only reachable here, so
+/// an inline image in `multipart/mixed` or a `cid:` target is still kept.
+/// Parts of nested messages are excluded; the nested message is one part.
+fn attachment_parts<'m>(message: &'m MimeMessage<'_>) -> impl Iterator<Item = MessagePart<'m>> {
+    message
+        .root()
+        .parts()
+        .filter(|part| part.is_attachment() || part.role() == PartRole::MediaBody)
+}
+
 /// Builds one kept attachment's metadata and bytes. A nested
 /// `message/rfc822` part is stored as its own raw bytes under a synthesized
 /// filename and content type; inner parts are never flattened.
@@ -398,11 +401,11 @@ fn build_attachment(part: &MessagePart<'_>) -> ParsedAttachment {
     let content_id = part
         .content_id()
         .map(|id| truncate_bytes(id, ATTACHMENT_FIELD_MAX));
-    let bytes = Bytes::copy_from_slice(part.contents());
+    let bytes = Bytes::copy_from_slice(&part.decoded());
 
     if part.is_message() {
         return ParsedAttachment {
-            filename: Some(nested_message_filename(part.message())),
+            filename: Some(nested_message_filename(part.nested())),
             content_type: "message/rfc822".to_owned(),
             content_disposition,
             content_id,

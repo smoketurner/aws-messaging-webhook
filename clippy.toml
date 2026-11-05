@@ -3,6 +3,8 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 doc-valid-idents = ["DynamoDB", "EventBridge", "GovCloud", "SNS", "SES", ".."]
 disallowed-methods = [
+    { path = "mail_parser::Message::text_body", reason = "lists inline media parts; read bodies through mime::parse_inbound's filtered text/html" },
+    { path = "mail_parser::Message::html_body", reason = "copies a lone text part in; read bodies through mime::parse_inbound's filtered text/html" },
     { path = "mail_parser::Message::text_bodies", reason = "lists inline non-text parts; read bodies through mime::parse_inbound's filtered text/html" },
     { path = "mail_parser::Message::html_bodies", reason = "falls back to text parts; read bodies through mime::parse_inbound's filtered text/html" },
     { path = "mail_parser::Message::body_text", reason = "reads the unfiltered body list; use mime::parse_inbound's filtered text" },
