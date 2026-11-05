@@ -2,22 +2,30 @@
 //!
 //! Executes the same `PlannedOp`s the real store executes, with the same
 //! condition semantics and cancellation decoding, so
-//! higher-level tests exercise the real planner (`mail::plan::plan_insert`)
-//! and decoder (`mail::txn::decode_cancellation`) rather than a shortcut.
+//! higher-level tests exercise the real planner (`plan::plan_insert`)
+//! and decoder (`txn::decode_cancellation`) rather than a shortcut.
 //! The test backend's `Table`.
 
+#![expect(
+    clippy::missing_panics_doc,
+    reason = "test double: a poisoned lock is a test bug, not documented API"
+)]
+#![expect(
+    clippy::must_use_candidate,
+    reason = "test double: callers always use the return value directly"
+)]
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use aws_messaging_webhook::mail::keys::{self, PageKey, TableKey};
-use aws_messaging_webhook::mail::mailbox::Mailbox;
-use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, WriteOp};
-use aws_messaging_webhook::mail::send::SendKey;
-use aws_messaging_webhook::mail::store::{MailStoreError, Page};
-use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
-use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
-use aws_messaging_webhook::mail::{InboxId, MailMessage, MessageId, PutOutcome, ThreadId};
+use crate::keys::{self, PageKey, TableKey};
+use crate::mailbox::Mailbox;
+use crate::plan::{Cond, PlannedOp, WriteOp};
+use crate::store::{MailStoreError, Page};
+use crate::table::{PageQuery, Read, Table, TxnOutcome};
+use crate::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use mailbox::send::SendKey;
+use mailbox::{InboxId, MailMessage, MessageId, PutOutcome, ThreadId};
 use serde_dynamo::{AttributeValue, Item};
 
 /// A scripted failure [`MailMemoryStore::inject`] queues, consumed once on
@@ -79,7 +87,7 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         thread_id: ThreadId::new(thread_id),
         message_id: MessageId::new(message_id),
         ses_message_id: None,
-        direction: aws_messaging_webhook::mail::Direction::Inbound,
+        direction: mailbox::Direction::Inbound,
         rfc_message_id: format!("<{message_id}@example.com>"),
         in_reply_to: None,
         labels: vec!["received".to_owned(), "unread".to_owned()],
@@ -206,11 +214,8 @@ impl MailMemoryStore {
         }
     }
 
-    fn check_holds(
-        existing: Option<&Item>,
-        check: &aws_messaging_webhook::mail::plan::Check,
-    ) -> bool {
-        use aws_messaging_webhook::mail::plan::Check;
+    fn check_holds(existing: Option<&Item>, check: &crate::plan::Check) -> bool {
+        use crate::plan::Check;
         let Check::Eq(name, expected) = check;
         existing
             .and_then(|item| item.inner().get(*name))
@@ -555,9 +560,10 @@ impl Table for MailMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_messaging_webhook::mail::send::SendState;
-    use aws_messaging_webhook::mail::store::{ListQuery, MarkOutcome};
-    use aws_messaging_webhook::mail::{InsertOutcome, RfcHit};
+    use crate::store::ListQuery;
+    use mailbox::send::MarkOutcome;
+    use mailbox::send::SendState;
+    use mailbox::{InsertOutcome, RfcHit};
 
     fn message(message_id: &str, thread_id: &str) -> MailMessage {
         sample_message("support@example.com", message_id, thread_id)
@@ -736,7 +742,7 @@ mod tests {
     }
 
     fn alias_op(id: &str, message_id: Option<&str>, thread_id: &str) -> PlannedOp {
-        use aws_messaging_webhook::mail::plan::OpRole;
+        use crate::plan::OpRole;
         PlannedOp {
             role: OpRole::RfcAlias,
             op: WriteOp::AliasFirstWriter {
@@ -803,7 +809,7 @@ mod tests {
     /// A queued outbound message and its send state, committed the way the
     /// send API commits them.
     async fn queued_send(store: &MailMemoryStore) -> SendState {
-        use aws_messaging_webhook::mail::send::Envelope;
+        use mailbox::send::Envelope;
 
         let mut msg = message("mid-1", "mid-1");
         msg.labels = vec!["queued".to_owned()];
@@ -845,7 +851,7 @@ mod tests {
         let error = Mailbox::new(&store)
             .mark_send(
                 &stale,
-                MarkOutcome::Sent(aws_messaging_webhook::mail::store::SesSent {
+                MarkOutcome::Sent(mailbox::send::SesSent {
                     message_id: "ses-1",
                     region: "us-east-1",
                 }),
@@ -943,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn insert_message_gives_up_after_max_retries_on_persistent_throttling() {
         let store = MailMemoryStore::default();
-        for _ in 0..=aws_messaging_webhook::mail::mailbox::MAX_TXN_RETRIES {
+        for _ in 0..=crate::mailbox::MAX_TXN_RETRIES {
             store.inject(Injected::Throttle);
         }
         let msg = message("mid-1", "mid-1");

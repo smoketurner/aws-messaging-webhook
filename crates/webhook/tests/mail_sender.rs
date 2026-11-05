@@ -7,16 +7,17 @@
 //! most one SES call, whatever the sender is handed.
 
 use aws_messaging_webhook::actions::SendOutcome;
-use aws_messaging_webhook::mail::keys::TableKey;
-use aws_messaging_webhook::mail::send::{SendFailure, SendState, SendStatus};
+use aws_messaging_webhook::mail::object_keys;
 use aws_messaging_webhook::mail::sender::{
     Handled, Resolution, handle_send, resolve_unknown, sweep,
 };
-use aws_messaging_webhook::mail::{InboxId, ids, object_keys, time};
-use aws_messaging_webhook::mail::{MessageId, SesMessageId, ThreadId};
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use mailbox::send::{SendFailure, SendState, SendStatus};
+use mailbox::{InboxId, ids, time};
+use mailbox::{MessageId, SesMessageId, ThreadId};
+use mailbox_store::keys::TableKey;
 use serde_json::{Value, json};
 use webhook_test_support::objects::{ObjectFailure, Op};
 use webhook_test_support::{Harness, TEST_INBOX, api, api_harness};
@@ -586,8 +587,7 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
             .await
             .unwrap();
     }
-    h.mail
-        .inject(webhook_test_support::mail_memory::Injected::Transient);
+    h.mail.inject(mailbox_store::memory::Injected::Transient);
 
     let report = sweep(&h.state).await.unwrap();
 
@@ -932,8 +932,7 @@ async fn the_sweep_leaves_a_recent_claim_alone() {
     // message gets sent twice.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    let now =
-        aws_messaging_webhook::mail::time::format(aws_messaging_webhook::mail::time::now_ms());
+    let now = mailbox::time::format(mailbox::time::now_ms());
     h.state
         .mailbox
         .claim_send(&MessageId::new(message_id.as_str()), &now)
@@ -1044,9 +1043,7 @@ async fn an_operator_can_close_an_unknown_message_as_failed() {
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Failed);
     assert_eq!(
-        state
-            .failure
-            .map(aws_messaging_webhook::mail::send::SendFailure::as_str),
+        state.failure.map(mailbox::send::SendFailure::as_str),
         Some("closed_by_operator")
     );
 }

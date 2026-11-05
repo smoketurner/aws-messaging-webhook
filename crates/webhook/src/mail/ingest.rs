@@ -10,17 +10,18 @@ use uuid::Uuid;
 
 use crate::actions::ActionError;
 use crate::config::MailConfig;
-use crate::mail::labels::SystemLabel;
-use crate::mail::mime::{ParseError, ParsedAttachment, ParsedMessage, parse_inbound};
 use crate::mail::objects::ObjectStore as _;
-use crate::mail::store::MailStoreError;
-use crate::mail::{
-    AttachmentMeta, Direction, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, MessageId,
-    SesMessageId, ThreadId, content, ids, labels, object_keys, strip_angle_brackets, thread, time,
-};
+use crate::mail::{content, object_keys};
 use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
 use crate::state::{AppState, Backend};
+use mailbox::labels::SystemLabel;
+use mailbox::mime::{ParseError, ParsedAttachment, ParsedMessage, parse_inbound};
+use mailbox::{
+    AttachmentMeta, Direction, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, MessageId,
+    SesMessageId, ThreadId, ids, labels, strip_angle_brackets, thread, time,
+};
+use mailbox_store::store::MailStoreError;
 
 /// Headroom held back from the invocation deadline: ingest runs under
 /// `deadline − now − DEADLINE_MARGIN`, leaving room for the timeout's own
@@ -391,7 +392,14 @@ async fn fetch_parse_and_extract<B: Backend>(
     key: &str,
     uuid: Uuid,
     message_id: &MessageId,
-) -> Result<(ParsedMessage, content::MessageContent, Vec<AttachmentMeta>), ActionError> {
+) -> Result<
+    (
+        ParsedMessage,
+        mailbox::content::MessageContent,
+        Vec<AttachmentMeta>,
+    ),
+    ActionError,
+> {
     let raw = state
         .objects
         .get_object(key, MAX_INBOUND_RAW_BYTES)
@@ -495,7 +503,7 @@ impl InboundDraft {
 async fn insert_into_all_targets<B: Backend>(
     state: &AppState<B>,
     draft: &InboundDraft,
-    content: &content::MessageContent,
+    content: &mailbox::content::MessageContent,
     targets: Vec<InboxId>,
 ) -> Result<bool, ActionError> {
     let mut had_transient = false;
@@ -538,7 +546,7 @@ async fn insert_into_all_targets<B: Backend>(
 async fn insert_into_inbox<B: Backend>(
     state: &AppState<B>,
     draft: &InboundDraft,
-    content: &content::MessageContent,
+    content: &mailbox::content::MessageContent,
     inbox_id: &InboxId,
 ) -> Result<(), ActionError> {
     let msg = draft.to_message(inbox_id);
@@ -733,8 +741,8 @@ async fn put_one<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::labels::InboundVerdict;
     use crate::model::ses_inbound::SesReceipt;
+    use mailbox::labels::InboundVerdict;
 
     #[test]
     fn normalized_recipients_lowercases_trims_and_dedupes() {

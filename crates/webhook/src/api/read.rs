@@ -18,15 +18,16 @@ use axum::extract::{Path, State};
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
 use crate::config::Config;
-use crate::mail::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
+use crate::mail::content;
 use crate::mail::objects;
 use crate::mail::objects::ObjectStore as _;
-use crate::mail::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
-use crate::mail::thread::ThreadState;
-use crate::mail::wire;
-use crate::mail::{InboxId, MailMessage, content, time};
-use crate::mail::{MessageId, ThreadId};
 use crate::state::{AppState, Backend};
+use mailbox::thread::ThreadState;
+use mailbox::wire;
+use mailbox::{InboxId, MailMessage, time};
+use mailbox::{MessageId, ThreadId};
+use mailbox_store::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
+use mailbox_store::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 
 /// How many store round-trips one list request may spend filling a page.
 /// Without a bound, a filter matching nothing could walk an entire partition

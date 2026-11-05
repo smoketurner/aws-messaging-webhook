@@ -2,7 +2,7 @@
 //! `Query`, conditional `PutItem` and `TransactWriteItems`.
 //!
 //! Every write goes through the transaction model
-//! ([`crate::mail::plan`]/[`crate::mail::txn`]): a planner builds
+//! ([`crate::plan`]/[`crate::txn`]): a planner builds
 //! role-tagged [`PlannedOp`]s from a pure, in-memory computation, this module
 //! renders them to a `TransactWriteItems` call, and
 //! [`decode_cancellation`] turns a cancellation into one of a handful of
@@ -21,13 +21,13 @@ use aws_sdk_dynamodb::types::{
     AttributeValue as DynamoAv, KeysAndAttributes, Put, TransactWriteItem, Update,
 };
 
-use crate::aws::FromSdkFailure;
-use crate::mail::PutOutcome;
-use crate::mail::keys::{PageKey, TableKey};
-use crate::mail::plan::{Check, Cond, PlannedOp, WriteOp};
-use crate::mail::store::{MailStoreError, Page};
-use crate::mail::table::{PageQuery, Read, Table, TxnOutcome};
-use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use crate::keys::{PageKey, TableKey};
+use crate::plan::{Check, Cond, PlannedOp, WriteOp};
+use crate::sdk_error::FromSdkFailure;
+use crate::store::{MailStoreError, Page};
+use crate::table::{PageQuery, Read, Table, TxnOutcome};
+use crate::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use mailbox::PutOutcome;
 
 /// `BatchGetItem` loops on `UnprocessedKeys` at most this many times before
 /// surfacing a transient error.
@@ -590,10 +590,10 @@ impl Table for DynamoTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::keys;
-    use crate::mail::mailbox::Mailbox;
-    use crate::mail::{Inbox, InboxId};
-    use crate::mail::{MessageId, SesMessageId, ThreadId};
+    use crate::keys;
+    use crate::mailbox::Mailbox;
+    use mailbox::{Inbox, InboxId};
+    use mailbox::{MessageId, SesMessageId, ThreadId};
 
     fn alias_put(message_id: Option<&str>) -> aws_sdk_dynamodb::types::Put {
         let op = WriteOp::AliasFirstWriter {

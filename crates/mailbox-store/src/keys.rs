@@ -5,8 +5,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use crate::mail::InboxId;
-use crate::mail::send::SendStatus;
+use mailbox::InboxId;
+use mailbox::send::SendStatus;
 
 /// A mail-table item's primary key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

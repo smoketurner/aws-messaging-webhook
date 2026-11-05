@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::mail::objects::ObjectError;
-use crate::mail::store::MailStoreError;
 use crate::metrics::names;
+use mailbox_store::store::MailStoreError;
 
 /// The standard error body.
 #[derive(Debug, Serialize)]

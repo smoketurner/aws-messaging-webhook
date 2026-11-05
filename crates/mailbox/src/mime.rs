@@ -2,15 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use axum::body::Bytes;
+use bytes::Bytes;
 use mail_parser::{
     AddressList, ContentType, Mailbox, Message as MimeMessage, MessageParser, MessagePart,
     MessageRef, PartKind, PartRole, TextList, preview_html, preview_text,
 };
 
-use crate::mail::content::MessageContent;
-use crate::mail::wire::ContentDisposition;
-use crate::mail::{
+use crate::content::MessageContent;
+use crate::wire::ContentDisposition;
+use crate::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, HEADER_NAME_MAX, HEADER_VALUE_MAX,
     HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, PREVIEW_CHARS, REFERENCES_MAX, REFERENCES_MAX_BYTES,
     SUBJECT_MAX_BYTES,
@@ -30,7 +30,7 @@ pub struct ParsedAttachment {
     pub content_type: String,
     pub content_disposition: ContentDisposition,
     pub content_id: Option<String>,
-    pub bytes: axum::body::Bytes,
+    pub bytes: bytes::Bytes,
 }
 
 /// A parsed inbound message, before thread resolution and item assembly:
@@ -264,7 +264,7 @@ fn flatten_addresses(address: Option<AddressList<'_>>, cap: usize) -> Vec<String
 
 /// `Message-ID`/`In-Reply-To`/`References` are parsed by `mail-parser` with
 /// the angle brackets stripped; this re-wraps an id to the RFC form our
-/// own [`crate::mail::ids::our_rfc_message_id`] and [`crate::mail::ids::ses_rfc_ids`]
+/// own [`crate::ids::our_rfc_message_id`] and [`crate::ids::ses_rfc_ids`]
 /// produce. The id is truncated to [`REFERENCES_MAX_BYTES`] (leaving room
 /// for the `<>` wrapping) so a single oversized id — still under the SES raw
 /// receive limit but able to JSON-escape sixfold — can never push the stored
@@ -430,11 +430,11 @@ fn build_attachment(part: &MessagePart<'_>) -> ParsedAttachment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::ATTACHMENTS_MAX;
+    use crate::ATTACHMENTS_MAX;
 
     macro_rules! fixture {
         ($name:literal) => {
-            parse_inbound(include_bytes!(concat!("../../tests/fixtures/mail/", $name))).unwrap()
+            parse_inbound(include_bytes!(concat!("../tests/fixtures/mail/", $name))).unwrap()
         };
     }
 
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn malformed_message_is_a_parse_error() {
         let error =
-            parse_inbound(include_bytes!("../../tests/fixtures/mail/malformed.eml")).unwrap_err();
+            parse_inbound(include_bytes!("../tests/fixtures/mail/malformed.eml")).unwrap_err();
         assert!(matches!(error, ParseError::Malformed));
     }
 

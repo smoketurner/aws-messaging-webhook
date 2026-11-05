@@ -23,12 +23,14 @@ use serde::Serialize;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
+use crate::mail::content;
 use crate::mail::objects::ObjectStore;
-use crate::mail::send::{Envelope, SendKey, SendSpec, SendState};
-use crate::mail::store::EnqueueOutcome;
-use crate::mail::{InboxId, MailMessage, content, ids, keys, time};
-use crate::mail::{MessageId, ThreadId};
 use crate::state::{AppState, Backend};
+use mailbox::send::{Envelope, SendKey, SendSpec, SendState};
+use mailbox::{InboxId, MailMessage, ids, time};
+use mailbox::{MessageId, ThreadId};
+use mailbox_store::keys;
+use mailbox_store::store::EnqueueOutcome;
 
 pub use reply::reply;
 pub use validate::{ReplyRequest, SendRequest};
@@ -75,7 +77,7 @@ async fn enqueue<B: Backend>(
     inbox: InboxId,
     request: SendRequest,
     headers: &HeaderMap,
-    original: Option<(&MailMessage, &content::MessageContent)>,
+    original: Option<(&MailMessage, &mailbox::content::MessageContent)>,
     route: &str,
 ) -> Result<Json<SendAccepted>, ApiError> {
     let key_hash = idempotency_key_hash(headers)?;
@@ -124,7 +126,7 @@ async fn enqueue<B: Backend>(
     if let Err(error) = upload_spec(&state.objects, &spec, &validated).await {
         return Err(discard_and_fail(&state.objects, &spec, error).await);
     }
-    let message_content = content::MessageContent {
+    let message_content = mailbox::content::MessageContent {
         text: validated.text.clone(),
         html: validated.html.clone(),
         headers: validated.headers.clone(),

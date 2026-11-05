@@ -2,6 +2,7 @@
 //! receiving-email-notifications-contents. The verdicts drive quarantine
 //! classification — nothing is dropped, and the full payload is forwarded.
 
+use mailbox::open_string_enum;
 use serde::{Deserialize, Serialize};
 
 use super::ses_notification::{SesCommonHeaders, SesMail};

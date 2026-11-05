@@ -3,7 +3,7 @@
 //! flow that runs a transaction shares one retry/conflict policy instead of
 //! re-deriving it from raw DynamoDB error codes.
 
-use crate::mail::plan::{Cond, OpRole, PlannedOp, WriteOp};
+use crate::plan::{Cond, OpRole, PlannedOp, WriteOp};
 
 /// The outcome `decode_cancellation` resolves a transaction cancellation to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +193,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::mail::plan::Cond;
+    use crate::plan::Cond;
 
     fn op(role: OpRole, op: WriteOp) -> PlannedOp {
         PlannedOp { role, op }

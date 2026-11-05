@@ -1,4 +1,4 @@
-//! End-to-end regression for `mail::txn::decode_cancellation`'s `Thread`
+//! End-to-end regression for `txn::decode_cancellation`'s `Thread`
 //! `NotExists` race: a brand-new thread whose `NotExists` check lost to a
 //! concurrent writer must decode to a retryable `VersionConflict`, not a
 //! `Permanent` drop. Exercises the real `Mailbox::insert_message` and
@@ -14,21 +14,21 @@
 //! inbox never received, where the second loses the parent's placeholder and
 //! must join the first one's thread.
 
-use aws_messaging_webhook::mail::{MessageId, ThreadId};
+use mailbox::{MessageId, ThreadId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use mailbox_store::memory::{MailMemoryStore, sample_message};
 use serde::de::DeserializeOwned;
-use webhook_test_support::mail_memory::{MailMemoryStore, sample_message};
 
-use aws_messaging_webhook::mail::keys::TableKey;
-use aws_messaging_webhook::mail::mailbox::Mailbox;
-use aws_messaging_webhook::mail::plan::{self, PlannedOp};
-use aws_messaging_webhook::mail::store::{MailStoreError, Page};
-use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
-use aws_messaging_webhook::mail::thread::{AliasLookup, new_thread};
-use aws_messaging_webhook::mail::{InsertOutcome, PutOutcome};
+use mailbox::thread::{AliasLookup, new_thread};
+use mailbox::{InsertOutcome, PutOutcome};
+use mailbox_store::keys::TableKey;
+use mailbox_store::mailbox::Mailbox;
+use mailbox_store::plan::{self, PlannedOp};
+use mailbox_store::store::{MailStoreError, Page};
+use mailbox_store::table::{PageQuery, Read, Table, TxnOutcome};
 
 /// A `Table` wrapper that, on the first `transact`, first commits a
 /// competing message's full insert plan against the inner store — simulating a
@@ -157,13 +157,13 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
 /// resurrects the thread does not cost the loser its committed message.
 #[tokio::test]
 async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurrent_writer() {
-    use aws_messaging_webhook::mail::send::{Envelope, SendState};
-    use aws_messaging_webhook::mail::store::EnqueueOutcome;
+    use mailbox::send::{Envelope, SendState};
+    use mailbox_store::store::EnqueueOutcome;
 
     let store_inner = MailMemoryStore::default();
     let r1 = sample_message("support@example.com", "mid-r1", "shared-thread");
     let mut r2 = sample_message("support@example.com", "mid-r2", "shared-thread");
-    r2.direction = aws_messaging_webhook::mail::Direction::Outbound;
+    r2.direction = mailbox::Direction::Outbound;
     r2.labels = vec!["queued".to_owned()];
     r2.timestamp = "00000002-0000".to_owned();
     let competing_plan =

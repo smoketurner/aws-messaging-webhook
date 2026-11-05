@@ -4,13 +4,14 @@
 //! insert path: every fixture goes in through `insert_message`, so the items
 //! these reads return are the ones ingest would actually write.
 
-use aws_messaging_webhook::mail::MessageId;
+use mailbox::MessageId;
 use std::collections::BTreeMap;
 
-use aws_messaging_webhook::mail::content::{self, MessageContent};
-use aws_messaging_webhook::mail::{InboxId, ids, time};
+use aws_messaging_webhook::mail::content;
 use axum::http::{Method, StatusCode};
-use webhook_test_support::mail_memory::sample_message;
+use mailbox::content::MessageContent;
+use mailbox::{InboxId, ids, time};
+use mailbox_store::memory::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 /// A harness with an authenticated key and an existing inbox.
@@ -32,7 +33,7 @@ async fn insert(h: &Harness, at: &str, thread: &str, adjust: impl FnOnce(&mut Ma
     h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 }
 
-type MailMessageOwned = aws_messaging_webhook::mail::MailMessage;
+type MailMessageOwned = mailbox::MailMessage;
 
 #[tokio::test]
 async fn listing_messages_returns_newest_first_by_default() {

@@ -5,7 +5,7 @@
 //! `mailbox_event_schemas.rs`.
 //!
 //! Stream images are built with `serde_dynamo::to_item` on
-//! [`aws_messaging_webhook::mail::MailMessage`] — never hand-parsed
+//! [`mailbox::MailMessage`] — never hand-parsed
 //! attribute JSON — matching what the store actually writes.
 
 // This binary's own helper functions never fail except on a bug in the test
@@ -13,11 +13,13 @@
 // doesn't extend to code outside that crate).
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-use aws_messaging_webhook::mail::{MessageId, SesMessageId, ThreadId};
+use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeMap;
 
-use aws_messaging_webhook::mail::content::{self, MessageContent};
-use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ThreadSnapshot, keys};
+use aws_messaging_webhook::mail::content;
+use mailbox::content::MessageContent;
+use mailbox::{Direction, InboxId, MailMessage, ThreadSnapshot};
+use mailbox_store::keys;
 use serde_dynamo::AttributeValue;
 use serde_json::{Value, json};
 use webhook_test_support::{Harness, harness, invoke};

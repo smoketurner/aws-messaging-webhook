@@ -2,7 +2,7 @@
 // Pedantic doc and must_use lints assume a public API with its own contract
 // to document; every item here exists only for a `#[tokio::test]` body to
 // call directly and unwrap, so they add no signal. Declared at the crate
-// root so they cover `mail_memory` and `objects` too.
+// root so they cover `objects` and `api_keys` too.
 #![expect(
     clippy::missing_panics_doc,
     reason = "test harness helpers: an internal unwrap is the intended fast-fail on setup failure, not documented API"
@@ -24,7 +24,6 @@
 
 pub mod api;
 pub mod api_keys;
-pub mod mail_memory;
 pub mod objects;
 
 use std::future::Future;
@@ -44,9 +43,7 @@ use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
-use aws_messaging_webhook::mail::mailbox::Mailbox;
-use aws_messaging_webhook::mail::send::SendSpec;
-use aws_messaging_webhook::mail::{InboxId, object_keys};
+use aws_messaging_webhook::mail::object_keys;
 use aws_messaging_webhook::model::DomainEvent;
 use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
 use aws_messaging_webhook::state::{AppState, Backend};
@@ -55,7 +52,10 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lambda_http::{Context, LambdaEvent};
-use mail_memory::MailMemoryStore;
+use mailbox::InboxId;
+use mailbox::send::SendSpec;
+use mailbox_store::mailbox::Mailbox;
+use mailbox_store::memory::{self as mail_memory, MailMemoryStore};
 use objects::FakeObjectStore;
 use serde_json::{Value, json};
 use sns_message_verifier::SnsVerifier;
@@ -320,7 +320,7 @@ impl FakeFetcher {
 impl AttachmentFetcher for FakeFetcher {
     fn fetch(
         &self,
-        url: &aws_messaging_webhook::mail::url_policy::AttachmentUrl,
+        url: &mailbox::url_policy::AttachmentUrl,
         max_bytes: u64,
     ) -> impl Future<Output = Result<Fetched, FetchError>> + Send {
         self.fetched.lock().unwrap().push(url.as_str().to_owned());

@@ -6,14 +6,15 @@
 //! The response means the send is durably queued, not that SES has accepted
 //! it — the sender does that from the stream.
 
-use aws_messaging_webhook::mail::keys::TableKey;
-use aws_messaging_webhook::mail::send::{SendState, SendStatus};
-use aws_messaging_webhook::mail::{InboxId, MESSAGE_USER_LABEL_CAP, content, labels};
-use aws_messaging_webhook::mail::{MessageId, ThreadId};
+use aws_messaging_webhook::mail::content;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use mailbox::send::{SendState, SendStatus};
+use mailbox::{InboxId, MESSAGE_USER_LABEL_CAP, labels};
+use mailbox::{MessageId, ThreadId};
+use mailbox_store::keys::TableKey;
 use serde_json::{Value, json};
 use webhook_test_support::objects::Op;
 use webhook_test_support::{Harness, TEST_INBOX, api, api_harness};
@@ -285,8 +286,7 @@ async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
     // messages/, reclaimed by the bucket's expire-messages lifecycle rule, so
     // discard_uploads leaves it and keeps its deletes scoped to outbox/.
     let h = api_harness().await;
-    h.mail
-        .inject(webhook_test_support::mail_memory::Injected::Transient);
+    h.mail.inject(mailbox_store::memory::Injected::Transient);
     let mut request = body();
     request["attachments"] = json!([{
         "content": STANDARD.encode("file bytes"),
@@ -337,8 +337,7 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
     // overlap; the in-memory store can inject it so a sequential test can
     // exercise the loser's cleanup path.
     let h = api_harness().await;
-    h.mail
-        .inject(webhook_test_support::mail_memory::Injected::KeyExists);
+    h.mail.inject(mailbox_store::memory::Injected::KeyExists);
     let mut request = body();
     request["attachments"] = json!([{
         "content": STANDARD.encode("file bytes"),
@@ -777,7 +776,7 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
 /// too, or it short-circuits the enqueue before the reclaim can run.
 #[tokio::test]
 async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
-    use aws_messaging_webhook::mail::send::SendKey;
+    use mailbox::send::SendKey;
     use sha2::{Digest as _, Sha256};
 
     let h = api_harness().await;

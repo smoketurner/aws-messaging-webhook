@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo test --workspace                                  # unit + handler tests; no AWS account needed
 cargo test -p aws-messaging-webhook --test handlers <name>   # one handler test
 cargo test -p sns-message-verifier <name>                    # one verifier test
+cargo test -p mailbox-store --test mailbox_behaviour <name>  # one store-behaviour test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo deny check                                        # advisories/licenses/bans (runs in CI)
@@ -36,15 +37,33 @@ a top-level `Records` array is either a DynamoDB stream batch (`eventSource: aws
 an SNS event; anything else is a Function URL request served through `lambda_http::Adapter`
 (in sender mode, a sweep or command). The pipeline for every notification is
 **verify → persist → act → publish**, in that order, and the order is load-bearing (see below).
-Three workspace crates:
+Five workspace crates; dependency direction is `aws-messaging-webhook` → `mailbox-store` →
+`mailbox`:
 
+- **`crates/mailbox`** — the pure mailbox domain, with no AWS SDK, axum or tokio: the stored
+  message, thread and send types and their caps, the id newtypes, labels, MIME parsing
+  (`mime`) and building (`build`), the content document, attachment-URL policy and the wire
+  shapes. Its `test-fixtures` feature exposes a sample message (and the plain-http URL parser)
+  to other crates' tests.
+- **`crates/mailbox-store`** — the mail table: keys, the transaction planner (`plan`) and its
+  cancellation decoding (`txn`), the `Table` seam with its `DynamoTable` implementation,
+  `Mailbox` (every mailbox read and write, written once on top of `Table`), and the SDK error
+  classification the binary's clients share (`sdk_error`). The `memory` feature, enabled only
+  by dev-dependencies, adds `MailMemoryStore`.
 - **`crates/sns-message-verifier`** — standalone SNS signature verification (versions 1 and 2),
   no AWS SDK dependency. Trust anchor is the `SigningCertURL` host policy (`https://sns.<region>.amazonaws.com`
   only, no redirects followed, no CA-chain check — same model as AWS's own validators). The
   `test-fixtures` feature generates throwaway keys/certs so consumers can sign test envelopes.
-- **`crates/webhook`** (package `aws-messaging-webhook`) — the Lambda itself.
-- **`crates/webhook-test-support`** — test-only fakes (one per seam, including the in-memory
-  mail table and object store) shared by the webhook crate's integration tests.
+- **`crates/webhook`** (package `aws-messaging-webhook`) — the Lambda itself, including the
+  binary's side of the mailbox (`mail/`: ingest, the sender, the relay's mail events,
+  attachment fetching, and the mail bucket).
+- **`crates/webhook-test-support`** — the request harness, SNS envelope signing and the
+  non-mail fakes (one per seam) shared by the webhook crate's integration tests.
+
+Tests live where the code they exercise lives: `mailbox` has inline unit tests only;
+`mailbox-store` keeps flow and read behaviour in `crates/mailbox-store/tests/` against
+`MailMemoryStore`, with the DynamoDB request-shape tests inline beside `DynamoTable`;
+`crates/webhook/tests/` only drives the router or the Lambda entry.
 
 ### Request flow through the webhook crate
 
@@ -100,11 +119,13 @@ Three workspace crates:
   a misconfigured opt-out list must not become a retry storm.
 - **No verification bypass in release builds.** `SNS_CERT_HOST_OVERRIDE` (for
   `cargo lambda watch` against a fake SNS) is compiled in under `#[cfg(debug_assertions)]`
-  only; `mail/fetch.rs`'s plain-http mode is `#[cfg(test)]` for the same reason. The SNS HTTP
+  only; `mail/fetch.rs`'s plain-http mode is `#[cfg(test)]`, and the URL parser behind it
+  (`mailbox::url_policy`) is test builds or the dev-only `test-fixtures` feature, for the same
+  reason. The SNS HTTP
   clients never follow redirects — that's part of the trust model, not a nicety. The one
   exception is `mail/fetch.rs`, which fetches caller-supplied attachment URLs and therefore
   *must* handle redirects; it follows them by hand, at most five hops, re-running the full
-  `mail/url_policy.rs` shape and address checks on every `Location`, because the first check
+  `mailbox::url_policy` shape and address checks on every `Location`, because the first check
   says nothing about where a redirect leads.
 - **Strongly consistent DynamoDB reads cost twice the capacity; use them only when a stale read
   would be wrong, not merely late.** Default to eventually consistent. A stale miss that a
@@ -118,8 +139,8 @@ Three workspace crates:
   `SmsVoiceApi`, `SesApi`, `ObjectStore`, `AttachmentFetcher` and `ApiKeySource` — and
   `Backend` names their types: `aws::Aws` in production (one small struct per client under
   `aws/`), `webhook_test_support::Fakes` in tests. Mailbox reads and writes are written once,
-  in `mail/mailbox.rs`, on top of the `Table` seam (`mail/table.rs`) that the DynamoDB store and
-  the in-memory double implement. New downstream calls go through those traits so tests stay
+  in `mailbox_store::mailbox`, on top of the `Table` seam (`mailbox_store::table`) that
+  `DynamoTable` and `MailMemoryStore` implement. New downstream calls go through those traits so tests stay
   AWS-free.
 - SNS topics and subscriptions deliberately live outside the SAM stack, except the two
   stack-owned mail topics (SES receipts and SES configuration-set events, created only when

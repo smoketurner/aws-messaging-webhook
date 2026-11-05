@@ -1,20 +1,20 @@
 //! The mail table seam: what a store provides so [`Mailbox`] can run every
 //! read and write against it. The DynamoDB store and the in-memory double
 //! implement only this; everything above it is written once, in
-//! [`crate::mail::mailbox`].
+//! [`crate::mailbox`].
 //!
-//! [`Mailbox`]: crate::mail::mailbox::Mailbox
+//! [`Mailbox`]: crate::mailbox::Mailbox
 
 use std::collections::HashMap;
 use std::future::Future;
 
 use serde::de::DeserializeOwned;
 
-use crate::mail::PutOutcome;
-use crate::mail::keys::{PageKey, TableKey};
-use crate::mail::plan::PlannedOp;
-use crate::mail::store::{ListQuery, MailStoreError, Page};
-use crate::mail::txn::TxnDecision;
+use crate::keys::{PageKey, TableKey};
+use crate::plan::PlannedOp;
+use crate::store::{ListQuery, MailStoreError, Page};
+use crate::txn::TxnDecision;
+use mailbox::PutOutcome;
 
 /// How fresh a read must be. A strongly consistent read costs twice the
 /// capacity, so [`Read::Consistent`] is only for a read where a stale answer
@@ -208,7 +208,7 @@ pub trait Table: Send + Sync {
 
 /// A shared table is a table, so a [`Mailbox`] can borrow one.
 ///
-/// [`Mailbox`]: crate::mail::mailbox::Mailbox
+/// [`Mailbox`]: crate::mailbox::Mailbox
 impl<S: Table> Table for &S {
     fn get<T: DeserializeOwned + Send>(
         &self,

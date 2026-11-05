@@ -28,7 +28,7 @@
 //! delivery, bounce, complaint, reject and open events of a sent message
 //! publish from the events-table branch instead, one per SES event, since
 //! only the SES event carries their details. A `MSG#`
-//! image deserializes straight into [`crate::mail::MailMessage`] via
+//! image deserializes straight into [`mailbox::MailMessage`] via
 //! `serde_dynamo::from_item`, never by hand-parsing the attribute JSON, so
 //! [`crate::mail::events`] works from the same struct the store reads and
 //! writes.
@@ -40,13 +40,9 @@ use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
 use crate::events_keys;
-use crate::mail::SesMessageId;
 use crate::mail::content;
 use crate::mail::events::{MailEvent, build_received_event, build_sent_event, build_ses_event};
-use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
-use crate::mail::store::MailStoreError;
-use crate::mail::{MailMessage, keys};
 use crate::metrics::names;
 use crate::model::ses_notification::SesNotification;
 use crate::model::{DomainEvent, Source};
@@ -54,6 +50,11 @@ use crate::publish::PublishEvents as _;
 use crate::publish::{OutboundEvent, PublishError, SCHEMA_VERSION, build_outbound};
 use crate::state::{AppState, Backend};
 use crate::store::EventRecord;
+use mailbox::MailMessage;
+use mailbox::SesMessageId;
+use mailbox::labels::SystemLabel;
+use mailbox_store::keys;
+use mailbox_store::store::MailStoreError;
 
 /// Reads a DynamoDB `String` attribute from a stream image.
 pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
@@ -388,7 +389,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
     // A queued send's INSERT publishes nothing (its lifecycle starts at the
     // `sent` relabel), and reading its content document first would be an S3
     // GET for an event that is never built.
-    if !crate::mail::labels::has(&msg.labels, SystemLabel::Received) {
+    if !mailbox::labels::has(&msg.labels, SystemLabel::Received) {
         return RelayOutcome::Settled;
     }
     let content = match content::load(&state.objects, &msg).await {
@@ -412,7 +413,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
                 event = "stream_bad_mail_content",
                 "message content document could not be read; publishing without it"
             );
-            content::MessageContent::default()
+            mailbox::content::MessageContent::default()
         }
     };
 
@@ -584,7 +585,7 @@ mod tests {
     #[test]
     fn records_classify_by_sk_across_both_tables() {
         let event_sk = events_keys::event_sk("2026-01-01T00:00:00.000Z", "sns-1");
-        let message = keys::message(&crate::mail::InboxId::new("support@example.com"), "mid-1");
+        let message = keys::message(&mailbox::InboxId::new("support@example.com"), "mid-1");
         assert_eq!(StreamItem::classify(&event_sk), StreamItem::Event);
         assert_eq!(
             StreamItem::classify(events_keys::AGGREGATE_SK),

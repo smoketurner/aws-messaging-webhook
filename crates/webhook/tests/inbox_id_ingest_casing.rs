@@ -9,10 +9,11 @@
 //! including `normalized_recipients` and `resolve_recipient`) and then the
 //! real axum router for both the lowercased and mixed-case path spellings.
 
-use aws_messaging_webhook::mail::MessageId;
-use aws_messaging_webhook::mail::{InboxId, content, ids, time};
+use aws_messaging_webhook::mail::content;
 use axum::body::Bytes;
 use axum::http::StatusCode;
+use mailbox::MessageId;
+use mailbox::{InboxId, ids, time};
 use serde_json::{Value, json};
 use webhook_test_support::{Harness, MAIL_BUCKET, TEST_API_KEY, api, mail_harness, post, wrapped};
 

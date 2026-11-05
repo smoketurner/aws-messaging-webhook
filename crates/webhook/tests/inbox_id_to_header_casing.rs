@@ -9,9 +9,11 @@
 //! builds always match the keys ingest wrote. This suite pins that any casing
 //! builds the stored key, and the client scenario end to end.
 
-use aws_messaging_webhook::mail::{InboxId, keys};
+use mailbox::InboxId;
+
 use axum::http::StatusCode;
-use webhook_test_support::mail_memory::sample_message;
+use mailbox_store::keys;
+use mailbox_store::memory::sample_message;
 use webhook_test_support::{TEST_INBOX, api, grant_api_access, harness};
 
 /// DynamoDB string equality is case-sensitive, so the partition keys for two

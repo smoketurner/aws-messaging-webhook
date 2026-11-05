@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use crate::allowlist::TopicAllowlist;
-use crate::mail::{InboxId, is_valid_local_part};
+use mailbox::{InboxId, is_valid_local_part};
 
 /// Runtime configuration from environment variables.
 #[derive(Debug, Clone)]

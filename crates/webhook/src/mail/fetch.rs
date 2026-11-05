@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use url::Host;
 
-use crate::mail::url_policy::{self, AttachmentUrl, UrlRejected};
+use mailbox::url_policy::{self, AttachmentUrl, UrlRejected};
 
 /// How many hops a redirect chain may take.
 const MAX_REDIRECTS: usize = 5;

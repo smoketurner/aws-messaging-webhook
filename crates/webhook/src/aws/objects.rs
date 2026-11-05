@@ -13,9 +13,9 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use axum::body::Bytes;
 
 use crate::aws::FromSdkFailure;
-use crate::mail::ObjectMeta;
-use crate::mail::PutOutcome;
 use crate::mail::objects::{ObjectError, ObjectStore};
+use mailbox::ObjectMeta;
+use mailbox::PutOutcome;
 
 /// The per-attempt and per-operation S3 timeouts, applied to every call
 /// via `.customize().config_override(...)` since the shared `s3` client

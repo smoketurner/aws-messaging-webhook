@@ -18,10 +18,10 @@ use serde::Deserialize;
 
 use crate::api::error::{ApiError, FieldError};
 use crate::api::json::OneOrMany;
-use crate::mail::address::envelope_address;
-use crate::mail::url_policy::{self, AttachmentUrl};
-use crate::mail::wire::ContentDisposition;
-use crate::mail::{
+use mailbox::address::envelope_address;
+use mailbox::url_policy::{self, AttachmentUrl};
+use mailbox::wire::ContentDisposition;
+use mailbox::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, HEADER_NAME_MAX, HEADER_VALUE_MAX,
     HEADERS_BUDGET, MAX_OUTBOUND_DECODED_BYTES, OUTBOUND_RECIPIENTS_MAX, SUBJECT_MAX_BYTES,
 };

@@ -1,6 +1,6 @@
 //! The transactional write model: every mail-table transaction is planned as
 //! a `Vec<PlannedOp>` up front, then executed and its cancellation decoded
-//! uniformly by `mail::txn::decode_cancellation`.
+//! uniformly by `txn::decode_cancellation`.
 //!
 //! `plan_insert` plans the ingest transaction: the message, its versioned
 //! thread, its `Message-ID` alias and placeholder aliases for the ids it
@@ -11,17 +11,17 @@
 
 use serde_dynamo::AttributeValue;
 
-use crate::mail::keys::{self, TableKey};
-use crate::mail::send::{SendKey, SendState, SendStatus};
-use crate::mail::store::{MailStoreError, SesSent};
-use crate::mail::thread::{AliasLookup, ThreadState};
-use crate::mail::{
+use crate::keys::{self, TableKey};
+use crate::store::MailStoreError;
+use mailbox::send::{SendKey, SendState, SendStatus, SesSent};
+use mailbox::thread::{AliasLookup, ThreadState};
+use mailbox::{
     Direction, Inbox, InboxId, MESSAGE_USER_LABEL_CAP, MailMessage, MessageId,
     THREAD_USER_LABEL_CAP, ThreadSnapshot, ids, labels, strip_angle_brackets,
 };
 
 /// Which role a planned op plays in its transaction — used by
-/// [`crate::mail::txn::decode_cancellation`] to interpret a cancellation
+/// [`crate::txn::decode_cancellation`] to interpret a cancellation
 /// reason without re-deriving it from the op's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpRole {
@@ -413,8 +413,8 @@ fn stored_message(msg: &MailMessage, thread_after: &ThreadState) -> MailMessage 
 ///
 /// `thread_before` is the thread's state from a consistent read, or `None`
 /// for a brand-new thread; `thread_after` is the caller-computed result of
-/// applying `msg` to it ([`crate::mail::thread::new_thread`] /
-/// [`crate::mail::thread::apply_message`]).
+/// applying `msg` to it ([`mailbox::thread::new_thread`] /
+/// [`mailbox::thread::apply_message`]).
 ///
 /// The message's own alias is written only where `aliases` found no row or
 /// a placeholder, which it takes over; a row another message already holds
@@ -666,9 +666,9 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::mail::ThreadId;
-    use crate::mail::thread::{apply_message, new_thread};
-    use crate::mail::{Direction, InboxId, test_fixtures};
+    use mailbox::ThreadId;
+    use mailbox::thread::{apply_message, new_thread};
+    use mailbox::{Direction, InboxId, test_fixtures};
 
     fn message(inbox: &str, thread_id: &str, message_id: &str, labels: &[&str]) -> MailMessage {
         MailMessage {
@@ -828,9 +828,9 @@ mod tests {
             msg.inbox_id.clone(),
             msg.message_id.clone(),
             msg.thread_id.clone(),
-            crate::mail::send::Envelope {
+            mailbox::send::Envelope {
                 to: vec!["recipient@example.com".to_owned()],
-                ..crate::mail::send::Envelope::default()
+                ..mailbox::send::Envelope::default()
             },
             key_pk.map(ToOwned::to_owned),
             "2026-01-01T00:00:00.000Z",
@@ -853,7 +853,7 @@ mod tests {
             (queued.unknown(now), true),
             (queued.sent(now), false),
             (
-                queued.failed(crate::mail::send::SendFailure::Rejected, now),
+                queued.failed(mailbox::send::SendFailure::Rejected, now),
                 false,
             ),
         ] {
@@ -881,7 +881,7 @@ mod tests {
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, Some("SENDKEY#abc"));
-        let key = crate::mail::send::SendKey {
+        let key = mailbox::send::SendKey {
             key_hash: "keyhash".to_owned(),
             inbox_id: msg.inbox_id.clone(),
             message_id: msg.message_id.clone(),
@@ -972,7 +972,7 @@ mod tests {
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, None);
-        let key = crate::mail::send::SendKey {
+        let key = mailbox::send::SendKey {
             key_hash: "keyhash".to_owned(),
             inbox_id: msg.inbox_id.clone(),
             message_id: msg.message_id.clone(),
@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn references_cap_stays_above_the_alias_cap() {
         assert!(
-            crate::mail::REFERENCES_MAX_BYTES.saturating_sub(2) > ALIAS_ID_MAX_BYTES,
+            mailbox::REFERENCES_MAX_BYTES.saturating_sub(2) > ALIAS_ID_MAX_BYTES,
             "REFERENCES_MAX_BYTES - 2 must exceed ALIAS_ID_MAX_BYTES so truncating a \
              Message-ID never changes which ids carry an alias row"
         );

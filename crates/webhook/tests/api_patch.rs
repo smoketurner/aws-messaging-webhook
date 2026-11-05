@@ -3,11 +3,11 @@
 //! `PATCH …/messages/{id}`: label changes, and what they do to the message's
 //! thread.
 
-use aws_messaging_webhook::mail::MessageId;
-use aws_messaging_webhook::mail::{InboxId, ids, time};
 use axum::http::{Method, StatusCode};
+use mailbox::MessageId;
+use mailbox::{InboxId, ids, time};
+use mailbox_store::memory::sample_message;
 use serde_json::{Value, json};
-use webhook_test_support::mail_memory::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 async fn patch(h: &Harness, message_id: &str, body: Value) -> (StatusCode, Value) {

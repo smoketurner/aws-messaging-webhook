@@ -12,9 +12,9 @@ use sha2::{Digest as _, Sha256};
 use crate::api::error::ApiError;
 use crate::api::send::SendAccepted;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
-use crate::mail::InboxId;
-use crate::mail::time;
 use crate::state::{AppState, Backend};
+use mailbox::InboxId;
+use mailbox::time;
 
 /// How long an `Idempotency-Key` is remembered.
 pub(super) const KEY_TTL_SECONDS: u64 = 24 * 60 * 60;

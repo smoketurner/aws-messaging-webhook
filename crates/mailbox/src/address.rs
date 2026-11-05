@@ -69,7 +69,7 @@ pub fn envelope_address(value: &str) -> Result<String, String> {
 
 /// Reads a stored participant for comparison: the entry grammar, with the
 /// local part lowercased as well as the domain, matching how
-/// [`InboxId`](crate::mail::InboxId) treats an address.
+/// [`InboxId`](crate::InboxId) treats an address.
 static PARTICIPANT_CONFIG: LazyLock<Config> = LazyLock::new(|| {
     Config::builder()
         .strictness(Strictness::Standard)

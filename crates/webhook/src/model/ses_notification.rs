@@ -3,9 +3,10 @@
 //! notifications (top-level `notificationType`). Only the fields the pipeline
 //! acts on are typed; the full payload is persisted and forwarded verbatim.
 
+use mailbox::open_string_enum;
 use serde::{Deserialize, Serialize};
 
-use crate::mail::labels::SystemLabel;
+use mailbox::labels::SystemLabel;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

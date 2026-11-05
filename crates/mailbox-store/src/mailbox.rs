@@ -12,16 +12,14 @@
 
 use std::collections::HashMap;
 
-use crate::mail::keys::{self, PageKey};
-use crate::mail::plan;
-use crate::mail::send::{SendKey, SendState, SendStatus, label_changes};
-use crate::mail::store::{
-    EnqueueOutcome, ListQuery, MailStoreError, MarkOutcome, Page, SesRef, ThreadView,
-};
-use crate::mail::table::{MailIndex, PageQuery, Read, Table, TxnOutcome};
-use crate::mail::thread::{AliasLookup, ThreadState, apply_label_patch, apply_message, new_thread};
-use crate::mail::txn::{TxnDecision, drop_taken_aliases};
-use crate::mail::{
+use crate::keys::{self, PageKey};
+use crate::plan;
+use crate::store::{EnqueueOutcome, ListQuery, MailStoreError, Page, SesRef, ThreadView};
+use crate::table::{MailIndex, PageQuery, Read, Table, TxnOutcome};
+use crate::txn::{TxnDecision, drop_taken_aliases};
+use mailbox::send::{MarkOutcome, SendKey, SendState, SendStatus, label_changes};
+use mailbox::thread::{AliasLookup, ThreadState, apply_label_patch, apply_message, new_thread};
+use mailbox::{
     Inbox, InboxId, InsertOutcome, MailMessage, MessageId, PutOutcome, RfcHit, SesMessageId,
     ThreadId,
 };
@@ -562,8 +560,7 @@ impl<T: Table> Mailbox<T> {
                     state.message_id
                 )));
             };
-            let (after, labels, ses) =
-                crate::mail::send::mark_transition(state, &msg, outcome, now);
+            let (after, labels, ses) = mailbox::send::mark_transition(state, &msg, outcome, now);
             let (added, removed) = label_changes(&msg.labels, &labels);
             let thread = if added.is_empty() && removed.is_empty() {
                 None

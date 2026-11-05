@@ -1,7 +1,7 @@
 //! Mail bucket object keys. The bucket's lifecycle rules expire objects by
 //! these prefixes, so the shapes are a storage format.
 
-use crate::mail::InboxId;
+use mailbox::InboxId;
 
 /// Where a message's content document lives: per inbox, because one inbound
 /// message delivered to two inboxes is two independent messages.

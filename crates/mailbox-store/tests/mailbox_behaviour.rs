@@ -3,17 +3,17 @@
 //! expiry, label caps, the inbound thread snapshot, and the enqueue
 //! transaction.
 
-use aws_messaging_webhook::mail::keys;
-use aws_messaging_webhook::mail::plan::ALIAS_ID_MAX_BYTES;
-use aws_messaging_webhook::mail::send::{Envelope, SendState, SendStatus};
-use aws_messaging_webhook::mail::store::{EnqueueOutcome, MailStoreError};
-use aws_messaging_webhook::mail::{
+use mailbox::send::{Envelope, SendState, SendStatus};
+use mailbox::{
     Direction, InboxId, InsertOutcome, MESSAGE_USER_LABEL_CAP, MailMessage, REFERENCES_MAX_BYTES,
     THREAD_USER_LABEL_CAP,
 };
-use aws_messaging_webhook::mail::{MessageId, ThreadId};
+use mailbox::{MessageId, ThreadId};
+use mailbox_store::keys;
+use mailbox_store::memory::{MailMemoryStore, sample_message};
+use mailbox_store::plan::ALIAS_ID_MAX_BYTES;
+use mailbox_store::store::{EnqueueOutcome, MailStoreError};
 use serde_dynamo::{AttributeValue, Item};
-use webhook_test_support::mail_memory::{MailMemoryStore, sample_message};
 
 const INBOX: &str = "support@example.com";
 const NOW: &str = "2026-01-01T00:00:10.000Z";

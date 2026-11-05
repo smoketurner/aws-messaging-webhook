@@ -9,10 +9,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use aws_messaging_webhook::mail::ObjectMeta;
-use aws_messaging_webhook::mail::PutOutcome;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
 use axum::body::Bytes;
+use mailbox::ObjectMeta;
+use mailbox::PutOutcome;
 
 #[derive(Debug, Clone)]
 struct StoredObject {

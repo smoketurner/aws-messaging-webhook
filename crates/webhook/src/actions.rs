@@ -6,14 +6,14 @@
 
 use std::future::Future;
 
-use crate::mail::SesMessageId;
 use crate::mail::ingest::IngestOutcome;
 use crate::mail::objects::ObjectError;
-use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
+use mailbox::SesMessageId;
+use mailbox_store::store::MailStoreError;
 
 /// How an action failure affects the request, per the SNS retry contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,7 +245,7 @@ async fn apply_delivery_label<B: Backend>(
         return Ok(false);
     };
 
-    let now = crate::mail::time::format(crate::mail::time::now_ms());
+    let now = mailbox::time::format(mailbox::time::now_ms());
     state
         .mailbox
         .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)

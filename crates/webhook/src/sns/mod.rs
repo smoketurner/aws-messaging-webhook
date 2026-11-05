@@ -219,7 +219,7 @@ async fn process_notification<B: Backend>(
     // fallback (after `mail.timestamp`/`receipt.timestamp`), so a redelivery
     // never has to fall back to wall-clock time to compute the same
     // deterministic inbound message id.
-    let envelope_ts_ms = crate::mail::time::parse(&envelope.timestamp);
+    let envelope_ts_ms = mailbox::time::parse(&envelope.timestamp);
     let action = match actions::run(state, &event, deadline, envelope_ts_ms).await {
         Ok(action) => action,
         Err(error) => match error.kind {

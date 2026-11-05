@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mail::content::MessageContent;
-use crate::mail::{AttachmentMeta, MailMessage};
-use crate::mail::{MessageId, ThreadId};
+use crate::content::MessageContent;
+use crate::{AttachmentMeta, MailMessage};
+use crate::{MessageId, ThreadId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -216,7 +216,7 @@ impl Thread {
     /// messages, oldest first.
     #[must_use]
     pub fn new(
-        thread: &crate::mail::thread::ThreadState,
+        thread: &crate::thread::ThreadState,
         messages: Vec<Message>,
         limit: usize,
         next_page_token: Option<String>,
@@ -320,8 +320,8 @@ impl From<&MailMessage> for ThreadItem {
     }
 }
 
-impl From<&crate::mail::thread::ThreadState> for ThreadItem {
-    fn from(thread: &crate::mail::thread::ThreadState) -> Self {
+impl From<&crate::thread::ThreadState> for ThreadItem {
+    fn from(thread: &crate::thread::ThreadState) -> Self {
         Self {
             inbox_id: thread.inbox_id.as_str().to_owned(),
             thread_id: thread.thread_id.clone(),
@@ -359,8 +359,8 @@ pub struct Inbox {
     pub metadata: Option<serde_json::Value>,
 }
 
-impl From<&crate::mail::Inbox> for Inbox {
-    fn from(inbox: &crate::mail::Inbox) -> Self {
+impl From<&crate::Inbox> for Inbox {
+    fn from(inbox: &crate::Inbox) -> Self {
         Self {
             pod_id: "pod_default".to_owned(),
             inbox_id: inbox.inbox_id.as_str().to_owned(),
@@ -442,7 +442,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mail::{InboxId, test_fixtures};
+    use crate::{InboxId, test_fixtures};
 
     fn sample_message() -> MailMessage {
         MailMessage {
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn inbox_golden_shape() {
-        let inbox = crate::mail::Inbox {
+        let inbox = crate::Inbox {
             inbox_id: InboxId::new("support@example.com"),
             email: "support@example.com".to_owned(),
             display_name: Some("Support".to_owned()),

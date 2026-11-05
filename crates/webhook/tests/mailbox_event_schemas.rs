@@ -15,20 +15,20 @@
 //! checker does not implement, so a payload passes only if it is exactly the
 //! documented shape.
 
-use aws_messaging_webhook::mail::{MessageId, SesMessageId, ThreadId};
+use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use aws_messaging_webhook::mail::content::{self, MessageContent};
+use aws_messaging_webhook::mail::content;
 use aws_messaging_webhook::mail::sender::handle_send;
-use aws_messaging_webhook::mail::{
-    AttachmentMeta, Direction, InboxId, MailMessage, ThreadSnapshot, keys, thread,
-};
 use axum::http::StatusCode;
+use mailbox::content::MessageContent;
+use mailbox::{AttachmentMeta, Direction, InboxId, MailMessage, ThreadSnapshot, thread};
+use mailbox_store::keys;
+use mailbox_store::memory::ReadFailure;
 use serde_dynamo::AttributeValue;
 use serde_json::{Map, Value, json};
-use webhook_test_support::mail_memory::ReadFailure;
 use webhook_test_support::{Harness, TEST_INBOX, api, api_harness, invoke};
 
 /// The schema keywords [`check`] implements. Anything else in a schema fails
@@ -342,7 +342,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
             size: 10,
             filename: Some("notes.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: aws_messaging_webhook::mail::wire::ContentDisposition::Inline,
+            content_disposition: mailbox::wire::ContentDisposition::Inline,
             content_id: Some("<notes@example.net>".to_owned()),
         }],
         attachments_truncated: false,

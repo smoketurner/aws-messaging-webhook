@@ -12,10 +12,11 @@ use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
 use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest};
 use crate::api::send::{SendAccepted, enqueue};
-use crate::mail::MessageId;
-use crate::mail::address::same_mailbox;
-use crate::mail::{InboxId, MailMessage, REFERENCES_MAX, content};
+use crate::mail::content;
 use crate::state::{AppState, Backend};
+use mailbox::MessageId;
+use mailbox::address::same_mailbox;
+use mailbox::{InboxId, MailMessage, REFERENCES_MAX};
 
 /// The `References` chain for a reply: the original's own chain plus the
 /// message being replied to, capped so a long thread cannot grow the header

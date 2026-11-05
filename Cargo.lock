@@ -159,6 +159,8 @@ dependencies = [
  "lambda_http",
  "mail-builder",
  "mail-parser",
+ "mailbox",
+ "mailbox-store",
  "metrics",
  "metrics_cloudwatch_embedded",
  "mime",
@@ -1808,6 +1810,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bytes",
+ "mail-builder",
+ "mail-parser",
+ "proptest",
+ "serde",
+ "serde_dynamo",
+ "serde_json",
+ "sha2 0.10.9",
+ "structured-email-address",
+ "thiserror",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "mailbox-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-sdk-dynamodb",
+ "aws-smithy-types",
+ "base64 0.23.1",
+ "mailbox",
+ "mailbox-store",
+ "proptest",
+ "serde",
+ "serde_dynamo",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3312,6 +3352,8 @@ dependencies = [
  "aws-smithy-types",
  "axum",
  "lambda_http",
+ "mailbox",
+ "mailbox-store",
  "reqwest",
  "serde",
  "serde_dynamo",

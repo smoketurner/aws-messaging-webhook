@@ -1,9 +1,6 @@
 //! Webhook receiver for AWS End User Messaging and SES events delivered over
 //! SNS: verify → persist → lifecycle actions → publish to EventBridge.
 
-#[macro_use]
-mod string_enum;
-
 pub mod actions;
 pub mod allowlist;
 pub mod api;

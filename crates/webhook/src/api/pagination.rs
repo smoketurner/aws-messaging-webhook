@@ -10,10 +10,10 @@
 //! by `<timestamp>#<thread_id>`. Each gets its own boundary encoding.
 
 use crate::api::error::{ApiError, FieldError};
-use crate::mail::labels::SystemLabel;
-use crate::mail::store::{DEFAULT_LIMIT, MAX_LIMIT};
-use crate::mail::thread::ThreadState;
-use crate::mail::{MailMessage, ids, time};
+use mailbox::labels::SystemLabel;
+use mailbox::thread::ThreadState;
+use mailbox::{MailMessage, ids, time};
+use mailbox_store::store::{DEFAULT_LIMIT, MAX_LIMIT};
 
 /// The `include_*` flags and the label each one admits. A flag that is absent
 /// or false excludes items carrying its label.
@@ -436,7 +436,7 @@ mod tests {
 
         // A real id minted inside the window falls between the two bounds.
         let inside = time::parse("2026-01-15T09:30:00.000Z").unwrap();
-        let id = crate::mail::ids::inbound_message_id("ses-1", inside).to_string();
+        let id = mailbox::ids::inbound_message_id("ses-1", inside).to_string();
         assert!(after < id && id < before, "{id} should fall inside");
     }
 

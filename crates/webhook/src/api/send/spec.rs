@@ -7,11 +7,12 @@ use axum::body::Bytes;
 
 use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
-use crate::mail::labels::SystemLabel;
+use crate::mail::object_keys;
 use crate::mail::objects::ObjectStore;
-use crate::mail::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
-use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime, object_keys};
-use crate::mail::{MessageId, ThreadId};
+use mailbox::labels::SystemLabel;
+use mailbox::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
+use mailbox::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime};
+use mailbox::{MessageId, ThreadId};
 
 /// Builds the spec the sender will assemble the message from.
 pub(super) fn build_spec(
@@ -211,7 +212,7 @@ pub(super) async fn discard_uploads<O: ObjectStore>(objects: &O, spec: &SendSpec
 mod tests {
     use super::preview_of;
     use crate::api::send::validate::ValidatedSend;
-    use crate::mail::PREVIEW_CHARS;
+    use mailbox::PREVIEW_CHARS;
 
     /// A `ValidatedSend` carrying only the bodies `preview_of` reads; every
     /// other field is empty because `preview_of` ignores it. Mirrors the
@@ -283,7 +284,7 @@ mod tests {
     /// them through a real MIME parse, pins that they still do.
     #[test]
     fn outbound_preview_matches_inbound_preview_for_the_same_html_body() {
-        use crate::mail::mime::parse_inbound;
+        use mailbox::mime::parse_inbound;
 
         let html = "<p>Hello <strong>there</strong> &amp; welcome</p>";
         let outbound = preview_of(&send(None, Some(html)));

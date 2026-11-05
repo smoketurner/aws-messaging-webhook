@@ -16,9 +16,9 @@ use serde::Deserialize;
 
 use crate::api::error::{ApiError, FieldError};
 use crate::api::json::{ApiJson, OneOrMany};
-use crate::mail::MessageId;
-use crate::mail::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
 use crate::state::{AppState, Backend};
+use mailbox::MessageId;
+use mailbox::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
 
 /// One label or a list of them.
 type Labels = OneOrMany<String>;

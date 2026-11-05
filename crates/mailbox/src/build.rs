@@ -17,9 +17,9 @@ use mail_builder::headers::address::Address;
 use mail_builder::headers::content_type::ContentType;
 use mail_builder::mime::MimePart;
 
-use crate::mail::send::{SendSpec, SpecAttachment};
-use crate::mail::strip_angle_brackets;
-use crate::mail::wire::ContentDisposition;
+use crate::send::{SendSpec, SpecAttachment};
+use crate::strip_angle_brackets;
+use crate::wire::ContentDisposition;
 
 /// One attachment's bytes, paired with the spec entry describing it.
 pub struct BuiltPart<'a> {
@@ -186,9 +186,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::mail::InboxId;
-    use crate::mail::send::Envelope;
-    use crate::mail::{MessageId, ThreadId};
+    use crate::InboxId;
+    use crate::send::Envelope;
+    use crate::{MessageId, ThreadId};
 
     fn spec() -> SendSpec {
         SendSpec {

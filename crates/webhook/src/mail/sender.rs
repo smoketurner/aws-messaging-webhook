@@ -26,17 +26,20 @@ use tokio::time::Instant;
 
 use crate::actions::SesApi as _;
 use crate::actions::{RawSend, SendOutcome};
-use crate::mail::MessageId;
-use crate::mail::build::{BuildError, BuiltPart, build_outbound};
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
+use crate::mail::object_keys;
 use crate::mail::objects::ObjectError;
 use crate::mail::objects::ObjectStore as _;
-use crate::mail::send::{SendFailure, SendSpec, SendState, SendStatus};
-use crate::mail::store::{MailStoreError, MarkOutcome, SesSent};
-use crate::mail::url_policy;
-use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, keys, object_keys, time};
 use crate::metrics::names;
 use crate::state::{AppState, Backend};
+use mailbox::MessageId;
+use mailbox::build::{BuildError, BuiltPart, build_outbound};
+use mailbox::send::{MarkOutcome, SesSent};
+use mailbox::send::{SendFailure, SendSpec, SendState, SendStatus};
+use mailbox::url_policy;
+use mailbox::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
+use mailbox_store::keys;
+use mailbox_store::store::MailStoreError;
 
 /// What one stream record came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,7 +864,7 @@ async fn load_spec<B: Backend>(
 /// One attachment's bytes, owned so the borrow checker does not tie them to
 /// the loop that fetched them.
 struct LoadedPart {
-    spec: crate::mail::send::SpecAttachment,
+    spec: mailbox::send::SpecAttachment,
     bytes: Vec<u8>,
 }
 

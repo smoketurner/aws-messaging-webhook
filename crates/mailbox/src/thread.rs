@@ -8,12 +8,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::mail::address::same_mailbox;
-use crate::mail::{
+use crate::address::same_mailbox;
+use crate::{
     AttachmentMeta, Direction, InboxId, MailMessage, RfcHit, THREAD_ATTACHMENT_SUMMARIES,
     ThreadSnapshot,
 };
-use crate::mail::{MessageId, ThreadId};
+use crate::{MessageId, ThreadId};
 
 /// The maximum candidate ids [`candidate_ids`] returns.
 const CANDIDATE_ID_CAP: usize = 20;
@@ -347,7 +347,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::mail::{AttachmentMeta, Direction, test_fixtures};
+    use crate::{AttachmentMeta, Direction, test_fixtures};
 
     fn message(direction: Direction, labels: &[&str]) -> MailMessage {
         MailMessage {
@@ -624,7 +624,7 @@ mod tests {
                 size: 10,
                 filename: None,
                 content_type: "text/plain".to_owned(),
-                content_disposition: crate::mail::wire::ContentDisposition::Attachment,
+                content_disposition: crate::wire::ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();
@@ -639,7 +639,7 @@ mod tests {
             size: 10,
             filename: None,
             content_type: "text/plain".to_owned(),
-            content_disposition: crate::mail::wire::ContentDisposition::Attachment,
+            content_disposition: crate::wire::ContentDisposition::Attachment,
             content_id: None,
         }];
         let after = apply_message(&before, &second);

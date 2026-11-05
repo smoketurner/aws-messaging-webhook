@@ -19,11 +19,11 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::mail::content::MessageContent;
-use crate::mail::labels::SystemLabel;
-use crate::mail::{MailMessage, ids, labels, time, wire};
 use crate::model::ses_notification::{SesEventKind, SesNotification};
 use crate::publish::{PUT_EVENTS_ENTRY_CAP_BYTES, detail_bytes};
+use mailbox::content::MessageContent;
+use mailbox::labels::SystemLabel;
+use mailbox::{MailMessage, ids, labels, time, wire};
 
 /// One outbound mailbox event, before publishing.
 #[derive(Debug, Clone)]
@@ -332,8 +332,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::mail::{AttachmentMeta, Direction, ThreadSnapshot, test_fixtures};
-    use crate::mail::{MessageId, ThreadId};
+    use mailbox::{AttachmentMeta, Direction, ThreadSnapshot, test_fixtures};
+    use mailbox::{MessageId, ThreadId};
 
     const EVENT_SOURCE: &str = "aws-messaging-webhook";
     const NOTIFIED_AT: &str = "2026-01-15T10:00:00.000Z";
@@ -477,7 +477,7 @@ mod tests {
             size: 10,
             filename: Some("a.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: crate::mail::wire::ContentDisposition::Attachment,
+            content_disposition: mailbox::wire::ContentDisposition::Attachment,
             content_id: None,
         }];
         msg.thread_snapshot = Some(snapshot);
@@ -808,7 +808,7 @@ mod tests {
                 size: 100,
                 filename: Some("f".repeat(5_000)),
                 content_type: "text/plain".to_owned(),
-                content_disposition: crate::mail::wire::ContentDisposition::Attachment,
+                content_disposition: mailbox::wire::ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();

@@ -16,6 +16,8 @@ aws-messaging-webhook.workspace = true
 aws-smithy-types.workspace = true
 axum.workspace = true
 lambda_http = { workspace = true, features = ["apigw_http", "tracing"] }
+mailbox.workspace = true
+mailbox-store = { workspace = true, features = ["memory"] }
 reqwest = { workspace = true, features = ["rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }

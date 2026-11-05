@@ -91,7 +91,8 @@ pub fn parse_attachment_url(raw: &str) -> Result<AttachmentUrl, UrlRejected> {
 /// # Errors
 ///
 /// As [`parse_attachment_url`], except that `http` and any port are accepted.
-#[cfg(test)]
+/// Test builds only: a release build has no way to reach a plain-http URL.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn parse_attachment_url_allowing_http(raw: &str) -> Result<AttachmentUrl, UrlRejected> {
     parse_with(raw, true)
 }
