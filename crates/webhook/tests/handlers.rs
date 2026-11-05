@@ -654,17 +654,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
             webhook_test_support::ALLOWED_ACCOUNT,
         ),
         http: reqwest::Client::new(),
-        config: aws_messaging_webhook::config::Config {
-            table_name: "events".to_owned(),
-            event_bus_name: "bus".to_owned(),
-            event_source: "aws-messaging-webhook".to_owned(),
-            auto_resubscribe: true,
-            opt_out_list_name: Some("opt-out-list".to_owned()),
-            raw_event_retention_days: 30,
-            aggregate_retention_days: 365,
-            mode: aws_messaging_webhook::config::FunctionMode::Webhook,
-            mail: None,
-        },
+        config: webhook_test_support::test_config(),
         dangerous_subscribe_url_prefix: Some(server.uri()),
     });
     let mut body = notification(&cert_url);

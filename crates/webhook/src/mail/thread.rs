@@ -343,42 +343,22 @@ impl From<&ThreadState> for ThreadSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use proptest::prelude::*;
 
     use super::*;
-    use crate::mail::{AttachmentMeta, Direction, InboxId};
+    use crate::mail::{AttachmentMeta, Direction, test_fixtures};
 
     fn message(direction: Direction, labels: &[&str]) -> MailMessage {
         MailMessage {
-            inbox_id: InboxId("support@example.com".to_owned()),
-            thread_id: "tid-1".to_owned(),
-            message_id: "mid-1".to_owned(),
             ses_message_id: None,
             direction,
-            rfc_message_id: "<mid-1@example.com>".to_owned(),
-            in_reply_to: None,
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),
             timestamp: "00000001-0000".to_owned(),
-            from: "sender@example.com".to_owned(),
-            to: vec!["support@example.com".to_owned()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Hello".to_owned(),
-            preview: "Hello there".to_owned(),
             size: 1_000,
-            attachments: Vec::new(),
-            attachments_truncated: false,
-            raw_s3_key: Some("inbound/x".to_owned()),
-            thread_snapshot: None,
-            delivery: BTreeMap::new(),
-            send_status: None,
-            sent_at: None,
             version: 0,
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            expires_at: 0,
+            ..test_fixtures::message()
         }
     }
 

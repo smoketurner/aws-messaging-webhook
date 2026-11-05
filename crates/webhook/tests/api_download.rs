@@ -4,36 +4,12 @@
 
 use aws_messaging_webhook::mail::AttachmentMeta;
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, ids, time};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use serde_json::Value;
-use tower::ServiceExt as _;
+use aws_messaging_webhook::mail::{ids, time};
+use axum::http::{Method, StatusCode};
 use webhook_test_support::mail_memory::sample_message;
-use webhook_test_support::{Harness, harness, mail_harness};
-
-const KEY: &str = "am_live_key";
-const INBOX: &str = "support@example.com";
-const AT: &str = "2026-01-01T09:00:00.000Z";
-
-async fn get(h: &Harness, path: &str) -> (StatusCode, Value) {
-    let request = Request::get(path)
-        .header("authorization", format!("Bearer {KEY}"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use webhook_test_support::{
+    Harness, TEST_AT, TEST_INBOX, api, grant_api_access, harness, mail_harness,
+};
 
 fn attachment(id: &str, filename: Option<&str>, key: Option<&str>) -> AttachmentMeta {
     AttachmentMeta {
@@ -55,17 +31,12 @@ async fn seed_in(
     h: Harness,
     adjust: impl FnOnce(&mut aws_messaging_webhook::mail::MailMessage),
 ) -> (Harness, String) {
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
-    h.state
-        .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), AT)
-        .await
-        .unwrap();
+    grant_api_access(&h).await;
 
-    let ms = time::parse(AT).unwrap();
+    let ms = time::parse(TEST_AT).unwrap();
     let id = ids::inbound_message_id("ses-1", ms).to_string();
-    let mut msg = sample_message(INBOX, &id, "t1");
-    AT.clone_into(&mut msg.timestamp);
+    let mut msg = sample_message(TEST_INBOX, &id, "t1");
+    TEST_AT.clone_into(&mut msg.timestamp);
     adjust(&mut msg);
     h.state.services.insert_message(&msg, &[]).await.unwrap();
     (h, id)
@@ -82,7 +53,7 @@ async fn seeded(
 async fn raw_returns_a_presigned_url_for_the_stored_mime() {
     let (h, id) = seeded(|m| m.raw_s3_key = Some("inbound/raw-1".to_owned())).await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}/raw")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw")).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["message_id"], id);
@@ -94,14 +65,14 @@ async fn raw_returns_a_presigned_url_for_the_stored_mime() {
         url.contains("response-content-type=message%2Frfc822"),
         "{url}"
     );
-    assert!(body["expires_at"].as_str().unwrap() > AT);
+    assert!(body["expires_at"].as_str().unwrap() > TEST_AT);
 }
 
 #[tokio::test]
 async fn raw_is_not_found_when_the_message_has_no_stored_object() {
     let (h, id) = seeded(|m| m.raw_s3_key = None).await;
 
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}/raw")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw")).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["name"], "NotFoundError");
@@ -118,9 +89,9 @@ async fn an_attachment_returns_its_metadata_with_the_url() {
     })
     .await;
 
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{id}/attachments/att_1"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/attachments/att_1"),
     )
     .await;
 
@@ -149,9 +120,9 @@ async fn a_hostile_filename_cannot_inject_into_the_signed_headers() {
     })
     .await;
 
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{id}/attachments/att_1"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/attachments/att_1"),
     )
     .await;
 
@@ -173,9 +144,9 @@ async fn an_unknown_attachment_is_not_found() {
     })
     .await;
 
-    let (status, _) = get(
+    let (status, _) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{id}/attachments/att_missing"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/attachments/att_missing"),
     )
     .await;
 
@@ -191,9 +162,9 @@ async fn an_attachment_dropped_for_size_has_no_download() {
     })
     .await;
 
-    let (status, _) = get(
+    let (status, _) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{id}/attachments/att_1"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/attachments/att_1"),
     )
     .await;
 
@@ -203,15 +174,16 @@ async fn an_attachment_dropped_for_size_has_no_download() {
 #[tokio::test]
 async fn downloads_require_a_key() {
     let (h, id) = seeded(|m| m.raw_s3_key = Some("inbound/raw-1".to_owned())).await;
-    let request = Request::get(format!("/v0/inboxes/{INBOX}/messages/{id}/raw"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
+    let (status, _) = api::call(
+        &h,
+        Method::GET,
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw"),
+        None,
+        &[],
+    )
+    .await;
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// The configured `attachment_url_ttl` (here 3,600 s, the harness default for
@@ -227,7 +199,7 @@ async fn the_configured_ttl_surfaces_in_the_presigned_url_and_expires_at_header(
     .await;
 
     let now = time::now_ms();
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}/raw")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw")).await;
     assert_eq!(status, StatusCode::OK);
 
     // The URL carries the configured lifetime (3,600 s), not the 15-minute
@@ -265,9 +237,9 @@ async fn the_configured_ttl_surfaces_on_the_attachment_route() {
     .await;
 
     let now = time::now_ms();
-    let (status, body) = get(
+    let (status, body) = api::get(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{id}/attachments/att_1"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/attachments/att_1"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -292,7 +264,7 @@ async fn the_default_ttl_applies_when_mail_is_not_configured() {
     let (h, id) = seeded(|m| m.raw_s3_key = Some("inbound/raw-1".to_owned())).await;
 
     let now = time::now_ms();
-    let (status, body) = get(&h, &format!("/v0/inboxes/{INBOX}/messages/{id}/raw")).await;
+    let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw")).await;
     assert_eq!(status, StatusCode::OK);
 
     let url = body["download_url"].as_str().unwrap();

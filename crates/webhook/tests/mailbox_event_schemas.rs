@@ -25,16 +25,11 @@ use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{
     AttachmentMeta, Direction, InboxId, MailMessage, ThreadSnapshot, keys, thread,
 };
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use serde_dynamo::AttributeValue;
 use serde_json::{Map, Value, json};
-use tower::ServiceExt as _;
 use webhook_test_support::mail_memory::ReadFailure;
-use webhook_test_support::{Harness, invoke, mail_harness};
-
-const KEY: &str = "am_live_key";
-const INBOX: &str = "support@example.com";
+use webhook_test_support::{Harness, TEST_INBOX, api, api_harness, invoke};
 
 /// The schema keywords [`check`] implements. Anything else in a schema fails
 /// the run rather than being silently ignored.
@@ -256,17 +251,6 @@ fn mailbox_details(h: &Harness) -> Vec<Value> {
         .collect()
 }
 
-async fn seeded() -> Harness {
-    let h = mail_harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
-    h.state
-        .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), "2026-01-01T00:00:00.000Z")
-        .await
-        .unwrap();
-    h
-}
-
 /// Sends one message through the real API and sender and returns it as
 /// stored.
 async fn sent_message(h: &Harness) -> MailMessage {
@@ -277,20 +261,9 @@ async fn sent_message(h: &Harness) -> MailMessage {
         "subject": "Hello",
         "text": "the body",
     });
-    let request = Request::post(format!("/v0/inboxes/{INBOX}/messages/send"))
-        .header("authorization", format!("Bearer {KEY}"))
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let sent: Value = serde_json::from_slice(&bytes).unwrap();
+    let (status, sent) =
+        api::post(h, &format!("/v0/inboxes/{TEST_INBOX}/messages/send"), &body).await;
+    assert_eq!(status, StatusCode::OK);
     let message_id = sent["message_id"].as_str().unwrap();
     handle_send(
         &h.state,
@@ -301,7 +274,7 @@ async fn sent_message(h: &Harness) -> MailMessage {
     .unwrap();
     h.state
         .services
-        .get_message(&InboxId(INBOX.to_owned()), message_id)
+        .get_message(&InboxId(TEST_INBOX.to_owned()), message_id)
         .await
         .unwrap()
         .unwrap()
@@ -348,7 +321,7 @@ fn mail_record(event_name: &str, new_image: &Value, old_image: Option<&Value>) -
 fn received_message(labels: &[&str]) -> MailMessage {
     let now = "2026-01-15T09:30:00.000Z".to_owned();
     let mut msg = MailMessage {
-        inbox_id: InboxId(INBOX.to_owned()),
+        inbox_id: InboxId(TEST_INBOX.to_owned()),
         thread_id: "tid-1".to_owned(),
         message_id: "mid-1".to_owned(),
         ses_message_id: Some("ses-in-1".to_owned()),
@@ -358,7 +331,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
         labels: labels.iter().map(|label| (*label).to_owned()).collect(),
         timestamp: now.clone(),
         from: "Sender <sender@example.net>".to_owned(),
-        to: vec![INBOX.to_owned()],
+        to: vec![TEST_INBOX.to_owned()],
         cc: vec!["cc@example.net".to_owned()],
         bcc: Vec::new(),
         subject: "Hello".to_owned(),
@@ -442,7 +415,7 @@ async fn received_events_match_the_schema() {
             "message.received.unauthenticated",
         ),
     ] {
-        let h = seeded().await;
+        let h = api_harness().await;
         publish_received(&h, &received_message(&labels)).await;
         let details = mailbox_details(&h);
         assert_eq!(details.len(), 1, "{event_type}");
@@ -469,7 +442,7 @@ async fn received_events_match_the_schema() {
 
 #[tokio::test]
 async fn the_sent_event_matches_the_schema() {
-    let h = seeded().await;
+    let h = api_harness().await;
     let sent = sent_message(&h).await;
     let mut queued = sent.clone();
     queued.labels = vec!["queued".to_owned()];
@@ -528,7 +501,7 @@ async fn ses_driven_events_match_the_schema() {
         ("event-rendering-failure.json", None),
         ("event-subscription.json", None),
     ] {
-        let h = seeded().await;
+        let h = api_harness().await;
         let sent = sent_message(&h).await;
         let ses_message_id = sent.ses_message_id.clone().unwrap();
 
@@ -550,7 +523,7 @@ async fn ses_driven_events_match_the_schema() {
 /// `ses.*` event.
 #[tokio::test]
 async fn ses_events_for_other_senders_publish_no_mailbox_event() {
-    let h = seeded().await;
+    let h = api_harness().await;
     publish_ses_example(&h, "event-delivery.json", "ses-someone-else").await;
     assert_eq!(mailbox_details(&h), [] as [serde_json::Value; 0]);
     assert_eq!(h.fake().published.lock().unwrap().len(), 1);
@@ -560,7 +533,7 @@ async fn ses_events_for_other_senders_publish_no_mailbox_event() {
 /// anything publishes, so the retry doesn't publish the `ses.*` event twice.
 #[tokio::test]
 async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
-    let h = seeded().await;
+    let h = api_harness().await;
     let sent = sent_message(&h).await;
     h.state
         .services
@@ -591,7 +564,7 @@ async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
 /// only the mailbox event is lost.
 #[tokio::test]
 async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
-    let h = seeded().await;
+    let h = api_harness().await;
     let sent = sent_message(&h).await;
     h.state
         .services
@@ -619,7 +592,7 @@ async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
 /// still suppress every bounced recipient.
 #[tokio::test]
 async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
-    let h = seeded().await;
+    let h = api_harness().await;
     let sent = sent_message(&h).await;
     h.state
         .services
@@ -649,7 +622,7 @@ async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
 /// delivery-label failure must not skip complaint suppression either.
 #[tokio::test]
 async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() {
-    let h = seeded().await;
+    let h = api_harness().await;
     let sent = sent_message(&h).await;
     h.state
         .services
@@ -681,7 +654,7 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
 /// not wait on the label step clearing.
 #[tokio::test]
 async fn transient_delivery_label_failure_suppresses_then_returns_500() {
-    let h = seeded().await;
+    let h = api_harness().await;
     let sent = sent_message(&h).await;
     h.state
         .services
@@ -761,7 +734,7 @@ fn the_checker_rejects_departures_from_the_schema() {
         "event_type": "message.opened",
         "event_id": "evt_1",
         "open": {
-            "inbox_id": INBOX,
+            "inbox_id": TEST_INBOX,
             "thread_id": "tid-1",
             "message_id": "mid-1",
             "timestamp": "2026-01-15T09:50:00.000Z",

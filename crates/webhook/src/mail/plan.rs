@@ -668,13 +668,11 @@ fn is_sorted_and_deduped(values: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use proptest::prelude::*;
 
     use super::*;
     use crate::mail::thread::{apply_message, new_thread};
-    use crate::mail::{Direction, InboxId};
+    use crate::mail::{Direction, InboxId, test_fixtures};
 
     fn message(inbox: &str, thread_id: &str, message_id: &str, labels: &[&str]) -> MailMessage {
         MailMessage {
@@ -682,29 +680,14 @@ mod tests {
             thread_id: thread_id.to_owned(),
             message_id: message_id.to_owned(),
             ses_message_id: None,
-            direction: Direction::Inbound,
             rfc_message_id: format!("<{message_id}@example.com>"),
-            in_reply_to: None,
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),
             timestamp: "00000001-0000".to_owned(),
-            from: "sender@example.com".to_owned(),
-            to: vec!["support@example.com".to_owned()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Hello".to_owned(),
-            preview: "Hello there".to_owned(),
             size: 1_000,
-            attachments: Vec::new(),
-            attachments_truncated: false,
-            raw_s3_key: Some("inbound/x".to_owned()),
-            thread_snapshot: None,
-            delivery: BTreeMap::new(),
-            send_status: None,
-            sent_at: None,
             version: 0,
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            expires_at: 0,
+            ..test_fixtures::message()
         }
     }
 

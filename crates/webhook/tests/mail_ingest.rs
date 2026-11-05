@@ -3,11 +3,8 @@
 //! `FakeServices` (`MailMemoryStore` + `FakeObjectStore`), and the
 //! `.eml` fixtures.
 //!
-//! `webhook_test_support::harness()` always builds a harness with
-//! `mail: None` (it is a shared crate this track does not own), so
-//! router-driven tests here build their own mail-configured harness
-//! (`mail_harness`), mirroring `harness_with`'s wiring with a non-`None`
-//! `MailConfig`. The paused-time deadline and resume tests call
+//! Router-driven tests run against `webhook_test_support::mail_harness`.
+//! The paused-time deadline and resume tests call
 //! `mail::ingest::ingest_inbound` directly instead of going through the
 //! router: `test_context()` and the Function URL fallback both hard-code a
 //! 60 s deadline that this track cannot override without touching the
@@ -16,11 +13,10 @@
 //! deadline.
 
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aws_messaging_webhook::allowlist::TopicAllowlist;
-use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
+use aws_messaging_webhook::config::{Config, MailConfig};
 use aws_messaging_webhook::mail::ids::inbound_message_id;
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::time::parse as parse_ts;
@@ -31,71 +27,11 @@ use axum::body::Bytes;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sns_message_verifier::SnsVerifier;
-use sns_message_verifier::fixtures::SnsFixture;
-use webhook_test_support::objects::ObjectFailure;
-use webhook_test_support::{FakeServices, Harness, direct_sns_event, invoke, post, wrapped};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-const BUCKET: &str = "mail-bucket";
-const DOMAIN: &str = "example.com";
-
-fn test_mail_config() -> MailConfig {
-    MailConfig {
-        domain: DOMAIN.to_owned(),
-        table_name: "mail-table".to_owned(),
-        bucket: BUCKET.to_owned(),
-        inbox: "support@example.com".to_owned(),
-        configuration_set: "config-set".to_owned(),
-        identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com".to_owned(),
-        api_keys_parameter: "/example/api-keys".to_owned(),
-        attachment_url_ttl: Duration::from_secs(3600),
-        region: "us-east-1".to_owned(),
-        retention_days: 365,
-    }
-}
-
-/// Builds a harness with `mail` configured (`webhook_test_support::harness`
-/// always sets `mail: None` — see the module doc).
-async fn mail_harness() -> Harness {
-    let fixture = SnsFixture::new();
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/cert.pem"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(&fixture.cert_pem))
-        .mount(&server)
-        .await;
-    let cert_url = format!("{}/cert.pem", server.uri());
-
-    let state = Arc::new(AppState {
-        services: FakeServices::default(),
-        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
-        verifier: SnsVerifier::builder()
-            .dangerous_allow_cert_url_prefix(server.uri())
-            .build()
-            .unwrap(),
-        allowlist: TopicAllowlist::parse(webhook_test_support::ALLOWED_ACCOUNT),
-        http: reqwest::Client::new(),
-        config: Config {
-            table_name: "events".to_owned(),
-            event_bus_name: "bus".to_owned(),
-            event_source: "aws-messaging-webhook".to_owned(),
-            auto_resubscribe: true,
-            opt_out_list_name: None,
-            raw_event_retention_days: 30,
-            aggregate_retention_days: 365,
-            mode: FunctionMode::Webhook,
-            mail: Some(test_mail_config()),
-        },
-        dangerous_subscribe_url_prefix: Some(server.uri()),
-    });
-    Harness {
-        state,
-        fixture,
-        cert_url,
-        server,
-    }
-}
+use webhook_test_support::objects::{ObjectFailure, Op};
+use webhook_test_support::{
+    FakeServices, Harness, MAIL_BUCKET, direct_sns_event, invoke, mail_harness, post, test_config,
+    test_mail_config, wrapped,
+};
 
 /// A `notificationType: "Received"` SNS payload with an S3 action pointer
 /// the fields ingest reads.
@@ -145,7 +81,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -238,7 +174,7 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/inline-img",
             "PASS",
             "PASS",
@@ -335,7 +271,7 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/giant-refs",
             "PASS",
             "PASS",
@@ -399,7 +335,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/giant-mid",
             "PASS",
             "PASS",
@@ -458,7 +394,7 @@ async fn direct_sns_invocation_also_ingests() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -501,7 +437,7 @@ async fn reply_threads_under_its_parent() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -521,7 +457,7 @@ async fn reply_threads_under_its_parent() {
             "ses-2",
             reply_ts,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-2",
             "PASS",
             "PASS",
@@ -562,7 +498,7 @@ async fn spam_message_gets_the_spam_label() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "FAIL",
             "PASS",
@@ -601,7 +537,7 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -640,7 +576,7 @@ async fn redelivery_is_idempotent() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -729,7 +665,7 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/missing",
             "PASS",
             "PASS",
@@ -765,7 +701,7 @@ async fn transient_s3_error_returns_500() {
             "ses-1",
             TS,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -789,7 +725,7 @@ async fn the_ses_setup_notification_is_acknowledged_and_ignored() {
             "AMAZON_SES_SETUP_NOTIFICATION",
             TS,
             &["recipient@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/raw/AMAZON_SES_SETUP_NOTIFICATION",
             "PASS",
             "PASS",
@@ -828,7 +764,7 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
                 ses_id,
                 TS,
                 &["support@example.com"],
-                BUCKET,
+                MAIL_BUCKET,
                 key,
                 "PASS",
                 "PASS",
@@ -871,7 +807,7 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
                 "sales@example.com",
                 "support@example.net",
             ],
-            BUCKET,
+            MAIL_BUCKET,
             "inbound/msg-1",
             "PASS",
             "PASS",
@@ -941,18 +877,12 @@ fn direct_state(bucket: &str) -> AppState<FakeServices> {
         allowlist: TopicAllowlist::parse(""),
         http: reqwest::Client::new(),
         config: Config {
-            table_name: "events".to_owned(),
-            event_bus_name: "bus".to_owned(),
-            event_source: "aws-messaging-webhook".to_owned(),
-            auto_resubscribe: true,
             opt_out_list_name: None,
-            raw_event_retention_days: 30,
-            aggregate_retention_days: 365,
-            mode: FunctionMode::Webhook,
             mail: Some(MailConfig {
                 bucket: bucket.to_owned(),
                 ..test_mail_config()
             }),
+            ..test_config()
         },
         dangerous_subscribe_url_prefix: None,
     }
@@ -965,7 +895,14 @@ fn notification(
     key: &str,
 ) -> SesInboundNotification {
     let value = ses_inbound_s3(
-        ses_id, timestamp, recipients, BUCKET, key, "PASS", "PASS", "PASS",
+        ses_id,
+        timestamp,
+        recipients,
+        MAIL_BUCKET,
+        key,
+        "PASS",
+        "PASS",
+        "PASS",
     );
     serde_json::from_value(value).unwrap()
 }
@@ -988,7 +925,7 @@ fn notification_without_timestamps(
             "spfVerdict": {"status": "PASS"},
             "dkimVerdict": {"status": "PASS"},
             "dmarcVerdict": {"status": "PASS"},
-            "action": {"type": "S3", "bucketName": BUCKET, "objectKey": key},
+            "action": {"type": "S3", "bucketName": MAIL_BUCKET, "objectKey": key},
         }
     });
     serde_json::from_value(value).unwrap()
@@ -996,7 +933,7 @@ fn notification_without_timestamps(
 
 #[tokio::test(start_paused = true)]
 async fn deadline_timeout_returns_transient() {
-    let state = direct_state(BUCKET);
+    let state = direct_state(MAIL_BUCKET);
     state
         .services
         .objects
@@ -1018,7 +955,7 @@ async fn deadline_timeout_returns_transient() {
 
 #[tokio::test]
 async fn resume_skips_an_already_present_part() {
-    let state = direct_state(BUCKET);
+    let state = direct_state(MAIL_BUCKET);
     let raw = include_bytes!("fixtures/mail/attachment-content-id.eml");
     state
         .services
@@ -1050,12 +987,12 @@ async fn resume_skips_an_already_present_part() {
     // is HEADed (once to detect a redelivery, once more in the per-part
     // resume check) but never put, since it was already present.
     assert_eq!(
-        state.services.objects.head_object_call_count(&object_key),
+        state.services.objects.call_count(Op::Head, &object_key),
         2,
         "resume HEADs every part: once to detect a redelivery, once per part"
     );
     assert_eq!(
-        state.services.objects.put_object_call_count(&object_key),
+        state.services.objects.call_count(Op::Put, &object_key),
         0,
         "an already-present part is skipped, never put"
     );
@@ -1090,7 +1027,7 @@ fn two_attachment_email() -> Vec<u8> {
 /// (see the doc comment on `mail::ingest::put_kept_parts`).
 #[tokio::test(start_paused = true)]
 async fn no_put_still_pending_after_the_deadline() {
-    let state = direct_state(BUCKET);
+    let state = direct_state(MAIL_BUCKET);
     state.services.objects.seed(
         "inbound/two-atts",
         Bytes::from(two_attachment_email()),
@@ -1123,7 +1060,7 @@ async fn no_put_still_pending_after_the_deadline() {
         aws_messaging_webhook::actions::ActionErrorKind::Transient
     );
 
-    let count_at_timeout = state.services.objects.put_object_call_count(&hung_key);
+    let count_at_timeout = state.services.objects.call_count(Op::Put, &hung_key);
     assert_eq!(
         count_at_timeout, 1,
         "the hung put was attempted exactly once"
@@ -1132,7 +1069,7 @@ async fn no_put_still_pending_after_the_deadline() {
     // dropped on timeout, the hung put would still be polled and retried.
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(
-        state.services.objects.put_object_call_count(&hung_key),
+        state.services.objects.call_count(Op::Put, &hung_key),
         count_at_timeout,
         "no put is still pending after the deadline: the call count must not keep growing"
     );
@@ -1148,7 +1085,7 @@ async fn no_put_still_pending_after_the_deadline() {
 /// second stored copy.
 #[tokio::test]
 async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
-    let state = direct_state(BUCKET);
+    let state = direct_state(MAIL_BUCKET);
     state.services.objects.seed(
         "inbound/no-ts",
         Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
@@ -1187,17 +1124,14 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
 /// value would make the id non-deterministic across a redelivery.
 #[tokio::test]
 async fn missing_every_timestamp_source_skips_rather_than_inventing_one() {
-    let state = direct_state(BUCKET);
+    let state = direct_state(MAIL_BUCKET);
     let event = notification_without_timestamps("ses-1", &["support@example.com"], "inbound/no-ts");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
     assert_eq!(result.unwrap(), "ingest_skipped");
     assert_eq!(
-        state
-            .services
-            .objects
-            .get_object_call_count("inbound/no-ts"),
+        state.services.objects.call_count(Op::Get, "inbound/no-ts"),
         0,
         "the message is skipped before ever fetching the raw object"
     );
@@ -1235,7 +1169,7 @@ async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
             &ses_id,
             &ts,
             &["support@example.com"],
-            BUCKET,
+            MAIL_BUCKET,
             &key,
             "PASS",
             "PASS",

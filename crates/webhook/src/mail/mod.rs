@@ -32,6 +32,9 @@ pub mod labels;
 pub mod mime;
 pub mod thread;
 
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

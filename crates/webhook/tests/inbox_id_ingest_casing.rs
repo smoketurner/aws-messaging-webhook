@@ -1,4 +1,3 @@
-#![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 //! End-to-end repro for the inbox-id casing inconsistency: ingest
 //! ASCII-lowercases the envelope recipient before storing under `InboxId`,
 //! but the `/v0` read API used the `{inbox_id}` path segment verbatim. With
@@ -12,14 +11,11 @@
 
 use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, content, ids, time};
-use axum::body::{Body, Bytes};
-use axum::http::{Request, StatusCode};
+use axum::body::Bytes;
+use axum::http::StatusCode;
 use serde_json::{Value, json};
-use tower::ServiceExt as _;
-use webhook_test_support::{Harness, mail_harness, post, wrapped};
+use webhook_test_support::{Harness, MAIL_BUCKET, TEST_API_KEY, api, mail_harness, post, wrapped};
 
-const KEY: &str = "am_live_key";
-const BUCKET: &str = "mail-bucket";
 const TS: &str = "2026-01-01T00:00:00.000Z";
 const SES_ID: &str = "ses-casing-1";
 
@@ -50,33 +46,17 @@ fn ses_inbound_s3(recipients: &[&str]) -> Value {
             "spfVerdict": {"status": "PASS"},
             "dkimVerdict": {"status": "PASS"},
             "dmarcVerdict": {"status": "PASS"},
-            "action": {"type": "S3", "bucketName": BUCKET, "objectKey": "inbound/msg-1"},
+            "action": {"type": "S3", "bucketName": MAIL_BUCKET, "objectKey": "inbound/msg-1"},
         }
     })
 }
 
-async fn get(h: &Harness, path: &str) -> (StatusCode, Value) {
-    let request = Request::get(path)
-        .header("authorization", format!("Bearer {KEY}"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
-
 async fn seeded() -> Harness {
     let h = mail_harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
+    h.state
+        .services
+        .api_keys
+        .set_keys(&[(TEST_API_KEY, "key_1")]);
     h.fake().objects.seed(
         "inbound/msg-1",
         Bytes::from_static(RAW_MIXED_CASE),
@@ -129,7 +109,7 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     // Before the fix: mixed-case path → 404 on the inbox, 200 with count: 0 on
     // the messages list. After the fix: both resolve because the API
     // normalizes the path the same way ingest normalizes the RCPT.
-    let (status, body) = get(&h, "/v0/inboxes/Support@Example.com").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/Support@Example.com").await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -137,7 +117,7 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     );
     assert_eq!(body["inbox_id"], "support@example.com");
 
-    let (status, body) = get(&h, "/v0/inboxes/Support@Example.com/messages").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/Support@Example.com/messages").await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -152,17 +132,17 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
 
     // The exact lowercased id the service published is still accepted — no
     // regression on the standard integration path.
-    let (status, body) = get(&h, "/v0/inboxes/support@example.com").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/support@example.com").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["inbox_id"], "support@example.com");
 
-    let (status, body) = get(&h, "/v0/inboxes/support@example.com/messages").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/support@example.com/messages").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 1);
     assert_eq!(body["messages"][0]["message_id"], message_id);
 
     // Padded variants are normalized too (trim), matching ingest.
-    let (status, body) = get(&h, "/v0/inboxes/%20Support@Example.com%20").await;
+    let (status, body) = api::get(&h, "/v0/inboxes/%20Support@Example.com%20").await;
     assert_eq!(
         status,
         StatusCode::OK,

@@ -7,44 +7,18 @@ use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::mime::parse_inbound;
 use aws_messaging_webhook::mail::send::SendSpec;
 use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ids, send, time};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ids, time};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
-use tower::ServiceExt as _;
 use webhook_test_support::mail_memory::sample_message;
-use webhook_test_support::{Harness, mail_harness};
-
-const KEY: &str = "am_live_key";
-const INBOX: &str = "support@example.com";
-const AT: &str = "2026-01-01T09:00:00.000Z";
-
-async fn post(h: &Harness, path: &str, body: &Value) -> (StatusCode, Value) {
-    let request = Request::post(path)
-        .header("authorization", format!("Bearer {KEY}"))
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
+use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, api_harness};
 
 /// Seeds one inbound message to reply to, letting the caller shape it.
 /// Stores the original message's content document, as ingest would have.
 async fn store_content(h: &Harness, message_id: &str, message_content: MessageContent) {
     content::store(
         &h.state.services,
-        &InboxId(INBOX.to_owned()),
+        &InboxId(TEST_INBOX.to_owned()),
         message_id,
         &message_content,
     )
@@ -53,35 +27,19 @@ async fn store_content(h: &Harness, message_id: &str, message_content: MessageCo
 }
 
 async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
-    let h = mail_harness().await;
-    h.state.services.api_keys.set_keys(&[(KEY, "key_1")]);
-    h.state
-        .services
-        .ensure_inbox(&InboxId(INBOX.to_owned()), AT)
-        .await
-        .unwrap();
+    let h = api_harness().await;
 
-    let ms = time::parse(AT).unwrap();
+    let ms = time::parse(TEST_AT).unwrap();
     let id = ids::inbound_message_id("ses-1", ms).to_string();
-    let mut msg = sample_message(INBOX, &id, "thread-1");
-    AT.clone_into(&mut msg.timestamp);
+    let mut msg = sample_message(TEST_INBOX, &id, "thread-1");
+    TEST_AT.clone_into(&mut msg.timestamp);
     "customer@example.net".clone_into(&mut msg.from);
-    msg.to = vec![INBOX.to_owned()];
+    msg.to = vec![TEST_INBOX.to_owned()];
     "Order 42".clone_into(&mut msg.subject);
     "<original@example.net>".clone_into(&mut msg.rfc_message_id);
     adjust(&mut msg);
     h.state.services.insert_message(&msg, &[]).await.unwrap();
     (h, id)
-}
-
-fn spec(h: &Harness, message_id: &str) -> SendSpec {
-    let bytes = h
-        .state
-        .services
-        .objects
-        .get(&send::spec_key(message_id))
-        .unwrap();
-    serde_json::from_slice(&bytes).unwrap()
 }
 
 fn body() -> Value {
@@ -92,9 +50,9 @@ fn body() -> Value {
 async fn a_reply_joins_the_original_thread_and_addresses_its_sender() {
     let (h, original_id) = seeded(|_| {}).await;
 
-    let (status, response) = post(
+    let (status, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
@@ -102,7 +60,7 @@ async fn a_reply_joins_the_original_thread_and_addresses_its_sender() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["thread_id"], "thread-1");
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(spec.subject, "Re: Order 42");
     assert_eq!(spec.in_reply_to.as_deref(), Some("<original@example.net>"));
@@ -113,14 +71,14 @@ async fn a_reply_joins_the_original_thread_and_addresses_its_sender() {
 async fn an_existing_re_prefix_is_not_repeated() {
     let (h, original_id) = seeded(|m| m.subject = "Re: Order 42".to_owned()).await;
 
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.subject, "Re: Order 42");
 }
 
@@ -129,15 +87,15 @@ async fn a_subject_starting_with_a_multi_byte_character_is_prefixed() {
     for subject in ["🎉 Party", "ab€ total", "é"] {
         let (h, original_id) = seeded(|m| m.subject = subject.to_owned()).await;
 
-        let (status, response) = post(
+        let (status, response) = api::post(
             &h,
-            &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+            &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
             &body(),
         )
         .await;
 
         assert_eq!(status, StatusCode::OK, "{subject}");
-        let spec = spec(&h, response["message_id"].as_str().unwrap());
+        let spec = h.send_spec(response["message_id"].as_str().unwrap());
         assert_eq!(spec.subject, format!("Re: {subject}"));
     }
 }
@@ -156,14 +114,14 @@ async fn reply_to_on_the_original_wins_over_its_sender() {
     )
     .await;
 
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["desk@example.net"]);
 }
 
@@ -172,7 +130,7 @@ async fn reply_all_copies_the_others_but_never_this_inbox() {
     // Replying to all must not send the message back to the inbox that sent
     // it, which would loop.
     let (h, original_id) = seeded(|m| {
-        m.to = vec![INBOX.to_owned(), "colleague@example.net".to_owned()];
+        m.to = vec![TEST_INBOX.to_owned(), "colleague@example.net".to_owned()];
         // Shares this inbox's local part at another domain: someone else.
         m.cc = vec![
             "watcher@example.net".to_owned(),
@@ -183,14 +141,14 @@ async fn reply_all_copies_the_others_but_never_this_inbox() {
 
     let mut request = body();
     request["reply_all"] = json!(true);
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(
         spec.envelope.cc,
@@ -201,7 +159,7 @@ async fn reply_all_copies_the_others_but_never_this_inbox() {
         ]
     );
     assert!(
-        !spec.envelope.cc.iter().any(|a| a == INBOX),
+        !spec.envelope.cc.iter().any(|a| a == TEST_INBOX),
         "this inbox must not be copied on its own reply"
     );
 }
@@ -213,14 +171,14 @@ async fn without_reply_all_only_the_sender_is_addressed() {
     })
     .await;
 
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(spec.envelope.cc, [] as [String; 0]);
 }
@@ -231,14 +189,14 @@ async fn an_explicit_recipient_overrides_the_derived_one() {
 
     let mut request = body();
     request["to"] = json!("someone-else@example.net");
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["someone-else@example.net"]);
     // The threading still comes from the original.
     assert_eq!(spec.in_reply_to.as_deref(), Some("<original@example.net>"));
@@ -257,14 +215,14 @@ async fn the_references_chain_grows_from_the_original() {
     )
     .await;
 
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(
         spec.references,
         vec!["<first@example.net>", "<original@example.net>"]
@@ -275,9 +233,9 @@ async fn the_references_chain_grows_from_the_original() {
 async fn replying_to_an_unknown_message_is_not_found() {
     let (h, _) = seeded(|_| {}).await;
 
-    let (status, _) = post(
+    let (status, _) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/nope/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/nope/reply"),
         &body(),
     )
     .await;
@@ -293,16 +251,16 @@ async fn replying_to_an_unknown_message_is_not_found() {
 async fn a_reply_survives_a_missing_content_document() {
     let (h, original_id) = seeded(|_| {}).await;
 
-    let (status, response) = post(
+    let (status, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["thread_id"], "thread-1");
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     // The original's References came from its content document, so the chain
     // starts from what the item itself carries.
@@ -313,9 +271,9 @@ async fn a_reply_survives_a_missing_content_document() {
 async fn a_reply_without_a_body_is_rejected() {
     let (h, original_id) = seeded(|_| {}).await;
 
-    let (status, response) = post(
+    let (status, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &json!({}),
     )
     .await;
@@ -327,25 +285,14 @@ async fn a_reply_without_a_body_is_rejected() {
 #[tokio::test]
 async fn a_reply_shows_up_in_the_original_thread() {
     let (h, original_id) = seeded(|_| {}).await;
-    post(
+    api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &body(),
     )
     .await;
 
-    let request = Request::get(format!("/v0/inboxes/{INBOX}/threads/thread-1"))
-        .header("authorization", format!("Bearer {KEY}"))
-        .body(Body::empty())
-        .unwrap();
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let thread: Value = serde_json::from_slice(&bytes).unwrap();
+    let (_, thread) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/threads/thread-1")).await;
 
     assert_eq!(thread["count"], 2);
     assert_eq!(thread["message_count"], 2);
@@ -358,7 +305,7 @@ async fn a_reply_shows_up_in_the_original_thread() {
 async fn a_reply_addressing_a_mixed_case_inbox_path_is_queued() {
     let (h, original_id) = seeded(|_| {}).await;
 
-    let (status, response) = post(
+    let (status, response) = api::post(
         &h,
         &format!("/v0/inboxes/Support@Example.com/messages/{original_id}/reply"),
         &body(),
@@ -418,16 +365,16 @@ async fn a_reply_reaches_the_mailbox_ingest_read_from_the_sender() {
     ];
     for (header, mailbox) in senders {
         let raw = format!(
-            "From: {header}\r\nTo: {INBOX}\r\nSubject: hi\r\n\
+            "From: {header}\r\nTo: {TEST_INBOX}\r\nSubject: hi\r\n\
              Message-ID: <rt@example.net>\r\n\r\nbody\r\n"
         );
         let stored = parse_inbound(raw.as_bytes()).unwrap().message.from;
         assert!(stored.len() <= aws_messaging_webhook::mail::ADDRESS_MAX_BYTES);
 
         let (h, original_id) = seeded(|m| m.from.clone_from(&stored)).await;
-        let (status, response) = post(
+        let (status, response) = api::post(
             &h,
-            &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+            &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
             &body(),
         )
         .await;
@@ -437,7 +384,7 @@ async fn a_reply_reaches_the_mailbox_ingest_read_from_the_sender() {
             StatusCode::OK,
             "{header} stored as {stored:?}: {response}"
         );
-        let spec = spec(&h, response["message_id"].as_str().unwrap());
+        let spec = h.send_spec(response["message_id"].as_str().unwrap());
         assert_eq!(
             spec.envelope.to,
             vec![mailbox],
@@ -449,21 +396,21 @@ async fn a_reply_reaches_the_mailbox_ingest_read_from_the_sender() {
 #[tokio::test]
 async fn reply_all_never_copies_this_inbox_under_a_display_name() {
     let (h, original_id) = seeded(|m| {
-        m.to = vec![format!("Support Desk <{INBOX}>")];
+        m.to = vec![format!("Support Desk <{TEST_INBOX}>")];
         m.cc = vec!["Watcher <watcher@example.net>".to_owned()];
     })
     .await;
 
     let mut request = body();
     request["reply_all"] = json!(true);
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
     assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
 }
@@ -473,7 +420,7 @@ async fn reply_all_never_copies_this_inbox_under_a_display_name() {
 async fn seeded_sent(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     seeded(|m| {
         m.direction = Direction::Outbound;
-        INBOX.clone_into(&mut m.from);
+        TEST_INBOX.clone_into(&mut m.from);
         m.to = Vec::new();
         m.cc = Vec::new();
         m.bcc = Vec::new();
@@ -489,13 +436,13 @@ async fn reply_to_sent(
     let (h, original_id) = seeded_sent(adjust).await;
     let mut request = body();
     request["reply_all"] = json!(reply_all);
-    let (status, response) = post(
+    let (status, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
-    let spec = response["message_id"].as_str().map(|id| spec(&h, id));
+    let spec = response["message_id"].as_str().map(|id| h.send_spec(id));
     (status, response, spec)
 }
 
@@ -599,14 +546,14 @@ async fn reply_all_never_ccs_a_direct_recipient_in_a_different_spelling() {
 
     let mut request = body();
     request["reply_all"] = json!(true);
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["alice@example.net"]);
     assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
     assert!(
@@ -645,14 +592,14 @@ async fn reply_all_never_copies_a_reply_to_recipient_into_cc_in_a_different_spel
 
     let mut request = body();
     request["reply_all"] = json!(true);
-    let (_, response) = post(
+    let (_, response) = api::post(
         &h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
 
-    let spec = spec(&h, response["message_id"].as_str().unwrap());
+    let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["alice@example.net"]);
     assert_eq!(spec.envelope.cc, vec!["watcher@example.net"]);
     assert!(
@@ -670,14 +617,14 @@ async fn reply_all_never_copies_a_reply_to_recipient_into_cc_in_a_different_spel
 async fn reply_spec(h: &Harness, original_id: &str, reply_all: bool) -> SendSpec {
     let mut request = body();
     request["reply_all"] = json!(reply_all);
-    let (status, response) = post(
+    let (status, response) = api::post(
         h,
-        &format!("/v0/inboxes/{INBOX}/messages/{original_id}/reply"),
+        &format!("/v0/inboxes/{TEST_INBOX}/messages/{original_id}/reply"),
         &request,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    spec(h, response["message_id"].as_str().unwrap())
+    h.send_spec(response["message_id"].as_str().unwrap())
 }
 
 /// A send's `reply_to` tells its recipients where to answer. Following up on
@@ -726,10 +673,10 @@ async fn a_follow_up_never_addresses_this_inbox_among_the_recipients() {
 /// so a follow-up to a note to itself still goes to itself.
 #[tokio::test]
 async fn a_follow_up_to_a_note_to_itself_goes_to_this_inbox() {
-    let (h, original_id) = seeded_sent(|m| m.to = vec![INBOX.to_owned()]).await;
+    let (h, original_id) = seeded_sent(|m| m.to = vec![TEST_INBOX.to_owned()]).await;
 
     let spec = reply_spec(&h, &original_id, false).await;
-    assert_eq!(spec.envelope.to, vec![INBOX]);
+    assert_eq!(spec.envelope.to, vec![TEST_INBOX]);
 }
 
 /// A `Reply-To` that names only this inbox would send the reply back here;
@@ -741,7 +688,7 @@ async fn a_reply_to_naming_only_this_inbox_falls_back_to_the_sender() {
         &h,
         &original_id,
         MessageContent {
-            reply_to: vec![format!("Support <{INBOX}>")],
+            reply_to: vec![format!("Support <{TEST_INBOX}>")],
             ..MessageContent::default()
         },
     )
@@ -756,7 +703,7 @@ async fn a_reply_to_naming_only_this_inbox_falls_back_to_the_sender() {
 #[tokio::test]
 async fn reply_all_copies_each_mailbox_once_however_it_was_written() {
     let (h, original_id) = seeded(|m| {
-        m.to = vec![INBOX.to_owned(), "Bob <bob@example.net>".to_owned()];
+        m.to = vec![TEST_INBOX.to_owned(), "Bob <bob@example.net>".to_owned()];
         m.cc = vec!["BOB@example.net".to_owned()];
     })
     .await;

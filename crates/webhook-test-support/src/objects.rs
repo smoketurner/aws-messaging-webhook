@@ -33,26 +33,25 @@ pub enum ObjectFailure {
     Hang,
 }
 
-/// The ordered sequence of calls made against each operation: a
-/// per-key call count is `iter().filter(|k| k == key).count()`, and the
-/// "no put still pending after the deadline" test relies on a call
-/// being recorded synchronously at entry, before any injected failure
-/// (including [`ObjectFailure::Hang`]) is even consulted — so a hung call
-/// still shows up here exactly once, and never again once its future is
-/// dropped.
-#[derive(Default)]
-struct CallLog {
-    get_object: Vec<String>,
-    head_object: Vec<String>,
-    put_object_if_absent: Vec<String>,
-    delete_object: Vec<String>,
+/// An `ObjectStore` operation whose calls the fake records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Op {
+    Get,
+    Head,
+    Put,
+    Delete,
 }
 
 #[derive(Default)]
 pub struct FakeObjectStore {
     objects: Mutex<HashMap<String, StoredObject>>,
     failures: Mutex<HashMap<String, ObjectFailure>>,
-    calls: Mutex<CallLog>,
+    /// The ordered sequence of keys each operation was called with. A call
+    /// is recorded synchronously at entry, before any injected failure
+    /// (including [`ObjectFailure::Hang`]) is consulted, so a hung call shows
+    /// up here exactly once, and never again once its future is dropped —
+    /// the "no put still pending after the deadline" tests rely on that.
+    calls: Mutex<HashMap<Op, Vec<String>>>,
     /// A 1-based countdown that fails the Nth `put_object_if_absent` call with
     /// `ObjectError::Transient`, regardless of key, then clears itself.
     /// `outbound_message_id` is random, so the spec key is unknowable ahead of
@@ -84,7 +83,7 @@ impl FakeObjectStore {
     /// fail with `ObjectError::Transient`, then clears the injection. Use this
     /// to fail a particular put when the key is unknowable ahead of time (as
     /// `outbound_message_id` is random). A put that the Nth countdown fails is
-    /// still recorded in [`Self::put_object_calls`]. A per-key injection by
+    /// still recorded in [`Self::calls`]. A per-key injection by
     /// [`Self::inject`] pre-empts the countdown entirely for the call it fails,
     /// so a per-key fixture never consumes the countdown.
     pub fn inject_nth_put_if_absent(&self, n: usize) {
@@ -122,77 +121,60 @@ impl FakeObjectStore {
         self.objects.lock().unwrap().contains_key(key)
     }
 
-    fn injected(&self, key: &str) -> Option<ObjectFailure> {
-        self.failures.lock().unwrap().get(key).copied()
-    }
-
-    /// The number of `get_object` calls made against `key` so far.
+    /// Every key `op` was called with, in order (repeats included).
     #[must_use]
-    pub fn get_object_call_count(&self, key: &str) -> usize {
-        count(&self.calls.lock().unwrap().get_object, key)
+    pub fn calls(&self, op: Op) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .get(&op)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    /// The number of `head_object` calls made against `key` so far.
+    /// The number of `op` calls made against `key` so far.
     #[must_use]
-    pub fn head_object_call_count(&self, key: &str) -> usize {
-        count(&self.calls.lock().unwrap().head_object, key)
+    pub fn call_count(&self, op: Op, key: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .get(&op)
+            .map_or(0, |keys| keys.iter().filter(|k| k.as_str() == key).count())
     }
 
-    /// The number of `put_object_if_absent` calls made against `key` so far.
-    #[must_use]
-    pub fn put_object_call_count(&self, key: &str) -> usize {
-        count(&self.calls.lock().unwrap().put_object_if_absent, key)
+    fn record(&self, op: Op, key: &str) {
+        self.calls
+            .lock()
+            .unwrap()
+            .entry(op)
+            .or_default()
+            .push(key.to_owned());
     }
 
-    /// The ordered sequence of every key `get_object` was called with
-    /// (repeats included).
-    #[must_use]
-    pub fn get_object_calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().get_object.clone()
+    /// Applies the failure injected for `key`, if any: never resolves for
+    /// `Hang`, and errors for `Permanent` and `Transient`. Returns whether
+    /// `NotFound` is injected, which each operation interprets for itself.
+    async fn injected(&self, operation: &str, key: &str) -> Result<bool, ObjectError> {
+        let failure = self.failures.lock().unwrap().get(key).copied();
+        match failure {
+            Some(ObjectFailure::Hang) => future::pending().await,
+            Some(ObjectFailure::NotFound) => Ok(true),
+            Some(ObjectFailure::Permanent) => Err(ObjectError::Permanent(anyhow!(
+                "injected permanent {operation} failure for {key}"
+            ))),
+            Some(ObjectFailure::Transient) => Err(ObjectError::Transient(anyhow!(
+                "injected transient {operation} failure for {key}"
+            ))),
+            None => Ok(false),
+        }
     }
-
-    /// The ordered sequence of every key `head_object` was called with
-    /// (repeats included).
-    #[must_use]
-    pub fn head_object_calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().head_object.clone()
-    }
-
-    /// The ordered sequence of every key `delete_object` was called with.
-    #[must_use]
-    pub fn delete_object_calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().delete_object.clone()
-    }
-
-    /// The ordered sequence of every key `put_object_if_absent` was called
-    /// with (repeats included).
-    #[must_use]
-    pub fn put_object_calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().put_object_if_absent.clone()
-    }
-}
-
-fn count(calls: &[String], key: &str) -> usize {
-    calls.iter().filter(|k| k.as_str() == key).count()
 }
 
 impl ObjectStore for FakeObjectStore {
     async fn get_object(&self, key: &str, max_bytes: u64) -> Result<Bytes, ObjectError> {
-        self.calls.lock().unwrap().get_object.push(key.to_owned());
-        match self.injected(key) {
-            Some(ObjectFailure::Hang) => future::pending().await,
-            Some(ObjectFailure::NotFound) => return Err(ObjectError::NotFound),
-            Some(ObjectFailure::Permanent) => {
-                return Err(ObjectError::Permanent(anyhow!(
-                    "injected permanent get_object failure for {key}"
-                )));
-            }
-            Some(ObjectFailure::Transient) => {
-                return Err(ObjectError::Transient(anyhow!(
-                    "injected transient get_object failure for {key}"
-                )));
-            }
-            None => {}
+        self.record(Op::Get, key);
+        if self.injected("get_object", key).await? {
+            return Err(ObjectError::NotFound);
         }
         let body = self
             .objects
@@ -209,21 +191,9 @@ impl ObjectStore for FakeObjectStore {
     }
 
     async fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>, ObjectError> {
-        self.calls.lock().unwrap().head_object.push(key.to_owned());
-        match self.injected(key) {
-            Some(ObjectFailure::Hang) => future::pending().await,
-            Some(ObjectFailure::NotFound) => return Ok(None),
-            Some(ObjectFailure::Permanent) => {
-                return Err(ObjectError::Permanent(anyhow!(
-                    "injected permanent head_object failure for {key}"
-                )));
-            }
-            Some(ObjectFailure::Transient) => {
-                return Err(ObjectError::Transient(anyhow!(
-                    "injected transient head_object failure for {key}"
-                )));
-            }
-            None => {}
+        self.record(Op::Head, key);
+        if self.injected("head_object", key).await? {
+            return Ok(None);
         }
         Ok(self.objects.lock().unwrap().get(key).map(|o| ObjectMeta {
             size: u64::try_from(o.body.len()).unwrap_or(u64::MAX),
@@ -236,30 +206,13 @@ impl ObjectStore for FakeObjectStore {
         body: Bytes,
         content_type: &str,
     ) -> Result<PutOutcome, ObjectError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .put_object_if_absent
-            .push(key.to_owned());
+        self.record(Op::Put, key);
         // A per-key failure pre-empts the nth-call countdown: the countdown
         // targets a particular put by call order, and a per-key fixture (a
         // `Hang` that never resolves, or a `Permanent`/`Transient` error) is a
         // different setup that should not consume it.
-        match self.injected(key) {
-            Some(ObjectFailure::Hang) => future::pending().await,
-            Some(ObjectFailure::Permanent) => {
-                return Err(ObjectError::Permanent(anyhow!(
-                    "injected permanent put_object_if_absent failure for {key}"
-                )));
-            }
-            Some(ObjectFailure::Transient) => {
-                return Err(ObjectError::Transient(anyhow!(
-                    "injected transient put_object_if_absent failure for {key}"
-                )));
-            }
-            // `NotFound` isn't meaningful for a put; ignored.
-            Some(ObjectFailure::NotFound) | None => {}
-        }
+        // `NotFound` isn't meaningful for a put; ignored.
+        self.injected("put_object_if_absent", key).await?;
         let fail = {
             let mut guard = self.nth_put_failure.lock().unwrap();
             match *guard {
@@ -294,27 +247,10 @@ impl ObjectStore for FakeObjectStore {
     }
 
     async fn delete_object(&self, key: &str) -> Result<(), ObjectError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .delete_object
-            .push(key.to_owned());
-        match self.injected(key) {
-            Some(ObjectFailure::Hang) => future::pending().await,
-            Some(ObjectFailure::Permanent) => {
-                return Err(ObjectError::Permanent(anyhow!(
-                    "injected permanent delete_object failure for {key}"
-                )));
-            }
-            Some(ObjectFailure::Transient) => {
-                return Err(ObjectError::Transient(anyhow!(
-                    "injected transient delete_object failure for {key}"
-                )));
-            }
-            // Deleting something already absent is the outcome the caller
-            // wanted.
-            Some(ObjectFailure::NotFound) | None => {}
-        }
+        self.record(Op::Delete, key);
+        // Deleting something already absent is the outcome the caller
+        // wanted, so an injected `NotFound` is ignored.
+        self.injected("delete_object", key).await?;
         self.objects.lock().unwrap().remove(key);
         Ok(())
     }
@@ -333,20 +269,8 @@ impl ObjectStore for FakeObjectStore {
         content_type: Option<&str>,
         ttl: Duration,
     ) -> Result<String, ObjectError> {
-        match self.injected(key) {
-            Some(ObjectFailure::Hang) => future::pending().await,
-            Some(ObjectFailure::NotFound) => return Err(ObjectError::NotFound),
-            Some(ObjectFailure::Permanent) => {
-                return Err(ObjectError::Permanent(anyhow!(
-                    "injected permanent presign_get failure for {key}"
-                )));
-            }
-            Some(ObjectFailure::Transient) => {
-                return Err(ObjectError::Transient(anyhow!(
-                    "injected transient presign_get failure for {key}"
-                )));
-            }
-            None => {}
+        if self.injected("presign_get", key).await? {
+            return Err(ObjectError::NotFound);
         }
         let mut url =
             format!("https://example-bucket.s3.amazonaws.test/{key}?X-Amz-Signature=fake");
@@ -480,14 +404,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.get_object_call_count("k"), 2);
-        assert_eq!(store.head_object_call_count("k"), 1);
-        assert_eq!(store.put_object_call_count("other"), 1);
-        assert_eq!(store.put_object_call_count("k"), 0);
-        assert_eq!(
-            store.get_object_calls(),
-            vec!["k".to_owned(), "k".to_owned()]
-        );
+        assert_eq!(store.call_count(Op::Get, "k"), 2);
+        assert_eq!(store.call_count(Op::Head, "k"), 1);
+        assert_eq!(store.call_count(Op::Put, "other"), 1);
+        assert_eq!(store.call_count(Op::Put, "k"), 0);
+        assert_eq!(store.calls(Op::Get), vec!["k".to_owned(), "k".to_owned()]);
     }
 
     #[tokio::test]
@@ -510,7 +431,7 @@ mod tests {
         let _ = hung.await;
 
         assert_eq!(
-            store.put_object_call_count("k"),
+            store.call_count(Op::Put, "k"),
             1,
             "the call was recorded even though it never returned"
         );
@@ -554,7 +475,7 @@ mod tests {
         assert!(store.contains("c"));
 
         assert_eq!(
-            store.put_object_calls(),
+            store.calls(Op::Put),
             vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
         );
     }
