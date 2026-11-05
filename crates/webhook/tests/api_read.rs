@@ -4,7 +4,6 @@
 //! insert path: every fixture goes in through `insert_message`, so the items
 //! these reads return are the ones ingest would actually write.
 
-use aws_messaging_webhook::mail::store::MailStore as _;
 use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content::{self, MessageContent};
@@ -29,7 +28,7 @@ async fn insert(h: &Harness, at: &str, thread: &str, adjust: impl FnOnce(&mut Ma
     msg.created_at = at.to_owned();
     msg.updated_at = at.to_owned();
     adjust(&mut msg);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
 }
 
 type MailMessageOwned = aws_messaging_webhook::mail::MailMessage;
@@ -146,7 +145,7 @@ async fn a_page_token_from_another_inbox_is_rejected() {
     // never be replayed against an inbox it was not issued for.
     let h = seeded().await;
     h.state
-        .services
+        .mailbox()
         .ensure_inbox(
             &InboxId::new("billing@example.com"),
             "2026-01-01T00:00:00.000Z",
@@ -214,7 +213,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
 
     // The same token is still rejected for a genuinely different inbox.
     h.state
-        .services
+        .mailbox()
         .ensure_inbox(
             &InboxId::new("billing@example.com"),
             "2026-01-01T00:00:00.000Z",

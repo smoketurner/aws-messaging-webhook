@@ -1,7 +1,8 @@
-//! The mail table store trait: every read and write the mailbox performs.
+//! The mailbox's result and query types.
 //!
-//! Three groups. Ingest (`get_inbox`, `ensure_inbox`, `message_exists`,
-//! `insert_message`, `get_message`), the read API
+//! [`crate::mail::mailbox::Mailbox`] serves three groups. Ingest
+//! (`get_inbox`, `ensure_inbox`, `message_exists`, `insert_message`,
+//! `get_message`), the read API
 //! (`list_inboxes`, `list_messages`, `list_threads`, `get_thread`,
 //! `update_labels`), and sending (`enqueue_send`, `get_send_key`,
 //! `claim_send`, `note_ses_call`, `mark_send`, `get_send_state`,
@@ -12,12 +13,10 @@
 //! maintaining a pointer row per label, so a `labels` filter is served by
 //! filtering the page. See [`ListQuery`] for how the bounds are encoded.
 
-use std::future::Future;
-
 use crate::mail::keys::PageKey;
-use crate::mail::send::{SendFailure, SendKey, SendState, SendStatus};
+use crate::mail::send::SendFailure;
 use crate::mail::thread::ThreadState;
-use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage};
+use crate::mail::{InboxId, MailMessage};
 
 /// Default page size when the caller doesn't ask for one.
 pub const DEFAULT_LIMIT: usize = 20;
@@ -64,7 +63,9 @@ pub enum EnqueueOutcome {
     KeyExists,
 }
 
-/// How a send finished, as [`MailStore::mark_send`] is told it.
+/// How a send finished, as [`Mailbox::mark_send`] is told it.
+///
+/// [`Mailbox::mark_send`]: crate::mail::mailbox::Mailbox::mark_send
 #[derive(Debug, Clone, Copy)]
 pub enum MarkOutcome<'a> {
     /// SES accepted it, and gave back its own id.
@@ -135,162 +136,6 @@ impl SesRef {
 pub struct ThreadView {
     pub thread: ThreadState,
     pub messages: Page<MailMessage>,
-}
-
-pub trait MailStore: Send + Sync {
-    fn get_inbox(
-        &self,
-        inbox: &InboxId,
-    ) -> impl Future<Output = Result<Option<Inbox>, MailStoreError>> + Send;
-
-    /// Creates the inbox if it doesn't exist. Its `email` is its id.
-    fn ensure_inbox(
-        &self,
-        inbox: &InboxId,
-        now: &str,
-    ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send;
-
-    fn message_exists(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> impl Future<Output = Result<bool, MailStoreError>> + Send;
-
-    /// Inserts an inbound message into the thread its `candidates` resolve
-    /// to (its own `Message-ID`, then `In-Reply-To`, then `References`
-    /// nearest first, angle brackets stripped), or into the new thread
-    /// `msg.thread_id` names when none resolves.
-    fn insert_message(
-        &self,
-        msg: &MailMessage,
-        candidates: &[String],
-    ) -> impl Future<Output = Result<InsertOutcome, MailStoreError>> + Send;
-
-    fn get_message(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send;
-
-    /// Reads the record an `Idempotency-Key` resolves to, consistently, so a
-    /// replay is never answered from a stale read.
-    fn get_send_key(
-        &self,
-        key_hash: &str,
-    ) -> impl Future<Output = Result<Option<SendKey>, MailStoreError>> + Send;
-
-    /// Commits a queued send: the message, its send state, its thread, the
-    /// alias, and the idempotency key when one was given.
-    fn enqueue_send(
-        &self,
-        msg: &MailMessage,
-        state: &SendState,
-        key: Option<&SendKey>,
-        now_epoch: u64,
-    ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send;
-
-    /// Resolves an SES message id back to the mailbox message sent under it.
-    ///
-    /// `None` when this SES message did not come from the mailbox — most
-    /// events on the configuration set will not have.
-    fn resolve_ses_message(
-        &self,
-        ses_message_id: &str,
-    ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send;
-
-    /// Lists sends currently in `status`, from the sparse status index.
-    ///
-    /// Only the index's projection is needed here: the sweep decides what to
-    /// do from the status and timestamps alone.
-    fn list_by_status(
-        &self,
-        status: SendStatus,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<SendState>, MailStoreError>> + Send;
-
-    /// Reads one send's state, consistently.
-    fn get_send_state(
-        &self,
-        message_id: &str,
-    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
-
-    /// Takes a queued send for this sender.
-    ///
-    /// `None` means someone else already has it, or it is no longer queued.
-    /// That is the ordinary outcome of two senders seeing the same stream
-    /// record, not an error.
-    fn claim_send(
-        &self,
-        message_id: &str,
-        now: &str,
-    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
-
-    /// Records that the send `claimed` describes is about to call SES, and
-    /// returns the updated state.
-    ///
-    /// `None` means the claim was lost: the state is no longer `sending` at
-    /// that version, so this sender must not call SES.
-    fn note_ses_call(
-        &self,
-        claimed: &SendState,
-        now: &str,
-    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send;
-
-    /// Records how a send ended, moving the state item and the message's
-    /// mirrored status and labels together.
-    fn mark_send(
-        &self,
-        state: &SendState,
-        outcome: MarkOutcome<'_>,
-        now: &str,
-    ) -> impl Future<Output = Result<(), MailStoreError>> + Send;
-
-    /// Adds and removes labels on one message, updating its thread's union in
-    /// the same transaction. Returns the message's resulting labels, or
-    /// `None` when the inbox holds no such message.
-    ///
-    /// `add` and `remove` are already validated and sorted; a label in both
-    /// is the caller's problem to reject, not this method's to arbitrate.
-    fn update_labels(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-        add: &[String],
-        remove: &[String],
-        now: &str,
-    ) -> impl Future<Output = Result<Option<Vec<String>>, MailStoreError>> + Send;
-
-    /// Lists every inbox, ordered by id. Inboxes are few and not
-    /// inbox-scoped, so this takes only a page size and a continuation.
-    fn list_inboxes(
-        &self,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> impl Future<Output = Result<Page<Inbox>, MailStoreError>> + Send;
-
-    /// Lists an inbox's messages newest-first by default, from the time-ordered
-    /// index. Label and substring filters are applied by the caller on the
-    /// returned page, so this returns whatever the bounds select.
-    fn list_messages(
-        &self,
-        query: &ListQuery,
-    ) -> impl Future<Output = Result<Page<MailMessage>, MailStoreError>> + Send;
-
-    /// Lists an inbox's threads by last activity, newest-first by default.
-    fn list_threads(
-        &self,
-        query: &ListQuery,
-    ) -> impl Future<Output = Result<Page<ThreadState>, MailStoreError>> + Send;
-
-    /// One thread with a page of its messages in ascending order. `None` when
-    /// the thread doesn't exist in this inbox.
-    fn get_thread(
-        &self,
-        inbox: &InboxId,
-        thread_id: &str,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> impl Future<Output = Result<Option<ThreadView>, MailStoreError>> + Send;
 }
 
 #[derive(Debug, thiserror::Error)]

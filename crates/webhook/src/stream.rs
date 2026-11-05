@@ -325,13 +325,13 @@ async fn mailbox_ses_event<T: Services>(
         return Ok(None);
     }
     let Some((inbox, message_id)) = state
-        .services
+        .mailbox()
         .resolve_ses_message(&ses.mail.message_id)
         .await?
     else {
         return Ok(None);
     };
-    let Some(msg) = state.services.get_message(&inbox, &message_id).await? else {
+    let Some(msg) = state.mailbox().get_message(&inbox, &message_id).await? else {
         return Ok(None);
     };
     Ok(

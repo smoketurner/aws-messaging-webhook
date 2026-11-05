@@ -1,10 +1,10 @@
 //! End-to-end regression for `mail::txn::decode_cancellation`'s `Thread`
 //! `NotExists` race: a brand-new thread whose `NotExists` check lost to a
 //! concurrent writer must decode to a retryable `VersionConflict`, not a
-//! `Permanent` drop. Exercises the real `flows::insert_message` and
-//! `flows::enqueue_send` retry loops over the real `MailMemoryStore`
+//! `Permanent` drop. Exercises the real `Mailbox::insert_message` and
+//! `Mailbox::enqueue_send` retry loops over the real `MailMemoryStore`
 //! plan/condition/`decode_cancellation` path (no hardcoded decision): a
-//! `TxnStore` wrapper commits a competing message's full insert plan against
+//! `Table` wrapper commits a competing message's full insert plan against
 //! the inner store between this request's read and its commit, so only this
 //! request's `Thread` `NotExists` check fails — exactly the post-TTL-deletion
 //! concurrent-reply race the bug report describes. Before the fix both flows
@@ -21,14 +21,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::de::DeserializeOwned;
 use webhook_test_support::mail_memory::{MailMemoryStore, sample_message};
 
-use aws_messaging_webhook::mail::flows::{self, TxnOutcome, TxnStore};
 use aws_messaging_webhook::mail::keys::TableKey;
+use aws_messaging_webhook::mail::mailbox::Mailbox;
 use aws_messaging_webhook::mail::plan::{self, PlannedOp};
-use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
+use aws_messaging_webhook::mail::store::{MailStoreError, Page};
+use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
 use aws_messaging_webhook::mail::thread::{AliasLookup, new_thread};
-use aws_messaging_webhook::mail::{InboxId, InsertOutcome, RfcHit};
+use aws_messaging_webhook::mail::{InsertOutcome, PutOutcome};
 
-/// A `TxnStore` wrapper that, on the first `run_txn`, first commits a
+/// A `Table` wrapper that, on the first `transact`, first commits a
 /// competing message's full insert plan against the inner store — simulating a
 /// concurrent writer that resurrects the thread between this request's
 /// consistent read and its commit — then runs this request's transaction
@@ -40,23 +41,41 @@ struct ConcurrentThreadWinner<'s> {
     armed: AtomicBool,
 }
 
-impl TxnStore for ConcurrentThreadWinner<'_> {
-    fn read_item<T: DeserializeOwned + Send>(
+impl Table for ConcurrentThreadWinner<'_> {
+    fn get<T: DeserializeOwned + Send>(
         &self,
         key: TableKey,
+        read: Read,
+        context: &'static str,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
-        self.inner.read_item::<T>(key)
+        self.inner.get(key, read, context)
     }
 
-    fn read_aliases(
+    fn batch_get<T: DeserializeOwned + Send>(
         &self,
-        inbox: &InboxId,
-        ids: &[String],
-    ) -> impl Future<Output = Result<HashMap<String, RfcHit>, MailStoreError>> + Send {
-        self.inner.read_aliases(inbox, ids)
+        keys: Vec<TableKey>,
+        read: Read,
+        context: &'static str,
+    ) -> impl Future<Output = Result<HashMap<TableKey, T>, MailStoreError>> + Send {
+        self.inner.batch_get(keys, read, context)
     }
 
-    fn run_txn(
+    fn query<T: DeserializeOwned + Send>(
+        &self,
+        query: PageQuery<'_>,
+    ) -> impl Future<Output = Result<Page<T>, MailStoreError>> + Send {
+        self.inner.query(query)
+    }
+
+    fn put_if_absent(
+        &self,
+        item: serde_dynamo::Item,
+        context: &'static str,
+    ) -> impl Future<Output = Result<PutOutcome, MailStoreError>> + Send {
+        self.inner.put_if_absent(item, context)
+    }
+
+    fn transact(
         &self,
         ops: &[PlannedOp],
     ) -> impl Future<Output = Result<TxnOutcome, MailStoreError>> + Send {
@@ -72,9 +91,9 @@ impl TxnStore for ConcurrentThreadWinner<'_> {
             if let Some(plan) = competing {
                 // A concurrent writer committed a distinct message in this
                 // same thread, resurrecting it, between our read and commit.
-                let _ = inner.run_txn(&plan).await?;
+                let _ = inner.transact(&plan).await?;
             }
-            inner.run_txn(&owned_ops).await
+            inner.transact(&owned_ops).await
         })
     }
 
@@ -102,19 +121,19 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
         armed: AtomicBool::new(true),
     };
 
-    let outcome = flows::insert_message(&store, &r2, &[]).await.unwrap();
+    let outcome = Mailbox::new(&store).insert_message(&r2, &[]).await.unwrap();
     assert_eq!(outcome, InsertOutcome::Fresh);
 
     // The losing reply landed, and the resurrecting reply did too — the race
     // cost neither mail.
     assert!(
-        store_inner
+        Mailbox::new(&store_inner)
             .message_exists(&r2.inbox_id, "mid-r2")
             .await
             .unwrap()
     );
     assert!(
-        store_inner
+        Mailbox::new(&store_inner)
             .message_exists(&r1.inbox_id, "mid-r1")
             .await
             .unwrap()
@@ -123,7 +142,7 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
     // The thread ends up carrying both replies, at version 1 (one
     // `apply_message` past the resurrecting commit's 0), proving the retry
     // re-read and branched on the version rather than dropping the loser.
-    let thread = store_inner
+    let thread = Mailbox::new(&store_inner)
         .get_thread(&r2.inbox_id, "shared-thread", 100, None)
         .await
         .unwrap()
@@ -132,7 +151,7 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
     assert_eq!(thread.thread.version, 1);
 }
 
-/// Same race against the enqueue flow (`flows::enqueue_send`): the queued
+/// Same race against the enqueue flow (`Mailbox::enqueue_send`): the queued
 /// send's `Thread` `NotExists` must likewise retry, so a concurrent send that
 /// resurrects the thread does not cost the loser its committed message.
 #[tokio::test]
@@ -167,18 +186,19 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
         armed: AtomicBool::new(true),
     };
 
-    let outcome = flows::enqueue_send(&store, &r2, &state, None, 1_800_000_000)
+    let outcome = Mailbox::new(&store)
+        .enqueue_send(&r2, &state, None, 1_800_000_000)
         .await
         .unwrap();
     assert_eq!(outcome, EnqueueOutcome::Committed);
     assert!(
-        store_inner
+        Mailbox::new(&store_inner)
             .message_exists(&r2.inbox_id, "mid-r2")
             .await
             .unwrap()
     );
     assert!(
-        store_inner
+        Mailbox::new(&store_inner)
             .message_exists(&r1.inbox_id, "mid-r1")
             .await
             .unwrap()
@@ -210,30 +230,27 @@ async fn insert_message_joins_the_thread_of_a_sibling_that_won_the_placeholder()
         competing_plan,
         armed: AtomicBool::new(true),
     };
-    let outcome = flows::insert_message(
-        &store,
-        &r2,
-        &["mid-r2@example.com".to_owned(), parent.clone()],
-    )
-    .await
-    .unwrap();
+    let outcome = Mailbox::new(&store)
+        .insert_message(&r2, &["mid-r2@example.com".to_owned(), parent.clone()])
+        .await
+        .unwrap();
     assert_eq!(outcome, InsertOutcome::Fresh);
 
-    let stored = store_inner
+    let stored = Mailbox::new(&store_inner)
         .get_message(&r2.inbox_id, "mid-r2")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(stored.thread_id, "mid-r1");
 
-    let thread = store_inner
+    let thread = Mailbox::new(&store_inner)
         .get_thread(&r2.inbox_id, "mid-r1", 100, None)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(thread.messages.items.len(), 2);
     assert!(
-        store_inner
+        Mailbox::new(&store_inner)
             .get_thread(&r2.inbox_id, "mid-r2", 100, None)
             .await
             .unwrap()

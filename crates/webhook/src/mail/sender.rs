@@ -185,7 +185,7 @@ pub async fn resolve_unknown<T: Services>(
 ) -> Result<(), SenderError> {
     let now = time::format(time::now_ms());
     let Some(send) = state
-        .services
+        .mailbox()
         .get_send_state(message_id)
         .await
         .map_err(store_error)?
@@ -297,7 +297,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
     let mut report = SweepReport::default();
 
     for stuck in state
-        .services
+        .mailbox()
         .list_by_status(SendStatus::Sending, SWEEP_LIMIT)
         .await
         .map_err(store_error)?
@@ -368,7 +368,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
     }
 
     report.unknown = state
-        .services
+        .mailbox()
         .list_by_status(SendStatus::Unknown, SWEEP_LIMIT)
         .await
         .map_err(store_error)?
@@ -408,7 +408,7 @@ pub async fn handle_send<T: Services>(
     let now = time::format(time::now_ms());
 
     let Some(claimed) = state
-        .services
+        .mailbox()
         .claim_send(message_id, &now)
         .await
         .map_err(store_error)?
@@ -464,7 +464,7 @@ pub async fn handle_send<T: Services>(
     // Recorded before the call, so a sender that dies from here on leaves a
     // claim the sweep will not release: it may already have been sent.
     let Some(calling) = state
-        .services
+        .mailbox()
         .note_ses_call(&claimed, &now)
         .await
         .map_err(store_error)?
@@ -612,7 +612,7 @@ async fn mark_sent<T: Services>(
     loop {
         attempt += 1;
         let result = state
-            .services
+            .mailbox()
             .mark_send(
                 calling,
                 MarkOutcome::Sent(SesSent {
@@ -707,7 +707,7 @@ async fn record<T: Services>(
     outcome: MarkOutcome<'_>,
     now: &str,
 ) -> Result<(), MailStoreError> {
-    state.services.mark_send(send, outcome, now).await?;
+    state.mailbox().mark_send(send, outcome, now).await?;
     if outcome.settles() {
         clear_outbox(state, send).await;
     }

@@ -1,4 +1,4 @@
-//! In-memory `MailStore` test double.
+//! In-memory mail [`Table`] test double.
 //!
 //! Executes the same `PlannedOp`s the real store executes, with the same
 //! condition semantics and cancellation decoding, so
@@ -10,16 +10,14 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Mutex;
 
-use aws_messaging_webhook::mail::flows;
 use aws_messaging_webhook::mail::keys::{self, PageKey, TableKey};
+use aws_messaging_webhook::mail::mailbox::Mailbox;
 use aws_messaging_webhook::mail::plan::{Cond, PlannedOp, WriteOp};
-use aws_messaging_webhook::mail::send::{SendKey, SendState, SendStatus};
-use aws_messaging_webhook::mail::store::{
-    EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, SesRef, ThreadView,
-};
-use aws_messaging_webhook::mail::thread::ThreadState;
+use aws_messaging_webhook::mail::send::SendKey;
+use aws_messaging_webhook::mail::store::{MailStoreError, Page};
+use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
 use aws_messaging_webhook::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
-use aws_messaging_webhook::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
+use aws_messaging_webhook::mail::{InboxId, MailMessage, PutOutcome};
 use serde_dynamo::{AttributeValue, Item};
 
 /// A scripted failure [`MailMemoryStore::inject`] queues, consumed once on
@@ -106,6 +104,11 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
 }
 
 impl MailMemoryStore {
+    /// The mailbox over this store, for tests that seed or inspect it.
+    pub fn mailbox(&self) -> Mailbox<&Self> {
+        Mailbox::new(self)
+    }
+
     /// Queues a scripted failure for the next transaction attempt only.
     pub fn inject(&self, failure: Injected) {
         #[expect(
@@ -136,7 +139,7 @@ impl MailMemoryStore {
     }
 
     /// The raw item at `key`, for tests asserting on an item the
-    /// `MailStore` trait has no reader for.
+    /// `Mailbox` has no reader for.
     #[must_use]
     pub fn raw_item(&self, key: &TableKey) -> Option<Item> {
         self.get_item(key)
@@ -276,7 +279,7 @@ impl MailMemoryStore {
     /// currently committed state, and either applies every write (all
     /// conditions held) or applies none (mirroring `TransactWriteItems`'
     /// all-or-nothing semantics).
-    fn attempt(&self, ops: &[PlannedOp]) -> Result<flows::TxnOutcome, MailStoreError> {
+    fn attempt(&self, ops: &[PlannedOp]) -> Result<TxnOutcome, MailStoreError> {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[expect(
@@ -291,9 +294,9 @@ impl MailMemoryStore {
                     "injected transient failure"
                 ))),
                 Injected::Conflict | Injected::Throttle => {
-                    Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry))
+                    Ok(TxnOutcome::Cancelled(TxnDecision::Retry))
                 }
-                Injected::KeyExists => Ok(flows::TxnOutcome::Cancelled(TxnDecision::KeyExists)),
+                Injected::KeyExists => Ok(TxnOutcome::Cancelled(TxnDecision::KeyExists)),
             };
         }
 
@@ -331,27 +334,25 @@ impl MailMemoryStore {
         }
 
         if !all_ok {
-            return Ok(flows::TxnOutcome::Cancelled(decode_cancellation(
-                ops, &reasons,
-            )));
+            return Ok(TxnOutcome::Cancelled(decode_cancellation(ops, &reasons)));
         }
 
         for planned in ops {
             Self::apply_op(&mut guard.items, &planned.op);
         }
-        Ok(flows::TxnOutcome::Committed)
+        Ok(TxnOutcome::Committed)
     }
 
     /// One page of an index partition, mirroring the real store's query: the
-    /// items carrying `pk_attr == partition`, ordered by `sk_attr`, bounded
-    /// exclusively by `before`/`after` and resumed after `start`.
+    /// items whose index partition attribute is `query.partition`, ordered by
+    /// the index sort attribute, bounded exclusively by `before`/`after` and
+    /// resumed after `start`.
     fn query_page<T: serde::de::DeserializeOwned>(
         &self,
-        partition: &str,
-        pk_attr: &str,
-        sk_attr: &str,
-        query: &ListQuery,
+        query: PageQuery<'_>,
     ) -> Result<Page<T>, MailStoreError> {
+        let partition = query.partition;
+        let (pk_attr, sk_attr) = query.index.key_attributes();
         #[expect(
             clippy::unwrap_used,
             reason = "test double: a poisoned lock is a test bug"
@@ -368,13 +369,13 @@ impl MailMemoryStore {
             let Some(sort) = Self::string_attr(item, sk_attr) else {
                 continue;
             };
-            if query.after.as_ref().is_some_and(|after| sort <= *after) {
+            if query.after.is_some_and(|after| sort.as_str() <= after) {
                 continue;
             }
-            if query.before.as_ref().is_some_and(|before| sort >= *before) {
+            if query.before.is_some_and(|before| sort.as_str() >= before) {
                 continue;
             }
-            if let Some(start) = &query.start {
+            if let Some(start) = query.start {
                 let seen = if query.ascending {
                     sort <= start.sort
                 } else {
@@ -412,10 +413,9 @@ impl MailMemoryStore {
         });
         let mut items = Vec::with_capacity(rows.len());
         for (_, item) in rows {
-            items.push(
-                serde_dynamo::from_item(item)
-                    .map_err(|e| MailStoreError::Permanent(anyhow::anyhow!("query page: {e}")))?,
-            );
+            items.push(serde_dynamo::from_item(item).map_err(|e| {
+                MailStoreError::Permanent(anyhow::anyhow!("{}: {e}", query.context))
+            })?);
         }
         Ok(Page {
             items,
@@ -451,37 +451,95 @@ impl MailMemoryStore {
     }
 }
 
-impl flows::TxnStore for MailMemoryStore {
-    fn read_item<T: serde::de::DeserializeOwned + Send>(
+impl Table for MailMemoryStore {
+    fn get<T: serde::de::DeserializeOwned + Send>(
         &self,
         key: TableKey,
+        _read: Read,
+        context: &'static str,
     ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
-        std::future::ready(self.read(&key, "GetItem"))
+        // `fail_next_resolve` scripts the SES-reference read alone.
+        if key.sk == keys::SES_REF_SK {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "test double: a poisoned lock is a test bug"
+            )]
+            let failure = self.inner.lock().unwrap().resolve_failure.take();
+            match failure {
+                Some(ReadFailure::Transient) => {
+                    return std::future::ready(Err(MailStoreError::Transient(anyhow::anyhow!(
+                        "injected transient read failure"
+                    ))));
+                }
+                Some(ReadFailure::Permanent) => {
+                    return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
+                        "injected permanent read failure"
+                    ))));
+                }
+                None => {}
+            }
+        }
+        std::future::ready(self.read(&key, context))
     }
 
-    fn read_aliases(
+    fn batch_get<T: serde::de::DeserializeOwned + Send>(
         &self,
-        inbox: &InboxId,
-        ids: &[String],
-    ) -> impl Future<Output = Result<HashMap<String, RfcHit>, MailStoreError>> + Send {
+        keys: Vec<TableKey>,
+        _read: Read,
+        _context: &'static str,
+    ) -> impl Future<Output = Result<HashMap<TableKey, T>, MailStoreError>> + Send {
         let mut found = HashMap::new();
-        for id in ids {
-            let Some(item) = self.get_item(&keys::rfc_alias(inbox, id)) else {
+        for key in keys {
+            let Some(item) = self.get_item(&key) else {
                 continue;
             };
-            // A row without the alias shape maps nothing.
-            let Ok(hit) = serde_dynamo::from_item::<_, RfcHit>(item) else {
+            let Ok(value) = serde_dynamo::from_item(item) else {
                 continue;
             };
-            found.insert(id.clone(), hit);
+            found.insert(key, value);
         }
         std::future::ready(Ok(found))
     }
 
-    fn run_txn(
+    fn query<T: serde::de::DeserializeOwned + Send>(
+        &self,
+        query: PageQuery<'_>,
+    ) -> impl Future<Output = Result<Page<T>, MailStoreError>> + Send {
+        std::future::ready(self.query_page(query))
+    }
+
+    fn put_if_absent(
+        &self,
+        item: Item,
+        _context: &'static str,
+    ) -> impl Future<Output = Result<PutOutcome, MailStoreError>> + Send {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double: a poisoned lock is a test bug"
+        )]
+        let mut guard = self.inner.lock().unwrap();
+        let outcome = match (
+            Self::string_attr(&item, "pk"),
+            Self::string_attr(&item, "sk"),
+        ) {
+            (Some(pk), Some(sk)) => match guard.items.entry(Self::key(&pk, &sk)) {
+                std::collections::hash_map::Entry::Occupied(_) => Ok(PutOutcome::AlreadyExists),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(item);
+                    Ok(PutOutcome::Created)
+                }
+            },
+            _ => Err(MailStoreError::Permanent(anyhow::anyhow!(
+                "put_if_absent: item has no pk/sk"
+            ))),
+        };
+        std::future::ready(outcome)
+    }
+
+    fn transact(
         &self,
         ops: &[PlannedOp],
-    ) -> impl Future<Output = Result<flows::TxnOutcome, MailStoreError>> + Send {
+    ) -> impl Future<Output = Result<TxnOutcome, MailStoreError>> + Send {
         std::future::ready(self.attempt(ops))
     }
 
@@ -492,242 +550,12 @@ impl flows::TxnStore for MailMemoryStore {
     }
 }
 
-impl MailStore for MailMemoryStore {
-    fn get_inbox(
-        &self,
-        inbox: &InboxId,
-    ) -> impl Future<Output = Result<Option<Inbox>, MailStoreError>> + Send {
-        std::future::ready(self.read(&keys::inbox(inbox), "GetItem(inbox)"))
-    }
-
-    fn ensure_inbox(
-        &self,
-        inbox: &InboxId,
-        now: &str,
-    ) -> impl Future<Output = Result<Inbox, MailStoreError>> + Send {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "test double: a poisoned lock is a test bug"
-        )]
-        let mut guard = self.inner.lock().unwrap();
-        let TableKey { pk, sk } = keys::inbox(inbox);
-        let key = Self::key(&pk, &sk);
-        if let Some(existing) = guard.items.get(&key) {
-            let result = serde_dynamo::from_item(existing.clone()).map_err(|e| {
-                MailStoreError::Permanent(anyhow::anyhow!("deserializing inbox: {e}"))
-            });
-            return std::future::ready(result);
-        }
-        let (inbox_record, item) = match aws_messaging_webhook::mail::plan::inbox_item(inbox, now) {
-            Ok(built) => built,
-            Err(error) => return std::future::ready(Err(error)),
-        };
-        guard.items.insert(key, item);
-        std::future::ready(Ok(inbox_record))
-    }
-
-    fn message_exists(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> impl Future<Output = Result<bool, MailStoreError>> + Send {
-        let exists = self.get_item(&keys::message(inbox, message_id)).is_some();
-        std::future::ready(Ok(exists))
-    }
-
-    fn insert_message(
-        &self,
-        msg: &MailMessage,
-        candidates: &[String],
-    ) -> impl Future<Output = Result<InsertOutcome, MailStoreError>> + Send {
-        flows::insert_message(self, msg, candidates)
-    }
-
-    fn get_send_key(
-        &self,
-        key_hash: &str,
-    ) -> impl Future<Output = Result<Option<SendKey>, MailStoreError>> + Send {
-        std::future::ready(self.read(&keys::send_key(key_hash), "GetItem(send key)"))
-    }
-
-    fn enqueue_send(
-        &self,
-        msg: &MailMessage,
-        state: &SendState,
-        key: Option<&SendKey>,
-        now_epoch: u64,
-    ) -> impl Future<Output = Result<EnqueueOutcome, MailStoreError>> + Send {
-        flows::enqueue_send(self, msg, state, key, now_epoch)
-    }
-
-    fn resolve_ses_message(
-        &self,
-        ses_message_id: &str,
-    ) -> impl Future<Output = Result<Option<(InboxId, String)>, MailStoreError>> + Send {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "test double: a poisoned lock is a test bug"
-        )]
-        let failure = self.inner.lock().unwrap().resolve_failure.take();
-        match failure {
-            Some(ReadFailure::Transient) => {
-                return std::future::ready(Err(MailStoreError::Transient(anyhow::anyhow!(
-                    "injected transient read failure"
-                ))));
-            }
-            Some(ReadFailure::Permanent) => {
-                return std::future::ready(Err(MailStoreError::Permanent(anyhow::anyhow!(
-                    "injected permanent read failure"
-                ))));
-            }
-            None => {}
-        }
-        let row: Result<Option<SesRef>, MailStoreError> =
-            self.read(&keys::ses_ref(ses_message_id), "GetItem(ses ref)");
-        std::future::ready(row.map(|row| row.and_then(SesRef::into_parts)))
-    }
-
-    fn list_by_status(
-        &self,
-        status: SendStatus,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<SendState>, MailStoreError>> + Send {
-        // Goes through the same `query_page` the other listings use, keyed by
-        // the status index's own attributes, so this double cannot quietly
-        // disagree with the real store about which index serves a query.
-        let query = ListQuery {
-            inbox: InboxId::new(""),
-            limit,
-            before: None,
-            after: None,
-            ascending: true,
-            start: None,
-        };
-        let page = self.query_page(
-            &keys::send_status_partition(status),
-            "gsi3pk",
-            "gsi3sk",
-            &query,
-        );
-        std::future::ready(page.map(|page| page.items))
-    }
-
-    fn get_send_state(
-        &self,
-        message_id: &str,
-    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
-        std::future::ready(self.read(&keys::send_state(message_id), "GetItem(send state)"))
-    }
-
-    fn claim_send(
-        &self,
-        message_id: &str,
-        now: &str,
-    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
-        flows::claim_send(self, message_id, now)
-    }
-
-    fn note_ses_call(
-        &self,
-        claimed: &SendState,
-        now: &str,
-    ) -> impl Future<Output = Result<Option<SendState>, MailStoreError>> + Send {
-        flows::note_ses_call(self, claimed, now)
-    }
-
-    fn mark_send(
-        &self,
-        state: &SendState,
-        outcome: MarkOutcome<'_>,
-        now: &str,
-    ) -> impl Future<Output = Result<(), MailStoreError>> + Send {
-        flows::mark_send(self, state, outcome, now)
-    }
-
-    fn update_labels(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-        add: &[String],
-        remove: &[String],
-        now: &str,
-    ) -> impl Future<Output = Result<Option<Vec<String>>, MailStoreError>> + Send {
-        flows::update_labels(self, inbox, message_id, add, remove, now)
-    }
-
-    fn get_message(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> impl Future<Output = Result<Option<MailMessage>, MailStoreError>> + Send {
-        std::future::ready(self.read(&keys::message(inbox, message_id), "GetItem(message)"))
-    }
-
-    fn list_inboxes(
-        &self,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> impl Future<Output = Result<Page<Inbox>, MailStoreError>> + Send {
-        let query = ListQuery {
-            inbox: InboxId::new(""),
-            limit,
-            before: None,
-            after: None,
-            ascending: true,
-            start,
-        };
-        std::future::ready(self.query_page(keys::INBOXES_PARTITION, "gsi1pk", "gsi1sk", &query))
-    }
-
-    fn list_messages(
-        &self,
-        query: &ListQuery,
-    ) -> impl Future<Output = Result<Page<MailMessage>, MailStoreError>> + Send {
-        let partition = keys::messages_partition(&query.inbox);
-        std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
-    }
-
-    fn list_threads(
-        &self,
-        query: &ListQuery,
-    ) -> impl Future<Output = Result<Page<ThreadState>, MailStoreError>> + Send {
-        let partition = keys::threads_partition(&query.inbox);
-        std::future::ready(self.query_page(&partition, "gsi1pk", "gsi1sk", query))
-    }
-
-    fn get_thread(
-        &self,
-        inbox: &InboxId,
-        thread_id: &str,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> impl Future<Output = Result<Option<ThreadView>, MailStoreError>> + Send {
-        let thread: ThreadState =
-            match self.read(&keys::thread(inbox, thread_id), "GetItem(thread)") {
-                Ok(Some(thread)) => thread,
-                Ok(None) => return std::future::ready(Ok(None)),
-                Err(error) => return std::future::ready(Err(error)),
-            };
-        let messages = self.query_page(
-            &keys::thread_messages_partition(inbox, thread_id),
-            "gsi2pk",
-            "gsi2sk",
-            &ListQuery {
-                inbox: inbox.clone(),
-                limit,
-                before: None,
-                after: None,
-                ascending: true,
-                start,
-            },
-        );
-        std::future::ready(messages.map(|messages| Some(ThreadView { thread, messages })))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_messaging_webhook::mail::send::SendState;
+    use aws_messaging_webhook::mail::store::{ListQuery, MarkOutcome};
+    use aws_messaging_webhook::mail::{InsertOutcome, RfcHit};
 
     fn message(message_id: &str, thread_id: &str) -> MailMessage {
         sample_message("support@example.com", message_id, thread_id)
@@ -737,17 +565,21 @@ mod tests {
     async fn ensure_inbox_creates_then_returns_the_same_inbox() {
         let store = MailMemoryStore::default();
         let inbox = InboxId::new("support@example.com");
-        let created = store
+        let created = Mailbox::new(&store)
             .ensure_inbox(&inbox, "2026-01-01T00:00:00.000Z")
             .await
             .unwrap();
         assert_eq!(created.inbox_id, inbox);
         assert_eq!(created.email, "support@example.com");
 
-        let fetched = store.get_inbox(&inbox).await.unwrap().unwrap();
+        let fetched = Mailbox::new(&store)
+            .get_inbox(&inbox)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.created_at, created.created_at);
 
-        let ensured_again = store
+        let ensured_again = Mailbox::new(&store)
             .ensure_inbox(&inbox, "2026-01-02T00:00:00.000Z")
             .await
             .unwrap();
@@ -759,11 +591,22 @@ mod tests {
         let store = MailMemoryStore::default();
         let msg = message("mid-1", "mid-1");
 
-        let outcome = store.insert_message(&msg, &[]).await.unwrap();
+        let outcome = Mailbox::new(&store)
+            .insert_message(&msg, &[])
+            .await
+            .unwrap();
         assert_eq!(outcome, InsertOutcome::Fresh);
-        assert!(store.message_exists(&msg.inbox_id, "mid-1").await.unwrap());
+        assert!(
+            Mailbox::new(&store)
+                .message_exists(&msg.inbox_id, "mid-1")
+                .await
+                .unwrap()
+        );
 
-        let redelivered = store.insert_message(&msg, &[]).await.unwrap();
+        let redelivered = Mailbox::new(&store)
+            .insert_message(&msg, &[])
+            .await
+            .unwrap();
         assert_eq!(redelivered, InsertOutcome::Duplicate);
     }
 
@@ -783,20 +626,20 @@ mod tests {
     async fn insert_message_into_an_existing_thread_updates_it_and_resolves_by_rfc_id() {
         let store = MailMemoryStore::default();
         let first = message("mid-1", "mid-1");
-        store
+        Mailbox::new(&store)
             .insert_message(&first, &ids(&["mid-1@example.com"]))
             .await
             .unwrap();
 
         let mut second = message("mid-2", "mid-2");
         second.in_reply_to = Some("mid-1@example.com".to_owned());
-        let outcome = store
+        let outcome = Mailbox::new(&store)
             .insert_message(&second, &ids(&["mid-2@example.com", "mid-1@example.com"]))
             .await
             .unwrap();
         assert_eq!(outcome, InsertOutcome::Fresh);
 
-        let stored = store
+        let stored = Mailbox::new(&store)
             .get_message(&second.inbox_id, "mid-2")
             .await
             .unwrap()
@@ -808,7 +651,7 @@ mod tests {
     async fn an_unresolved_reference_leaves_a_placeholder_in_the_new_thread() {
         let store = MailMemoryStore::default();
         let reply = message("mid-2", "mid-2");
-        store
+        Mailbox::new(&store)
             .insert_message(&reply, &ids(&["mid-2@example.com", "parent@example.com"]))
             .await
             .unwrap();
@@ -834,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_parent_joins_its_replys_thread_and_claims_the_placeholder() {
         let store = MailMemoryStore::default();
-        store
+        Mailbox::new(&store)
             .insert_message(
                 &message("mid-2", "mid-2"),
                 &ids(&["mid-2@example.com", "parent@example.com"]),
@@ -844,12 +687,12 @@ mod tests {
 
         let mut parent = message("mid-1", "mid-1");
         parent.rfc_message_id = "<parent@example.com>".to_owned();
-        store
+        Mailbox::new(&store)
             .insert_message(&parent, &ids(&["parent@example.com"]))
             .await
             .unwrap();
 
-        let stored = store
+        let stored = Mailbox::new(&store)
             .get_message(&parent.inbox_id, "mid-1")
             .await
             .unwrap()
@@ -869,14 +712,14 @@ mod tests {
     #[tokio::test]
     async fn a_real_alias_is_never_replaced() {
         let store = MailMemoryStore::default();
-        store
+        Mailbox::new(&store)
             .insert_message(&message("mid-1", "mid-1"), &ids(&["mid-1@example.com"]))
             .await
             .unwrap();
 
         let mut copy = message("mid-2", "mid-2");
         copy.rfc_message_id = "<mid-1@example.com>".to_owned();
-        store
+        Mailbox::new(&store)
             .insert_message(&copy, &ids(&["mid-1@example.com"]))
             .await
             .unwrap();
@@ -910,7 +753,7 @@ mod tests {
     fn alias_conditions_match_the_real_store() {
         let store = MailMemoryStore::default();
         let committed =
-            |op: PlannedOp| matches!(store.attempt(&[op]).unwrap(), flows::TxnOutcome::Committed);
+            |op: PlannedOp| matches!(store.attempt(&[op]).unwrap(), TxnOutcome::Committed);
 
         assert!(committed(alias_op("a@example.com", None, "t1")));
         assert!(
@@ -936,7 +779,10 @@ mod tests {
         let store = MailMemoryStore::default();
         store.inject(Injected::Conflict);
         let msg = message("mid-1", "mid-1");
-        let outcome = store.insert_message(&msg, &[]).await.unwrap();
+        let outcome = Mailbox::new(&store)
+            .insert_message(&msg, &[])
+            .await
+            .unwrap();
         assert_eq!(outcome, InsertOutcome::Fresh);
     }
 
@@ -945,7 +791,10 @@ mod tests {
         let store = MailMemoryStore::default();
         store.inject(Injected::Transient);
         let msg = message("mid-1", "mid-1");
-        let err = store.insert_message(&msg, &[]).await.unwrap_err();
+        let err = Mailbox::new(&store)
+            .insert_message(&msg, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(err, MailStoreError::Transient(_)));
     }
 
@@ -967,7 +816,7 @@ mod tests {
             None,
             "2026-01-01T00:00:00.000Z",
         );
-        store
+        Mailbox::new(&store)
             .enqueue_send(&msg, &state, None, 1_800_000_000)
             .await
             .unwrap();
@@ -984,14 +833,14 @@ mod tests {
         let stale = queued_send(&store).await;
 
         // Another sender claims it, moving the version on.
-        store
+        Mailbox::new(&store)
             .claim_send("mid-1", "2026-01-01T00:00:01.000Z")
             .await
             .unwrap()
             .unwrap();
 
         let attempts_before = store.txn_attempts();
-        let error = store
+        let error = Mailbox::new(&store)
             .mark_send(
                 &stale,
                 MarkOutcome::Sent(aws_messaging_webhook::mail::store::SesSent {
@@ -1017,10 +866,17 @@ mod tests {
         let mut msg = message("mid-1", "mid-1");
         msg.labels = vec!["received".to_owned(), "unread".to_owned()];
         let inbox = msg.inbox_id.clone();
-        store.insert_message(&msg, &[]).await.unwrap();
-        let before = store.get_message(&inbox, "mid-1").await.unwrap().unwrap();
+        Mailbox::new(&store)
+            .insert_message(&msg, &[])
+            .await
+            .unwrap();
+        let before = Mailbox::new(&store)
+            .get_message(&inbox, "mid-1")
+            .await
+            .unwrap()
+            .unwrap();
 
-        let labels = store
+        let labels = Mailbox::new(&store)
             .update_labels(
                 &inbox,
                 "mid-1",
@@ -1033,7 +889,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(labels, before.labels);
-        let after = store.get_message(&inbox, "mid-1").await.unwrap().unwrap();
+        let after = Mailbox::new(&store)
+            .get_message(&inbox, "mid-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(after.version, before.version);
         assert_eq!(after.updated_at, before.updated_at);
     }
@@ -1048,7 +908,10 @@ mod tests {
         let store = MailMemoryStore::default();
         let inbox = InboxId::new("support@example.com");
         for id in ["mid-1", "mid-2"] {
-            store.insert_message(&message(id, id), &[]).await.unwrap();
+            Mailbox::new(&store)
+                .insert_message(&message(id, id), &[])
+                .await
+                .unwrap();
         }
 
         let query = |start: Option<PageKey>| ListQuery {
@@ -1060,11 +923,17 @@ mod tests {
             start,
         };
 
-        let page = store.list_messages(&query(None)).await.unwrap();
+        let page = Mailbox::new(&store)
+            .list_messages(&query(None))
+            .await
+            .unwrap();
         assert_eq!(page.items.len(), 2);
         let next = page.next.expect("a full page carries a continuation key");
 
-        let page = store.list_messages(&query(Some(next))).await.unwrap();
+        let page = Mailbox::new(&store)
+            .list_messages(&query(Some(next)))
+            .await
+            .unwrap();
         assert!(page.items.is_empty());
         assert!(page.next.is_none());
     }
@@ -1072,21 +941,27 @@ mod tests {
     #[tokio::test]
     async fn insert_message_gives_up_after_max_retries_on_persistent_throttling() {
         let store = MailMemoryStore::default();
-        for _ in 0..=flows::MAX_TXN_RETRIES {
+        for _ in 0..=aws_messaging_webhook::mail::mailbox::MAX_TXN_RETRIES {
             store.inject(Injected::Throttle);
         }
         let msg = message("mid-1", "mid-1");
-        let err = store.insert_message(&msg, &[]).await.unwrap_err();
+        let err = Mailbox::new(&store)
+            .insert_message(&msg, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(err, MailStoreError::Conflict));
     }
 
     #[tokio::test]
-    async fn read_aliases_omits_unknown_ids() {
-        use aws_messaging_webhook::mail::flows::TxnStore;
+    async fn a_batch_read_omits_unknown_keys() {
         let store = MailMemoryStore::default();
         let inbox = InboxId::new("support@example.com");
-        let found = store
-            .read_aliases(&inbox, &ids(&["nope@example.com"]))
+        let found: HashMap<TableKey, RfcHit> = store
+            .batch_get(
+                vec![keys::rfc_alias(&inbox, "nope@example.com")],
+                Read::Consistent,
+                "test",
+            )
             .await
             .unwrap();
         assert!(found.is_empty());
@@ -1112,7 +987,7 @@ mod tests {
         };
         store.seed_send_key(&key);
 
-        let fetched = store
+        let fetched = Mailbox::new(&store)
             .get_send_key("deadbeef")
             .await
             .unwrap()

@@ -27,6 +27,7 @@ pub mod api_keys;
 pub mod mail_memory;
 pub mod objects;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,17 +45,13 @@ use aws_messaging_webhook::app::app;
 use aws_messaging_webhook::config::{Config, FunctionMode, MailConfig};
 use aws_messaging_webhook::entry::dispatch;
 use aws_messaging_webhook::mail::fetch::{AttachmentFetcher, FetchError, Fetched};
-use aws_messaging_webhook::mail::keys::PageKey;
+use aws_messaging_webhook::mail::keys::TableKey;
 use aws_messaging_webhook::mail::objects::{ObjectError, ObjectStore};
-use aws_messaging_webhook::mail::send::{SendKey, SendSpec, SendState, SendStatus};
-use aws_messaging_webhook::mail::store::{
-    EnqueueOutcome, ListQuery, MarkOutcome, Page, ThreadView,
-};
-use aws_messaging_webhook::mail::store::{MailStore, MailStoreError};
-use aws_messaging_webhook::mail::thread::ThreadState;
-use aws_messaging_webhook::mail::{
-    Inbox, InboxId, InsertOutcome, MailMessage, ObjectMeta, PutOutcome, object_keys,
-};
+use aws_messaging_webhook::mail::plan::PlannedOp;
+use aws_messaging_webhook::mail::send::SendSpec;
+use aws_messaging_webhook::mail::store::{MailStoreError, Page};
+use aws_messaging_webhook::mail::table::{PageQuery, Read, Table, TxnOutcome};
+use aws_messaging_webhook::mail::{InboxId, ObjectMeta, PutOutcome, object_keys};
 use aws_messaging_webhook::model::DomainEvent;
 use aws_messaging_webhook::publish::{OutboundEvent, PublishError, PublishEvents};
 use aws_messaging_webhook::state::AppState;
@@ -92,7 +89,7 @@ pub struct FakeServices {
     /// simulating SES `BadRequestException` for a malformed recipient. Other
     /// recipients still succeed — the action must continue past these.
     pub permanent_suppression_failures: Mutex<Vec<String>>,
-    /// In-memory mail store; `MailStore` is delegated to it below.
+    /// In-memory mail table; `Table` is delegated to it below.
     pub mail: MailMemoryStore,
     /// Fake object store; `ObjectStore` is delegated to it below.
     pub objects: FakeObjectStore,
@@ -166,134 +163,49 @@ impl ApiKeySource for FakeServices {
     }
 }
 
-impl MailStore for FakeServices {
-    async fn get_inbox(&self, inbox: &InboxId) -> Result<Option<Inbox>, MailStoreError> {
-        self.mail.get_inbox(inbox).await
-    }
-
-    async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
-        self.mail.ensure_inbox(inbox, now).await
-    }
-
-    async fn message_exists(
+impl Table for FakeServices {
+    fn get<T: serde::de::DeserializeOwned + Send>(
         &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> Result<bool, MailStoreError> {
-        self.mail.message_exists(inbox, message_id).await
+        key: TableKey,
+        read: Read,
+        context: &'static str,
+    ) -> impl Future<Output = Result<Option<T>, MailStoreError>> + Send {
+        self.mail.get(key, read, context)
     }
 
-    async fn insert_message(
+    fn batch_get<T: serde::de::DeserializeOwned + Send>(
         &self,
-        msg: &MailMessage,
-        candidates: &[String],
-    ) -> Result<InsertOutcome, MailStoreError> {
-        self.mail.insert_message(msg, candidates).await
+        keys: Vec<TableKey>,
+        read: Read,
+        context: &'static str,
+    ) -> impl Future<Output = Result<HashMap<TableKey, T>, MailStoreError>> + Send {
+        self.mail.batch_get(keys, read, context)
     }
 
-    async fn get_message(
+    fn query<T: serde::de::DeserializeOwned + Send>(
         &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> Result<Option<MailMessage>, MailStoreError> {
-        self.mail.get_message(inbox, message_id).await
+        query: PageQuery<'_>,
+    ) -> impl Future<Output = Result<Page<T>, MailStoreError>> + Send {
+        self.mail.query(query)
     }
 
-    async fn list_inboxes(
+    fn put_if_absent(
         &self,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> Result<Page<Inbox>, MailStoreError> {
-        self.mail.list_inboxes(limit, start).await
+        item: serde_dynamo::Item,
+        context: &'static str,
+    ) -> impl Future<Output = Result<PutOutcome, MailStoreError>> + Send {
+        self.mail.put_if_absent(item, context)
     }
 
-    async fn get_send_key(&self, request_hash: &str) -> Result<Option<SendKey>, MailStoreError> {
-        self.mail.get_send_key(request_hash).await
-    }
-
-    async fn enqueue_send(
+    fn transact(
         &self,
-        msg: &MailMessage,
-        state: &SendState,
-        key: Option<&SendKey>,
-        now_epoch: u64,
-    ) -> Result<EnqueueOutcome, MailStoreError> {
-        self.mail.enqueue_send(msg, state, key, now_epoch).await
+        ops: &[PlannedOp],
+    ) -> impl Future<Output = Result<TxnOutcome, MailStoreError>> + Send {
+        self.mail.transact(ops)
     }
 
-    async fn resolve_ses_message(
-        &self,
-        ses_message_id: &str,
-    ) -> Result<Option<(InboxId, String)>, MailStoreError> {
-        self.mail.resolve_ses_message(ses_message_id).await
-    }
-
-    async fn list_by_status(
-        &self,
-        status: SendStatus,
-        limit: usize,
-    ) -> Result<Vec<SendState>, MailStoreError> {
-        self.mail.list_by_status(status, limit).await
-    }
-
-    async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
-        self.mail.get_send_state(message_id).await
-    }
-
-    async fn claim_send(
-        &self,
-        message_id: &str,
-        now: &str,
-    ) -> Result<Option<SendState>, MailStoreError> {
-        self.mail.claim_send(message_id, now).await
-    }
-
-    async fn note_ses_call(
-        &self,
-        claimed: &SendState,
-        now: &str,
-    ) -> Result<Option<SendState>, MailStoreError> {
-        self.mail.note_ses_call(claimed, now).await
-    }
-
-    async fn mark_send(
-        &self,
-        state: &SendState,
-        outcome: MarkOutcome<'_>,
-        now: &str,
-    ) -> Result<(), MailStoreError> {
-        self.mail.mark_send(state, outcome, now).await
-    }
-
-    async fn update_labels(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-        add: &[String],
-        remove: &[String],
-        now: &str,
-    ) -> Result<Option<Vec<String>>, MailStoreError> {
-        self.mail
-            .update_labels(inbox, message_id, add, remove, now)
-            .await
-    }
-
-    async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
-        self.mail.list_messages(query).await
-    }
-
-    async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
-        self.mail.list_threads(query).await
-    }
-
-    async fn get_thread(
-        &self,
-        inbox: &InboxId,
-        thread_id: &str,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> Result<Option<ThreadView>, MailStoreError> {
-        self.mail.get_thread(inbox, thread_id, limit, start).await
+    fn pause(&self, attempt: u32) -> impl Future<Output = ()> + Send {
+        self.mail.pause(attempt)
     }
 }
 
@@ -638,7 +550,7 @@ pub async fn grant_api_access(h: &Harness) {
         .api_keys
         .set_keys(&[(TEST_API_KEY, "key_1")]);
     h.state
-        .services
+        .mailbox()
         .ensure_inbox(&InboxId::new(TEST_INBOX), TEST_INBOX_CREATED_AT)
         .await
         .unwrap();

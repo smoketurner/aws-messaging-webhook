@@ -17,6 +17,7 @@ pub mod plan;
 pub mod send;
 pub mod sender;
 pub mod store;
+pub mod table;
 pub mod time;
 pub mod txn;
 pub mod url_policy;
@@ -27,9 +28,9 @@ pub mod build;
 pub mod content;
 pub mod events;
 pub mod fetch;
-pub mod flows;
 pub mod ingest;
 pub mod labels;
+pub mod mailbox;
 pub mod mime;
 pub mod thread;
 
@@ -273,7 +274,7 @@ pub struct MailMessage {
     pub expires_at: u64,
 }
 
-/// Outcome of [`store::MailStore::insert_message`]. A redelivered ingest
+/// Outcome of [`mailbox::Mailbox::insert_message`]. A redelivered ingest
 /// (same deterministic message id) is a `Duplicate`, which the ingest flow
 /// counts as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,7 +21,6 @@ use std::path::PathBuf;
 
 use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::sender::handle_send;
-use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{
     AttachmentMeta, Direction, InboxId, MailMessage, ThreadSnapshot, keys, thread,
 };
@@ -273,7 +272,7 @@ async fn sent_message(h: &Harness) -> MailMessage {
     .await
     .unwrap();
     h.state
-        .services
+        .mailbox()
         .get_message(&InboxId::new(TEST_INBOX), message_id)
         .await
         .unwrap()

@@ -5,8 +5,9 @@ use crate::allowlist::TopicAllowlist;
 use crate::api::keys::{ApiKeySource, KeyCache};
 use crate::config::Config;
 use crate::mail::fetch::AttachmentFetcher;
+use crate::mail::mailbox::Mailbox;
 use crate::mail::objects::ObjectStore;
-use crate::mail::store::MailStore;
+use crate::mail::table::Table;
 use crate::publish::PublishEvents;
 use crate::store::EventStore;
 
@@ -18,7 +19,7 @@ pub trait Services:
     + PublishEvents
     + SmsVoiceApi
     + SesApi
-    + MailStore
+    + Table
     + ObjectStore
     + AttachmentFetcher
     + ApiKeySource
@@ -33,7 +34,7 @@ impl<T> Services for T where
         + PublishEvents
         + SmsVoiceApi
         + SesApi
-        + MailStore
+        + Table
         + ObjectStore
         + AttachmentFetcher
         + ApiKeySource
@@ -57,4 +58,11 @@ pub struct AppState<T: Services> {
     /// Accept `SubscribeURL`s with this prefix, bypassing the SNS host
     /// policy. Tests and debug builds only.
     pub dangerous_subscribe_url_prefix: Option<String>,
+}
+
+impl<T: Services> AppState<T> {
+    /// The mailbox over the services' mail table.
+    pub fn mailbox(&self) -> Mailbox<&T> {
+        Mailbox::new(&self.services)
+    }
 }

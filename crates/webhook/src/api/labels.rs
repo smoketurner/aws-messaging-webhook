@@ -148,7 +148,7 @@ pub async fn update_labels<T: Services>(
 
     let now = time::format(time::now_ms());
     let labels = state
-        .services
+        .mailbox()
         .update_labels(&inbox, &message_id, &add, &remove, &now)
         .await?
         .ok_or(ApiError::NotFound)?;

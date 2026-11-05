@@ -117,7 +117,7 @@ pub async fn list_inboxes<T: Services>(
     let request = ListRequest::parse(query.as_deref().unwrap_or_default())?;
     let start = cursor(&request, keys::INBOXES_PARTITION, UNSCOPED)?;
 
-    let page = state.services.list_inboxes(request.limit, start).await?;
+    let page = state.mailbox().list_inboxes(request.limit, start).await?;
 
     let inboxes: Vec<wire::Inbox> = page.items.iter().map(wire::Inbox::from).collect();
     Ok(Json(wire::InboxList {
@@ -142,7 +142,7 @@ pub async fn get_inbox<T: Services>(
     Path(inbox): Path<InboxId>,
 ) -> Result<Json<wire::Inbox>, ApiError> {
     let inbox = state
-        .services
+        .mailbox()
         .get_inbox(&inbox)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -174,7 +174,7 @@ pub async fn list_messages<T: Services>(
         ascending: request.ascending,
         start,
     };
-    let services = &state.services;
+    let mailbox = &state.mailbox();
     let (messages, next) = fill(
         &query,
         |msg: &MailMessage| request.filters.matches_message(msg),
@@ -187,7 +187,7 @@ pub async fn list_messages<T: Services>(
                 table_sk: sk,
             }
         },
-        |round| async move { services.list_messages(&round).await },
+        |round| async move { mailbox.list_messages(&round).await },
     )
     .await?;
 
@@ -212,7 +212,7 @@ pub async fn get_message<T: Services>(
     Path((inbox, message_id)): Path<(InboxId, String)>,
 ) -> Result<Json<wire::Message>, ApiError> {
     let message = state
-        .services
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -235,7 +235,7 @@ pub async fn get_raw<T: Services>(
     Path((inbox, message_id)): Path<(InboxId, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
-        .services
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -272,7 +272,7 @@ pub async fn get_attachment<T: Services>(
     Path((inbox, message_id, attachment_id)): Path<(InboxId, String, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
-        .services
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -350,7 +350,7 @@ pub async fn list_threads<T: Services>(
         ascending: request.ascending,
         start,
     };
-    let services = &state.services;
+    let mailbox = &state.mailbox();
     let (threads, next) = fill(
         &query,
         |thread: &ThreadState| request.filters.matches_thread(thread),
@@ -363,7 +363,7 @@ pub async fn list_threads<T: Services>(
                 table_sk: sk,
             }
         },
-        |round| async move { services.list_threads(&round).await },
+        |round| async move { mailbox.list_threads(&round).await },
     )
     .await?;
 
@@ -397,7 +397,7 @@ pub async fn get_thread<T: Services>(
     let start = cursor(&request, &partition, UNSCOPED)?;
 
     let view = state
-        .services
+        .mailbox()
         .get_thread(&inbox, &thread_id, request.limit, start)
         .await?
         .ok_or(ApiError::NotFound)?;

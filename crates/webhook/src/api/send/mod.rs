@@ -83,7 +83,7 @@ async fn enqueue<T: Services>(
     };
     // An inbox that does not exist cannot send: the address would not be one
     // this domain owns.
-    if state.services.get_inbox(&inbox).await?.is_none() {
+    if state.mailbox().get_inbox(&inbox).await?.is_none() {
         return Err(ApiError::NotFound);
     }
 
@@ -161,7 +161,7 @@ async fn enqueue<T: Services>(
     });
 
     let committed = state
-        .services
+        .mailbox()
         .enqueue_send(&message, &state_item, key.as_ref(), now_ms / 1_000)
         .await;
     match committed {

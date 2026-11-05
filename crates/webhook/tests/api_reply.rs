@@ -6,7 +6,6 @@
 use aws_messaging_webhook::mail::content::{self, MessageContent};
 use aws_messaging_webhook::mail::mime::parse_inbound;
 use aws_messaging_webhook::mail::send::SendSpec;
-use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ids, time};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -38,7 +37,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     "Order 42".clone_into(&mut msg.subject);
     "<original@example.net>".clone_into(&mut msg.rfc_message_id);
     adjust(&mut msg);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

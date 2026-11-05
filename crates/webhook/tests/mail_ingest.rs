@@ -18,7 +18,6 @@ use std::time::Duration;
 use aws_messaging_webhook::allowlist::TopicAllowlist;
 use aws_messaging_webhook::config::{Config, MailConfig};
 use aws_messaging_webhook::mail::ids::inbound_message_id;
-use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::time::parse as parse_ts;
 use aws_messaging_webhook::mail::{content, ids, ingest};
 use aws_messaging_webhook::model::ses_inbound::SesInboundNotification;
@@ -97,6 +96,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
     let stored = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await
         .unwrap()
@@ -138,6 +138,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
     let thread = h
         .fake()
         .mail
+        .mailbox()
         .get_thread(&inbox, &message_id, 1, None)
         .await
         .unwrap()
@@ -190,6 +191,7 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
     let stored = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await
         .unwrap()
@@ -286,6 +288,7 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
     let stored = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await
         .unwrap()
@@ -350,6 +353,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
     let stored = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await
         .unwrap()
@@ -410,6 +414,7 @@ async fn direct_sns_invocation_also_ingests() {
     assert!(
         h.fake()
             .mail
+            .mailbox()
             .get_message(&inbox, &message_id)
             .await
             .unwrap()
@@ -474,6 +479,7 @@ async fn reply_threads_under_its_parent() {
     let reply = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &reply_id)
         .await
         .unwrap()
@@ -515,6 +521,7 @@ async fn spam_message_gets_the_spam_label() {
     let stored = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await
         .unwrap()
@@ -554,6 +561,7 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
     let stored = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await
         .unwrap()
@@ -618,7 +626,15 @@ async fn missing_s3_pointer_skips() {
     // No S3 pointer means nothing was ever fetched or inserted; a configured
     // inbox is never even created for a receipt that carries no pointer.
     let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
-    assert!(h.fake().mail.get_inbox(&inbox).await.unwrap().is_none());
+    assert!(
+        h.fake()
+            .mail
+            .mailbox()
+            .get_inbox(&inbox)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -648,6 +664,7 @@ async fn wrong_bucket_is_a_permanent_skip() {
     assert!(
         h.fake()
             .mail
+            .mailbox()
             .get_message(&inbox, &message_id)
             .await
             .unwrap()
@@ -682,6 +699,7 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
     assert!(
         h.fake()
             .mail
+            .mailbox()
             .get_message(&inbox, &message_id)
             .await
             .unwrap()
@@ -782,6 +800,7 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
     let second = h
         .fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &expected_message_id("ses-2", TS))
         .await
         .unwrap()
@@ -826,6 +845,7 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
         let message_id = message_id.clone();
         async move {
             fake.mail
+                .mailbox()
                 .get_message(&inbox, &message_id)
                 .await
                 .unwrap()
@@ -847,6 +867,7 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     assert!(
         h.fake()
             .mail
+            .mailbox()
             .get_inbox(&aws_messaging_webhook::mail::InboxId::new(
                 "sales@example.com"
             ))
@@ -858,6 +879,7 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let created = h
         .fake()
         .mail
+        .mailbox()
         .get_inbox(&aws_messaging_webhook::mail::InboxId::new(
             "support@example.com",
         ))
@@ -1001,6 +1023,7 @@ async fn resume_skips_an_already_present_part() {
     let stored = state
         .services
         .mail
+        .mailbox()
         .get_message(&inbox, &message_id.to_string())
         .await
         .unwrap()
@@ -1104,6 +1127,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
         state
             .services
             .mail
+            .mailbox()
             .get_message(&inbox, &message_id.to_string())
             .await
             .unwrap()
@@ -1183,6 +1207,7 @@ async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
     let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
     h.fake()
         .mail
+        .mailbox()
         .get_message(&inbox, &expected_message_id(&ses_id, &ts))
         .await
         .unwrap()

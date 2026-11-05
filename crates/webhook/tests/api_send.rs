@@ -8,7 +8,6 @@
 
 use aws_messaging_webhook::mail::keys::TableKey;
 use aws_messaging_webhook::mail::send::{SendState, SendStatus};
-use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{InboxId, MESSAGE_USER_LABEL_CAP, content, labels};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -60,7 +59,7 @@ async fn a_send_is_queued_with_its_state_spec_and_message() {
     // The message is readable straight away, labelled queued.
     let message = h
         .state
-        .services
+        .mailbox()
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -103,7 +102,7 @@ async fn a_send_with_a_full_set_of_user_labels_and_a_system_toggle_is_queued() {
 
     let message = h
         .state
-        .services
+        .mailbox()
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -686,7 +685,7 @@ async fn an_html_only_send_gets_a_non_empty_preview_on_the_message_and_listing()
     // The stored message item carries a non-empty preview derived from HTML.
     let message = h
         .state
-        .services
+        .mailbox()
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -752,7 +751,7 @@ async fn a_send_addressing_a_mixed_case_inbox_path_is_queued() {
     // The send lands on the inbox ingest/reads know — the lowercased id.
     let message = h
         .state
-        .services
+        .mailbox()
         .get_message(&InboxId::new(TEST_INBOX), &message_id)
         .await
         .unwrap()
@@ -838,7 +837,7 @@ async fn an_expired_key_reused_with_the_same_request_is_a_fresh_send() {
     let key_hash = format!("{:x}", Sha256::digest(b"key-1"));
     let mut existing = h
         .state
-        .services
+        .mailbox()
         .get_send_key(&key_hash)
         .await
         .unwrap()

@@ -54,7 +54,7 @@ pub async fn reply<T: Services>(
     ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
     let original = state
-        .services
+        .mailbox()
         .get_message(&inbox, &message_id)
         .await?
         .ok_or(ApiError::NotFound)?;

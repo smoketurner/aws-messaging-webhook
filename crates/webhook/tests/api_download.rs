@@ -3,7 +3,6 @@
 //! The presigned download routes: raw MIME and attachments.
 
 use aws_messaging_webhook::mail::AttachmentMeta;
-use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{ids, time};
 use axum::http::{Method, StatusCode};
 use webhook_test_support::mail_memory::sample_message;
@@ -38,7 +37,7 @@ async fn seed_in(
     let mut msg = sample_message(TEST_INBOX, &id, "t1");
     TEST_AT.clone_into(&mut msg.timestamp);
     adjust(&mut msg);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 

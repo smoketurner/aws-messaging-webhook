@@ -115,8 +115,10 @@ Three workspace crates:
   sends properly signed SNS envelopes, and the `api_*`/`mail_*` suites exercise the mailbox,
   all against fakes from `crates/webhook-test-support` implementing the `Services` trait
   (`state.rs` — the single bound aggregating `EventStore`, `PublishEvents`, `SmsVoiceApi`,
-  `SesApi`, `MailStore`, `ObjectStore`, `AttachmentFetcher` and `ApiKeySource`). New
-  downstream calls go through that trait so tests stay AWS-free.
+  `SesApi`, `Table`, `ObjectStore`, `AttachmentFetcher` and `ApiKeySource`). Mailbox reads and
+  writes are written once, in `mail/mailbox.rs`, on top of the `Table` seam (`mail/table.rs`)
+  that the DynamoDB store and the in-memory double implement. New downstream calls go
+  through those traits so tests stay AWS-free.
 - SNS topics and subscriptions deliberately live outside the SAM stack, except the two
   stack-owned mail topics (SES receipts and SES configuration-set events, created only when
   `pMailDomain` is set); `template.yaml` maps CloudFormation parameters to the env vars

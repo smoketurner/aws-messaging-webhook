@@ -416,9 +416,8 @@ pub fn label_changes(before: &[String], after: &[String]) -> (Vec<String>, Vec<S
 /// Works out the new send state, the message's new labels, and the SES id to
 /// record, for one outcome.
 ///
-/// Shared by every [`crate::mail::store::MailStore`] implementation so the
-/// in-memory double cannot drift from the real one on the question of what a
-/// given outcome means.
+/// Used by [`crate::mail::mailbox::Mailbox::mark_send`], so every store
+/// agrees on what a given outcome means.
 #[must_use]
 pub fn mark_transition<'a>(
     state: &SendState,

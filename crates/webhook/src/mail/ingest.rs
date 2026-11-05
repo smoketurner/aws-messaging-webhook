@@ -194,7 +194,7 @@ async fn fresh_targets<T: Services>(
 ) -> Vec<InboxId> {
     let mut targets = Vec::with_capacity(inboxes.len());
     for inbox_id in inboxes {
-        match state.services.message_exists(&inbox_id, message_id).await {
+        match state.mailbox().message_exists(&inbox_id, message_id).await {
             Ok(false) => targets.push(inbox_id),
             Ok(true) => {}
             Err(error) => record_resolution_error(resolution, error),
@@ -278,7 +278,7 @@ async fn resolve_recipient<T: Services>(
     }
     let inbox_id = InboxId::new(address);
 
-    match state.services.get_inbox(&inbox_id).await {
+    match state.mailbox().get_inbox(&inbox_id).await {
         Ok(Some(_)) => {
             resolution.inboxes.push(inbox_id);
             return;
@@ -291,7 +291,7 @@ async fn resolve_recipient<T: Services>(
     }
 
     let now = time::format(time::now_ms());
-    match state.services.ensure_inbox(&inbox_id, &now).await {
+    match state.mailbox().ensure_inbox(&inbox_id, &now).await {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }
@@ -579,7 +579,7 @@ async fn insert_into_inbox<T: Services>(
         .map_err(ActionError::from)?;
 
     state
-        .services
+        .mailbox()
         .insert_message(&msg, &candidates)
         .await
         .map(|_outcome| ())

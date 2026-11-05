@@ -236,7 +236,7 @@ async fn apply_delivery_label<T: Services>(
     }
 
     let resolved = state
-        .services
+        .mailbox()
         .resolve_ses_message(&event.mail.message_id)
         .await
         .map_err(ActionError::from)?;
@@ -246,7 +246,7 @@ async fn apply_delivery_label<T: Services>(
 
     let now = crate::mail::time::format(crate::mail::time::now_ms());
     state
-        .services
+        .mailbox()
         .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
         .await
         .map_err(ActionError::from)?;

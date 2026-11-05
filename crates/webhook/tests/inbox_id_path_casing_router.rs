@@ -9,7 +9,6 @@
 //! applies the same `trim().to_ascii_lowercase()` canonicalization as ingest,
 //! so all variants address the same row.
 
-use aws_messaging_webhook::mail::store::MailStore as _;
 use aws_messaging_webhook::mail::{ids, time};
 use axum::http::StatusCode;
 use webhook_test_support::mail_memory::sample_message;
@@ -27,7 +26,7 @@ async fn seeded() -> (Harness, String) {
     TEST_AT.clone_into(&mut msg.timestamp);
     TEST_AT.clone_into(&mut msg.created_at);
     TEST_AT.clone_into(&mut msg.updated_at);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox().insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 
