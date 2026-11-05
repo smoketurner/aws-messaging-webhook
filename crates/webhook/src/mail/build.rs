@@ -19,6 +19,7 @@ use mail_builder::mime::MimePart;
 
 use crate::mail::send::{SendSpec, SpecAttachment};
 use crate::mail::strip_angle_brackets;
+use crate::mail::wire::ContentDisposition;
 
 /// One attachment's bytes, paired with the spec entry describing it.
 pub struct BuiltPart<'a> {
@@ -106,7 +107,7 @@ pub fn build_outbound(
 fn body_part<'a>(spec: &'a SendSpec, parts: &'a [BuiltPart<'a>]) -> MimePart<'a> {
     let (inline, attached): (Vec<_>, Vec<_>) = parts
         .iter()
-        .partition(|part| part.spec.content_disposition == "inline");
+        .partition(|part| part.spec.content_disposition == ContentDisposition::Inline);
 
     let body = alternative(spec);
 
@@ -213,14 +214,19 @@ mod tests {
         }
     }
 
-    fn part(id: &str, content_type: &str, disposition: &str, cid: Option<&str>) -> SpecAttachment {
+    fn part(
+        id: &str,
+        content_type: &str,
+        disposition: ContentDisposition,
+        cid: Option<&str>,
+    ) -> SpecAttachment {
         SpecAttachment {
             attachment_id: id.to_owned(),
             object_key: Some(format!("outbox/mid-1/parts/{id}")),
             url: None,
             filename: Some(format!("{id}.bin")),
             content_type: content_type.to_owned(),
-            content_disposition: disposition.to_owned(),
+            content_disposition: disposition,
             content_id: cid.map(ToOwned::to_owned),
             size: 3,
         }
@@ -278,7 +284,12 @@ mod tests {
     #[test]
     fn an_attachment_is_wrapped_in_mixed_and_keeps_its_filename() {
         let mut spec = spec();
-        let attachment = part("att_1", "application/pdf", "attachment", None);
+        let attachment = part(
+            "att_1",
+            "application/pdf",
+            ContentDisposition::Attachment,
+            None,
+        );
         spec.attachments = vec![attachment.clone()];
         let parts = vec![BuiltPart {
             spec: &attachment,
@@ -302,7 +313,12 @@ mod tests {
     #[test]
     fn a_filenameless_attachment_still_emits_a_disposition_header() {
         let mut spec = spec();
-        let mut attachment = part("att_1", "application/pdf", "attachment", None);
+        let mut attachment = part(
+            "att_1",
+            "application/pdf",
+            ContentDisposition::Attachment,
+            None,
+        );
         attachment.filename = None;
         spec.attachments = vec![attachment.clone()];
         let parts = vec![BuiltPart {
@@ -335,7 +351,12 @@ mod tests {
     #[test]
     fn an_attachment_with_a_filename_has_exactly_one_disposition_header() {
         let mut spec = spec();
-        let attachment = part("att_1", "application/pdf", "attachment", None);
+        let attachment = part(
+            "att_1",
+            "application/pdf",
+            ContentDisposition::Attachment,
+            None,
+        );
         spec.attachments = vec![attachment.clone()];
         let parts = vec![BuiltPart {
             spec: &attachment,
@@ -361,7 +382,12 @@ mod tests {
         // and the part has to sit in the same `related` tree as the body.
         let mut spec = spec();
         spec.html = Some("<img src=\"cid:logo\">".to_owned());
-        let attachment = part("att_1", "image/png", "inline", Some("logo"));
+        let attachment = part(
+            "att_1",
+            "image/png",
+            ContentDisposition::Inline,
+            Some("logo"),
+        );
         spec.attachments = vec![attachment.clone()];
         let parts = vec![BuiltPart {
             spec: &attachment,
@@ -379,8 +405,18 @@ mod tests {
     fn inline_and_attached_parts_nest_rather_than_flatten() {
         let mut spec = spec();
         spec.html = Some("<img src=\"cid:logo\">".to_owned());
-        let inline = part("att_1", "image/png", "inline", Some("logo"));
-        let attached = part("att_2", "application/pdf", "attachment", None);
+        let inline = part(
+            "att_1",
+            "image/png",
+            ContentDisposition::Inline,
+            Some("logo"),
+        );
+        let attached = part(
+            "att_2",
+            "application/pdf",
+            ContentDisposition::Attachment,
+            None,
+        );
         spec.attachments = vec![inline.clone(), attached.clone()];
         let parts = vec![
             BuiltPart {

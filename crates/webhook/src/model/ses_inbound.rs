@@ -75,12 +75,35 @@ pub struct SesReceiptAction {
     pub object_key: Option<String>,
 }
 
-/// Verdict status: `PASS` | `FAIL` | `GRAY` | `PROCESSING_FAILED` — kept as a
-/// string because the documented value set is not closed.
+open_string_enum! {
+    /// A receipt verdict's `status`. The documented value set is not closed.
+    pub enum VerdictStatus {
+        Pass = "PASS",
+        Fail = "FAIL",
+        Gray = "GRAY",
+        ProcessingFailed = "PROCESSING_FAILED",
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Verdict {
-    pub status: String,
+    pub status: VerdictStatus,
+}
+
+impl Verdict {
+    /// Whether this verdict is `FAIL`. Every other status, known or not,
+    /// counts as not failed.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        match self.status {
+            VerdictStatus::Fail => true,
+            VerdictStatus::Pass
+            | VerdictStatus::Gray
+            | VerdictStatus::ProcessingFailed
+            | VerdictStatus::Other(_) => false,
+        }
+    }
 }
 
 impl SesReceipt {
@@ -88,8 +111,7 @@ impl SesReceipt {
     /// Classification only — the event still persists and publishes.
     #[must_use]
     pub fn is_quarantined(&self) -> bool {
-        let failed =
-            |verdict: &Option<Verdict>| verdict.as_ref().is_some_and(|v| v.status == "FAIL");
+        let failed = |verdict: &Option<Verdict>| verdict.as_ref().is_some_and(Verdict::failed);
         failed(&self.spam_verdict) || failed(&self.virus_verdict)
     }
 
@@ -313,7 +335,10 @@ mod tests {
             headers.message_id.as_deref(),
             Some("<abc@mail.example.com>")
         );
-        assert_eq!(event.receipt.dmarc_verdict.as_ref().unwrap().status, "FAIL");
+        assert_eq!(
+            event.receipt.dmarc_verdict.as_ref().unwrap().status,
+            VerdictStatus::Fail
+        );
         assert_eq!(event.receipt.dmarc_policy.as_deref(), Some("reject"));
     }
 
@@ -331,5 +356,27 @@ mod tests {
             "action":{"type":"S3","bucketName":"b"}},"mail":{"messageId":"m"}}"#;
         let event: SesInboundNotification = serde_json::from_str(raw).unwrap();
         assert_eq!(event.receipt.s3_pointer(), None);
+    }
+
+    #[test]
+    fn verdict_status_round_trips_verbatim_and_only_fail_fails() {
+        for (wire, failed) in [
+            ("PASS", false),
+            ("FAIL", true),
+            ("GRAY", false),
+            ("PROCESSING_FAILED", false),
+            ("DISABLED", false),
+        ] {
+            let verdict: Verdict =
+                serde_json::from_value(serde_json::json!({ "status": wire })).unwrap();
+            assert_eq!(verdict.failed(), failed, "{wire}");
+            assert_eq!(verdict.status.as_str(), wire);
+            assert_eq!(
+                serde_json::to_value(&verdict.status).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+        let verdict: Verdict = serde_json::from_str(r#"{"status":"DISABLED"}"#).unwrap();
+        assert_eq!(verdict.status, VerdictStatus::Other("DISABLED".to_owned()));
     }
 }

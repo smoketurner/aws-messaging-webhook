@@ -39,6 +39,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mail::wire::ContentDisposition;
+
 // ---------------------------------------------------------------------------
 // Caps
 // ---------------------------------------------------------------------------
@@ -160,7 +162,7 @@ pub struct AttachmentMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     pub content_type: String,
-    pub content_disposition: String,
+    pub content_disposition: ContentDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<String>,
 }
@@ -257,7 +259,7 @@ pub struct MailMessage {
 
     // Outbound-only mirror of the send state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub send_status: Option<String>,
+    pub send_status: Option<crate::mail::send::SendStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<String>,
 
@@ -365,5 +367,63 @@ mod tests {
             serde_json::to_value(&id).unwrap(),
             serde_json::json!("support@example.com")
         );
+    }
+
+    /// The typed `send_status` and `content_disposition` are stored as the
+    /// same plain strings the item has always carried, and read back.
+    #[test]
+    fn typed_item_fields_round_trip_as_stored_strings() {
+        use serde_dynamo::AttributeValue;
+
+        use crate::mail::send::SendStatus;
+
+        for (status, disposition, disposition_wire) in [
+            (SendStatus::Queued, ContentDisposition::Inline, "inline"),
+            (
+                SendStatus::Sent,
+                ContentDisposition::Attachment,
+                "attachment",
+            ),
+            (
+                SendStatus::Failed,
+                ContentDisposition::Attachment,
+                "attachment",
+            ),
+            (SendStatus::Unknown, ContentDisposition::Inline, "inline"),
+        ] {
+            let message = MailMessage {
+                send_status: Some(status),
+                attachments: vec![AttachmentMeta {
+                    attachment_id: "att_1".to_owned(),
+                    object_key: None,
+                    size: 3,
+                    filename: None,
+                    content_type: "image/png".to_owned(),
+                    content_disposition: disposition,
+                    content_id: None,
+                }],
+                ..test_fixtures::message()
+            };
+            let item: serde_dynamo::Item = serde_dynamo::to_item(&message).unwrap();
+            let attributes = item.inner();
+            assert_eq!(
+                attributes["send_status"],
+                AttributeValue::S(status.as_str().to_owned())
+            );
+            let AttributeValue::L(attachments) = &attributes["attachments"] else {
+                panic!("attachments are a list");
+            };
+            let AttributeValue::M(attachment) = &attachments[0] else {
+                panic!("an attachment is a map");
+            };
+            assert_eq!(
+                attachment["content_disposition"],
+                AttributeValue::S(disposition_wire.to_owned())
+            );
+
+            let back: MailMessage = serde_dynamo::from_item(item.clone()).unwrap();
+            assert_eq!(back.send_status, Some(status));
+            assert_eq!(back.attachments[0].content_disposition, disposition);
+        }
     }
 }

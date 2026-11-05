@@ -9,6 +9,7 @@ use mail_parser::{
 };
 
 use crate::mail::content::MessageContent;
+use crate::mail::wire::ContentDisposition;
 use crate::mail::{
     ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, Direction, HEADER_NAME_MAX,
     HEADER_VALUE_MAX, HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, InboxId, MailMessage,
@@ -27,7 +28,7 @@ pub enum ParseError {
 pub struct ParsedAttachment {
     pub filename: Option<String>,
     pub content_type: String,
-    pub content_disposition: String,
+    pub content_disposition: ContentDisposition,
     pub content_id: Option<String>,
     pub bytes: axum::body::Bytes,
 }
@@ -356,11 +357,15 @@ fn normalize_content_type(content_type: Option<ContentType<'_>>) -> String {
 
 /// `inline` when the `Content-Disposition` says so (case-insensitively),
 /// else `attachment`, the disposition default.
-fn normalized_disposition(part: &MessagePart<'_>) -> String {
+fn normalized_disposition(part: &MessagePart<'_>) -> ContentDisposition {
     let is_inline = part
         .content_disposition()
         .is_some_and(|cd| cd.ctype().eq_ignore_ascii_case("inline"));
-    if is_inline { "inline" } else { "attachment" }.to_owned()
+    if is_inline {
+        ContentDisposition::Inline
+    } else {
+        ContentDisposition::Attachment
+    }
 }
 
 /// A filename for a nested `message/rfc822` part: the inner
@@ -461,7 +466,7 @@ mod tests {
         assert_eq!(parsed.attachments.len(), 1);
         let attachment = &parsed.attachments[0];
         assert_eq!(attachment.content_id.as_deref(), Some("logo123"));
-        assert_eq!(attachment.content_disposition, "inline");
+        assert_eq!(attachment.content_disposition, ContentDisposition::Inline);
         assert_eq!(attachment.content_type, "image/png");
         assert_eq!(attachment.filename.as_deref(), Some("logo.png"));
         assert_eq!(attachment.bytes.as_ref(), b"hello world");
@@ -666,14 +671,14 @@ mod tests {
 
         let svg = &parsed.attachments[0];
         assert_eq!(svg.content_type, "image/svg+xml");
-        assert_eq!(svg.content_disposition, "inline");
+        assert_eq!(svg.content_disposition, ContentDisposition::Inline);
         assert_eq!(svg.content_id.as_deref(), Some("badge123"));
         assert_eq!(svg.filename.as_deref(), Some("badge.svg"));
         assert!(std::str::from_utf8(&svg.bytes).unwrap().contains("<svg"));
 
         let png = &parsed.attachments[1];
         assert_eq!(png.content_type, "image/png");
-        assert_eq!(png.content_disposition, "inline");
+        assert_eq!(png.content_disposition, ContentDisposition::Inline);
         assert_eq!(png.content_id.as_deref(), Some("dot123"));
         assert_eq!(png.filename.as_deref(), Some("dot.png"));
         assert_eq!(png.bytes.as_ref(), b"hello");

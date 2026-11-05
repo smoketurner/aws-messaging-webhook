@@ -97,7 +97,7 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
         state_of(&h, &message_id).expires_at,
         Some(message.expires_at)
     );
-    assert_eq!(message.send_status.as_deref(), Some("sent"));
+    assert_eq!(message.send_status, Some(SendStatus::Sent));
     assert_eq!(
         message.ses_message_id.as_deref(),
         Some(format!("ses-{message_id}").as_str())
@@ -161,7 +161,7 @@ async fn an_ambiguous_outcome_is_never_resent() {
         .unwrap()
         .unwrap();
     assert_eq!(message.labels, vec!["queued"]);
-    assert_eq!(message.send_status.as_deref(), Some("unknown"));
+    assert_eq!(message.send_status, Some(SendStatus::Unknown));
     // Nothing may expire a send an operator still has to resolve.
     assert_eq!(state_of(&h, &message_id).expires_at, None);
 }

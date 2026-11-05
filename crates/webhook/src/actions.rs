@@ -6,7 +6,7 @@
 
 use std::future::Future;
 
-use crate::mail::labels::SystemLabel;
+use crate::mail::ingest::IngestOutcome;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
@@ -185,22 +185,6 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
     }
 }
 
-/// The mailbox label an SES event records, if it records one.
-///
-/// `Send` is deliberately absent: the sender already marks the message sent,
-/// and a `Send` event arriving afterwards would say nothing new. `Click` has
-/// no mailbox label in the vocabulary this service uses.
-fn delivery_label(kind: &str) -> Option<SystemLabel> {
-    match kind {
-        "Delivery" => Some(SystemLabel::Delivered),
-        "Bounce" => Some(SystemLabel::Bounced),
-        "Complaint" => Some(SystemLabel::Complained),
-        "Reject" => Some(SystemLabel::Rejected),
-        "Open" => Some(SystemLabel::Opened),
-        _ => None,
-    }
-}
-
 /// Labels the mailbox message an SES event belongs to, when it belongs to
 /// one.
 ///
@@ -213,7 +197,7 @@ async fn apply_delivery_label<T: Services>(
     state: &AppState<T>,
     event: &crate::model::ses_notification::SesNotification,
 ) -> Result<bool, ActionError> {
-    let Some(label) = delivery_label(&event.kind) else {
+    let Some(label) = event.kind.mailbox_label() else {
         return Ok(false);
     };
     // Mail is only tracked when the mailbox is configured.
@@ -299,8 +283,38 @@ async fn suppress_recipients<T: Services>(
     Ok(())
 }
 
-/// Dispatches whatever lifecycle action the event calls for. Returns the name
-/// of the action taken, for the outcome log line.
+/// The lifecycle action an event led to, reported on the outcome log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionTaken {
+    NoAction,
+    OptOut,
+    OptIn,
+    Feedback,
+    Suppression,
+    DeliveryLabel,
+    Ingest(IngestOutcome),
+    /// A permanent action failure, logged and counted by the caller.
+    Failed,
+}
+
+impl ActionTaken {
+    /// The log form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAction => "none",
+            Self::OptOut => "opt_out",
+            Self::OptIn => "opt_in",
+            Self::Feedback => "feedback",
+            Self::Suppression => "suppression",
+            Self::DeliveryLabel => "delivery_label",
+            Self::Ingest(outcome) => outcome.as_str(),
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Dispatches whatever lifecycle action the event calls for.
 ///
 /// # Errors
 ///
@@ -316,7 +330,7 @@ pub async fn run<T: Services>(
     // caller; the third `received_ms` fallback, threaded to the
     // `SesInbound` arm only.
     envelope_ts_ms: Option<u64>,
-) -> Result<&'static str, ActionError> {
+) -> Result<ActionTaken, ActionError> {
     match event {
         DomainEvent::SmsInbound { event, .. } => {
             let intent = keyword_intent(
@@ -332,20 +346,20 @@ pub async fn run<T: Services>(
                         .services
                         .put_opted_out_number(list, &event.origination_number)
                         .await?;
-                    Ok("opt_out")
+                    Ok(ActionTaken::OptOut)
                 }
                 (KeywordIntent::OptIn, Some(list)) => {
                     state
                         .services
                         .delete_opted_out_number(list, &event.origination_number)
                         .await?;
-                    Ok("opt_in")
+                    Ok(ActionTaken::OptIn)
                 }
                 (KeywordIntent::OptOut | KeywordIntent::OptIn, None) => {
                     tracing::debug!("keyword received but OPT_OUT_LIST_NAME is not set; skipping");
-                    Ok("none")
+                    Ok(ActionTaken::NoAction)
                 }
-                (KeywordIntent::None, _) => Ok("none"),
+                (KeywordIntent::None, _) => Ok(ActionTaken::NoAction),
             }
         }
         DomainEvent::SmsDelivery { event, .. } => {
@@ -354,7 +368,7 @@ pub async fn run<T: Services>(
             // call is made on every terminal event; "no feedback record" is
             // treated as a no-op by the API wrapper.
             if !event.is_final {
-                return Ok("none");
+                return Ok(ActionTaken::NoAction);
             }
             let status = if event.is_successful_delivery() {
                 FeedbackStatus::Received
@@ -365,7 +379,7 @@ pub async fn run<T: Services>(
                 .services
                 .put_message_feedback(&event.message_id, status)
                 .await?;
-            Ok("feedback")
+            Ok(ActionTaken::Feedback)
         }
         DomainEvent::Ses { event, .. } => {
             // The delivery label is informational; the SES account-level
@@ -416,21 +430,51 @@ pub async fn run<T: Services>(
                 return Err(error);
             }
             Ok(match (suppression, labelled) {
-                (Some(_), _) => "suppression",
-                (None, true) => "delivery_label",
-                (None, false) => "none",
+                (Some(_), _) => ActionTaken::Suppression,
+                (None, true) => ActionTaken::DeliveryLabel,
+                (None, false) => ActionTaken::NoAction,
             })
         }
         DomainEvent::SesInbound { event, .. } => {
-            crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms).await
+            crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms)
+                .await
+                .map(ActionTaken::Ingest)
         }
-        DomainEvent::Unknown { .. } => Ok("none"),
+        DomainEvent::Unknown { .. } => Ok(ActionTaken::NoAction),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The outcome log line's `action` field values are what dashboards
+    /// and log queries match on.
+    #[test]
+    fn actions_log_as_their_established_names() {
+        for (action, expected) in [
+            (ActionTaken::NoAction, "none"),
+            (ActionTaken::OptOut, "opt_out"),
+            (ActionTaken::OptIn, "opt_in"),
+            (ActionTaken::Feedback, "feedback"),
+            (ActionTaken::Suppression, "suppression"),
+            (ActionTaken::DeliveryLabel, "delivery_label"),
+            (ActionTaken::Failed, "failed"),
+            (ActionTaken::Ingest(IngestOutcome::MailDisabled), "none"),
+            (
+                ActionTaken::Ingest(IngestOutcome::Skipped),
+                "ingest_skipped",
+            ),
+            (ActionTaken::Ingest(IngestOutcome::Failed), "ingest_failed"),
+            (
+                ActionTaken::Ingest(IngestOutcome::Duplicate),
+                "ingest_duplicate",
+            ),
+            (ActionTaken::Ingest(IngestOutcome::Ingested), "ingested"),
+        ] {
+            assert_eq!(action.as_str(), expected);
+        }
+    }
 
     #[test]
     fn stop_family_keywords_opt_out() {

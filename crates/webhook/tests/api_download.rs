@@ -18,7 +18,7 @@ fn attachment(id: &str, filename: Option<&str>, key: Option<&str>) -> Attachment
         size: 2_048,
         filename: filename.map(ToOwned::to_owned),
         content_type: "application/pdf".to_owned(),
-        content_disposition: "attachment".to_owned(),
+        content_disposition: aws_messaging_webhook::mail::wire::ContentDisposition::Attachment,
         content_id: None,
     }
 }
