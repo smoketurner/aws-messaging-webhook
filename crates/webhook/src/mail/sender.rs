@@ -38,8 +38,8 @@ use mailbox::send::{MarkOutcome, SesSent};
 use mailbox::send::{SendFailure, SendSpec, SendState, SendStatus};
 use mailbox::url_policy;
 use mailbox::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
+use mailbox_store::MailStoreError;
 use mailbox_store::keys;
-use mailbox_store::store::MailStoreError;
 
 /// What one stream record came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,7 @@ pub enum SenderError {
 /// # Errors
 ///
 /// Only when the payload is not a stream event at all.
-pub async fn handle_sender_stream<B: Backend>(
+pub(crate) async fn handle_sender_stream<B: Backend>(
     state: &AppState<B>,
     payload: serde_json::Value,
     deadline: Instant,
@@ -144,7 +144,7 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<M
 /// account-scoped, so `lambda:InvokeFunction` is a better gate than a bearer
 /// key, and the public API surface stays the contract it mirrors.
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct Command {
+pub(crate) struct Command {
     #[serde(rename = "command")]
     pub resolution: Resolution,
     pub message_id: MessageId,
@@ -156,7 +156,7 @@ pub struct Command {
 ///
 /// [`SenderError`] when the send is missing, is not `unknown`, or the store
 /// cannot be written.
-pub async fn handle_command<B: Backend>(
+pub(crate) async fn handle_command<B: Backend>(
     state: &AppState<B>,
     command: &Command,
 ) -> Result<(), SenderError> {

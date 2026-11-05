@@ -15,7 +15,11 @@ pub struct EventBridgePublisher {
 
 impl EventBridgePublisher {
     #[must_use]
-    pub fn new(client: aws_sdk_eventbridge::Client, bus_name: String, source: String) -> Self {
+    pub(crate) fn new(
+        client: aws_sdk_eventbridge::Client,
+        bus_name: String,
+        source: String,
+    ) -> Self {
         Self {
             client,
             bus_name,

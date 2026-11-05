@@ -24,7 +24,7 @@ impl SesInboundNotification {
     /// Whether this is SES checking that it can publish to the topic, rather
     /// than a received message.
     #[must_use]
-    pub fn is_setup_notification(&self) -> bool {
+    pub(crate) fn is_setup_notification(&self) -> bool {
         self.mail.message_id == SETUP_NOTIFICATION_MESSAGE_ID
     }
 }
@@ -96,7 +96,7 @@ impl Verdict {
     /// Whether this verdict is `FAIL`. Every other status, known or not,
     /// counts as not failed.
     #[must_use]
-    pub fn failed(&self) -> bool {
+    pub(crate) fn failed(&self) -> bool {
         match self.status {
             VerdictStatus::Fail => true,
             VerdictStatus::Pass
@@ -111,7 +111,7 @@ impl SesReceipt {
     /// Spam or virus verdict FAIL selects the quarantined detail-type.
     /// Classification only — the event still persists and publishes.
     #[must_use]
-    pub fn is_quarantined(&self) -> bool {
+    pub(crate) fn is_quarantined(&self) -> bool {
         let failed = |verdict: &Option<Verdict>| verdict.as_ref().is_some_and(Verdict::failed);
         failed(&self.spam_verdict) || failed(&self.virus_verdict)
     }
@@ -120,7 +120,7 @@ impl SesReceipt {
     /// action and SES populated both the bucket and key. `None` for any other
     /// action or an incomplete pointer.
     #[must_use]
-    pub fn s3_pointer(&self) -> Option<(&str, &str)> {
+    pub(crate) fn s3_pointer(&self) -> Option<(&str, &str)> {
         let action = self.action.as_ref()?;
         match (action.bucket_name.as_deref(), action.object_key.as_deref()) {
             (Some(bucket), Some(key)) => Some((bucket, key)),
@@ -135,7 +135,7 @@ impl SesReceipt {
 /// `skip_serializing_if` omits absent sub-fields rather than emitting null.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InboundSummary<'a> {
+pub(crate) struct InboundSummary<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<&'a SesCommonHeaders>,
     #[serde(skip_serializing_if = "AuthSummary::is_empty")]
@@ -172,7 +172,7 @@ impl AuthSummary<'_> {
 
 impl<'a> InboundSummary<'a> {
     #[must_use]
-    pub fn from_receipt(mail: &'a SesMail, receipt: &'a SesReceipt) -> Self {
+    pub(crate) fn from_receipt(mail: &'a SesMail, receipt: &'a SesReceipt) -> Self {
         let status = |verdict: &'a Option<Verdict>| verdict.as_ref().map(|v| v.status.as_str());
         Self {
             headers: mail.common_headers.as_ref(),
@@ -190,7 +190,7 @@ impl<'a> InboundSummary<'a> {
     /// True when neither headers nor any verdict is present, so the whole
     /// summary should be omitted from `meta`.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.headers.is_none() && self.auth.is_empty()
     }
 }

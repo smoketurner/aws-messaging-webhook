@@ -22,7 +22,7 @@ use mailbox::{ObjectMeta, PutOutcome};
 /// API's bearer key is not needed to use it — stops working quickly. An
 /// operator may shorten it (down to 60 s) for faster revocation or extend
 /// it (up to 3,600 s) for a longer download window.
-pub const DOWNLOAD_URL_TTL: Duration = Duration::from_mins(15);
+pub(crate) const DOWNLOAD_URL_TTL: Duration = Duration::from_mins(15);
 
 pub trait ObjectStore: Send + Sync {
     /// Fetches `key`, rejecting a response over `max_bytes` (the S3 client
@@ -81,7 +81,7 @@ pub trait ObjectStore: Send + Sync {
 /// semicolons and path separators out of the header value entirely. A name
 /// left with nothing usable falls back to `download`.
 #[must_use]
-pub fn attachment_disposition(filename: Option<&str>) -> String {
+pub(crate) fn attachment_disposition(filename: Option<&str>) -> String {
     let cleaned: String = filename
         .unwrap_or_default()
         .chars()

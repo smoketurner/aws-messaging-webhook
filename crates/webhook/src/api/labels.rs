@@ -24,7 +24,7 @@ use mailbox::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wi
 type Labels = OneOrMany<String>;
 
 #[derive(Debug, Deserialize)]
-pub struct UpdateRequest {
+pub(crate) struct UpdateRequest {
     #[serde(default)]
     add_labels: Option<Labels>,
     #[serde(default)]
@@ -98,7 +98,7 @@ pub(crate) fn normalize_labels(
 /// label, or one that would leave the message or its thread over its label
 /// cap; [`ApiError::NotFound`] when the inbox holds no such message; a
 /// store failure otherwise.
-pub async fn update_labels<B: Backend>(
+pub(crate) async fn update_labels<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, MessageId)>,
     ApiJson(request): ApiJson<UpdateRequest>,

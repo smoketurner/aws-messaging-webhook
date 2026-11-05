@@ -13,17 +13,17 @@ use crate::api::error::ApiError;
 /// A route the API contract defines that this service does not implement:
 /// drafts, labels, pods, domains, webhooks, and the inbox-management and
 /// delete routes.
-pub fn not_implemented() -> Ready<ApiError> {
+pub(crate) fn not_implemented() -> Ready<ApiError> {
     ready(ApiError::NotImplemented)
 }
 
 /// Fallback for any unmatched path under `/v0`.
-pub fn unknown_route() -> Ready<ApiError> {
+pub(crate) fn unknown_route() -> Ready<ApiError> {
     ready(ApiError::NotFound)
 }
 
 /// Fallback for a known `/v0` path used with the wrong method.
-pub fn method_not_allowed() -> Ready<ApiError> {
+pub(crate) fn method_not_allowed() -> Ready<ApiError> {
     ready(ApiError::MethodNotAllowed)
 }
 

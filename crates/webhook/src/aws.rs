@@ -1,16 +1,16 @@
 //! Production components wrapping the AWS SDK clients, one per seam. The
-//! SDK error classification they share is `mailbox_store::sdk_error`.
+//! SDK error classification they share is `mailbox_store::FromSdkFailure`.
 
-pub mod api_keys;
-pub mod events_table;
-pub mod objects;
-pub mod publisher;
-pub mod ses;
-pub mod sms;
+pub(crate) mod api_keys;
+pub(crate) mod events_table;
+pub(crate) mod objects;
+pub(crate) mod publisher;
+pub(crate) mod ses;
+pub(crate) mod sms;
 
-use mailbox_store::dynamo_table::DynamoTable;
-use mailbox_store::mailbox::Mailbox;
-use mailbox_store::sdk_error::FromSdkFailure;
+use mailbox_store::DynamoTable;
+use mailbox_store::FromSdkFailure;
+use mailbox_store::Mailbox;
 
 use crate::actions::{ActionError, ActionErrorKind};
 use crate::config::Config;

@@ -13,7 +13,7 @@ use crate::api::error::{ApiError, FieldError};
 use mailbox::labels::SystemLabel;
 use mailbox::thread::ThreadState;
 use mailbox::{MailMessage, ids, time};
-use mailbox_store::store::{DEFAULT_LIMIT, MAX_LIMIT};
+use mailbox_store::{DEFAULT_LIMIT, MAX_LIMIT};
 
 /// The `include_*` flags and the label each one admits. A flag that is absent
 /// or false excludes items carrying its label.
@@ -33,7 +33,7 @@ const INCLUDE_FLAGS: [(&str, &str); 4] = [
 
 /// A parsed, validated list request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListRequest {
+pub(crate) struct ListRequest {
     pub limit: usize,
     /// Oldest first when true; newest first (the default) when false.
     pub ascending: bool,
@@ -48,7 +48,7 @@ pub struct ListRequest {
 /// The post-query filters. The index is time-ordered, so these are applied to
 /// each page as it comes back rather than pushed into the key condition.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Filters {
+pub(crate) struct Filters {
     /// Every one of these labels must be present for an item to match.
     pub labels: Vec<String>,
     /// Any one of these labels excludes an item, from the `include_*` flags.
@@ -75,7 +75,7 @@ impl Filters {
     }
 
     #[must_use]
-    pub fn matches_message(&self, msg: &MailMessage) -> bool {
+    pub(crate) fn matches_message(&self, msg: &MailMessage) -> bool {
         self.labels_match(&msg.labels)
             && any_contains(&self.from, std::slice::from_ref(&msg.from))
             && any_contains(&self.to, &msg.to)
@@ -83,7 +83,7 @@ impl Filters {
     }
 
     #[must_use]
-    pub fn matches_thread(&self, thread: &ThreadState) -> bool {
+    pub(crate) fn matches_thread(&self, thread: &ThreadState) -> bool {
         self.labels_match(&thread.labels)
             && any_contains(&self.from, &thread.senders)
             && any_contains(&self.to, &thread.recipients)
@@ -126,7 +126,7 @@ impl ListRequest {
     /// `after` lands below every id in its millisecond and `before` below
     /// every id in its own, giving a half-open `[after, before)` range.
     #[must_use]
-    pub fn message_bounds(&self) -> (Option<String>, Option<String>) {
+    pub(crate) fn message_bounds(&self) -> (Option<String>, Option<String>) {
         (
             self.before_ms.map(ids::time_prefix),
             self.after_ms.map(ids::time_prefix),
@@ -137,7 +137,7 @@ impl ListRequest {
     /// `<timestamp>#<thread_id>`. A bare timestamp sorts below every key that
     /// extends it, so the same half-open range holds.
     #[must_use]
-    pub fn thread_bounds(&self) -> (Option<String>, Option<String>) {
+    pub(crate) fn thread_bounds(&self) -> (Option<String>, Option<String>) {
         (
             self.before_ms.map(time::format),
             self.after_ms.map(time::format),
@@ -148,7 +148,7 @@ impl ListRequest {
     /// window. A token is only valid for a request with the same shape, since
     /// its start key must fall inside that request's key range.
     #[must_use]
-    pub fn token_scope(&self) -> String {
+    pub(crate) fn token_scope(&self) -> String {
         format!(
             "asc={};before={};after={}",
             self.ascending,
@@ -163,7 +163,7 @@ impl ListRequest {
     ///
     /// [`ApiError::Validation`] listing every offending parameter at once, so
     /// a caller fixing a request sees all of its problems in one response.
-    pub fn parse(query: &str) -> Result<Self, ApiError> {
+    pub(crate) fn parse(query: &str) -> Result<Self, ApiError> {
         let mut errors = Vec::new();
         let mut request = Self {
             limit: DEFAULT_LIMIT,

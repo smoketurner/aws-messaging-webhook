@@ -1,8 +1,8 @@
 //! Domain events parsed from the inner SNS `Message` JSON.
 
-pub mod eum_sms;
+pub(crate) mod eum_sms;
 pub mod ses_inbound;
-pub mod ses_notification;
+pub(crate) mod ses_notification;
 
 use serde::Deserialize as _;
 use serde_json::Value;
@@ -23,7 +23,7 @@ pub enum Source {
 }
 
 impl Source {
-    pub const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::SmsInbound,
         Self::SmsEvents,
         Self::SesEvents,
@@ -31,7 +31,7 @@ impl Source {
     ];
 
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SmsInbound => "sms-inbound",
             Self::SmsEvents => "sms-events",
@@ -43,7 +43,7 @@ impl Source {
     /// Parses the label written by [`Self::as_str`] back into a family;
     /// `None` for `"unknown"` or any unrecognized label.
     #[must_use]
-    pub fn from_label(label: &str) -> Option<Self> {
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
         match label {
             "sms-inbound" => Some(Self::SmsInbound),
             "sms-events" => Some(Self::SmsEvents),
@@ -54,7 +54,7 @@ impl Source {
     }
 
     #[must_use]
-    pub fn webhook_path(self) -> &'static str {
+    pub(crate) fn webhook_path(self) -> &'static str {
         match self {
             Self::SmsInbound => "/webhooks/sms/inbound",
             Self::SmsEvents => "/webhooks/sms/events",
@@ -176,7 +176,7 @@ impl DomainEvent {
     /// Currently only populated for inbound SMS that carries a
     /// `previousPublishedMessageId`.
     #[must_use]
-    pub fn previous_message_id(&self) -> Option<&str> {
+    pub(crate) fn previous_message_id(&self) -> Option<&str> {
         match self {
             Self::SmsInbound { event, .. } => event.previous_published_message_id.as_deref(),
             _ => None,
@@ -187,7 +187,7 @@ impl DomainEvent {
     /// an inbound receipt whose rule used the S3 action. `None` for every
     /// other family and for inbound receipts delivered without an S3 action.
     #[must_use]
-    pub fn s3_pointer(&self) -> Option<(&str, &str)> {
+    pub(crate) fn s3_pointer(&self) -> Option<(&str, &str)> {
         match self {
             Self::SesInbound { event, .. } => event.receipt.s3_pointer(),
             _ => None,
@@ -199,7 +199,7 @@ impl DomainEvent {
     /// verdicts — so consumers can route without pulling the message from S3.
     /// `None` for every other family. Absent sub-fields are omitted, not null.
     #[must_use]
-    pub fn inbound_meta(&self) -> Option<Value> {
+    pub(crate) fn inbound_meta(&self) -> Option<Value> {
         let Self::SesInbound { event, .. } = self else {
             return None;
         };
@@ -213,7 +213,7 @@ impl DomainEvent {
 
     /// The event payload as forwarded to EventBridge.
     #[must_use]
-    pub fn payload(&self) -> &Value {
+    pub(crate) fn payload(&self) -> &Value {
         match self {
             Self::SmsInbound { raw, .. }
             | Self::SmsDelivery { raw, .. }

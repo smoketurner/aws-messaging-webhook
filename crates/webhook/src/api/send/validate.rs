@@ -57,12 +57,12 @@ const CONTENT_TYPE_MAX_BYTES: usize = 127;
 
 /// One address, or several. The contract allows both spellings everywhere a
 /// list of addresses appears.
-pub type Addresses = OneOrMany<String>;
+pub(crate) type Addresses = OneOrMany<String>;
 
 /// An attachment as the request gives it: bytes inline, or a URL for the
 /// sender to fetch.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AttachmentInput {
+pub(crate) struct AttachmentInput {
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -79,7 +79,7 @@ pub struct AttachmentInput {
 
 /// `POST …/messages/send`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct SendRequest {
+pub(crate) struct SendRequest {
     #[serde(default)]
     pub to: Option<Addresses>,
     #[serde(default)]
@@ -107,7 +107,7 @@ pub struct SendRequest {
 /// The same body as a send, plus `reply_all`. Anything the caller leaves out
 /// is derived from the message being replied to.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ReplyRequest {
+pub(crate) struct ReplyRequest {
     #[serde(flatten)]
     pub send: SendRequest,
     /// Copy the original's other recipients as well as its sender.
@@ -118,14 +118,14 @@ pub struct ReplyRequest {
 /// One attachment that passed validation. Inline bytes are already decoded;
 /// a URL has already been vetted for shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttachmentSource {
+pub(crate) enum AttachmentSource {
     Inline(Vec<u8>),
     Url(AttachmentUrl),
 }
 
 /// A validated attachment, before it is given an id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedAttachment {
+pub(crate) struct ValidatedAttachment {
     pub source: AttachmentSource,
     pub filename: Option<String>,
     pub content_type: String,
@@ -135,7 +135,7 @@ pub struct ValidatedAttachment {
 
 /// A send request that has passed every rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedSend {
+pub(crate) struct ValidatedSend {
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
@@ -156,7 +156,7 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 /// # Errors
 ///
 /// [`ApiError::Validation`] listing every offending field.
-pub fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> {
+pub(crate) fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> {
     let mut errors = Vec::new();
 
     let to = addresses(request.to, "to", &mut errors);

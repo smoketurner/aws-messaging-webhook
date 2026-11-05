@@ -31,7 +31,7 @@ use crate::state::{AppState, Backend};
 /// [`ApiError::Unavailable`] when the key cache has never loaded and the
 /// parameter store cannot be read, so the key can be neither confirmed nor
 /// denied.
-pub async fn require_bearer<B: Backend>(
+pub(crate) async fn require_bearer<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     mut request: Request,
     next: Next,

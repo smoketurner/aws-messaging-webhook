@@ -43,7 +43,7 @@ pub const THREAD_USER_LABEL_CAP: usize = 20;
 pub const LABEL_MAX_BYTES: usize = 64;
 pub const SUBJECT_MAX_BYTES: usize = 2_000;
 pub const ADDRESS_MAX_BYTES: usize = 320;
-pub const INBOUND_ADDRESS_LIST_MAX: usize = 100;
+pub(crate) const INBOUND_ADDRESS_LIST_MAX: usize = 100;
 pub const OUTBOUND_RECIPIENTS_MAX: usize = 50;
 pub const REFERENCES_MAX: usize = 50;
 /// Per-entry byte cap for each stored `References`/`In-Reply-To` id,
@@ -64,7 +64,7 @@ pub const PREVIEW_CHARS: usize = 256;
 pub const MAX_INBOUND_RAW_BYTES: u64 = 45_000_000;
 pub const MAX_OUTBOUND_DECODED_BYTES: u64 = 28_000_000;
 pub const MAX_OUTBOUND_RAW_BYTES: u64 = 39_500_000;
-pub const THREAD_ATTACHMENT_SUMMARIES: usize = 20;
+pub(crate) const THREAD_ATTACHMENT_SUMMARIES: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Core storage types

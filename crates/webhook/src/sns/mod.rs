@@ -1,8 +1,8 @@
 //! The per-message state machine: confirmations, auto-re-subscribe, and the
 //! persist → actions → publish notification pipeline.
 
-pub mod confirm;
-pub mod extractor;
+pub(crate) mod confirm;
+pub(crate) mod extractor;
 
 use anyhow::{Context as _, anyhow};
 use axum::http::StatusCode;
@@ -26,7 +26,7 @@ use crate::store::{EventRecord, PersistOutcome};
 /// family an event actually belongs to comes from [`DomainEvent::classify`];
 /// the HTTP expectation is only checked to surface mis-wired topics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ingress {
+pub(crate) enum Ingress {
     Http(Source),
     Direct,
 }
@@ -47,7 +47,7 @@ impl Ingress {
 ///
 /// Returns [`AppError`] per the response policy: 4xx for rejected messages,
 /// 5xx to recruit SNS redelivery for transient downstream failures.
-pub async fn handle_sns<B: Backend>(
+pub(crate) async fn handle_sns<B: Backend>(
     state: &AppState<B>,
     ingress: Ingress,
     verified: VerifiedSns,

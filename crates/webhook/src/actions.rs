@@ -13,7 +13,7 @@ use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
 use mailbox::SesMessageId;
-use mailbox_store::store::MailStoreError;
+use mailbox_store::MailStoreError;
 
 /// How an action failure affects the request, per the SNS retry contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +188,7 @@ const START_KEYWORDS: [&str; 3] = ["START", "UNSTOP", "YES"];
 
 /// What an inbound SMS keyword asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeywordIntent {
+pub(crate) enum KeywordIntent {
     OptOut,
     OptIn,
     None,
@@ -198,7 +198,7 @@ pub enum KeywordIntent {
 /// exact-match message body. No auto-replies here — responses are downstream
 /// business logic.
 #[must_use]
-pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordIntent {
+pub(crate) fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordIntent {
     let normalized = keyword
         .or(body)
         .map(str::trim)
@@ -302,7 +302,7 @@ async fn suppress_recipients<B: Backend>(
 
 /// The lifecycle action an event led to, reported on the outcome log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionTaken {
+pub(crate) enum ActionTaken {
     NoAction,
     OptOut,
     OptIn,
@@ -317,7 +317,7 @@ pub enum ActionTaken {
 impl ActionTaken {
     /// The log form.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NoAction => "none",
             Self::OptOut => "opt_out",
@@ -337,7 +337,7 @@ impl ActionTaken {
 ///
 /// Propagates [`ActionError`] from the underlying API call; the caller maps
 /// `Transient` to a 5xx and logs-and-continues on `Permanent`.
-pub async fn run<B: Backend>(
+pub(crate) async fn run<B: Backend>(
     state: &AppState<B>,
     event: &DomainEvent,
     // Threaded through for inbound-ingest time-boxing; only the

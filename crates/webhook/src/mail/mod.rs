@@ -2,7 +2,7 @@
 //! relay's mail events, attachment fetching, and the mail bucket.
 
 pub mod content;
-pub mod events;
+pub(crate) mod events;
 pub mod fetch;
 pub mod ingest;
 pub mod object_keys;

@@ -587,7 +587,7 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
             .await
             .unwrap();
     }
-    h.mail.inject(mailbox_store::memory::Injected::Transient);
+    h.mail.inject(mailbox_store::Injected::Transient);
 
     let report = sweep(&h.state).await.unwrap();
 

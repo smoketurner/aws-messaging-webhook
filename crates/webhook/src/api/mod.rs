@@ -10,15 +10,15 @@
 //! `/v0` paths answer the contract's `404`. Paths outside `/v0` keep axum's
 //! default `404`.
 
-pub mod auth;
-pub mod error;
-pub mod json;
+pub(crate) mod auth;
+pub(crate) mod error;
+pub(crate) mod json;
 pub mod keys;
-pub mod labels;
-pub mod pagination;
-pub mod read;
-pub mod send;
-pub mod unimplemented;
+pub(crate) mod labels;
+pub(crate) mod pagination;
+pub(crate) mod read;
+pub(crate) mod send;
+pub(crate) mod unimplemented;
 
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ const SEND_BODY_BYTES: usize = 6 * 1024 * 1024;
 /// The `/v0` router, ready to nest. Auth wraps every route including the
 /// fallbacks, so an unauthenticated caller learns nothing about which paths
 /// exist.
-pub fn router<B: Backend>(state: Arc<AppState<B>>) -> Router {
+pub(crate) fn router<B: Backend>(state: Arc<AppState<B>>) -> Router {
     Router::new()
         // Reads.
         .route("/inboxes", get(read::list_inboxes::<B>))

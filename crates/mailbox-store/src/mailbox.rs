@@ -26,7 +26,7 @@ use mailbox::{
 
 /// How many times a cancelled transaction is replanned before the caller is
 /// told the write conflicted.
-pub const MAX_TXN_RETRIES: u32 = 3;
+pub(crate) const MAX_TXN_RETRIES: u32 = 3;
 
 /// The mailbox over one mail table.
 pub struct Mailbox<T> {

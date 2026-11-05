@@ -16,7 +16,7 @@ use crate::error::AppError;
 ///
 /// Returns [`AppError::SubscribeUrlRejected`] for any URL that is not
 /// `https://sns.<region>.amazonaws.com(.cn)` on port 443.
-pub fn validate_subscribe_url(
+pub(crate) fn validate_subscribe_url(
     raw: &str,
     dangerous_allow_prefix: Option<&str>,
 ) -> Result<Url, AppError> {
@@ -31,7 +31,7 @@ pub fn validate_subscribe_url(
 ///
 /// Returns [`AppError::Internal`] (a 5xx, so SNS redelivers the confirmation)
 /// if the request fails or SNS answers with an error status.
-pub async fn get_subscribe_url(http: &reqwest::Client, url: Url) -> Result<(), AppError> {
+pub(crate) async fn get_subscribe_url(http: &reqwest::Client, url: Url) -> Result<(), AppError> {
     let response = http
         .get(url)
         .send()

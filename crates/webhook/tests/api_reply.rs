@@ -10,7 +10,7 @@ use mailbox::content::MessageContent;
 use mailbox::mime::parse_inbound;
 use mailbox::send::SendSpec;
 use mailbox::{Direction, InboxId, MailMessage, ids, time};
-use mailbox_store::memory::sample_message;
+use mailbox_store::sample_message;
 use serde_json::{Value, json};
 use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, api_harness};
 

@@ -27,7 +27,7 @@ use mailbox::{MailMessage, ids, labels, time, wire};
 
 /// One outbound mailbox event, before publishing.
 #[derive(Debug, Clone)]
-pub struct MailEvent {
+pub(crate) struct MailEvent {
     pub detail_type: &'static str,
     pub detail: Value,
 }
@@ -91,7 +91,7 @@ fn received_event_type(labels: &[String]) -> &'static str {
 /// message's labels. `None` for any other INSERT (e.g. a `queued` outbound
 /// message), whose lifecycle publishes from [`build_sent_event`] instead.
 #[must_use]
-pub fn build_received_event(
+pub(crate) fn build_received_event(
     msg: &MailMessage,
     content: &MessageContent,
     event_source: &str,
@@ -142,7 +142,7 @@ pub fn build_received_event(
 /// `old_labels`. Any other write — a delivery label, a read receipt, a
 /// user's own label — builds nothing.
 #[must_use]
-pub fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Option<MailEvent> {
+pub(crate) fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Option<MailEvent> {
     if !labels::has(&msg.labels, SystemLabel::Sent) || labels::has(old_labels, SystemLabel::Sent) {
         return None;
     }
@@ -184,7 +184,7 @@ pub fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Option<Mail
 /// event type with no mailbox event, or one missing the object it is named
 /// for.
 #[must_use]
-pub fn build_ses_event(
+pub(crate) fn build_ses_event(
     ses: &SesNotification,
     msg: &MailMessage,
     sns_message_id: &str,

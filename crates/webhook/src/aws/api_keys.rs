@@ -17,7 +17,7 @@ pub struct SsmKeys {
 
 impl SsmKeys {
     #[must_use]
-    pub fn new(client: aws_sdk_ssm::Client, parameter: Option<String>) -> Self {
+    pub(crate) fn new(client: aws_sdk_ssm::Client, parameter: Option<String>) -> Self {
         Self { client, parameter }
     }
 }

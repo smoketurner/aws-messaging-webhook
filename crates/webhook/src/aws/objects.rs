@@ -96,7 +96,7 @@ pub struct S3Objects {
 
 impl S3Objects {
     #[must_use]
-    pub fn new(client: aws_sdk_s3::Client, bucket: Option<String>) -> Self {
+    pub(crate) fn new(client: aws_sdk_s3::Client, bucket: Option<String>) -> Self {
         Self { client, bucket }
     }
 

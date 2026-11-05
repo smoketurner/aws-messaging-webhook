@@ -18,7 +18,7 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 /// `TransactionConflictException`, minus `LimitExceededException`, which
 /// SES and others also use for account quotas a retry cannot clear — that
 /// must stay permanent rather than become a retry storm.
-pub const TRANSIENT_ERROR_CODES: [&str; 15] = [
+pub(crate) const TRANSIENT_ERROR_CODES: [&str; 15] = [
     "Throttling",
     "ThrottlingException",
     "ThrottledException",
@@ -40,7 +40,7 @@ pub const TRANSIENT_ERROR_CODES: [&str; 15] = [
 /// the mail store and the binary's actions and object store: network faults, timeouts,
 /// 5xx/429 responses, and any [`TRANSIENT_ERROR_CODES`] code are transient
 /// (worth a retry); everything else is permanent.
-pub fn sdk_error_is_transient<E>(error: &SdkError<E>) -> bool
+pub(crate) fn sdk_error_is_transient<E>(error: &SdkError<E>) -> bool
 where
     E: ProvideErrorMetadata,
 {

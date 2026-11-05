@@ -37,7 +37,7 @@ pub enum TxnDecision {
 /// errors — `TransactionInProgressException` etc. — are handled by the
 /// caller before this, since they carry no per-item reasons).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancellationReason {
+pub(crate) enum CancellationReason {
     None,
     ConditionalCheckFailed,
     TransactionConflict,
@@ -107,7 +107,10 @@ fn is_version_or_status_conditioned(op: &WriteOp) -> bool {
 /// precedence documented above. `ops` and `reasons` are parallel: one
 /// cancellation reason per planned transaction item.
 #[must_use]
-pub fn decode_cancellation(ops: &[PlannedOp], reasons: &[CancellationReason]) -> TxnDecision {
+pub(crate) fn decode_cancellation(
+    ops: &[PlannedOp],
+    reasons: &[CancellationReason],
+) -> TxnDecision {
     debug_assert_eq!(ops.len(), reasons.len(), "ops and reasons must be parallel");
 
     // Step 1: the idempotency key lost its check. Only an enqueue plans one,
@@ -181,7 +184,7 @@ fn taken_aliases(ops: &[PlannedOp], reasons: &[CancellationReason]) -> Vec<Strin
 }
 
 /// Removes the alias writes for keys an earlier message already holds.
-pub fn drop_taken_aliases(ops: &mut Vec<PlannedOp>, taken: &[String]) {
+pub(crate) fn drop_taken_aliases(ops: &mut Vec<PlannedOp>, taken: &[String]) {
     ops.retain(|op| match &op.op {
         WriteOp::AliasFirstWriter { pk, .. } => !taken.contains(pk),
         WriteOp::Put { .. } | WriteOp::Update { .. } => true,

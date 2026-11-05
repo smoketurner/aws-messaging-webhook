@@ -18,34 +18,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use metrics_cloudwatch_embedded::Collector;
 
 /// Metric names — constants so callers and dashboards stay in sync.
-pub mod names {
-    pub const MESSAGES_RECEIVED: &str = "MessagesReceived";
-    pub const SIGNATURE_REJECTIONS: &str = "SignatureRejections";
-    pub const ALLOWLIST_REJECTIONS: &str = "AllowlistRejections";
-    pub const UNCLASSIFIED_PAYLOADS: &str = "UnclassifiedPayloads";
-    pub const DUPLICATES: &str = "Duplicates";
+pub(crate) mod names {
+    pub(crate) const MESSAGES_RECEIVED: &str = "MessagesReceived";
+    pub(crate) const SIGNATURE_REJECTIONS: &str = "SignatureRejections";
+    pub(crate) const ALLOWLIST_REJECTIONS: &str = "AllowlistRejections";
+    pub(crate) const UNCLASSIFIED_PAYLOADS: &str = "UnclassifiedPayloads";
+    pub(crate) const DUPLICATES: &str = "Duplicates";
     /// Stale out-of-order `current_status` transitions suppressed by the
     /// precedence guard (see `aws::status_transition`): the raw event was
     /// durable but the status did not regress.
-    pub const STATUS_TRANSITIONS_SUPPRESSED: &str = "StatusTransitionsSuppressed";
-    pub const EVENTS_PUBLISHED: &str = "EventsPublished";
-    pub const PUBLISH_FAILURES: &str = "PublishFailures";
-    pub const INTERNAL_ERRORS: &str = "InternalErrors";
-    pub const ACTION_FAILURES: &str = "ActionFailures";
-    pub const RESUBSCRIBES: &str = "Resubscribes";
-    pub const SUBSCRIPTIONS_LOST: &str = "SubscriptionsLost";
-    pub const COLD_START: &str = "ColdStart";
-    pub const LATENCY: &str = "Latency";
+    pub(crate) const STATUS_TRANSITIONS_SUPPRESSED: &str = "StatusTransitionsSuppressed";
+    pub(crate) const EVENTS_PUBLISHED: &str = "EventsPublished";
+    pub(crate) const PUBLISH_FAILURES: &str = "PublishFailures";
+    pub(crate) const INTERNAL_ERRORS: &str = "InternalErrors";
+    pub(crate) const ACTION_FAILURES: &str = "ActionFailures";
+    pub(crate) const RESUBSCRIBES: &str = "Resubscribes";
+    pub(crate) const SUBSCRIPTIONS_LOST: &str = "SubscriptionsLost";
+    pub(crate) const COLD_START: &str = "ColdStart";
+    pub(crate) const LATENCY: &str = "Latency";
 
     // Mail inbox.
-    pub const MESSAGES_INGESTED: &str = "MessagesIngested";
-    pub const INGEST_FAILURES: &str = "IngestFailures";
-    pub const INGEST_SKIPPED: &str = "IngestSkipped";
-    pub const INGEST_TIMEOUTS: &str = "IngestTimeouts";
-    pub const API_AUTH_FAILURES: &str = "ApiAuthFailures";
-    pub const MESSAGES_SENT: &str = "MessagesSent";
-    pub const SEND_FAILURES: &str = "SendFailures";
-    pub const SEND_OUTCOME_UNKNOWN: &str = "SendOutcomeUnknown";
+    pub(crate) const MESSAGES_INGESTED: &str = "MessagesIngested";
+    pub(crate) const INGEST_FAILURES: &str = "IngestFailures";
+    pub(crate) const INGEST_SKIPPED: &str = "IngestSkipped";
+    pub(crate) const INGEST_TIMEOUTS: &str = "IngestTimeouts";
+    pub(crate) const API_AUTH_FAILURES: &str = "ApiAuthFailures";
+    pub(crate) const MESSAGES_SENT: &str = "MessagesSent";
+    pub(crate) const SEND_FAILURES: &str = "SendFailures";
+    pub(crate) const SEND_OUTCOME_UNKNOWN: &str = "SendOutcomeUnknown";
 }
 
 /// Initialize the EMF collector. Returns a `&'static Collector` handle which
@@ -86,7 +86,11 @@ pub fn init(namespace: String) -> Result<&'static Collector, metrics_cloudwatch_
 /// [`Collector::write_single`], separate from the per-invocation
 /// [`Collector::flush`], mirroring the layout the library's own
 /// `MetricsService` produces.
-pub fn emit_cold_start(emitted: &AtomicBool, collector: &Collector, writer: impl std::io::Write) {
+pub(crate) fn emit_cold_start(
+    emitted: &AtomicBool,
+    collector: &Collector,
+    writer: impl std::io::Write,
+) {
     if emitted
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()

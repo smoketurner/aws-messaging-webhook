@@ -51,7 +51,7 @@ pub enum MailIndex {
 
 impl MailIndex {
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::ByTime => "ByTime",
             Self::ByThread => "ByThread",
@@ -61,7 +61,7 @@ impl MailIndex {
 
     /// The index's partition and sort key attribute names.
     #[must_use]
-    pub fn key_attributes(self) -> (&'static str, &'static str) {
+    pub(crate) fn key_attributes(self) -> (&'static str, &'static str) {
         match self {
             Self::ByTime => ("gsi1pk", "gsi1sk"),
             Self::ByThread => ("gsi2pk", "gsi2sk"),
@@ -95,7 +95,7 @@ pub struct PageQuery<'a> {
 impl<'a> PageQuery<'a> {
     /// A whole partition, oldest first, from `start`.
     #[must_use]
-    pub fn unbounded(
+    pub(crate) fn unbounded(
         index: MailIndex,
         partition: &'a str,
         limit: usize,
@@ -116,7 +116,7 @@ impl<'a> PageQuery<'a> {
 
     /// The inbox-scoped case: a [`ListQuery`] aimed at `partition`.
     #[must_use]
-    pub fn scoped(
+    pub(crate) fn scoped(
         index: MailIndex,
         partition: &'a str,
         query: &'a ListQuery,
