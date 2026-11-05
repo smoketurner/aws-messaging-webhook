@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 description = "The mail table: keys, transaction planning, the Table seam and the Mailbox over it"
 publish = false
+readme = "README.md"
 
 [features]
 memory = []
