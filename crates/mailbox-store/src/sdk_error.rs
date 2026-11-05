@@ -18,7 +18,7 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 /// `TransactionConflictException`, minus `LimitExceededException`, which
 /// SES and others also use for account quotas a retry cannot clear — that
 /// must stay permanent rather than become a retry storm.
-pub const TRANSIENT_ERROR_CODES: [&str; 15] = [
+pub(crate) const TRANSIENT_ERROR_CODES: [&str; 15] = [
     "Throttling",
     "ThrottlingException",
     "ThrottledException",
@@ -40,7 +40,7 @@ pub const TRANSIENT_ERROR_CODES: [&str; 15] = [
 /// the mail store and the binary's actions and object store: network faults, timeouts,
 /// 5xx/429 responses, and any [`TRANSIENT_ERROR_CODES`] code are transient
 /// (worth a retry); everything else is permanent.
-pub fn sdk_error_is_transient<E>(error: &SdkError<E>) -> bool
+pub(crate) fn sdk_error_is_transient<E>(error: &SdkError<E>) -> bool
 where
     E: ProvideErrorMetadata,
 {
@@ -227,5 +227,25 @@ mod tests {
         assert!(sdk_error_is_transient(&unhandled_get_item_error(500)));
         assert!(sdk_error_is_transient(&unhandled_get_item_error(503)));
         assert!(sdk_error_is_transient(&unhandled_get_item_error(429)));
+    }
+
+    /// A request that never got a service answer (timed out, could not be
+    /// dispatched, or came back unparseable) is worth retrying; one the SDK
+    /// could not even build is not.
+    #[test]
+    fn failures_without_a_service_answer_are_transient_but_construction_is_not() {
+        let timeout: SdkError<GetItemError> = SdkError::timeout_error("timed out");
+        assert!(sdk_error_is_transient(&timeout));
+        let dispatch: SdkError<GetItemError> = SdkError::dispatch_failure(
+            aws_sdk_dynamodb::error::ConnectorError::io("connection refused".into()),
+        );
+        assert!(sdk_error_is_transient(&dispatch));
+        let response: SdkError<GetItemError> = SdkError::response_error(
+            "truncated body",
+            HttpResponse::new(200.try_into().unwrap(), SdkBody::empty()),
+        );
+        assert!(sdk_error_is_transient(&response));
+        let construction: SdkError<GetItemError> = SdkError::construction_failure("bad input");
+        assert!(!sdk_error_is_transient(&construction));
     }
 }

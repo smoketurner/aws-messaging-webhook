@@ -11,7 +11,7 @@ use crate::state::{AppState, Backend};
 /// verification. Both ingress paths — this extractor on the HTTP routes and
 /// `entry::dispatch` on direct SNS → Lambda invokes — construct it only via
 /// [`VerifiedSns::verify`], so no handler can see an unverified message.
-pub struct VerifiedSns {
+pub(crate) struct VerifiedSns {
     pub envelope: SnsEnvelope,
     /// The envelope bytes that get persisted: the exact HTTP body on the
     /// webhook path; on the direct-invoke path, the `Sns` record re-serialized

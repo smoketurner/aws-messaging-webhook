@@ -13,7 +13,7 @@ use crate::store::EventRecord;
 /// Schema version stamped on every EventBridge detail this service emits, so
 /// downstream consumers have a stable field to switch on as the contract
 /// evolves. Bump only on a breaking change to the emitted detail shape.
-pub const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// `PutEvents` caps an entry at 256 KB; leave headroom for the envelope.
 const MAX_DETAIL_BYTES: usize = 250_000;
@@ -77,7 +77,7 @@ pub(crate) fn detail_bytes(detail: &Value) -> usize {
 /// from `Config::event_source`). It counts toward the same 256 KiB entry cap
 /// as `Detail` and `DetailType`, so Step 3 reserves it as envelope headroom.
 #[must_use]
-pub fn build_outbound(
+pub(crate) fn build_outbound(
     record: &EventRecord,
     event: &DomainEvent,
     event_source: &str,

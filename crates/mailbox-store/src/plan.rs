@@ -24,7 +24,7 @@ use mailbox::{
 /// [`crate::txn::decode_cancellation`] to interpret a cancellation
 /// reason without re-deriving it from the op's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpRole {
+pub(crate) enum OpRole {
     IdempotencyKey,
     Message,
     SendState,
@@ -36,13 +36,13 @@ pub enum OpRole {
 /// One equality check on an existing item's attribute, rendered into a
 /// `ConditionExpression` clause by the op's executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Check {
+pub(crate) enum Check {
     Eq(&'static str, AttributeValue),
 }
 
 /// A write's condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Cond {
+pub(crate) enum Cond {
     None,
     NotExists,
     VersionEquals(u64),
@@ -55,7 +55,7 @@ pub enum Cond {
 
 /// One write in a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WriteOp {
+pub(crate) enum WriteOp {
     Put {
         item: serde_dynamo::Item,
         cond: Cond,
@@ -85,10 +85,12 @@ pub enum WriteOp {
     },
 }
 
+/// One write of a planned transaction, opaque outside this crate: a
+/// [`crate::Table`] implementation passes these through to the store it wraps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedOp {
-    pub role: OpRole,
-    pub op: WriteOp,
+    pub(crate) role: OpRole,
+    pub(crate) op: WriteOp,
 }
 
 /// An item type the mail table stores whole: where it lives and the index
@@ -257,7 +259,7 @@ impl Keyed for SesRefItem<'_> {
 
 /// Aliases skip ids over this many bytes, keeping the alias pk under
 /// DynamoDB's key-length limit with headroom for the `RFC#<inbox>#` prefix.
-pub const ALIAS_ID_MAX_BYTES: usize = 900;
+pub(crate) const ALIAS_ID_MAX_BYTES: usize = 900;
 
 /// One transaction's writes, in the order they are added.
 #[derive(Default)]
@@ -380,7 +382,7 @@ impl Txn {
 /// # Errors
 ///
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
-pub fn inbox_item(
+pub(crate) fn inbox_item(
     inbox: &InboxId,
     now: &str,
 ) -> Result<(Inbox, serde_dynamo::Item), MailStoreError> {
@@ -428,7 +430,7 @@ fn stored_message(msg: &MailMessage, thread_after: &ThreadState) -> MailMessage 
 /// # Errors
 ///
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
-pub fn plan_insert(
+pub(crate) fn plan_insert(
     msg: &MailMessage,
     thread_before: Option<&ThreadState>,
     thread_after: &ThreadState,
@@ -471,7 +473,7 @@ pub fn plan_insert(
 ///
 /// [`MailStoreError::LabelLimit`] when the message or its thread would carry
 /// more user labels than their caps.
-pub fn plan_enqueue(
+pub(crate) fn plan_enqueue(
     msg: &MailMessage,
     state: &SendState,
     key: Option<&SendKey>,
@@ -507,7 +509,7 @@ pub fn plan_enqueue(
 /// # Errors
 ///
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
-pub fn plan_state_cas(
+pub(crate) fn plan_state_cas(
     before: &SendState,
     after: &SendState,
     expected: SendStatus,
@@ -538,7 +540,7 @@ pub fn plan_state_cas(
 /// # Errors
 ///
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
-pub fn plan_mark(
+pub(crate) fn plan_mark(
     state_before: &SendState,
     state_after: &SendState,
     msg: &MailMessage,
@@ -611,7 +613,7 @@ pub fn plan_mark(
 ///
 /// [`MailStoreError::LabelLimit`] when the message or its thread would carry
 /// more user labels than their caps.
-pub fn plan_patch(
+pub(crate) fn plan_patch(
     msg: &MailMessage,
     new_labels: &[String],
     thread_before: &ThreadState,
@@ -1093,5 +1095,18 @@ mod tests {
             let ops = plan_insert(&msg, Some(&before), &after, &AliasLookup::default()).unwrap();
             prop_assert_eq!(ops.len(), 3);
         }
+    }
+
+    /// The planners' debug assertion: label sets are strictly ascending, so a
+    /// duplicate or an out-of-order pair is refused.
+    #[test]
+    fn only_strictly_ascending_labels_are_sorted_and_deduped() {
+        let labels = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+        assert!(is_sorted_and_deduped(&[]));
+        assert!(is_sorted_and_deduped(&labels(&["a", "b", "c"])));
+        assert!(!is_sorted_and_deduped(&labels(&["a", "a"])));
+        assert!(!is_sorted_and_deduped(&labels(&["b", "a"])));
     }
 }

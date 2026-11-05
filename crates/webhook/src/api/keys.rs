@@ -83,11 +83,11 @@ pub enum ApiKeyError {
 /// The id of the key a request authenticated with, attached as a request
 /// extension. Ids are operator-facing labels, not secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyId(pub String);
+pub(crate) struct KeyId(pub(crate) String);
 
 /// The outcome of checking a presented key.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub(crate) enum Verdict {
     /// Matched the key with this id.
     Allowed(KeyId),
     /// No configured key matched.
@@ -123,7 +123,7 @@ impl KeyCache {
 
     /// Checks `presented` against the configured keys, refreshing the cache
     /// when it is stale, never loaded, or (rate-limited) on a miss.
-    pub async fn verify<S: ApiKeySource>(&self, source: &S, presented: &str) -> Verdict {
+    pub(crate) async fn verify<S: ApiKeySource>(&self, source: &S, presented: &str) -> Verdict {
         let digest = Sha256::digest(presented.as_bytes());
 
         let (mut hashes, stale) = self.snapshot();

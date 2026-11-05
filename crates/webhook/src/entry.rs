@@ -59,13 +59,13 @@ static COLD_START_EMITTED: AtomicBool = AtomicBool::new(false);
 /// values reach [`VerifiedSns::verify`] verbatim.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct SnsEvent {
+pub(crate) struct SnsEvent {
     pub records: Vec<SnsRecord>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct SnsRecord {
+pub(crate) struct SnsRecord {
     pub sns: Value,
 }
 

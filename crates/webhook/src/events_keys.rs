@@ -2,29 +2,29 @@
 //! holding its event items (`EVT#…`) and its rolled-up aggregate (`AGG`).
 
 /// The aggregate item's `sk`.
-pub const AGGREGATE_SK: &str = "AGG";
+pub(crate) const AGGREGATE_SK: &str = "AGG";
 
 /// The prefix of an event item's `sk`.
-pub const EVENT_SK_PREFIX: &str = "EVT#";
+pub(crate) const EVENT_SK_PREFIX: &str = "EVT#";
 
 const PARTITION_PREFIX: &str = "MSG#";
 
 /// The partition holding every item for `aggregate_id`.
 #[must_use]
-pub fn partition(aggregate_id: &str) -> String {
+pub(crate) fn partition(aggregate_id: &str) -> String {
     format!("{PARTITION_PREFIX}{aggregate_id}")
 }
 
 /// The aggregate id a partition `pk` names; `None` for any other `pk`.
 #[must_use]
-pub fn parse_partition(pk: &str) -> Option<&str> {
+pub(crate) fn parse_partition(pk: &str) -> Option<&str> {
     pk.strip_prefix(PARTITION_PREFIX)
 }
 
 /// An event item's `sk`: ordered by event time, made unique by the SNS
 /// message id.
 #[must_use]
-pub fn event_sk(event_timestamp: &str, sns_message_id: &str) -> String {
+pub(crate) fn event_sk(event_timestamp: &str, sns_message_id: &str) -> String {
     format!("{EVENT_SK_PREFIX}{event_timestamp}#{sns_message_id}")
 }
 

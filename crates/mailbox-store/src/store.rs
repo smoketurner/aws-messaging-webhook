@@ -66,7 +66,7 @@ pub enum EnqueueOutcome {
 /// Both fields are optional so a row missing either resolves to nothing
 /// rather than failing the read.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct SesRef {
+pub(crate) struct SesRef {
     pub inbox_id: Option<InboxId>,
     pub message_id: Option<MessageId>,
 }
@@ -74,7 +74,7 @@ pub struct SesRef {
 impl SesRef {
     /// The inbox and message the row names, when it names both.
     #[must_use]
-    pub fn into_parts(self) -> Option<(InboxId, MessageId)> {
+    pub(crate) fn into_parts(self) -> Option<(InboxId, MessageId)> {
         Some((self.inbox_id?, self.message_id?))
     }
 }

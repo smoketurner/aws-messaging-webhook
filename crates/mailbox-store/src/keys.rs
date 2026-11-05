@@ -70,7 +70,7 @@ pub fn thread(inbox: &InboxId, thread_id: &(impl AsRef<str> + ?Sized)) -> TableK
 /// The send-state item's key: a message's send state lives outside its
 /// inbox partition so the sender never needs the inbox id to find it.
 #[must_use]
-pub fn send_state(message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
+pub(crate) fn send_state(message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
     let message_id = message_id.as_ref();
     TableKey {
         pk: format!("{OUTBOX_PK_PREFIX}{message_id}"),
@@ -87,7 +87,7 @@ pub fn parse_outbox_pk(pk: &str) -> Option<&str> {
 /// The RFC alias item's key: `rfc_id` is the `Message-ID` value with the
 /// surrounding `<`/`>` stripped.
 #[must_use]
-pub fn rfc_alias(inbox: &InboxId, rfc_id: &str) -> TableKey {
+pub(crate) fn rfc_alias(inbox: &InboxId, rfc_id: &str) -> TableKey {
     TableKey {
         pk: format!("RFC#{}#{rfc_id}", inbox.as_str()),
         sk: RFC_ALIAS_SK.to_owned(),
@@ -96,7 +96,7 @@ pub fn rfc_alias(inbox: &InboxId, rfc_id: &str) -> TableKey {
 
 /// The item mapping an SES message id back to the message it sent.
 #[must_use]
-pub fn ses_ref(ses_message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
+pub(crate) fn ses_ref(ses_message_id: &(impl AsRef<str> + ?Sized)) -> TableKey {
     let ses_message_id = ses_message_id.as_ref();
     TableKey {
         pk: format!("SESMSG#{ses_message_id}"),
@@ -113,7 +113,7 @@ pub fn send_key_pk(key_hash: &str) -> String {
 
 /// The `Idempotency-Key` item's key.
 #[must_use]
-pub fn send_key(key_hash: &str) -> TableKey {
+pub(crate) fn send_key(key_hash: &str) -> TableKey {
     TableKey {
         pk: send_key_pk(key_hash),
         sk: SEND_KEY_SK.to_owned(),
@@ -154,7 +154,7 @@ pub fn thread_time_sort(timestamp: &str, thread_id: &(impl AsRef<str> + ?Sized))
 
 /// The `ByStatus` partition listing the sends in `status`.
 #[must_use]
-pub fn send_status_partition(status: SendStatus) -> String {
+pub(crate) fn send_status_partition(status: SendStatus) -> String {
     format!("SENDSTATUS#{}", status.as_str())
 }
 

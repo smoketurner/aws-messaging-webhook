@@ -22,7 +22,7 @@ pub struct SesClient {
 
 impl SesClient {
     #[must_use]
-    pub fn new(client: aws_sdk_sesv2::Client) -> Self {
+    pub(crate) fn new(client: aws_sdk_sesv2::Client) -> Self {
         Self { client }
     }
 }
@@ -117,7 +117,7 @@ impl SesApi for SesClient {
 }
 
 /// How long one `SendEmail` call may take before its outcome is unknown.
-pub const SES_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const SES_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Turns one `SendEmail` result into a [`SendOutcome`].
 ///

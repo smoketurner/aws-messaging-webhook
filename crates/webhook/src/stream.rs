@@ -53,8 +53,8 @@ use crate::store::EventRecord;
 use mailbox::MailMessage;
 use mailbox::SesMessageId;
 use mailbox::labels::SystemLabel;
+use mailbox_store::MailStoreError;
 use mailbox_store::keys;
-use mailbox_store::store::MailStoreError;
 
 /// Reads a DynamoDB `String` attribute from a stream image.
 pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
@@ -152,7 +152,7 @@ fn insert_opt(target: &mut Value, key: &str, value: Option<impl Into<Value>>) {
 /// Returns an error only if the payload is not a well-formed DynamoDB stream
 /// event; per-record faults are handled via the returned failure list or
 /// skipped.
-pub async fn handle_stream<B: Backend>(
+pub(crate) async fn handle_stream<B: Backend>(
     state: &AppState<B>,
     payload: Value,
 ) -> Result<Value, lambda_http::Error> {

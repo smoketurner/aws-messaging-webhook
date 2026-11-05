@@ -13,7 +13,7 @@ use mailbox::InboxId;
 
 use axum::http::StatusCode;
 use mailbox_store::keys;
-use mailbox_store::memory::sample_message;
+use mailbox_store::sample_message;
 use webhook_test_support::{TEST_INBOX, api, grant_api_access, harness};
 
 /// DynamoDB string equality is case-sensitive, so the partition keys for two

@@ -76,7 +76,7 @@ pub struct Envelope {
 impl Envelope {
     /// Every recipient across all three lists.
     #[must_use]
-    pub fn recipient_count(&self) -> usize {
+    pub(crate) fn recipient_count(&self) -> usize {
         self.to.len() + self.cc.len() + self.bcc.len()
     }
 

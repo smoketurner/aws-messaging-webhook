@@ -1,0 +1,7 @@
+exclude_re = [
+  # The first BatchGetItem attempt would sleep for 0 ms instead of not at
+  # all: no observable difference.
+  'replace > with >= in <impl Table for DynamoTable>::batch_get',
+  # The trait's default already returns an empty Vec.
+  'replace Keyed::index_keys -> .* with vec!\[\]',
+]

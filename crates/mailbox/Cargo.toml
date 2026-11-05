@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 description = "Mailbox domain types, MIME parsing and building, and wire shapes"
 publish = false
+readme = "README.md"
 
 [features]
 # A sample `MailMessage` for other crates' unit tests.

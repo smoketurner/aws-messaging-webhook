@@ -21,7 +21,7 @@ use mailbox::{
     AttachmentMeta, Direction, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, MessageId,
     SesMessageId, ThreadId, ids, labels, strip_angle_brackets, thread, time,
 };
-use mailbox_store::store::MailStoreError;
+use mailbox_store::MailStoreError;
 
 /// Headroom held back from the invocation deadline: ingest runs under
 /// `deadline − now − DEADLINE_MARGIN`, leaving room for the timeout's own
@@ -45,7 +45,7 @@ pub enum IngestOutcome {
 impl IngestOutcome {
     /// The log form.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::MailDisabled => "none",
             Self::Skipped => "ingest_skipped",

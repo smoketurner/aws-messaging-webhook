@@ -39,7 +39,7 @@ impl TopicAllowlist {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -47,7 +47,7 @@ impl TopicAllowlist {
     /// allowlist allows everything — deployment docs mark that dev-only, and
     /// startup logs a loud warning.
     #[must_use]
-    pub fn allows(&self, topic_arn: &str) -> bool {
+    pub(crate) fn allows(&self, topic_arn: &str) -> bool {
         if self.entries.is_empty() {
             return true;
         }

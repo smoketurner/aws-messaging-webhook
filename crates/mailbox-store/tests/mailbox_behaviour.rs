@@ -1,19 +1,19 @@
 //! What the mailbox's writes leave in the table, driven through `Mailbox`
-//! over the in-memory store: alias claiming and skipping, placeholder
-//! expiry, label caps, the inbound thread snapshot, and the enqueue
-//! transaction.
+//! over the in-memory store's public API: label caps, the inbound thread
+//! snapshot, the enqueue transaction and its idempotency key, the send
+//! lifecycle, label patches, list bounds, and the scripted SES-reference read
+//! failure. What insertion leaves in the alias rows is tested inline, in
+//! `src/alias_tests.rs`, because reading those rows needs crate internals.
 
-use mailbox::send::{Envelope, SendState, SendStatus};
+use mailbox::send::{Envelope, MarkOutcome, SendKey, SendState, SendStatus, SesSent};
 use mailbox::{
-    Direction, InboxId, InsertOutcome, MESSAGE_USER_LABEL_CAP, MailMessage, REFERENCES_MAX_BYTES,
+    Direction, InboxId, InsertOutcome, MESSAGE_USER_LABEL_CAP, MailMessage, SesMessageId,
     THREAD_USER_LABEL_CAP,
 };
 use mailbox::{MessageId, ThreadId};
-use mailbox_store::keys;
-use mailbox_store::memory::{MailMemoryStore, sample_message};
-use mailbox_store::plan::ALIAS_ID_MAX_BYTES;
-use mailbox_store::store::{EnqueueOutcome, MailStoreError};
-use serde_dynamo::{AttributeValue, Item};
+use mailbox_store::{
+    EnqueueOutcome, ListQuery, MailMemoryStore, MailStoreError, ReadFailure, sample_message,
+};
 
 const INBOX: &str = "support@example.com";
 const NOW: &str = "2026-01-01T00:00:10.000Z";
@@ -28,130 +28,8 @@ fn message(message_id: &str, thread_id: &str) -> MailMessage {
     msg
 }
 
-fn alias_row(store: &MailMemoryStore, id: &str) -> Option<Item> {
-    store.raw_item(&keys::rfc_alias(&inbox(), id))
-}
-
-fn string(item: &Item, name: &str) -> Option<String> {
-    match item.inner().get(name) {
-        Some(AttributeValue::S(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
 fn user_labels(count: usize) -> Vec<String> {
     (0..count).map(|i| format!("label-{i:03}")).collect()
-}
-
-/// Placeholders cover exactly the referenced ids no row maps: never the
-/// message's own id, which gets a real alias, and never an id another row
-/// already maps.
-#[tokio::test]
-async fn placeholders_are_written_only_for_unmapped_references() {
-    let store = MailMemoryStore::default();
-    let mailbox = store.mailbox();
-    let root = message("mid-0", "tid-0");
-    mailbox
-        .insert_message(&root, &["mid-0@example.com".to_owned()])
-        .await
-        .unwrap();
-
-    let reply = message("mid-1", "tid-1");
-    mailbox
-        .insert_message(
-            &reply,
-            &[
-                "mid-1@example.com".to_owned(),
-                "parent@example.com".to_owned(),
-                "mid-0@example.com".to_owned(),
-            ],
-        )
-        .await
-        .unwrap();
-
-    let own = alias_row(&store, "mid-1@example.com").unwrap();
-    assert_eq!(string(&own, "message_id").as_deref(), Some("mid-1"));
-    let placeholder = alias_row(&store, "parent@example.com").unwrap();
-    assert_eq!(string(&placeholder, "message_id"), None);
-    let mapped = alias_row(&store, "mid-0@example.com").unwrap();
-    assert_eq!(string(&mapped, "message_id").as_deref(), Some("mid-0"));
-}
-
-/// A message takes over the placeholder an earlier reference left for it,
-/// but never another message's alias for the same id.
-#[tokio::test]
-async fn a_message_claims_its_own_placeholder_but_not_another_messages_alias() {
-    let store = MailMemoryStore::default();
-    let mailbox = store.mailbox();
-    let referrer = message("mid-0", "tid-0");
-    mailbox
-        .insert_message(
-            &referrer,
-            &[
-                "mid-0@example.com".to_owned(),
-                "mid-1@example.com".to_owned(),
-            ],
-        )
-        .await
-        .unwrap();
-    let placeholder = alias_row(&store, "mid-1@example.com").unwrap();
-    assert_eq!(string(&placeholder, "message_id"), None);
-
-    let late = message("mid-1", "tid-1");
-    mailbox
-        .insert_message(&late, &["mid-1@example.com".to_owned()])
-        .await
-        .unwrap();
-    let claimed = alias_row(&store, "mid-1@example.com").unwrap();
-    assert_eq!(string(&claimed, "message_id").as_deref(), Some("mid-1"));
-
-    let mut duplicate_id = message("mid-2", "tid-2");
-    duplicate_id.rfc_message_id = "<mid-1@example.com>".to_owned();
-    mailbox
-        .insert_message(&duplicate_id, &["mid-1@example.com".to_owned()])
-        .await
-        .unwrap();
-    let kept = alias_row(&store, "mid-1@example.com").unwrap();
-    assert_eq!(string(&kept, "message_id").as_deref(), Some("mid-1"));
-}
-
-#[tokio::test]
-async fn an_oversized_placeholder_is_skipped() {
-    let store = MailMemoryStore::default();
-    let oversized = format!("{}@example.com", "x".repeat(ALIAS_ID_MAX_BYTES));
-    let msg = message("mid-1", "tid-1");
-    store
-        .mailbox()
-        .insert_message(&msg, &["mid-1@example.com".to_owned(), oversized.clone()])
-        .await
-        .unwrap();
-    assert!(alias_row(&store, &oversized).is_none());
-    assert!(alias_row(&store, "mid-1@example.com").is_some());
-}
-
-/// A placeholder outliving the message whose reference it records would
-/// thread a later reply into a thread that no longer exists.
-#[tokio::test]
-async fn a_placeholder_points_at_the_messages_thread_and_expires_with_it() {
-    let store = MailMemoryStore::default();
-    let msg = message("mid-1", "tid-1");
-    store
-        .mailbox()
-        .insert_message(
-            &msg,
-            &[
-                "mid-1@example.com".to_owned(),
-                "parent@example.com".to_owned(),
-            ],
-        )
-        .await
-        .unwrap();
-    let placeholder = alias_row(&store, "parent@example.com").unwrap();
-    assert_eq!(string(&placeholder, "thread_id").as_deref(), Some("tid-1"));
-    assert_eq!(
-        placeholder.inner().get("expires_at"),
-        Some(&AttributeValue::N(msg.expires_at.to_string()))
-    );
 }
 
 /// A thread full of user labels must still take the system labels an
@@ -370,26 +248,256 @@ async fn an_enqueue_commits_the_message_and_its_send_state_together() {
     );
 }
 
-#[tokio::test]
-async fn an_oversized_message_id_gets_no_alias() {
-    let store = MailMemoryStore::default();
-    let mut msg = message("mid-1", "tid-1");
-    let id = format!("{}@example.com", "x".repeat(ALIAS_ID_MAX_BYTES + 10));
-    msg.rfc_message_id = format!("<{id}>");
-    store.mailbox().insert_message(&msg, &[]).await.unwrap();
-    assert!(alias_row(&store, &id).is_none());
+/// Enqueues `msg` and claims its send, returning the claimed state.
+async fn claimed(store: &MailMemoryStore, msg: &MailMessage) -> Result<SendState, MailStoreError> {
+    let mailbox = store.mailbox();
+    mailbox
+        .enqueue_send(msg, &queued(msg), None, 1_800_000_000)
+        .await?;
+    mailbox
+        .claim_send(&msg.message_id, NOW)
+        .await?
+        .ok_or(MailStoreError::NotFound)
 }
 
-/// A `Message-ID` truncated to `REFERENCES_MAX_BYTES` by `mime::parse_inbound`
-/// is still too long to carry an alias row once its angle brackets are
-/// stripped, so truncating never changes which ids carry one.
+/// The status index lists a send under its current status only.
 #[tokio::test]
-async fn a_message_id_truncated_to_the_cap_still_gets_no_alias() {
+async fn a_send_is_listed_under_its_current_status() {
     let store = MailMemoryStore::default();
-    let mut msg = message("mid-1", "tid-1");
-    let id = "a".repeat(REFERENCES_MAX_BYTES.saturating_sub(2));
-    msg.rfc_message_id = format!("<{id}>");
-    assert_eq!(msg.rfc_message_id.len(), REFERENCES_MAX_BYTES);
-    store.mailbox().insert_message(&msg, &[]).await.unwrap();
-    assert!(alias_row(&store, &id).is_none());
+    let mailbox = store.mailbox();
+    let msg = outbound("mid-1");
+    mailbox
+        .enqueue_send(&msg, &queued(&msg), None, 1_800_000_000)
+        .await
+        .unwrap();
+    let listed = mailbox
+        .list_by_status(SendStatus::Queued, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].message_id, msg.message_id);
+
+    mailbox.claim_send(&msg.message_id, NOW).await.unwrap();
+    let still_queued = mailbox
+        .list_by_status(SendStatus::Queued, 10)
+        .await
+        .unwrap();
+    assert_eq!(still_queued, []);
+    assert_eq!(
+        mailbox
+            .list_by_status(SendStatus::Sending, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Recording the SES call writes over the claim it was given, once: the
+/// same claim presented again has been moved on and is reported gone.
+#[tokio::test]
+async fn the_ses_call_is_recorded_only_over_the_claim_it_was_given() {
+    let store = MailMemoryStore::default();
+    let mailbox = store.mailbox();
+    let claim = claimed(&store, &outbound("mid-1")).await.unwrap();
+
+    let noted = mailbox.note_ses_call(&claim, NOW).await.unwrap().unwrap();
+    assert_eq!(noted.ses_call_at.as_deref(), Some(NOW));
+    assert_eq!(noted.version, claim.version + 1);
+    let stored = mailbox
+        .get_send_state(&claim.message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, noted);
+
+    assert!(mailbox.note_ses_call(&claim, NOW).await.unwrap().is_none());
+}
+
+/// A sent mark moves the message's labels and status, rolls the new label
+/// up to the thread even when no label is removed, and maps the SES id back
+/// to the message.
+#[tokio::test]
+async fn a_sent_mark_relabels_the_message_and_thread_and_maps_the_ses_id() {
+    let store = MailMemoryStore::default();
+    let mailbox = store.mailbox();
+    let mut msg = outbound("mid-1");
+    msg.labels = Vec::new();
+    let claim = claimed(&store, &msg).await.unwrap();
+
+    let sent = SesSent {
+        message_id: "ses-1",
+        region: "us-east-1",
+    };
+    mailbox
+        .mark_send(&claim, MarkOutcome::Sent(sent), NOW)
+        .await
+        .unwrap();
+
+    let stored = mailbox
+        .get_message(&inbox(), &msg.message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.labels, ["sent"]);
+    assert_eq!(stored.send_status, Some(SendStatus::Sent));
+    assert_eq!(stored.ses_message_id, Some(SesMessageId::new("ses-1")));
+    assert_eq!(stored.version, msg.version + 1);
+
+    let view = mailbox
+        .get_thread(&inbox(), &msg.thread_id, 10, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        view.thread.labels.iter().any(|label| label == "sent"),
+        "{:?}",
+        view.thread.labels
+    );
+
+    assert_eq!(
+        mailbox
+            .resolve_ses_message(&SesMessageId::new("ses-1"))
+            .await
+            .unwrap(),
+        Some((inbox(), msg.message_id.clone()))
+    );
+}
+
+/// A label patch is written to the stored message under a new version.
+#[tokio::test]
+async fn a_label_patch_is_stored_on_the_message() {
+    let store = MailMemoryStore::default();
+    let mailbox = store.mailbox();
+    let msg = message("mid-1", "tid-1");
+    mailbox.insert_message(&msg, &[]).await.unwrap();
+
+    let labels = mailbox
+        .update_labels(&inbox(), &msg.message_id, &["work".to_owned()], &[], NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = mailbox
+        .get_message(&inbox(), &msg.message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.labels, labels);
+    assert!(stored.labels.iter().any(|label| label == "work"));
+    assert_eq!(stored.version, msg.version + 1);
+    assert_eq!(stored.updated_at, NOW);
+}
+
+fn send_key(msg: &MailMessage, expires_at: u64) -> SendKey {
+    SendKey {
+        key_hash: "keyhash".to_owned(),
+        inbox_id: msg.inbox_id.clone(),
+        message_id: msg.message_id.clone(),
+        thread_id: msg.thread_id.clone(),
+        request_hash: "request".to_owned(),
+        route: "send".to_owned(),
+        created_at: NOW.to_owned(),
+        expires_at,
+    }
+}
+
+/// An idempotency key is reusable only once it has expired: one expiring
+/// at `now` or later still claims its request.
+#[tokio::test]
+async fn an_idempotency_key_is_reusable_only_after_it_expires() {
+    const NOW_EPOCH: u64 = 1_800_000_000;
+    for (expires_at, expected) in [
+        (NOW_EPOCH - 1, EnqueueOutcome::Committed),
+        (NOW_EPOCH, EnqueueOutcome::KeyExists),
+        (NOW_EPOCH + 1, EnqueueOutcome::KeyExists),
+    ] {
+        let store = MailMemoryStore::default();
+        let msg = outbound("mid-1");
+        store.seed_send_key(&send_key(&msg, expires_at));
+        let outcome = store
+            .mailbox()
+            .enqueue_send(
+                &msg,
+                &queued(&msg),
+                Some(&send_key(&msg, NOW_EPOCH + 100)),
+                NOW_EPOCH,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, expected, "key expiring at {expires_at}");
+    }
+}
+
+/// The scripted failure hits the next SES-reference read only: other reads
+/// are untouched, and the one after it succeeds.
+#[tokio::test]
+async fn a_scripted_resolve_failure_hits_only_the_next_ses_reference_read() {
+    let store = MailMemoryStore::default();
+    let mailbox = store.mailbox();
+    store.fail_next_resolve(ReadFailure::Transient);
+    assert!(mailbox.get_inbox(&inbox()).await.unwrap().is_none());
+    let ses = SesMessageId::new("ses-1");
+    assert!(matches!(
+        mailbox.resolve_ses_message(&ses).await,
+        Err(MailStoreError::Transient(_))
+    ));
+    assert!(mailbox.resolve_ses_message(&ses).await.unwrap().is_none());
+
+    store.fail_next_resolve(ReadFailure::Permanent);
+    assert!(matches!(
+        mailbox.resolve_ses_message(&ses).await,
+        Err(MailStoreError::Permanent(_))
+    ));
+}
+
+fn list(limit: usize, ascending: bool) -> ListQuery {
+    ListQuery {
+        inbox: inbox(),
+        limit,
+        before: None,
+        after: None,
+        ascending,
+        start: None,
+    }
+}
+
+fn ids(page: &[MailMessage]) -> Vec<&str> {
+    page.iter().map(|msg| msg.message_id.as_ref()).collect()
+}
+
+/// List bounds are exclusive on both sides, and a newest-first page
+/// resumes strictly after the last item it returned.
+#[tokio::test]
+async fn list_bounds_are_exclusive_and_pages_resume_after_their_last_item() {
+    let store = MailMemoryStore::default();
+    let mailbox = store.mailbox();
+    for id in ["mid-1", "mid-2", "mid-3"] {
+        mailbox
+            .insert_message(&message(id, &format!("tid-{id}")), &[])
+            .await
+            .unwrap();
+    }
+
+    let after = ListQuery {
+        after: Some("mid-1".to_owned()),
+        ..list(10, true)
+    };
+    let page = mailbox.list_messages(&after).await.unwrap();
+    assert_eq!(ids(&page.items), ["mid-2", "mid-3"]);
+
+    let before = ListQuery {
+        before: Some("mid-3".to_owned()),
+        ..list(10, true)
+    };
+    let page = mailbox.list_messages(&before).await.unwrap();
+    assert_eq!(ids(&page.items), ["mid-1", "mid-2"]);
+
+    let mut seen = Vec::new();
+    let mut query = list(1, false);
+    for _ in 0..3 {
+        let page = mailbox.list_messages(&query).await.unwrap();
+        seen.extend(page.items.iter().map(|msg| msg.message_id.to_string()));
+        query.start = page.next;
+    }
+    assert_eq!(seen, ["mid-3", "mid-2", "mid-1"]);
 }

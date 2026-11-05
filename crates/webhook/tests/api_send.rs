@@ -286,7 +286,7 @@ async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
     // messages/, reclaimed by the bucket's expire-messages lifecycle rule, so
     // discard_uploads leaves it and keeps its deletes scoped to outbox/.
     let h = api_harness().await;
-    h.mail.inject(mailbox_store::memory::Injected::Transient);
+    h.mail.inject(mailbox_store::Injected::Transient);
     let mut request = body();
     request["attachments"] = json!([{
         "content": STANDARD.encode("file bytes"),
@@ -337,7 +337,7 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
     // overlap; the in-memory store can inject it so a sequential test can
     // exercise the loser's cleanup path.
     let h = api_harness().await;
-    h.mail.inject(mailbox_store::memory::Injected::KeyExists);
+    h.mail.inject(mailbox_store::Injected::KeyExists);
     let mut request = body();
     request["attachments"] = json!([{
         "content": STANDARD.encode("file bytes"),

@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::mail::objects::ObjectError;
 use crate::metrics::names;
-use mailbox_store::store::MailStoreError;
+use mailbox_store::MailStoreError;
 
 /// The standard error body.
 #[derive(Debug, Serialize)]
@@ -27,13 +27,13 @@ struct ErrorBody {
 
 /// One field-level problem in a [`ValidationBody`].
 #[derive(Debug, Serialize)]
-pub struct FieldError {
+pub(crate) struct FieldError {
     pub path: String,
     pub message: String,
 }
 
 impl FieldError {
-    pub fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             message: message.into(),
@@ -55,7 +55,7 @@ struct ValidationBody {
 /// `anyhow::Error` for the log line only, and its response body is a fixed
 /// string.
 #[derive(Debug, thiserror::Error)]
-pub enum ApiError {
+pub(crate) enum ApiError {
     /// Bad input: caps exceeded, reserved labels, malformed page token, bad
     /// `Idempotency-Key`, and so on. One entry per offending field.
     #[error("validation failed")]
@@ -100,7 +100,7 @@ pub enum ApiError {
 
 impl ApiError {
     /// A single-field validation failure, the common case.
-    pub fn field(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn field(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Validation(vec![FieldError::new(path, message)])
     }
 }
@@ -143,7 +143,7 @@ impl From<ObjectError> for ApiError {
 
 impl ApiError {
     #[must_use]
-    pub fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -160,7 +160,7 @@ impl ApiError {
 
     /// The `name` field SDK clients match on.
     #[must_use]
-    pub fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Validation(_) => "ValidationError",
             Self::Unauthorized => "UnauthorizedError",

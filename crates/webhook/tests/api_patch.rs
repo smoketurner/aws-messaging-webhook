@@ -6,7 +6,7 @@
 use axum::http::{Method, StatusCode};
 use mailbox::MessageId;
 use mailbox::{InboxId, ids, time};
-use mailbox_store::memory::sample_message;
+use mailbox_store::sample_message;
 use serde_json::{Value, json};
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 

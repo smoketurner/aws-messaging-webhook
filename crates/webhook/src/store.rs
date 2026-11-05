@@ -44,7 +44,7 @@ impl EventRecord {
     ///
     /// Returns an error if the system clock cannot be represented as a
     /// timestamp (practically unreachable).
-    pub fn build(
+    pub(crate) fn build(
         source: Option<Source>,
         envelope: &SnsEnvelope,
         raw_body: Bytes,
@@ -74,7 +74,7 @@ impl EventRecord {
 
     /// The family label persisted and logged; `"unknown"` when unclassified.
     #[must_use]
-    pub fn source_label(&self) -> &'static str {
+    pub(crate) fn source_label(&self) -> &'static str {
         self.source.map_or("unknown", Source::as_str)
     }
 }

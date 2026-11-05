@@ -11,7 +11,7 @@
 
 use axum::http::StatusCode;
 use mailbox::{ids, time};
-use mailbox_store::memory::sample_message;
+use mailbox_store::sample_message;
 use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, grant_api_access, harness};
 
 /// Seeds the store the way ingest does: an inbox and one message, both under

@@ -11,7 +11,7 @@ use aws_messaging_webhook::mail::content;
 use axum::http::{Method, StatusCode};
 use mailbox::content::MessageContent;
 use mailbox::{InboxId, ids, time};
-use mailbox_store::memory::sample_message;
+use mailbox_store::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 /// A harness with an authenticated key and an existing inbox.

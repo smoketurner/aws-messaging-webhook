@@ -19,16 +19,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mailbox_store::memory::{MailMemoryStore, sample_message};
+use crate::memory::{MailMemoryStore, sample_message};
 use serde::de::DeserializeOwned;
 
+use crate::keys::TableKey;
+use crate::mailbox::Mailbox;
+use crate::plan::{self, PlannedOp};
+use crate::store::{MailStoreError, Page};
+use crate::table::{PageQuery, Read, Table, TxnOutcome};
 use mailbox::thread::{AliasLookup, new_thread};
 use mailbox::{InsertOutcome, PutOutcome};
-use mailbox_store::keys::TableKey;
-use mailbox_store::mailbox::Mailbox;
-use mailbox_store::plan::{self, PlannedOp};
-use mailbox_store::store::{MailStoreError, Page};
-use mailbox_store::table::{PageQuery, Read, Table, TxnOutcome};
 
 /// A `Table` wrapper that, on the first `transact`, first commits a
 /// competing message's full insert plan against the inner store — simulating a
@@ -157,8 +157,8 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
 /// resurrects the thread does not cost the loser its committed message.
 #[tokio::test]
 async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurrent_writer() {
+    use crate::store::EnqueueOutcome;
     use mailbox::send::{Envelope, SendState};
-    use mailbox_store::store::EnqueueOutcome;
 
     let store_inner = MailMemoryStore::default();
     let r1 = sample_message("support@example.com", "mid-r1", "shared-thread");

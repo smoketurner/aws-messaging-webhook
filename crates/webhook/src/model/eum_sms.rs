@@ -55,12 +55,12 @@ const SUCCESS_EVENT_TYPES: [&str; 6] = [
 
 impl SmsDeliveryEvent {
     #[must_use]
-    pub fn is_successful_delivery(&self) -> bool {
+    pub(crate) fn is_successful_delivery(&self) -> bool {
         SUCCESS_EVENT_TYPES.contains(&self.event_type.as_str())
     }
 
     #[must_use]
-    pub fn detail_type(&self) -> &'static str {
+    pub(crate) fn detail_type(&self) -> &'static str {
         if self.event_type.starts_with("MEDIA_") {
             "mms.delivery"
         } else if self.event_type.starts_with("VOICE_") {

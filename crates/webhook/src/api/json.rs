@@ -15,14 +15,14 @@ use crate::api::error::ApiError;
 /// One value, or several: the contract allows both spellings for a list.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
-pub enum OneOrMany<T> {
+pub(crate) enum OneOrMany<T> {
     One(T),
     Many(Vec<T>),
 }
 
 impl<T> OneOrMany<T> {
     #[must_use]
-    pub fn into_vec(self) -> Vec<T> {
+    pub(crate) fn into_vec(self) -> Vec<T> {
         match self {
             Self::One(one) => vec![one],
             Self::Many(many) => many,
@@ -31,7 +31,7 @@ impl<T> OneOrMany<T> {
 }
 
 /// A request body deserialized from JSON.
-pub struct ApiJson<T>(pub T);
+pub(crate) struct ApiJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for ApiJson<T>
 where

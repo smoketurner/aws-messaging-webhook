@@ -66,7 +66,7 @@ pub enum FetchError {
 impl FetchError {
     /// Whether another attempt could succeed.
     #[must_use]
-    pub fn is_transient(&self) -> bool {
+    pub(crate) fn is_transient(&self) -> bool {
         matches!(self, Self::Transient(_))
     }
 }
@@ -106,7 +106,7 @@ impl Default for HttpAttachmentFetcher {
 
 impl HttpAttachmentFetcher {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             extra_public: Vec::new(),
             #[cfg(test)]

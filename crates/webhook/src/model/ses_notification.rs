@@ -88,7 +88,7 @@ pub struct SesBounce {
 impl SesBounce {
     /// Only permanent bounces feed the account-level suppression list.
     #[must_use]
-    pub fn is_permanent(&self) -> bool {
+    pub(crate) fn is_permanent(&self) -> bool {
         match self.bounce_type {
             BounceType::Permanent => true,
             BounceType::Undetermined | BounceType::Transient | BounceType::Other(_) => false,
@@ -159,7 +159,7 @@ impl SesEngagement {
     /// A missing or `Unlikely` value counts as human, so pre-feature events
     /// keep accruing to the human counters.
     #[must_use]
-    pub fn is_bot(&self) -> bool {
+    pub(crate) fn is_bot(&self) -> bool {
         match &self.is_bot_event {
             Some(BotFlag::Likely) => true,
             Some(BotFlag::Unlikely | BotFlag::Other(_)) | None => false,

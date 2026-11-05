@@ -143,8 +143,8 @@ impl MailMemoryStore {
     }
 
     /// How many transactions have been attempted against this store.
-    #[must_use]
-    pub fn txn_attempts(&self) -> usize {
+    #[cfg(test)]
+    fn txn_attempts(&self) -> usize {
         self.attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
 

@@ -27,7 +27,7 @@ use mailbox::wire;
 use mailbox::{InboxId, MailMessage, time};
 use mailbox::{MessageId, ThreadId};
 use mailbox_store::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
-use mailbox_store::store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
+use mailbox_store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 
 /// How many store round-trips one list request may spend filling a page.
 /// Without a bound, a filter matching nothing could walk an entire partition
@@ -113,7 +113,7 @@ fn cursor(
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
 /// for another request; a store failure mapped onto the API's retry contract.
-pub async fn list_inboxes<B: Backend>(
+pub(crate) async fn list_inboxes<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     request: ListRequest,
 ) -> Result<Json<wire::InboxList>, ApiError> {
@@ -139,7 +139,7 @@ pub async fn list_inboxes<B: Backend>(
 ///
 /// [`ApiError::NotFound`] when no such inbox exists; a store failure mapped
 /// onto the API's retry contract.
-pub async fn get_inbox<B: Backend>(
+pub(crate) async fn get_inbox<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
 ) -> Result<Json<wire::Inbox>, ApiError> {
@@ -157,7 +157,7 @@ pub async fn get_inbox<B: Backend>(
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
 /// for another inbox; a store failure mapped onto the API's retry contract.
-pub async fn list_messages<B: Backend>(
+pub(crate) async fn list_messages<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
     request: ListRequest,
@@ -208,7 +208,7 @@ pub async fn list_messages<B: Backend>(
 /// [`ApiError::NotFound`] when the inbox holds no such message; a store
 /// failure or a content document read failure, mapped onto the API's retry
 /// contract.
-pub async fn get_message<B: Backend>(
+pub(crate) async fn get_message<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, MessageId)>,
 ) -> Result<Json<wire::Message>, ApiError> {
@@ -231,7 +231,7 @@ pub async fn get_message<B: Backend>(
 /// [`ApiError::NotFound`] when the inbox holds no such message, or the
 /// message predates retention and its raw object is gone; a store or object
 /// failure otherwise.
-pub async fn get_raw<B: Backend>(
+pub(crate) async fn get_raw<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, MessageId)>,
 ) -> Result<Json<wire::Download>, ApiError> {
@@ -268,7 +268,7 @@ pub async fn get_raw<B: Backend>(
 ///
 /// [`ApiError::NotFound`] when the message, the attachment, or the stored
 /// object does not exist; a store or object failure otherwise.
-pub async fn get_attachment<B: Backend>(
+pub(crate) async fn get_attachment<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id, attachment_id)): Path<(InboxId, MessageId, String)>,
 ) -> Result<Json<wire::Download>, ApiError> {
@@ -332,7 +332,7 @@ fn expires_at(ttl: Duration) -> String {
 ///
 /// [`ApiError::Validation`] for a bad query parameter or a page token issued
 /// for another inbox; a store failure mapped onto the API's retry contract.
-pub async fn list_threads<B: Backend>(
+pub(crate) async fn list_threads<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
     request: ListRequest,
@@ -387,7 +387,7 @@ pub async fn list_threads<B: Backend>(
 /// [`ApiError::Validation`] for a bad query parameter or page token;
 /// [`ApiError::NotFound`] when the inbox holds no such thread; a store
 /// failure mapped onto the API's retry contract.
-pub async fn get_thread<B: Backend>(
+pub(crate) async fn get_thread<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, thread_id)): Path<(InboxId, ThreadId)>,
     request: ListRequest,

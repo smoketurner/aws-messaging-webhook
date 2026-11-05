@@ -19,7 +19,7 @@ use tracing::Level;
 /// crates fixed at `WARN`, and this crate's own target left at the requested
 /// level uncapped.
 #[must_use]
-pub fn directives(level: &str) -> String {
+pub(crate) fn directives(level: &str) -> String {
     let level = level.parse::<Level>().unwrap_or(Level::INFO);
     let default = level.min(Level::DEBUG);
     format!("{default},reqwest=warn,hyper=warn,hyper_util=warn,aws_messaging_webhook={level}")

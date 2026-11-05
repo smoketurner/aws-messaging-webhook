@@ -9,10 +9,10 @@
 //! outbox writes, and [`reply`] the route that derives a send from the
 //! message being replied to.
 
-pub mod idempotency;
-pub mod reply;
-pub mod spec;
-pub mod validate;
+pub(crate) mod idempotency;
+pub(crate) mod reply;
+pub(crate) mod spec;
+pub(crate) mod validate;
 
 use std::sync::Arc;
 
@@ -29,11 +29,11 @@ use crate::state::{AppState, Backend};
 use mailbox::send::{Envelope, SendKey, SendSpec, SendState};
 use mailbox::{InboxId, MailMessage, ids, time};
 use mailbox::{MessageId, ThreadId};
+use mailbox_store::EnqueueOutcome;
 use mailbox_store::keys;
-use mailbox_store::store::EnqueueOutcome;
 
-pub use reply::reply;
-pub use validate::{ReplyRequest, SendRequest};
+pub(crate) use reply::reply;
+pub(crate) use validate::SendRequest;
 
 use idempotency::{KEY_TTL_SECONDS, fingerprint, idempotency_key_hash, replay_key};
 use reply::threading_references;
@@ -41,7 +41,7 @@ use spec::{build_spec, discard_uploads, queued_message, upload_spec};
 
 /// The response both send routes return.
 #[derive(Debug, Serialize)]
-pub struct SendAccepted {
+pub(crate) struct SendAccepted {
     pub message_id: MessageId,
     pub thread_id: ThreadId,
 }
@@ -58,7 +58,7 @@ pub struct SendAccepted {
 /// [`ApiError::NotFound`] when the inbox does not exist,
 /// [`ApiError::Conflict`] when an `Idempotency-Key` is reused with a
 /// different request, and a store or object failure otherwise.
-pub async fn send<B: Backend>(
+pub(crate) async fn send<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
     headers: HeaderMap,

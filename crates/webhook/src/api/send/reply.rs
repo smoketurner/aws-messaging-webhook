@@ -49,7 +49,7 @@ pub(super) fn threading_references(
 ///
 /// [`ApiError::NotFound`] when the inbox or the original message does not
 /// exist; otherwise as [`send`].
-pub async fn reply<B: Backend>(
+pub(crate) async fn reply<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, MessageId)>,
     headers: HeaderMap,

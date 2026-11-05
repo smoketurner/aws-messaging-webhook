@@ -9,7 +9,7 @@ use crate::metrics::names;
 /// downstream failures MUST be 5xx (to recruit redelivery) and
 /// rejected-by-policy messages MUST be 4xx (to avoid retry storms).
 #[derive(Debug, thiserror::Error)]
-pub enum AppError {
+pub(crate) enum AppError {
     #[error("missing x-amz-sns-message-type header")]
     MissingSnsHeader,
 
@@ -31,7 +31,7 @@ pub enum AppError {
 
 impl AppError {
     #[must_use]
-    pub fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::MissingSnsHeader | Self::UnreadableBody | Self::SubscribeUrlRejected => {
                 StatusCode::BAD_REQUEST

@@ -9,8 +9,7 @@
 samconfig.toml
 
 # Mutation testing
-mutants.out/
-mutants.out.old/
+mutants.out*/
 
 # Editor artifacts
 .idea/

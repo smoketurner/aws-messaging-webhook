@@ -13,7 +13,7 @@ pub struct SmsClient {
 
 impl SmsClient {
     #[must_use]
-    pub fn new(client: aws_sdk_pinpointsmsvoicev2::Client) -> Self {
+    pub(crate) fn new(client: aws_sdk_pinpointsmsvoicev2::Client) -> Self {
         Self { client }
     }
 }

@@ -22,7 +22,7 @@ pub struct EventsTable {
 
 impl EventsTable {
     #[must_use]
-    pub fn new(client: aws_sdk_dynamodb::Client, table_name: String) -> Self {
+    pub(crate) fn new(client: aws_sdk_dynamodb::Client, table_name: String) -> Self {
         Self { client, table_name }
     }
 

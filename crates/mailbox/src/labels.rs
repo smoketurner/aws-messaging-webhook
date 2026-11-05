@@ -54,7 +54,7 @@ impl SystemLabel {
     /// is a record of something that happened, which a request must not be
     /// able to invent.
     #[must_use]
-    pub fn is_settable_by_request(self) -> bool {
+    pub(crate) fn is_settable_by_request(self) -> bool {
         match self {
             Self::Unread | Self::Spam | Self::Trash => true,
             Self::Received

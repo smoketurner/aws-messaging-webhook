@@ -54,8 +54,8 @@ use axum::http::{Request, StatusCode};
 use lambda_http::{Context, LambdaEvent};
 use mailbox::InboxId;
 use mailbox::send::SendSpec;
-use mailbox_store::mailbox::Mailbox;
-use mailbox_store::memory::{self as mail_memory, MailMemoryStore};
+use mailbox_store::Mailbox;
+use mailbox_store::{Injected, MailMemoryStore};
 use objects::FakeObjectStore;
 use serde_json::{Value, json};
 use sns_message_verifier::SnsVerifier;
@@ -233,7 +233,7 @@ impl SesApi for FakeSes {
         self.calls
             .record(format!("send_raw:{}", request.message_id));
         for _ in 0..std::mem::take(&mut *self.store_failures_after_send.lock().unwrap()) {
-            self.mail.inject(mail_memory::Injected::Transient);
+            self.mail.inject(Injected::Transient);
         }
         self.sent.lock().unwrap().push(SentMessage {
             message_id: request.message_id.to_owned(),

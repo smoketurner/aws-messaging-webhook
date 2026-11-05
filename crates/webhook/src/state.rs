@@ -8,8 +8,8 @@ use crate::mail::fetch::AttachmentFetcher;
 use crate::mail::objects::ObjectStore;
 use crate::publish::PublishEvents;
 use crate::store::EventStore;
-use mailbox_store::mailbox::Mailbox;
-use mailbox_store::table::Table;
+use mailbox_store::Mailbox;
+use mailbox_store::Table;
 
 /// The component types one deployment wires together, one per external
 /// system, so handlers carry a single type parameter. Production is

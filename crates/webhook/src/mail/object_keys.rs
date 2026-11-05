@@ -6,14 +6,14 @@ use mailbox::InboxId;
 /// Where a message's content document lives: per inbox, because one inbound
 /// message delivered to two inboxes is two independent messages.
 #[must_use]
-pub fn content(inbox_id: &InboxId, message_id: &(impl AsRef<str> + ?Sized)) -> String {
+pub(crate) fn content(inbox_id: &InboxId, message_id: &(impl AsRef<str> + ?Sized)) -> String {
     let message_id = message_id.as_ref();
     format!("messages/{}/{message_id}.json", inbox_id.as_str())
 }
 
 /// Where one kept inbound attachment lives.
 #[must_use]
-pub fn attachment(
+pub(crate) fn attachment(
     message_id: &(impl AsRef<str> + ?Sized),
     attachment_id: &(impl AsRef<str> + ?Sized),
 ) -> String {
@@ -31,7 +31,7 @@ pub fn spec(message_id: &(impl AsRef<str> + ?Sized)) -> String {
 
 /// Where one outbound attachment's bytes live before the message is sent.
 #[must_use]
-pub fn part(
+pub(crate) fn part(
     message_id: &(impl AsRef<str> + ?Sized),
     attachment_id: &(impl AsRef<str> + ?Sized),
 ) -> String {
