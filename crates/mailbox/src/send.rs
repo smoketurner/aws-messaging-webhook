@@ -20,9 +20,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mail::InboxId;
-use crate::mail::labels::SystemLabel;
-use crate::mail::wire::ContentDisposition;
+use crate::InboxId;
+use crate::labels::SystemLabel;
+use crate::wire::ContentDisposition;
+use crate::{MessageId, ThreadId};
 
 string_enum! {
     /// Where a send has got to.
@@ -120,15 +121,15 @@ string_enum! {
 /// The `OUTBOX#<message_id>` / `STATE` item.
 ///
 /// Mirrors the item's attributes one-to-one so it round-trips through
-/// `serde_dynamo`, the same way [`crate::mail::thread::ThreadState`] does.
+/// `serde_dynamo`, the same way [`crate::thread::ThreadState`] does.
 /// It is never deleted explicitly. Once the send settles it takes its
 /// message's TTL, so the two age out together; until then it has none, since
 /// a queued, sending or unknown send must stay findable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendState {
     pub inbox_id: InboxId,
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
     pub send_status: SendStatus,
     pub version: u64,
     pub envelope: Envelope,
@@ -173,8 +174,8 @@ impl SendState {
     #[must_use]
     pub fn queued(
         inbox_id: InboxId,
-        message_id: String,
-        thread_id: String,
+        message_id: MessageId,
+        thread_id: ThreadId,
         envelope: Envelope,
         idempotency_key_pk: Option<String>,
         now: &str,
@@ -217,8 +218,8 @@ pub struct SendKey {
     /// in the sense that it must not be guessable by another caller.
     pub key_hash: String,
     pub inbox_id: InboxId,
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
     /// A fingerprint of the request body, so the same key presented with a
     /// *different* request is refused instead of silently sending something
     /// the caller did not ask for.
@@ -257,8 +258,8 @@ pub struct SpecAttachment {
 /// message does not have to fit in a table row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendSpec {
-    pub message_id: String,
-    pub thread_id: String,
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
     pub inbox_id: InboxId,
     pub from: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -413,25 +414,67 @@ pub fn label_changes(before: &[String], after: &[String]) -> (Vec<String>, Vec<S
     (added, removed)
 }
 
+/// How a send finished, as the mailbox is told it when marking the send.
+#[derive(Debug, Clone, Copy)]
+pub enum MarkOutcome<'a> {
+    /// SES accepted it, and gave back its own id.
+    Sent(SesSent<'a>),
+    /// It will not be sent.
+    Failed(SendFailure),
+    /// SES may or may not have it. The message keeps its `queued` label,
+    /// because it is neither sent nor known to have failed.
+    Unknown,
+    /// Hand it back for another attempt.
+    Released,
+    /// An operator decided this send did go out, without SES telling us so.
+    /// There is no SES id to record, which is the difference from `Sent`.
+    ClosedSent,
+    /// An operator asked for an `unknown` send to be attempted again,
+    /// accepting the risk that SES already has it.
+    Resumed,
+}
+
+impl MarkOutcome<'_> {
+    /// Whether this outcome settles the send: the record takes its message's
+    /// TTL and the message will never be assembled from its outbox again.
+    ///
+    /// Pairs one-to-one with the arms [`mailbox::send::mark_transition`]
+    /// wraps in `settled(..)`, and is what the sender keys outbox cleanup off:
+    /// the `outbox/` prefix has no lifecycle rule, so a settled send that does
+    /// not clear its own objects leaks them forever.
+    #[must_use]
+    pub fn settles(&self) -> bool {
+        match self {
+            Self::Sent(_) | Self::Failed(_) | Self::ClosedSent => true,
+            // A send that is handed back, left for an operator, or resumed
+            // may yet be assembled again, so it keeps its outbox.
+            Self::Released | Self::Unknown | Self::Resumed => false,
+        }
+    }
+}
+
+/// What SES said about a message it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SesSent<'a> {
+    /// The SES message id.
+    pub message_id: &'a str,
+    /// The region the message was sent through, which SES puts in the
+    /// `Message-ID` it writes over ours.
+    pub region: &'a str,
+}
+
 /// Works out the new send state, the message's new labels, and the SES id to
 /// record, for one outcome.
 ///
-/// Shared by every [`crate::mail::store::MailStore`] implementation so the
-/// in-memory double cannot drift from the real one on the question of what a
-/// given outcome means.
+/// Used by the mailbox's send marking, so every store
+/// agrees on what a given outcome means.
 #[must_use]
 pub fn mark_transition<'a>(
     state: &SendState,
-    msg: &crate::mail::MailMessage,
-    outcome: crate::mail::store::MarkOutcome<'a>,
+    msg: &crate::MailMessage,
+    outcome: MarkOutcome<'a>,
     now: &str,
-) -> (
-    SendState,
-    Vec<String>,
-    Option<crate::mail::store::SesSent<'a>>,
-) {
-    use crate::mail::store::MarkOutcome;
-
+) -> (SendState, Vec<String>, Option<SesSent<'a>>) {
     let relabel = |remove: SystemLabel, add: SystemLabel| {
         let mut labels: Vec<String> = msg
             .labels
@@ -439,7 +482,7 @@ pub fn mark_transition<'a>(
             .filter(|label| label.as_str() != remove.as_str())
             .cloned()
             .collect();
-        if !crate::mail::labels::has(&labels, add) {
+        if !crate::labels::has(&labels, add) {
             labels.push(add.to_label());
         }
         labels.sort();
@@ -476,18 +519,6 @@ pub fn mark_transition<'a>(
         ),
         MarkOutcome::Resumed => (state.resumed(now), msg.labels.clone(), None),
     }
-}
-
-/// Where the spec for `message_id` lives.
-#[must_use]
-pub fn spec_key(message_id: &str) -> String {
-    format!("outbox/{message_id}/spec.json")
-}
-
-/// Where one attachment's bytes live before the message is sent.
-#[must_use]
-pub fn part_key(message_id: &str, attachment_id: &str) -> String {
-    format!("outbox/{message_id}/parts/{attachment_id}")
 }
 
 #[cfg(test)]
@@ -542,8 +573,8 @@ mod tests {
     fn a_queued_state_starts_at_version_zero_with_no_claim() {
         let state = SendState::queued(
             InboxId::new("support@example.com"),
-            "mid-1".to_owned(),
-            "tid-1".to_owned(),
+            MessageId::new("mid-1"),
+            ThreadId::new("tid-1"),
             Envelope {
                 to: vec!["a@example.com".to_owned()],
                 ..Envelope::default()
@@ -562,8 +593,8 @@ mod tests {
     fn a_send_state_round_trips_through_the_item_encoding() {
         let state = SendState::queued(
             InboxId::new("support@example.com"),
-            "mid-1".to_owned(),
-            "tid-1".to_owned(),
+            MessageId::new("mid-1"),
+            ThreadId::new("tid-1"),
             Envelope {
                 to: vec!["a@example.com".to_owned()],
                 cc: vec!["b@example.com".to_owned()],
@@ -589,14 +620,23 @@ mod tests {
         assert!(Envelope::default().is_empty());
     }
 
+    /// The pairing this predicate exists for: the outcomes
+    /// [`mark_transition`] wraps in `settled(..)` are
+    /// exactly the ones whose outbox the sender clears. Adding an outcome
+    /// without deciding which side it falls on is how the terminal-failure,
+    /// sweep-abandon and operator-close paths each came to leak.
     #[test]
-    fn outbox_keys_all_sit_under_one_prefix() {
-        // Retention and cleanup both work by prefix, so every object for a
-        // message must be under it.
-        let prefix = "outbox/mid-1/";
-        assert!(spec_key("mid-1").starts_with(prefix));
-        assert!(part_key("mid-1", "att_1").starts_with(prefix));
-        assert_eq!(spec_key("mid-1"), "outbox/mid-1/spec.json");
-        assert_eq!(part_key("mid-1", "att_1"), "outbox/mid-1/parts/att_1");
+    fn only_the_outcomes_that_take_a_ttl_settle() {
+        let sent = SesSent {
+            message_id: "0100-ses",
+            region: "us-east-1",
+        };
+        assert!(MarkOutcome::Sent(sent).settles());
+        assert!(MarkOutcome::Failed(SendFailure::Rejected).settles());
+        assert!(MarkOutcome::ClosedSent.settles());
+
+        assert!(!MarkOutcome::Released.settles());
+        assert!(!MarkOutcome::Unknown.settles());
+        assert!(!MarkOutcome::Resumed.settles());
     }
 }

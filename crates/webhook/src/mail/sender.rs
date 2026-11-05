@@ -24,16 +24,22 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::actions::SesApi as _;
 use crate::actions::{RawSend, SendOutcome};
-use crate::mail::build::{BuildError, BuiltPart, build_outbound};
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
+use crate::mail::object_keys;
 use crate::mail::objects::ObjectError;
-use crate::mail::send::{self, SendFailure, SendSpec, SendState, SendStatus};
-use crate::mail::store::{MailStoreError, MarkOutcome, SesSent};
-use crate::mail::url_policy;
-use crate::mail::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
+use crate::mail::objects::ObjectStore as _;
 use crate::metrics::names;
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
+use mailbox::MessageId;
+use mailbox::build::{BuildError, BuiltPart, build_outbound};
+use mailbox::send::{MarkOutcome, SesSent};
+use mailbox::send::{SendFailure, SendSpec, SendState, SendStatus};
+use mailbox::url_policy;
+use mailbox::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
+use mailbox_store::keys;
+use mailbox_store::store::MailStoreError;
 
 /// What one stream record came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,8 +81,8 @@ pub enum SenderError {
 /// # Errors
 ///
 /// Only when the payload is not a stream event at all.
-pub async fn handle_sender_stream<T: Services>(
-    state: &AppState<T>,
+pub async fn handle_sender_stream<B: Backend>(
+    state: &AppState<B>,
     payload: serde_json::Value,
     deadline: Instant,
 ) -> Result<serde_json::Value, lambda_http::Error> {
@@ -90,7 +96,7 @@ pub async fn handle_sender_stream<T: Services>(
         };
         if let Err(error) = handle_send(state, &message_id, deadline).await {
             tracing::error!(
-                message_id,
+                %message_id,
                 error = ?error,
                 event = "send_record_failed",
                 "returning this record for redelivery"
@@ -104,18 +110,18 @@ pub async fn handle_sender_stream<T: Services>(
 }
 
 /// The message id a record is asking to be sent, if it is asking at all.
-fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<String> {
+fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<MessageId> {
     let new_image = &record.change.new_image;
-    if crate::stream::image_str(new_image, "sk")? != "STATE" {
+    if crate::stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
         return None;
     }
     if crate::stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
         return None;
     }
 
-    let message_id = crate::stream::image_str(new_image, "pk")?
-        .strip_prefix("OUTBOX#")?
-        .to_owned();
+    let message_id = MessageId::new(keys::parse_outbox_pk(crate::stream::image_str(
+        new_image, "pk",
+    )?)?);
 
     match record.event_name.as_str() {
         "INSERT" => Some(message_id),
@@ -141,7 +147,7 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<S
 pub struct Command {
     #[serde(rename = "command")]
     pub resolution: Resolution,
-    pub message_id: String,
+    pub message_id: MessageId,
 }
 
 /// Runs one operator instruction.
@@ -150,8 +156,8 @@ pub struct Command {
 ///
 /// [`SenderError`] when the send is missing, is not `unknown`, or the store
 /// cannot be written.
-pub async fn handle_command<T: Services>(
-    state: &AppState<T>,
+pub async fn handle_command<B: Backend>(
+    state: &AppState<B>,
     command: &Command,
 ) -> Result<(), SenderError> {
     resolve_unknown(state, &command.message_id, command.resolution).await
@@ -180,14 +186,14 @@ pub enum Resolution {
 ///
 /// [`SenderError::Store`] when the send does not exist or is not `unknown` —
 /// resolving a send that is still in flight would race the sender holding it.
-pub async fn resolve_unknown<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+pub async fn resolve_unknown<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
     resolution: Resolution,
 ) -> Result<(), SenderError> {
     let now = time::format(time::now_ms());
     let Some(send) = state
-        .services
+        .mailbox
         .get_send_state(message_id)
         .await
         .map_err(store_error)?
@@ -213,7 +219,7 @@ pub async fn resolve_unknown<T: Services>(
         .map_err(store_error)?;
 
     tracing::warn!(
-        message_id,
+        %message_id,
         resolution = ?resolution,
         event = "send_resolved_by_operator",
         "an operator resolved a send whose outcome SES never confirmed"
@@ -293,13 +299,13 @@ pub struct SweepReport {
 /// # Errors
 ///
 /// [`SenderError`] when the store cannot be listed.
-pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, SenderError> {
+pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, SenderError> {
     let now_ms = time::now_ms();
     let now = time::format(now_ms);
     let mut report = SweepReport::default();
 
     for stuck in state
-        .services
+        .mailbox
         .list_by_status(SendStatus::Sending, SWEEP_LIMIT)
         .await
         .map_err(store_error)?
@@ -370,7 +376,7 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
     }
 
     report.unknown = state
-        .services
+        .mailbox
         .list_by_status(SendStatus::Unknown, SWEEP_LIMIT)
         .await
         .map_err(store_error)?
@@ -397,9 +403,9 @@ pub async fn sweep<T: Services>(state: &AppState<T>) -> Result<SweepReport, Send
 /// [`SenderError`] only when the store could not record where the send got
 /// to; every other outcome, including a hand-back for another attempt, is
 /// recorded and returns `Ok`.
-pub async fn handle_send<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+pub async fn handle_send<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
     deadline: Instant,
 ) -> Result<Handled, SenderError> {
     let config = state
@@ -410,13 +416,13 @@ pub async fn handle_send<T: Services>(
     let now = time::format(time::now_ms());
 
     let Some(claimed) = state
-        .services
+        .mailbox
         .claim_send(message_id, &now)
         .await
         .map_err(store_error)?
     else {
         tracing::debug!(
-            message_id,
+            %message_id,
             event = "send_not_claimed",
             "another sender holds this send, or it is already finished"
         );
@@ -434,7 +440,7 @@ pub async fn handle_send<T: Services>(
         }
         Ok(Err(LoadError::Transient { failure, error })) => {
             tracing::warn!(
-                message_id,
+                %message_id,
                 error = ?error,
                 event = "send_load_unavailable",
                 "could not load the send; handing it back"
@@ -443,7 +449,7 @@ pub async fn handle_send<T: Services>(
         }
         Err(_elapsed) => {
             tracing::warn!(
-                message_id,
+                %message_id,
                 event = "send_load_timed_out",
                 "loading the send did not finish in the time available; handing it back"
             );
@@ -466,13 +472,13 @@ pub async fn handle_send<T: Services>(
     // Recorded before the call, so a sender that dies from here on leaves a
     // claim the sweep will not release: it may already have been sent.
     let Some(calling) = state
-        .services
+        .mailbox
         .note_ses_call(&claimed, &now)
         .await
         .map_err(store_error)?
     else {
         tracing::warn!(
-            message_id,
+            %message_id,
             event = "send_claim_lost",
             "the claim moved on before SES was called; not sending"
         );
@@ -480,7 +486,7 @@ pub async fn handle_send<T: Services>(
     };
 
     let outcome = state
-        .services
+        .ses
         .send_raw(&RawSend {
             raw: &built,
             from: &spec.from,
@@ -489,7 +495,7 @@ pub async fn handle_send<T: Services>(
             bcc: &spec.envelope.bcc,
             configuration_set: &config.configuration_set,
             identity_arn: &config.identity_arn,
-            message_id,
+            message_id: message_id.as_str(),
         })
         .await;
 
@@ -514,7 +520,7 @@ fn build(spec: &SendSpec, parts: &[LoadedPart]) -> Result<Vec<u8>, SendFailure> 
     .map_err(|error| match error {
         BuildError::TooLarge { size, limit } => {
             tracing::warn!(
-                message_id,
+                %message_id,
                 size,
                 limit,
                 event = "send_too_large",
@@ -524,7 +530,7 @@ fn build(spec: &SendSpec, parts: &[LoadedPart]) -> Result<Vec<u8>, SendFailure> 
         }
         BuildError::Failed(error) => {
             tracing::error!(
-                message_id,
+                %message_id,
                 error = ?error,
                 event = "send_build_failed",
                 "could not assemble the message"
@@ -535,8 +541,8 @@ fn build(spec: &SendSpec, parts: &[LoadedPart]) -> Result<Vec<u8>, SendFailure> 
 }
 
 /// Records what SES said, which is the only write that touches the message.
-async fn record_outcome<T: Services>(
-    state: &AppState<T>,
+async fn record_outcome<B: Backend>(
+    state: &AppState<B>,
     calling: &SendState,
     outcome: SendOutcome,
     now: &str,
@@ -548,7 +554,7 @@ async fn record_outcome<T: Services>(
             mark_sent(state, calling, &ses_message_id, now, deadline).await?;
             metrics::counter!(names::MESSAGES_SENT).increment(1);
             tracing::info!(
-                message_id,
+                %message_id,
                 ses_message_id,
                 inbox_id = %calling.inbox_id.as_str(),
                 event = "message_sent",
@@ -559,7 +565,7 @@ async fn record_outcome<T: Services>(
         }
         SendOutcome::Failed { reason } => {
             tracing::warn!(
-                message_id,
+                %message_id,
                 reason,
                 event = "send_rejected",
                 "SES refused the message"
@@ -568,7 +574,7 @@ async fn record_outcome<T: Services>(
         }
         SendOutcome::Retryable { reason } => {
             tracing::warn!(
-                message_id,
+                %message_id,
                 reason,
                 event = "send_retryable",
                 "SES did not take the request; handing it back for another attempt"
@@ -579,7 +585,7 @@ async fn record_outcome<T: Services>(
             // Deliberately terminal. SES may hold the message; sending it
             // again could deliver it twice, so this waits for an operator.
             tracing::error!(
-                message_id,
+                %message_id,
                 reason,
                 event = "send_outcome_unknown",
                 "SES may or may not have accepted this message; not resending"
@@ -598,8 +604,8 @@ async fn record_outcome<T: Services>(
 /// SES already has the message, so this is worth trying hard: if it cannot
 /// be recorded, the claim is left carrying its SES-call mark, and the sweep
 /// moves it to `unknown` rather than sending it again.
-async fn mark_sent<T: Services>(
-    state: &AppState<T>,
+async fn mark_sent<B: Backend>(
+    state: &AppState<B>,
     calling: &SendState,
     ses_message_id: &str,
     now: &str,
@@ -614,7 +620,7 @@ async fn mark_sent<T: Services>(
     loop {
         attempt += 1;
         let result = state
-            .services
+            .mailbox
             .mark_send(
                 calling,
                 MarkOutcome::Sent(SesSent {
@@ -659,8 +665,8 @@ async fn mark_sent<T: Services>(
 /// Returns `Ok`: the release sets `requeued_at`, which is itself the stream
 /// record that re-triggers the sender. Also failing the invocation would
 /// redeliver the original record on top, multiplying attempts.
-async fn hand_back<T: Services>(
-    state: &AppState<T>,
+async fn hand_back<B: Backend>(
+    state: &AppState<B>,
     claimed: &SendState,
     failure: SendFailure,
     now: &str,
@@ -689,7 +695,7 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
 /// Records an outcome for a send and disposes of what that outcome makes
 /// dead.
 ///
-/// The sender's one way to call [`Services::mark_send`], because the write and
+/// The sender's one way to call [`Mailbox::mark_send`], because the write and
 /// the cleanup belong together: any outcome [`MarkOutcome::settles`] leaves a
 /// send that will never be assembled again, and `outbox/` has no lifecycle
 /// rule, so objects not cleared here are leaked for good. Routing every record
@@ -703,13 +709,13 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
 ///
 /// Cleanup is best effort and never reported: only the store write can fail
 /// the caller.
-async fn record<T: Services>(
-    state: &AppState<T>,
+async fn record<B: Backend>(
+    state: &AppState<B>,
     send: &SendState,
     outcome: MarkOutcome<'_>,
     now: &str,
 ) -> Result<(), MailStoreError> {
-    state.services.mark_send(send, outcome, now).await?;
+    state.mailbox.mark_send(send, outcome, now).await?;
     if outcome.settles() {
         clear_outbox(state, send).await;
     }
@@ -729,9 +735,9 @@ async fn record<T: Services>(
 /// of them will be assembled again, so none of them needs its outbox. A send
 /// in `unknown`, released or resumed keeps its objects, because it may yet go
 /// out.
-async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
+async fn clear_outbox<B: Backend>(state: &AppState<B>, finished: &SendState) {
     let message_id = &finished.message_id;
-    let mut keys = vec![send::spec_key(message_id)];
+    let mut keys = vec![object_keys::spec(message_id)];
 
     // The spec names the parts, so it is read before it is removed. When that
     // read fails for any reason but absence — including bytes that are present
@@ -739,8 +745,8 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     // which parts exist, and deleting it would strand them where nothing can
     // find them.
     match state
-        .services
-        .get_object(&send::spec_key(message_id), MAX_OUTBOUND_RAW_BYTES)
+        .objects
+        .get_object(&object_keys::spec(message_id), MAX_OUTBOUND_RAW_BYTES)
         .await
     {
         Ok(bytes) => {
@@ -748,7 +754,7 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
                 Ok(spec) => spec,
                 Err(error) => {
                     tracing::warn!(
-                        message_id,
+                        %message_id,
                         error = ?error,
                         event = "outbox_cleanup_failed",
                         "could not parse the send spec, so its outbox objects are kept; the `outbox/` prefix has no retention rule, so they will need manual cleanup"
@@ -757,13 +763,13 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
                 }
             };
             for attachment in &spec.attachments {
-                keys.push(send::part_key(message_id, &attachment.attachment_id));
+                keys.push(object_keys::part(message_id, &attachment.attachment_id));
             }
         }
         Err(ObjectError::NotFound) => {}
         Err(error) => {
             tracing::warn!(
-                message_id,
+                %message_id,
                 error = ?error,
                 event = "outbox_cleanup_failed",
                 "could not read the send spec, so its outbox objects are kept; the `outbox/` prefix has no retention rule, so they will need manual cleanup"
@@ -773,9 +779,9 @@ async fn clear_outbox<T: Services>(state: &AppState<T>, finished: &SendState) {
     }
 
     for key in keys {
-        if let Err(error) = state.services.delete_object(&key).await {
+        if let Err(error) = state.objects.delete_object(&key).await {
             tracing::warn!(
-                message_id,
+                %message_id,
                 key,
                 error = ?error,
                 event = "outbox_cleanup_failed",
@@ -800,7 +806,7 @@ enum LoadError {
 /// Classifies an object-store failure while loading `key`. `missing` is the
 /// failure a key that is not there comes to.
 fn object_load_error(
-    message_id: &str,
+    message_id: &MessageId,
     key: &str,
     error: ObjectError,
     missing: SendFailure,
@@ -815,7 +821,7 @@ fn object_load_error(
         // time, so retrying would only loop.
         error @ (ObjectError::Permanent(_) | ObjectError::TooLarge { .. }) => {
             tracing::error!(
-                message_id,
+                %message_id,
                 key,
                 error = ?error,
                 event = "send_outbox_refused",
@@ -827,22 +833,22 @@ fn object_load_error(
 }
 
 /// Reads the spec and every part it names.
-async fn load<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+async fn load<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
 ) -> Result<(SendSpec, Vec<LoadedPart>), LoadError> {
     let spec = load_spec(state, message_id).await?;
     let parts = load_parts(state, &spec).await?;
     Ok((spec, parts))
 }
 
-async fn load_spec<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+async fn load_spec<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
 ) -> Result<SendSpec, LoadError> {
-    let key = send::spec_key(message_id);
+    let key = object_keys::spec(message_id);
     let bytes = state
-        .services
+        .objects
         .get_object(&key, MAX_OUTBOUND_RAW_BYTES)
         .await
         .map_err(|error| {
@@ -850,7 +856,7 @@ async fn load_spec<T: Services>(
         })?;
     serde_json::from_slice(&bytes).map_err(|e| {
         // A spec that will not parse will not parse on a retry either.
-        tracing::error!(message_id, error = ?e, event = "send_spec_unreadable", "unreadable spec");
+        tracing::error!(%message_id, error = ?e, event = "send_spec_unreadable", "unreadable spec");
         LoadError::Permanent(SendFailure::SendSpecMissing)
     })
 }
@@ -858,17 +864,17 @@ async fn load_spec<T: Services>(
 /// One attachment's bytes, owned so the borrow checker does not tie them to
 /// the loop that fetched them.
 struct LoadedPart {
-    spec: crate::mail::send::SpecAttachment,
+    spec: mailbox::send::SpecAttachment,
     bytes: Vec<u8>,
 }
 
 /// Reads every attachment named by the spec: bytes already in the outbox, or
 /// a URL fetched once and stored so a retry reuses it.
-async fn load_parts<T: Services>(
-    state: &AppState<T>,
+async fn load_parts<B: Backend>(
+    state: &AppState<B>,
     spec: &SendSpec,
 ) -> Result<Vec<LoadedPart>, LoadError> {
-    let message_id = spec.message_id.as_str();
+    let message_id = &spec.message_id;
     let mut parts = Vec::with_capacity(spec.attachments.len());
     let mut budget = MAX_OUTBOUND_DECODED_BYTES;
 
@@ -878,7 +884,7 @@ async fn load_parts<T: Services>(
         // re-fetching everything.
         if let Some(key) = &attachment.object_key {
             let bytes = state
-                .services
+                .objects
                 .get_object(key, MAX_OUTBOUND_RAW_BYTES)
                 .await
                 .map_err(|error| {
@@ -895,9 +901,9 @@ async fn load_parts<T: Services>(
         // An earlier attempt may already have fetched and stored it. The
         // spec is written once at enqueue and never rewritten, so the stored
         // object is the only record that the fetch happened.
-        let stored_key = send::part_key(message_id, &attachment.attachment_id);
+        let stored_key = object_keys::part(message_id, &attachment.attachment_id);
         match state
-            .services
+            .objects
             .get_object(&stored_key, MAX_OUTBOUND_RAW_BYTES)
             .await
         {
@@ -925,7 +931,7 @@ async fn load_parts<T: Services>(
 
         let Some(raw_url) = &attachment.url else {
             tracing::error!(
-                message_id,
+                %message_id,
                 attachment_id = %attachment.attachment_id,
                 event = "send_part_has_no_source",
                 "attachment names neither stored bytes nor a URL"
@@ -936,7 +942,7 @@ async fn load_parts<T: Services>(
         // are cheap, and the spec has been sitting in S3 since enqueue.
         let url = url_policy::parse_attachment_url(raw_url).map_err(|rejected| {
             tracing::warn!(
-                message_id,
+                %message_id,
                 attachment_id = %attachment.attachment_id,
                 rejected = %rejected,
                 event = "send_part_url_blocked",
@@ -945,7 +951,9 @@ async fn load_parts<T: Services>(
             LoadError::Permanent(SendFailure::AttachmentFetchFailed)
         })?;
 
-        let fetched = AttachmentFetcher::fetch(&state.services, &url, budget)
+        let fetched = state
+            .fetcher
+            .fetch(&url, budget)
             .await
             .map_err(|error| fetch_error(message_id, &attachment.attachment_id, error))?;
         budget = budget.saturating_sub(fetched.bytes.len() as u64);
@@ -953,7 +961,7 @@ async fn load_parts<T: Services>(
         // Stored under the attachment's own key so a retry reuses these
         // bytes instead of fetching a URL whose content may have changed.
         state
-            .services
+            .objects
             .put_object_if_absent(
                 &stored_key,
                 axum::body::Bytes::from(fetched.bytes.clone()),
@@ -981,7 +989,7 @@ async fn load_parts<T: Services>(
 }
 
 /// Maps a fetch failure onto whether another attempt could succeed.
-fn fetch_error(message_id: &str, attachment_id: &str, error: FetchError) -> LoadError {
+fn fetch_error(message_id: &MessageId, attachment_id: &str, error: FetchError) -> LoadError {
     if error.is_transient() {
         return LoadError::Transient {
             failure: SendFailure::AttachmentFetchUnavailable,
@@ -991,7 +999,7 @@ fn fetch_error(message_id: &str, attachment_id: &str, error: FetchError) -> Load
     // The URL is never logged: it came from a caller and may carry a
     // credential in its path or query.
     tracing::warn!(
-        message_id,
+        %message_id,
         attachment_id,
         error = %error,
         event = "send_part_fetch_failed",
@@ -1000,8 +1008,8 @@ fn fetch_error(message_id: &str, attachment_id: &str, error: FetchError) -> Load
     LoadError::Permanent(SendFailure::AttachmentFetchFailed)
 }
 
-async fn fail<T: Services>(
-    state: &AppState<T>,
+async fn fail<B: Backend>(
+    state: &AppState<B>,
     claimed: &SendState,
     failure: SendFailure,
     now: &str,

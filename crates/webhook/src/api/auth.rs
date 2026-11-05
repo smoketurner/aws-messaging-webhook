@@ -20,12 +20,7 @@ use axum::response::Response;
 
 use crate::api::error::ApiError;
 use crate::api::keys::Verdict;
-use crate::state::{AppState, Services};
-
-/// The id of the key a request authenticated with, attached as a request
-/// extension. Ids are operator-facing labels, not secrets.
-#[derive(Debug, Clone)]
-pub struct KeyId(pub String);
+use crate::state::{AppState, Backend};
 
 /// Rejects the request unless it carries a recognized bearer key.
 ///
@@ -36,8 +31,8 @@ pub struct KeyId(pub String);
 /// [`ApiError::Unavailable`] when the key cache has never loaded and the
 /// parameter store cannot be read, so the key can be neither confirmed nor
 /// denied.
-pub async fn require_bearer<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn require_bearer<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
@@ -48,10 +43,14 @@ pub async fn require_bearer<T: Services>(
         .and_then(bearer_token)
         .ok_or(ApiError::Unauthorized)?;
 
-    match state.api_keys.verify(&state.services, presented).await {
+    match state.api_keys.verify(&state.key_source, presented).await {
         Verdict::Allowed(key_id) => {
-            tracing::debug!(key_id, event = "api_authenticated", "authenticated request");
-            request.extensions_mut().insert(KeyId(key_id));
+            tracing::debug!(
+                key_id = key_id.0.as_str(),
+                event = "api_authenticated",
+                "authenticated request"
+            );
+            request.extensions_mut().insert(key_id);
             Ok(next.run(request).await)
         }
         Verdict::Denied => Err(ApiError::Unauthorized),

@@ -4,13 +4,14 @@
 //! insert path: every fixture goes in through `insert_message`, so the items
 //! these reads return are the ones ingest would actually write.
 
-use aws_messaging_webhook::mail::store::MailStore as _;
+use mailbox::MessageId;
 use std::collections::BTreeMap;
 
-use aws_messaging_webhook::mail::content::{self, MessageContent};
-use aws_messaging_webhook::mail::{InboxId, ids, time};
+use aws_messaging_webhook::mail::content;
 use axum::http::{Method, StatusCode};
-use webhook_test_support::mail_memory::sample_message;
+use mailbox::content::MessageContent;
+use mailbox::{InboxId, ids, time};
+use mailbox_store::memory::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 /// A harness with an authenticated key and an existing inbox.
@@ -29,10 +30,10 @@ async fn insert(h: &Harness, at: &str, thread: &str, adjust: impl FnOnce(&mut Ma
     msg.created_at = at.to_owned();
     msg.updated_at = at.to_owned();
     adjust(&mut msg);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 }
 
-type MailMessageOwned = aws_messaging_webhook::mail::MailMessage;
+type MailMessageOwned = mailbox::MailMessage;
 
 #[tokio::test]
 async fn listing_messages_returns_newest_first_by_default() {
@@ -146,7 +147,7 @@ async fn a_page_token_from_another_inbox_is_rejected() {
     // never be replayed against an inbox it was not issued for.
     let h = seeded().await;
     h.state
-        .services
+        .mailbox
         .ensure_inbox(
             &InboxId::new("billing@example.com"),
             "2026-01-01T00:00:00.000Z",
@@ -214,7 +215,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
 
     // The same token is still rejected for a genuinely different inbox.
     h.state
-        .services
+        .mailbox
         .ensure_inbox(
             &InboxId::new("billing@example.com"),
             "2026-01-01T00:00:00.000Z",
@@ -394,9 +395,9 @@ async fn fetching_one_message_returns_the_body_a_list_omits() {
     let (_, list) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages")).await;
     let id = list["messages"][0]["message_id"].as_str().unwrap();
     content::store(
-        &h.state.services,
+        &h.state.objects,
         &InboxId::new(TEST_INBOX),
-        id,
+        &MessageId::new(id),
         &MessageContent {
             text: Some("the full body".to_owned()),
             headers: BTreeMap::from([("X-Custom".to_owned(), "yes".to_owned())]),

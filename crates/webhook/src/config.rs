@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use crate::allowlist::TopicAllowlist;
-use crate::mail::is_valid_local_part;
+use mailbox::{InboxId, is_valid_local_part};
 
 /// Runtime configuration from environment variables.
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct MailConfig {
     /// The one inbox's full address, at `domain`: its inbox id, and the only
     /// recipient the
     /// receipt rule accepts.
-    pub inbox: String,
+    pub inbox: InboxId,
     pub configuration_set: String,
     pub identity_arn: String,
     /// SSM parameter name holding the bearer API key hashes; must start with
@@ -169,7 +169,7 @@ impl MailConfig {
             domain,
             table_name,
             bucket,
-            inbox,
+            inbox: InboxId::new(&inbox),
             configuration_set,
             identity_arn,
             api_keys_parameter,

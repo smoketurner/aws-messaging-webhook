@@ -1,6 +1,5 @@
-//! [`ObjectStore`] for [`AwsServices`](crate::aws::AwsServices): S3 access
-//! for mail bodies, attachments and send specs, with the client
-//! timeouts (`operation_attempt_timeout` 20 s, `operation_timeout` 45 s).
+//! [`ObjectStore`] over S3: mail bodies, attachments and send specs, with
+//! the client timeouts (`operation_attempt_timeout` 20 s, `operation_timeout` 45 s).
 
 use std::time::Duration;
 
@@ -13,10 +12,10 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use axum::body::Bytes;
 
-use crate::aws::{self, AwsServices};
-use crate::mail::ObjectMeta;
-use crate::mail::PutOutcome;
+use crate::aws::FromSdkFailure;
 use crate::mail::objects::{ObjectError, ObjectStore};
+use mailbox::ObjectMeta;
+use mailbox::PutOutcome;
 
 /// The per-attempt and per-operation S3 timeouts, applied to every call
 /// via `.customize().config_override(...)` since the shared `s3` client
@@ -33,9 +32,8 @@ fn timeout_override() -> S3ConfigBuilder {
 /// `s3:ListBucket` grant is what makes this a real 404 rather than a 403) is
 /// [`ObjectError::NotFound`]; a 403 is [`ObjectError::Permanent`]; timeouts,
 /// dispatch/response failures, throttling and 5xx are
-/// [`ObjectError::Transient`]; everything else is permanent. Shares its
-/// transient/permanent classification with `aws.rs`'s
-/// `classify_action_error` via `aws::sdk_error_is_transient`.
+/// [`ObjectError::Transient`]; everything else is permanent. The
+/// transient/permanent split is the shared [`FromSdkFailure::from_sdk`].
 fn classify_object_error<E>(context: &'static str, error: &SdkError<E>) -> ObjectError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
@@ -52,11 +50,16 @@ where
             _ => {}
         }
     }
-    let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if aws::sdk_error_is_transient(error) {
-        ObjectError::Transient(source)
-    } else {
-        ObjectError::Permanent(source)
+    ObjectError::from_sdk(context, error)
+}
+
+impl FromSdkFailure for ObjectError {
+    fn transient(source: anyhow::Error) -> Self {
+        Self::Transient(source)
+    }
+
+    fn permanent(source: anyhow::Error) -> Self {
+        Self::Permanent(source)
     }
 }
 
@@ -84,25 +87,35 @@ where
     }
 }
 
-impl AwsServices {
+/// The mail bucket.
+pub struct S3Objects {
+    client: aws_sdk_s3::Client,
+    /// `None` when mail is not configured.
+    bucket: Option<String>,
+}
+
+impl S3Objects {
+    #[must_use]
+    pub fn new(client: aws_sdk_s3::Client, bucket: Option<String>) -> Self {
+        Self { client, bucket }
+    }
+
     /// The mail bucket name (`MailConfig.bucket`) — the only bucket the
     /// object store ever addresses. Missing mail config here is a caller
     /// bug: every ingress path guards on `mail` being configured before an
     /// `ObjectStore` method can be reached.
     fn mail_bucket(&self) -> Result<&str, ObjectError> {
-        self.mail_config()
-            .map(|config| config.bucket.as_str())
-            .ok_or_else(|| {
-                ObjectError::Permanent(anyhow!("ObjectStore called with mail not configured"))
-            })
+        self.bucket.as_deref().ok_or_else(|| {
+            ObjectError::Permanent(anyhow!("ObjectStore called with mail not configured"))
+        })
     }
 }
 
-impl ObjectStore for AwsServices {
+impl ObjectStore for S3Objects {
     async fn get_object(&self, key: &str, max_bytes: u64) -> Result<Bytes, ObjectError> {
         let bucket = self.mail_bucket()?;
         let output = self
-            .s3
+            .client
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -139,7 +152,7 @@ impl ObjectStore for AwsServices {
     async fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>, ObjectError> {
         let bucket = self.mail_bucket()?;
         let result = self
-            .s3
+            .client
             .head_object()
             .bucket(bucket)
             .key(key)
@@ -170,7 +183,7 @@ impl ObjectStore for AwsServices {
     ) -> Result<PutOutcome, ObjectError> {
         let bucket = self.mail_bucket()?;
         let result = self
-            .s3
+            .client
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -190,7 +203,7 @@ impl ObjectStore for AwsServices {
     async fn delete_object(&self, key: &str) -> Result<(), ObjectError> {
         let bucket = self.mail_bucket()?;
         let result = self
-            .s3
+            .client
             .delete_object()
             .bucket(bucket)
             .key(key)
@@ -220,7 +233,7 @@ impl ObjectStore for AwsServices {
         let config = PresigningConfig::expires_in(ttl)
             .map_err(|e| ObjectError::Permanent(anyhow!("building the presigning config: {e}")))?;
 
-        let mut request = self.s3.get_object().bucket(bucket).key(key);
+        let mut request = self.client.get_object().bucket(bucket).key(key);
         if let Some(disposition) = disposition {
             request = request.response_content_disposition(disposition);
         }

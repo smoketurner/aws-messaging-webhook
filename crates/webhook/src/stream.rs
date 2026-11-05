@@ -28,7 +28,7 @@
 //! delivery, bounce, complaint, reject and open events of a sent message
 //! publish from the events-table branch instead, one per SES event, since
 //! only the SES event carries their details. A `MSG#`
-//! image deserializes straight into [`crate::mail::MailMessage`] via
+//! image deserializes straight into [`mailbox::MailMessage`] via
 //! `serde_dynamo::from_item`, never by hand-parsing the attribute JSON, so
 //! [`crate::mail::events`] works from the same struct the store reads and
 //! writes.
@@ -39,18 +39,22 @@ use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
 
-use crate::mail::MailMessage;
+use crate::events_keys;
 use crate::mail::content;
 use crate::mail::events::{MailEvent, build_received_event, build_sent_event, build_ses_event};
-use crate::mail::labels::SystemLabel;
 use crate::mail::objects::ObjectError;
-use crate::mail::store::MailStoreError;
 use crate::metrics::names;
 use crate::model::ses_notification::SesNotification;
 use crate::model::{DomainEvent, Source};
+use crate::publish::PublishEvents as _;
 use crate::publish::{OutboundEvent, PublishError, SCHEMA_VERSION, build_outbound};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 use crate::store::EventRecord;
+use mailbox::MailMessage;
+use mailbox::SesMessageId;
+use mailbox::labels::SystemLabel;
+use mailbox_store::keys;
+use mailbox_store::store::MailStoreError;
 
 /// Reads a DynamoDB `String` attribute from a stream image.
 pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
@@ -101,6 +105,36 @@ enum RelayOutcome {
     Retry,
 }
 
+/// Which kind of item a stream record carries, told apart by `sk` alone: the
+/// relay consumes both the events table and the mail table, and their `sk`
+/// shapes do not overlap. (`MSG#` is the events table's `pk` prefix too,
+/// which is why classification never looks at `pk`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamItem {
+    /// An events-table event item.
+    Event,
+    /// An events-table per-message aggregate.
+    Aggregate,
+    /// A mail-table message item.
+    MailMessage,
+    /// Any other mail-table item, which never publishes.
+    Other,
+}
+
+impl StreamItem {
+    fn classify(sk: &str) -> Self {
+        if sk.starts_with(events_keys::EVENT_SK_PREFIX) {
+            Self::Event
+        } else if sk == events_keys::AGGREGATE_SK {
+            Self::Aggregate
+        } else if sk.starts_with(keys::MESSAGE_SK_PREFIX) {
+            Self::MailMessage
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Inserts `key: value` into a JSON object only when the value is present,
 /// keeping the status snapshot free of null fields.
 fn insert_opt(target: &mut Value, key: &str, value: Option<impl Into<Value>>) {
@@ -118,8 +152,8 @@ fn insert_opt(target: &mut Value, key: &str, value: Option<impl Into<Value>>) {
 /// Returns an error only if the payload is not a well-formed DynamoDB stream
 /// event; per-record faults are handled via the returned failure list or
 /// skipped.
-pub async fn handle_stream<T: Services>(
-    state: &AppState<T>,
+pub async fn handle_stream<B: Backend>(
+    state: &AppState<B>,
     payload: Value,
 ) -> Result<Value, lambda_http::Error> {
     let event: Event = serde_json::from_value(payload)
@@ -132,30 +166,33 @@ pub async fn handle_stream<T: Services>(
         let Some(sk) = image_str(new_image, "sk") else {
             continue;
         };
-        let published = if sk.starts_with("EVT#") {
-            // Event items are write-once, so only their INSERT publishes.
-            if record.event_name != "INSERT" {
-                continue;
+        let published = match StreamItem::classify(sk) {
+            StreamItem::Event => {
+                // Event items are write-once, so only their INSERT publishes.
+                if record.event_name != "INSERT" {
+                    continue;
+                }
+                publish_record(state, new_image).await
             }
-            publish_record(state, new_image).await
-        } else if sk == "AGG" {
-            // The per-message aggregate: publish a status delta when
-            // current_status transitions (INSERT of the first status, or a
-            // MODIFY that changes it) — not on count-only bumps.
-            publish_status_changed(state, new_image, &record.change.old_image).await
-        } else if sk.starts_with("MSG#") {
-            // Mail-table message item: an INSERT publishes the arrival of
-            // received mail, a MODIFY the send when it is the sent relabel.
-            if record.event_name == "INSERT" {
-                publish_mail_record(state, new_image).await
-            } else {
-                publish_mail_sent(state, new_image, &record.change.old_image).await
+            StreamItem::Aggregate => {
+                // The per-message aggregate: publish a status delta when
+                // current_status transitions (INSERT of the first status, or a
+                // MODIFY that changes it) — not on count-only bumps.
+                publish_status_changed(state, new_image, &record.change.old_image).await
             }
-        } else {
+            StreamItem::MailMessage => {
+                // Mail-table message item: an INSERT publishes the arrival of
+                // received mail, a MODIFY the send when it is the sent relabel.
+                if record.event_name == "INSERT" {
+                    publish_mail_record(state, new_image).await
+                } else {
+                    publish_mail_sent(state, new_image, &record.change.old_image).await
+                }
+            }
             // Every other mail-table item (STATE, META, THR#…, MSGAT#…,
             // THRAT#…, RFC, SESMSG#…, SENDKEY#…, SESCALL#…) never matches the
             // relay filter in production and never publishes here.
-            continue;
+            StreamItem::Other => continue,
         };
         // Reconstruction / no-op cases settle without a retry; only a
         // transient publish failure recruits redelivery of this record.
@@ -184,7 +221,7 @@ pub async fn handle_stream<T: Services>(
 /// transient publish failure; a deterministic reconstruction failure is logged
 /// and returns [`RelayOutcome::Settled`] so it is skipped rather than retried
 /// forever.
-async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
+async fn publish_record<B: Backend>(state: &AppState<B>, image: &Item) -> RelayOutcome {
     let Some(AttributeValue::B(raw_body)) = image.get("raw_body") else {
         tracing::error!(
             event = "stream_missing_raw_body",
@@ -282,8 +319,8 @@ async fn publish_record<T: Services>(state: &AppState<T>, image: &Item) -> Relay
 /// belongs to, when it is for mail this mailbox sent. Most events on a
 /// shared configuration set are for other senders, so an unresolved id is
 /// `None`, not an error.
-async fn mailbox_ses_event<T: Services>(
-    state: &AppState<T>,
+async fn mailbox_ses_event<B: Backend>(
+    state: &AppState<B>,
     ses: &SesNotification,
     envelope: &SnsEnvelope,
 ) -> Result<Option<(MailMessage, MailEvent)>, MailStoreError> {
@@ -291,13 +328,13 @@ async fn mailbox_ses_event<T: Services>(
         return Ok(None);
     }
     let Some((inbox, message_id)) = state
-        .services
-        .resolve_ses_message(&ses.mail.message_id)
+        .mailbox
+        .resolve_ses_message(&SesMessageId::new(ses.mail.message_id.as_str()))
         .await?
     else {
         return Ok(None);
     };
-    let Some(msg) = state.services.get_message(&inbox, &message_id).await? else {
+    let Some(msg) = state.mailbox.get_message(&inbox, &message_id).await? else {
         return Ok(None);
     };
     Ok(
@@ -324,11 +361,11 @@ fn decode_mail_image(image: &Item) -> Option<MailMessage> {
 
 /// Publishes one event and counts the outcome; the caller logs it, since
 /// each kind of event identifies itself with different fields.
-async fn publish_one<T: Services>(
-    state: &AppState<T>,
+async fn publish_one<B: Backend>(
+    state: &AppState<B>,
     outbound: &OutboundEvent,
 ) -> Result<(), PublishError> {
-    let result = state.services.publish(outbound).await;
+    let result = state.publisher.publish(outbound).await;
     let counter = if result.is_ok() {
         names::EVENTS_PUBLISHED
     } else {
@@ -344,7 +381,7 @@ async fn publish_one<T: Services>(
 /// a deserialization failure is a deterministic bug (not a transient fault),
 /// so it is logged and returns [`RelayOutcome::Settled`] (an INSERT's absent
 /// or empty `OldImage` is never read here, so it can't cause this).
-async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> RelayOutcome {
+async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> RelayOutcome {
     let Some(msg) = decode_mail_image(image) else {
         return RelayOutcome::Settled;
     };
@@ -352,15 +389,15 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
     // A queued send's INSERT publishes nothing (its lifecycle starts at the
     // `sent` relabel), and reading its content document first would be an S3
     // GET for an event that is never built.
-    if !crate::mail::labels::has(&msg.labels, SystemLabel::Received) {
+    if !mailbox::labels::has(&msg.labels, SystemLabel::Received) {
         return RelayOutcome::Settled;
     }
-    let content = match content::load(&state.services, &msg).await {
+    let content = match content::load(&state.objects, &msg).await {
         Ok(content) => content,
         Err(ObjectError::Transient(error)) => {
             tracing::error!(
                 ?error,
-                message_id = msg.message_id,
+                message_id = %msg.message_id,
                 event = "publish_failure",
                 "failed to read the message content document; will retry"
             );
@@ -372,11 +409,11 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
             // retrying a permanent failure, so publish what the item holds.
             tracing::error!(
                 ?error,
-                message_id = msg.message_id,
+                message_id = %msg.message_id,
                 event = "stream_bad_mail_content",
                 "message content document could not be read; publishing without it"
             );
-            content::MessageContent::default()
+            mailbox::content::MessageContent::default()
         }
     };
 
@@ -390,8 +427,8 @@ async fn publish_mail_record<T: Services>(state: &AppState<T>, image: &Item) -> 
 /// sender's `queued` → `sent` relabel. Any other write — a delivery label, a
 /// user's own label, a read receipt, a promotion repoint, a metadata write —
 /// publishes nothing. Same retry contract as [`publish_mail_record`].
-async fn publish_mail_sent<T: Services>(
-    state: &AppState<T>,
+async fn publish_mail_sent<B: Backend>(
+    state: &AppState<B>,
     new_image: &Item,
     old_image: &Item,
 ) -> RelayOutcome {
@@ -412,8 +449,8 @@ async fn publish_mail_sent<T: Services>(
 }
 
 /// Publishes already-built mail events, one `PutEvents` call each.
-async fn publish_mail_events<T: Services>(
-    state: &AppState<T>,
+async fn publish_mail_events<B: Backend>(
+    state: &AppState<B>,
     msg: &MailMessage,
     events: Vec<MailEvent>,
 ) -> RelayOutcome {
@@ -427,7 +464,7 @@ async fn publish_mail_events<T: Services>(
             Ok(()) => {
                 tracing::info!(
                     inbox_id = msg.inbox_id.as_str(),
-                    message_id = msg.message_id,
+                    message_id = %msg.message_id,
                     detail_type = outbound.detail_type,
                     outcome = "published",
                     "mail event published to EventBridge"
@@ -436,7 +473,7 @@ async fn publish_mail_events<T: Services>(
             Err(error) => {
                 tracing::error!(
                     ?error,
-                    message_id = msg.message_id,
+                    message_id = %msg.message_id,
                     event = "publish_failure",
                     "failed to publish mail event to EventBridge; will retry"
                 );
@@ -453,8 +490,8 @@ async fn publish_mail_events<T: Services>(
 /// untouched) produce no event. Carries the rolled-up snapshot so consumers get
 /// the authoritative status without re-deriving precedence. Same retry contract
 /// as `publish_record`: [`RelayOutcome::Retry`] on a transient publish failure.
-async fn publish_status_changed<T: Services>(
-    state: &AppState<T>,
+async fn publish_status_changed<B: Backend>(
+    state: &AppState<B>,
     new_image: &Item,
     old_image: &Item,
 ) -> RelayOutcome {
@@ -464,7 +501,7 @@ async fn publish_status_changed<T: Services>(
     if image_str(old_image, "current_status") == Some(current) {
         return RelayOutcome::Settled; // not a status transition — count-only change
     }
-    let Some(message_id) = image_str(new_image, "pk").and_then(|pk| pk.strip_prefix("MSG#")) else {
+    let Some(message_id) = image_str(new_image, "pk").and_then(events_keys::parse_partition) else {
         tracing::error!(
             event = "stream_agg_missing_pk",
             "aggregate item has no MSG# pk"
@@ -520,7 +557,7 @@ async fn publish_status_changed<T: Services>(
     match publish_one(state, &outbound).await {
         Ok(()) => {
             tracing::info!(
-                message_id,
+                %message_id,
                 current_status = current,
                 outcome = "status_published",
                 "published message.status.changed"
@@ -530,11 +567,48 @@ async fn publish_status_changed<T: Services>(
         Err(error) => {
             tracing::error!(
                 ?error,
-                message_id,
+                %message_id,
                 event = "publish_failure",
                 "failed to publish status change; will retry"
             );
             RelayOutcome::Retry
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MSG#` is an events-table `pk` and a mail-table `sk`: only the `sk`
+    /// decides, so an events-table record is never mistaken for mail.
+    #[test]
+    fn records_classify_by_sk_across_both_tables() {
+        let event_sk = events_keys::event_sk("2026-01-01T00:00:00.000Z", "sns-1");
+        let message = keys::message(&mailbox::InboxId::new("support@example.com"), "mid-1");
+        assert_eq!(StreamItem::classify(&event_sk), StreamItem::Event);
+        assert_eq!(
+            StreamItem::classify(events_keys::AGGREGATE_SK),
+            StreamItem::Aggregate
+        );
+        assert_eq!(StreamItem::classify(&message.sk), StreamItem::MailMessage);
+        assert_eq!(
+            StreamItem::classify(&events_keys::partition("mid-1")),
+            StreamItem::MailMessage,
+            "an sk shaped like an events-table pk is a mail-table message sk"
+        );
+        for sk in [
+            keys::SEND_STATE_SK,
+            keys::INBOX_SK,
+            keys::RFC_ALIAS_SK,
+            keys::SES_REF_SK,
+            keys::SEND_KEY_SK,
+            "THR#tid-1",
+            "MSGAT#x",
+            "THRAT#x",
+            "SESCALL#x",
+        ] {
+            assert_eq!(StreamItem::classify(sk), StreamItem::Other, "{sk}");
         }
     }
 }

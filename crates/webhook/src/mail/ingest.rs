@@ -2,6 +2,7 @@
 //! per-inbox thread resolution and insert, all bounded by the invocation
 //! deadline.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -9,17 +10,18 @@ use uuid::Uuid;
 
 use crate::actions::ActionError;
 use crate::config::MailConfig;
-use crate::mail::labels::SystemLabel;
-use crate::mail::mime::{ParseError, ParsedAttachment, parse_inbound};
-use crate::mail::objects::ObjectError;
-use crate::mail::store::MailStoreError;
-use crate::mail::{
-    AttachmentMeta, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, content, ids, labels,
-    strip_angle_brackets, thread, time,
-};
+use crate::mail::objects::ObjectStore as _;
+use crate::mail::{content, object_keys};
 use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
+use mailbox::labels::SystemLabel;
+use mailbox::mime::{ParseError, ParsedAttachment, ParsedMessage, parse_inbound};
+use mailbox::{
+    AttachmentMeta, Direction, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, MessageId,
+    SesMessageId, ThreadId, ids, labels, strip_angle_brackets, thread, time,
+};
+use mailbox_store::store::MailStoreError;
 
 /// Headroom held back from the invocation deadline: ingest runs under
 /// `deadline − now − DEADLINE_MARGIN`, leaving room for the timeout's own
@@ -64,8 +66,8 @@ impl IngestOutcome {
 /// object, a size or label cap violation, or throttling that outlasts the
 /// transaction retry budget; those are logged and counted, and the inbound
 /// event still publishes.
-pub async fn ingest_inbound<T: Services>(
-    state: &AppState<T>,
+pub async fn ingest_inbound<B: Backend>(
+    state: &AppState<B>,
     event: &SesInboundNotification,
     deadline: tokio::time::Instant,
     envelope_ts_ms: Option<u64>,
@@ -108,11 +110,11 @@ pub async fn ingest_inbound<T: Services>(
         return finish(resolution.had_transient, IngestOutcome::Skipped);
     }
 
-    let message_id = ids::inbound_message_id(&event.mail.message_id, received_ms);
-    let message_id_str = message_id.to_string();
+    let uuid = ids::inbound_message_id(&event.mail.message_id, received_ms);
+    let message_id = MessageId::from(uuid);
 
     let inboxes = std::mem::take(&mut resolution.inboxes);
-    let targets = fresh_targets(state, inboxes, &message_id_str, &mut resolution).await;
+    let targets = fresh_targets(state, inboxes, &message_id, &mut resolution).await;
     if targets.is_empty() {
         let outcome = if resolution.had_permanent {
             IngestOutcome::Failed
@@ -127,27 +129,19 @@ pub async fn ingest_inbound<T: Services>(
         .saturating_sub(DEADLINE_MARGIN);
     let outcome = tokio::time::timeout(
         budget,
-        ingest_into_targets(
-            state,
-            key,
-            event,
-            targets,
-            message_id,
-            &message_id_str,
-            received_ms,
-        ),
+        ingest_into_targets(state, key, event, targets, uuid, &message_id, received_ms),
     )
     .await;
 
     if let Ok(result) = outcome {
         let result = result
-            .map_err(|error| record_ingest_error(error, &event.mail.message_id, &message_id_str))?;
+            .map_err(|error| record_ingest_error(error, &event.mail.message_id, &message_id))?;
         finish(resolution.had_transient, result)
     } else {
         metrics::counter!(names::INGEST_TIMEOUTS).increment(1);
         tracing::warn!(
             event = "ingest_deadline",
-            message_id = %message_id_str,
+            %message_id,
             "ingest exceeded its deadline budget"
         );
         Err(ActionError::transient(anyhow::anyhow!(
@@ -187,15 +181,15 @@ fn guarded_s3_pointer<'a>(
 /// Drops inboxes where `message_exists` is already true (a redelivery),
 /// aggregating any store error into `resolution` the same way
 /// [`resolve_recipient`] does.
-async fn fresh_targets<T: Services>(
-    state: &AppState<T>,
+async fn fresh_targets<B: Backend>(
+    state: &AppState<B>,
     inboxes: Vec<InboxId>,
-    message_id: &str,
+    message_id: &MessageId,
     resolution: &mut InboxResolution,
 ) -> Vec<InboxId> {
     let mut targets = Vec::with_capacity(inboxes.len());
     for inbox_id in inboxes {
-        match state.services.message_exists(&inbox_id, message_id).await {
+        match state.mailbox.message_exists(&inbox_id, message_id).await {
             Ok(false) => targets.push(inbox_id),
             Ok(true) => {}
             Err(error) => record_resolution_error(resolution, error),
@@ -209,13 +203,17 @@ async fn fresh_targets<T: Services>(
 /// message id (what an operator has from the bounce or the SES console) and
 /// the message id this service would have given it. A transient failure is
 /// left alone: the redelivery it recruits is the outcome, not a loss.
-fn record_ingest_error(error: ActionError, ses_message_id: &str, message_id: &str) -> ActionError {
+fn record_ingest_error(
+    error: ActionError,
+    ses_message_id: &str,
+    message_id: &MessageId,
+) -> ActionError {
     if error.kind == crate::actions::ActionErrorKind::Permanent {
         metrics::counter!(names::INGEST_FAILURES).increment(1);
         tracing::error!(
             error = ?error.source,
             ses_message_id,
-            message_id,
+            %message_id,
             event = "ingest_failure",
             "inbound message could not be ingested"
         );
@@ -262,13 +260,13 @@ fn normalized_recipients(receipt: &SesReceipt) -> Vec<String> {
 /// seeing in a default INFO deployment. This is a per-recipient
 /// skip, so unlike the whole-message skips above it does not increment
 /// `IngestSkipped` — that metric keeps meaning "a message we didn't store".
-async fn resolve_recipient<T: Services>(
-    state: &AppState<T>,
+async fn resolve_recipient<B: Backend>(
+    state: &AppState<B>,
     mail_config: &MailConfig,
     address: &str,
     resolution: &mut InboxResolution,
 ) {
-    if address != mail_config.inbox {
+    if address != mail_config.inbox.as_str() {
         tracing::warn!(
             event = "ingest_skipped",
             reason = "unknown_inbox",
@@ -279,7 +277,7 @@ async fn resolve_recipient<T: Services>(
     }
     let inbox_id = InboxId::new(address);
 
-    match state.services.get_inbox(&inbox_id).await {
+    match state.mailbox.get_inbox(&inbox_id).await {
         Ok(Some(_)) => {
             resolution.inboxes.push(inbox_id);
             return;
@@ -292,7 +290,7 @@ async fn resolve_recipient<T: Services>(
     }
 
     let now = time::format(time::now_ms());
-    match state.services.ensure_inbox(&inbox_id, &now).await {
+    match state.mailbox.ensure_inbox(&inbox_id, &now).await {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }
@@ -304,7 +302,7 @@ async fn resolve_recipient<T: Services>(
 /// and counted here — it would otherwise be indistinguishable from "this
 /// message was addressed to an inbox we don't serve".
 fn record_resolution_error(resolution: &mut InboxResolution, error: MailStoreError) {
-    let error = map_store_error(error);
+    let error = ActionError::from(error);
     match error.kind {
         crate::actions::ActionErrorKind::Transient => resolution.had_transient = true,
         crate::actions::ActionErrorKind::Permanent => {
@@ -342,70 +340,71 @@ fn received_ms(event: &SesInboundNotification, envelope_ts_ms: Option<u64>) -> O
 
 /// Fetches, parses and extracts the raw MIME once, then inserts the built
 /// item into every target inbox.
-async fn ingest_into_targets<T: Services>(
-    state: &AppState<T>,
+async fn ingest_into_targets<B: Backend>(
+    state: &AppState<B>,
     key: &str,
     event: &SesInboundNotification,
     targets: Vec<InboxId>,
-    message_id: Uuid,
-    message_id_str: &str,
+    uuid: Uuid,
+    message_id: &MessageId,
     received_ms: u64,
 ) -> Result<IngestOutcome, ActionError> {
-    let (mut parsed_message, mut parsed_content, attachment_metas) =
-        fetch_parse_and_extract(state, key, message_id, message_id_str).await?;
+    let (parsed, mut content, attachments) =
+        fetch_parse_and_extract(state, key, uuid, message_id).await?;
 
     let verdict =
         labels::classify_inbound(event.receipt.is_quarantined(), auth_failed(&event.receipt));
-    let message_labels = verdict_labels(verdict);
     let now_ms = time::now_ms();
-    let now = time::format(now_ms);
-    let timestamp = time::format(received_ms);
-    parsed_content.verdicts = Some(verdicts_json(&event.receipt));
-    if let Some(mail) = &state.config.mail {
-        parsed_message.expires_at = time::expires_at(now_ms, mail.retention_days);
-    }
+    content.verdicts = Some(verdicts_json(&event.receipt));
+    let draft = InboundDraft {
+        parsed,
+        message_id: message_id.clone(),
+        ses_message_id: SesMessageId::new(event.mail.message_id.as_str()),
+        labels: verdict_labels(verdict),
+        timestamp: time::format(received_ms),
+        now: time::format(now_ms),
+        raw_s3_key: key.to_owned(),
+        attachments,
+        expires_at: state
+            .config
+            .mail
+            .as_ref()
+            .map_or(0, |mail| time::expires_at(now_ms, mail.retention_days)),
+    };
 
-    let inserted = insert_into_all_targets(
-        state,
-        &parsed_message,
-        &parsed_content,
-        targets,
-        message_id_str,
-        &message_labels,
-        &timestamp,
-        &now,
-        key,
-        event,
-        &attachment_metas,
-    )
-    .await?;
-
-    if !inserted {
+    if !insert_into_all_targets(state, &draft, &content, targets).await? {
         return Ok(IngestOutcome::Failed);
     }
     metrics::counter!(names::MESSAGES_INGESTED).increment(1);
     tracing::info!(
         event = "ingest_complete",
-        message_id = %message_id_str,
+        %message_id,
         "ingested inbound message"
     );
     Ok(IngestOutcome::Ingested)
 }
 
 /// `GetObject`, then a `spawn_blocking` parse, then extraction of the kept
-/// attachment parts, returning the parsed content template and its
-/// attachments' persisted metadata.
-async fn fetch_parse_and_extract<T: Services>(
-    state: &AppState<T>,
+/// attachment parts, returning the parsed fields, the content template and
+/// its attachments' persisted metadata.
+async fn fetch_parse_and_extract<B: Backend>(
+    state: &AppState<B>,
     key: &str,
-    message_id: Uuid,
-    message_id_str: &str,
-) -> Result<(MailMessage, content::MessageContent, Vec<AttachmentMeta>), ActionError> {
+    uuid: Uuid,
+    message_id: &MessageId,
+) -> Result<
+    (
+        ParsedMessage,
+        mailbox::content::MessageContent,
+        Vec<AttachmentMeta>,
+    ),
+    ActionError,
+> {
     let raw = state
-        .services
+        .objects
         .get_object(key, MAX_INBOUND_RAW_BYTES)
         .await
-        .map_err(map_object_error)?;
+        .map_err(ActionError::from)?;
 
     let parsed = tokio::task::spawn_blocking(move || parse_inbound(&raw))
         .await
@@ -420,15 +419,15 @@ async fn fetch_parse_and_extract<T: Services>(
         .attachments
         .into_iter()
         .enumerate()
-        .map(|(ordinal, attachment)| (ids::attachment_id(&message_id, ordinal), attachment))
+        .map(|(ordinal, attachment)| (ids::attachment_id(&uuid, ordinal), attachment))
         .collect();
-    put_kept_parts(state, message_id_str, &kept_attachments).await?;
+    put_kept_parts(state, message_id, &kept_attachments).await?;
 
     let attachment_metas: Vec<AttachmentMeta> = kept_attachments
         .iter()
         .map(|(attachment_id, attachment)| AttachmentMeta {
             attachment_id: attachment_id.clone(),
-            object_key: Some(object_key(message_id_str, attachment_id)),
+            object_key: Some(object_keys::attachment(message_id, attachment_id)),
             size: u64::try_from(attachment.bytes.len()).unwrap_or(u64::MAX),
             filename: attachment.filename.clone(),
             content_type: attachment.content_type.clone(),
@@ -440,46 +439,78 @@ async fn fetch_parse_and_extract<T: Services>(
     Ok((parsed.message, parsed.content, attachment_metas))
 }
 
+/// Everything one inbound message's item is built from, before it is
+/// addressed to an inbox: one draft is inserted into every target inbox.
+struct InboundDraft {
+    parsed: ParsedMessage,
+    message_id: MessageId,
+    ses_message_id: SesMessageId,
+    labels: Vec<String>,
+    /// Fixed-width (`mail::time::format`) receipt time.
+    timestamp: String,
+    now: String,
+    raw_s3_key: String,
+    attachments: Vec<AttachmentMeta>,
+    expires_at: u64,
+}
+
+impl InboundDraft {
+    /// The message as `inbox_id` stores it. Its thread is the one it starts
+    /// when no candidate resolves; `insert_message` moves it otherwise.
+    ///
+    /// `thread_snapshot` is left `None` here — `plan_insert` populates it
+    /// from `thread_after` (the thread's full state including this message,
+    /// computed from the versioned retry loop's consistent read), so a reply
+    /// publishes the thread's real `message_count` rather than 1.
+    fn to_message(&self, inbox_id: &InboxId) -> MailMessage {
+        let parsed = self.parsed.clone();
+        MailMessage {
+            inbox_id: inbox_id.clone(),
+            thread_id: ThreadId::from(&self.message_id),
+            message_id: self.message_id.clone(),
+            ses_message_id: Some(self.ses_message_id.clone()),
+            direction: Direction::Inbound,
+            rfc_message_id: parsed.rfc_message_id,
+            in_reply_to: parsed.in_reply_to,
+            labels: self.labels.clone(),
+            timestamp: self.timestamp.clone(),
+            from: parsed.from,
+            to: parsed.to,
+            cc: parsed.cc,
+            bcc: parsed.bcc,
+            subject: parsed.subject,
+            preview: parsed.preview,
+            size: parsed.size,
+            attachments: self.attachments.clone(),
+            attachments_truncated: parsed.attachments_truncated,
+            raw_s3_key: Some(self.raw_s3_key.clone()),
+            thread_snapshot: None,
+            delivery: BTreeMap::new(),
+            send_status: None,
+            sent_at: None,
+            version: 0,
+            created_at: self.now.clone(),
+            updated_at: self.now.clone(),
+            expires_at: self.expires_at,
+        }
+    }
+}
+
 /// Inserts into every target inbox: each is attempted regardless of an
 /// earlier permanent failure; a transient failure anywhere
 /// fails the whole action once every inbox has been attempted. Returns
 /// whether at least one inbox succeeded.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one call site; see `ingest_into_targets`"
-)]
-async fn insert_into_all_targets<T: Services>(
-    state: &AppState<T>,
-    template: &MailMessage,
-    content: &content::MessageContent,
+async fn insert_into_all_targets<B: Backend>(
+    state: &AppState<B>,
+    draft: &InboundDraft,
+    content: &mailbox::content::MessageContent,
     targets: Vec<InboxId>,
-    message_id_str: &str,
-    message_labels: &[String],
-    timestamp: &str,
-    now: &str,
-    raw_key: &str,
-    event: &SesInboundNotification,
-    attachment_metas: &[AttachmentMeta],
 ) -> Result<bool, ActionError> {
     let mut had_transient = false;
     let mut inserted_any = false;
 
     for inbox_id in targets {
-        match insert_into_inbox(
-            state,
-            template,
-            content,
-            &inbox_id,
-            message_id_str,
-            message_labels,
-            timestamp,
-            now,
-            raw_key,
-            event,
-            attachment_metas,
-        )
-        .await
-        {
+        match insert_into_inbox(state, draft, content, &inbox_id).await {
             Ok(()) => inserted_any = true,
             Err(ActionError {
                 kind: crate::actions::ActionErrorKind::Transient,
@@ -491,7 +522,7 @@ async fn insert_into_all_targets<T: Services>(
                 metrics::counter!(names::INGEST_FAILURES).increment(1);
                 tracing::error!(
                     error = ?error.source,
-                    message_id = %message_id_str,
+                    message_id = %draft.message_id,
                     inbox_id = inbox_id.as_str(),
                     event = "ingest_failure",
                     "permanent error inserting inbound message; continuing with remaining inboxes"
@@ -509,32 +540,22 @@ async fn insert_into_all_targets<T: Services>(
 }
 
 /// Stores this message's content document and inserts its item for one
-/// target inbox: label assignment, the document, then `insert_message`,
-/// which resolves the thread (`Duplicate` counts as success). The document goes
-/// first so an item never exists without it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one call site; see `ingest_into_targets`"
-)]
-async fn insert_into_inbox<T: Services>(
-    state: &AppState<T>,
-    template: &MailMessage,
-    content: &content::MessageContent,
+/// target inbox: the document, then `insert_message`, which resolves the
+/// thread (`Duplicate` counts as success). The document goes first so an
+/// item never exists without it.
+async fn insert_into_inbox<B: Backend>(
+    state: &AppState<B>,
+    draft: &InboundDraft,
+    content: &mailbox::content::MessageContent,
     inbox_id: &InboxId,
-    message_id: &str,
-    message_labels: &[String],
-    timestamp: &str,
-    now: &str,
-    raw_key: &str,
-    event: &SesInboundNotification,
-    attachment_metas: &[AttachmentMeta],
 ) -> Result<(), ActionError> {
+    let msg = draft.to_message(inbox_id);
     // `parse_inbound` re-wraps `In-Reply-To`/`References` in angle brackets
     // (matching `our_rfc_message_id`/`ses_rfc_ids`'s output shape), but the
     // RFC alias key `plan_insert` writes strips them (`strip_angle_brackets`
     // in `mail/plan.rs`) — candidates must be stripped the same way or every
     // lookup misses.
-    let in_reply_to = template.in_reply_to.as_deref().map(strip_angle_brackets);
+    let in_reply_to = msg.in_reply_to.as_deref().map(strip_angle_brackets);
     let references: Vec<String> = content
         .references
         .iter()
@@ -546,7 +567,7 @@ async fn insert_into_inbox<T: Services>(
     // left for it — the message joins that row's thread. `insert_message`
     // resolves the thread from these and leaves a placeholder for each
     // referenced id that no row maps yet.
-    let own_id = strip_angle_brackets(&template.rfc_message_id);
+    let own_id = strip_angle_brackets(&msg.rfc_message_id);
     let mut candidates = Vec::new();
     if !own_id.is_empty() {
         candidates.push(own_id.to_owned());
@@ -557,34 +578,16 @@ async fn insert_into_inbox<T: Services>(
         }
     }
 
-    let mut msg = template.clone();
-    msg.inbox_id = inbox_id.clone();
-    // The thread this message starts if no candidate resolves.
-    msg.thread_id = message_id.to_owned();
-    msg.message_id = message_id.to_owned();
-    msg.ses_message_id = Some(event.mail.message_id.clone());
-    msg.labels = message_labels.to_vec();
-    msg.timestamp = timestamp.to_owned();
-    msg.attachments = attachment_metas.to_vec();
-    msg.raw_s3_key = Some(raw_key.to_owned());
-    // `thread_snapshot` is left `None` here — `plan_insert` populates it
-    // from `thread_after` (the thread's full state including this message,
-    // computed from the versioned retry loop's consistent read), so a reply
-    // publishes the thread's real `message_count` rather than 1.
-    msg.version = 0;
-    msg.created_at = now.to_owned();
-    msg.updated_at = now.to_owned();
-
-    content::store(&state.services, inbox_id, message_id, content)
+    content::store(&state.objects, inbox_id, &draft.message_id, content)
         .await
-        .map_err(map_object_error)?;
+        .map_err(ActionError::from)?;
 
     state
-        .services
+        .mailbox
         .insert_message(&msg, &candidates)
         .await
         .map(|_outcome| ())
-        .map_err(map_store_error)
+        .map_err(ActionError::from)
 }
 
 /// The labels an inbound message carries: `received` and `unread`, plus
@@ -620,25 +623,21 @@ fn verdicts_json(receipt: &SesReceipt) -> serde_json::Value {
     })
 }
 
-fn object_key(message_id: &str, attachment_id: &str) -> String {
-    format!("attachments/{message_id}/{attachment_id}")
-}
-
 /// Extracts the kept attachment parts into `attachments/<mid>/<att_id>`,
 /// resuming a redelivery by skipping parts a prior attempt already put, in
 /// chunks of 4 concurrent puts.
 ///
 /// `tokio::join!` rather than a `JoinSet`: a `JoinSet` requires its spawned
-/// futures to be `'static`, which this function's borrowed `&AppState<T>` is
-/// not (the pipeline never passes an `Arc<AppState<T>>` down to this depth).
+/// futures to be `'static`, which this function's borrowed `&AppState<B>` is
+/// not (the pipeline never passes an `Arc<AppState<B>>` down to this depth).
 /// `join!` gives the same bounded 4-way concurrency and, holding no
 /// independent task handles, a stronger cancellation guarantee when the
 /// surrounding `tokio::time::timeout` elapses: every pending put is dropped
 /// synchronously with the future tree, so no separate shutdown step is
 /// needed to be sure no put is still running.
-async fn put_kept_parts<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+async fn put_kept_parts<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
     attachments: &[(String, ParsedAttachment)],
 ) -> Result<(), ActionError> {
     if attachments.is_empty() {
@@ -656,17 +655,17 @@ async fn put_kept_parts<T: Services>(
 /// every part and skip the ones already stored. Otherwise, put
 /// everything (a race with a concurrent attempt still gets a harmless 412,
 /// surfaced as `PutOutcome::AlreadyExists`).
-async fn resume_filtered<'a, T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+async fn resume_filtered<'a, B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
     attachments: &'a [(String, ParsedAttachment)],
 ) -> Result<Vec<&'a (String, ParsedAttachment)>, ActionError> {
     let (first_id, _) = &attachments[0];
     let first_present = state
-        .services
-        .head_object(&object_key(message_id, first_id))
+        .objects
+        .head_object(&object_keys::attachment(message_id, first_id))
         .await
-        .map_err(map_object_error)?
+        .map_err(ActionError::from)?
         .is_some();
 
     if !first_present {
@@ -676,10 +675,10 @@ async fn resume_filtered<'a, T: Services>(
     let mut kept = Vec::with_capacity(attachments.len());
     for entry @ (attachment_id, _) in attachments {
         let present = state
-            .services
-            .head_object(&object_key(message_id, attachment_id))
+            .objects
+            .head_object(&object_keys::attachment(message_id, attachment_id))
             .await
-            .map_err(map_object_error)?
+            .map_err(ActionError::from)?
             .is_some();
         if !present {
             kept.push(entry);
@@ -688,9 +687,9 @@ async fn resume_filtered<'a, T: Services>(
     Ok(kept)
 }
 
-async fn put_chunk<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+async fn put_chunk<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
     chunk: &[&(String, ParsedAttachment)],
 ) -> Result<(), ActionError> {
     match chunk {
@@ -721,14 +720,14 @@ async fn put_chunk<T: Services>(
     }
 }
 
-async fn put_one<T: Services>(
-    state: &AppState<T>,
-    message_id: &str,
+async fn put_one<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
     (attachment_id, attachment): &(String, ParsedAttachment),
 ) -> Result<(), ActionError> {
-    let key = object_key(message_id, attachment_id);
+    let key = object_keys::attachment(message_id, attachment_id);
     state
-        .services
+        .objects
         .put_object_if_absent(
             &key,
             Bytes::clone(&attachment.bytes),
@@ -736,30 +735,14 @@ async fn put_one<T: Services>(
         )
         .await
         .map(|_outcome| ())
-        .map_err(map_object_error)
-}
-
-fn map_store_error(error: MailStoreError) -> ActionError {
-    match error {
-        MailStoreError::Transient(source) => ActionError::transient(source),
-        MailStoreError::Conflict => ActionError::transient(anyhow::anyhow!("mail store conflict")),
-        other => ActionError::permanent(anyhow::Error::from(other)),
-    }
-}
-
-fn map_object_error(error: ObjectError) -> ActionError {
-    match error {
-        ObjectError::Transient(source) => ActionError::transient(source),
-        other => ActionError::permanent(anyhow::Error::from(other)),
-    }
+        .map_err(ActionError::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::ActionErrorKind;
-    use crate::mail::labels::InboundVerdict;
     use crate::model::ses_inbound::SesReceipt;
+    use mailbox::labels::InboundVerdict;
 
     #[test]
     fn normalized_recipients_lowercases_trims_and_dedupes() {
@@ -800,11 +783,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn object_key_has_the_documented_shape() {
-        assert_eq!(object_key("mid-1", "att-1"), "attachments/mid-1/att-1");
-    }
-
     /// A store failure while resolving the recipient's inbox is either
     /// worth a redelivery or a failure we report — never the silent
     /// "addressed to an inbox we don't serve" skip it used to look like.
@@ -822,34 +800,6 @@ mod tests {
         record_resolution_error(&mut resolution, MailStoreError::NotFound);
         assert!(resolution.had_permanent);
         assert!(!resolution.had_transient);
-    }
-
-    #[test]
-    fn map_store_error_classifies_transient_and_permanent() {
-        assert_eq!(
-            map_store_error(MailStoreError::Transient(anyhow::anyhow!("x"))).kind,
-            ActionErrorKind::Transient
-        );
-        assert_eq!(
-            map_store_error(MailStoreError::Conflict).kind,
-            ActionErrorKind::Transient
-        );
-        assert_eq!(
-            map_store_error(MailStoreError::NotFound).kind,
-            ActionErrorKind::Permanent
-        );
-    }
-
-    #[test]
-    fn map_object_error_classifies_transient_and_permanent() {
-        assert_eq!(
-            map_object_error(ObjectError::Transient(anyhow::anyhow!("x"))).kind,
-            ActionErrorKind::Transient
-        );
-        assert_eq!(
-            map_object_error(ObjectError::NotFound).kind,
-            ActionErrorKind::Permanent
-        );
     }
 
     fn notification_with_timestamps(

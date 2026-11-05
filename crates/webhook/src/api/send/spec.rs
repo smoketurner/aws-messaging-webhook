@@ -7,20 +7,22 @@ use axum::body::Bytes;
 
 use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
-use crate::mail::labels::SystemLabel;
-use crate::mail::send::{self as send_mod, Envelope, SendSpec, SendStatus, SpecAttachment};
-use crate::mail::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime};
-use crate::state::Services;
+use crate::mail::object_keys;
+use crate::mail::objects::ObjectStore;
+use mailbox::labels::SystemLabel;
+use mailbox::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
+use mailbox::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime};
+use mailbox::{MessageId, ThreadId};
 
 /// Builds the spec the sender will assemble the message from.
 pub(super) fn build_spec(
     inbox: &InboxId,
     send: &ValidatedSend,
-    message_id: &str,
-    thread_id: &str,
+    uuid: uuid::Uuid,
+    thread_id: &ThreadId,
     now: &str,
 ) -> SendSpec {
-    let uuid = uuid::Uuid::parse_str(message_id).unwrap_or_else(|_| uuid::Uuid::nil());
+    let message_id = MessageId::from(uuid);
     let attachments = send
         .attachments
         .iter()
@@ -31,7 +33,7 @@ pub(super) fn build_spec(
                 // Inline bytes are uploaded under the id before the send is
                 // queued, so the sender finds them already there.
                 AttachmentSource::Inline(bytes) => (
-                    Some(send_mod::part_key(message_id, &attachment_id)),
+                    Some(object_keys::part(&message_id, &attachment_id)),
                     None,
                     bytes.len() as u64,
                 ),
@@ -51,8 +53,8 @@ pub(super) fn build_spec(
         .collect();
 
     SendSpec {
-        message_id: message_id.to_owned(),
-        thread_id: thread_id.to_owned(),
+        message_id: message_id.clone(),
+        thread_id: thread_id.clone(),
         inbox_id: inbox.clone(),
         from: inbox.as_str().to_owned(),
         display_name: None,
@@ -65,7 +67,7 @@ pub(super) fn build_spec(
         subject: send.subject.clone(),
         text: send.text.clone(),
         html: send.html.clone(),
-        rfc_message_id: ids::our_rfc_message_id(message_id, inbox.domain()),
+        rfc_message_id: ids::our_rfc_message_id(message_id.as_str(), inbox.domain()),
         in_reply_to: None,
         references: Vec::new(),
         headers: send.headers.clone(),
@@ -79,8 +81,8 @@ pub(super) fn build_spec(
 /// The spec goes last on purpose: the sender treats it as the signal that a
 /// send is ready to build, so it must never be visible before the parts it
 /// refers to.
-pub(super) async fn upload_spec<T: Services>(
-    services: &T,
+pub(super) async fn upload_spec<O: ObjectStore>(
+    objects: &O,
     spec: &SendSpec,
     send: &ValidatedSend,
 ) -> Result<(), ApiError> {
@@ -91,7 +93,7 @@ pub(super) async fn upload_spec<T: Services>(
         let Some(key) = &spec_attachment.object_key else {
             continue;
         };
-        services
+        objects
             .put_object_if_absent(
                 key,
                 Bytes::from(bytes.clone()),
@@ -102,9 +104,9 @@ pub(super) async fn upload_spec<T: Services>(
 
     let body = serde_json::to_vec(spec)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing the send spec: {e}")))?;
-    services
+    objects
         .put_object_if_absent(
-            &send_mod::spec_key(&spec.message_id),
+            &object_keys::spec(&spec.message_id),
             Bytes::from(body),
             "application/json",
         )
@@ -186,15 +188,15 @@ pub(super) fn preview_of(send: &ValidatedSend) -> String {
 /// bucket's `expire-messages` lifecycle rule, so deleting it here would only
 /// add a no-op call (and a noisy warning under a narrower grant). Best effort:
 /// the request has already failed, and a leftover object is harmless.
-pub(super) async fn discard_uploads<T: Services>(services: &T, spec: &SendSpec) {
-    let mut keys = vec![send_mod::spec_key(&spec.message_id)];
+pub(super) async fn discard_uploads<O: ObjectStore>(objects: &O, spec: &SendSpec) {
+    let mut keys = vec![object_keys::spec(&spec.message_id)];
     keys.extend(
         spec.attachments
             .iter()
             .filter_map(|attachment| attachment.object_key.clone()),
     );
     for key in keys {
-        if let Err(error) = services.delete_object(&key).await {
+        if let Err(error) = objects.delete_object(&key).await {
             tracing::warn!(
                 message_id = %spec.message_id,
                 key,
@@ -210,7 +212,7 @@ pub(super) async fn discard_uploads<T: Services>(services: &T, spec: &SendSpec) 
 mod tests {
     use super::preview_of;
     use crate::api::send::validate::ValidatedSend;
-    use crate::mail::PREVIEW_CHARS;
+    use mailbox::PREVIEW_CHARS;
 
     /// A `ValidatedSend` carrying only the bodies `preview_of` reads; every
     /// other field is empty because `preview_of` ignores it. Mirrors the
@@ -282,7 +284,7 @@ mod tests {
     /// them through a real MIME parse, pins that they still do.
     #[test]
     fn outbound_preview_matches_inbound_preview_for_the_same_html_body() {
-        use crate::mail::mime::parse_inbound;
+        use mailbox::mime::parse_inbound;
 
         let html = "<p>Hello <strong>there</strong> &amp; welcome</p>";
         let outbound = preview_of(&send(None, Some(html)));

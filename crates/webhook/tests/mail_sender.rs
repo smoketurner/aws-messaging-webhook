@@ -7,15 +7,17 @@
 //! most one SES call, whatever the sender is handed.
 
 use aws_messaging_webhook::actions::SendOutcome;
-use aws_messaging_webhook::mail::send::{SendFailure, SendState, SendStatus};
+use aws_messaging_webhook::mail::object_keys;
 use aws_messaging_webhook::mail::sender::{
     Handled, Resolution, handle_send, resolve_unknown, sweep,
 };
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, ids, send, time};
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use mailbox::send::{SendFailure, SendState, SendStatus};
+use mailbox::{InboxId, ids, time};
+use mailbox::{MessageId, SesMessageId, ThreadId};
+use mailbox_store::keys::TableKey;
 use serde_json::{Value, json};
 use webhook_test_support::objects::{ObjectFailure, Op};
 use webhook_test_support::{Harness, TEST_INBOX, api, api_harness};
@@ -26,17 +28,17 @@ fn deadline() -> tokio::time::Instant {
 }
 
 /// Queues one send through the real API and returns its message id.
-async fn queued(h: &Harness, body: &Value) -> String {
+async fn queued(h: &Harness, body: &Value) -> MessageId {
     let (status, value) =
         api::post(h, &format!("/v0/inboxes/{TEST_INBOX}/messages/send"), body).await;
     assert_eq!(status, StatusCode::OK);
-    value["message_id"].as_str().unwrap().to_owned()
+    MessageId::new(value["message_id"].as_str().unwrap())
 }
 
 /// The labels on a thread, which roll up its messages' labels.
-async fn thread_labels(h: &Harness, thread_id: &str) -> Vec<String> {
+async fn thread_labels(h: &Harness, thread_id: &ThreadId) -> Vec<String> {
     h.state
-        .services
+        .mailbox
         .get_thread(&InboxId::new(TEST_INBOX), thread_id, 1, None)
         .await
         .unwrap()
@@ -53,12 +55,13 @@ fn body() -> Value {
     })
 }
 
-fn state_of(h: &Harness, message_id: &str) -> SendState {
+fn state_of(h: &Harness, message_id: &MessageId) -> SendState {
     let item = h
-        .state
-        .services
         .mail
-        .raw_item(&format!("OUTBOX#{message_id}"), "STATE")
+        .raw_item(&TableKey {
+            pk: format!("OUTBOX#{message_id}"),
+            sk: "STATE".to_owned(),
+        })
         .unwrap();
     serde_dynamo::from_item(item).unwrap()
 }
@@ -74,7 +77,7 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
 
     assert_eq!(handled, Handled::Sent);
     {
-        let sent = h.state.services.sent.lock().unwrap();
+        let sent = h.state.ses.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].to, vec!["recipient@example.net"]);
         assert!(sent[0].raw_text().contains("Subject: Hello"));
@@ -84,8 +87,11 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
 
     let message = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -99,7 +105,7 @@ async fn a_queued_send_reaches_ses_once_and_is_recorded_sent() {
     );
     assert_eq!(message.send_status, Some(SendStatus::Sent));
     assert_eq!(
-        message.ses_message_id.as_deref(),
+        message.ses_message_id.as_ref().map(SesMessageId::as_str),
         Some(format!("ses-{message_id}").as_str())
     );
     assert!(message.sent_at.is_some());
@@ -122,7 +128,7 @@ async fn a_second_delivery_of_the_same_record_does_not_send_again() {
     assert_eq!(first, Handled::Sent);
     assert_eq!(second, Handled::Skipped);
     assert_eq!(
-        h.state.services.sent.lock().unwrap().len(),
+        h.state.ses.sent.lock().unwrap().len(),
         1,
         "the message must reach SES exactly once"
     );
@@ -134,7 +140,7 @@ async fn an_ambiguous_outcome_is_never_resent() {
     // The send stops as `unknown` and waits for an operator.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
         reason: "connection reset".to_owned(),
     });
 
@@ -149,14 +155,17 @@ async fn an_ambiguous_outcome_is_never_resent() {
         .await
         .unwrap();
     assert_eq!(again, Handled::Skipped);
-    assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 1);
 
     // The message keeps its queued label: it is neither sent nor known to
     // have failed, and claiming either would be a statement we cannot make.
     let message = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -189,7 +198,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
     let raw = format!(
         "From: {TEST_INBOX}@example.com\r\nTo: {TEST_INBOX}@example.com\r\nSubject: Note to self\r\nMessage-ID: <ses-{message_id}@email.amazonses.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nthe body\r\n"
     );
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/raw/copy",
         axum::body::Bytes::from(raw),
         "message/rfc822",
@@ -224,16 +233,24 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
     let copy_id = ids::inbound_message_id("inbound-copy", time::parse(received_at).unwrap());
     let copy = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &copy_id.to_string())
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(copy_id.to_string()),
+        )
         .await
         .unwrap()
         .expect("the copy was stored");
-    assert_eq!(copy.thread_id, message_id);
+    assert_eq!(copy.thread_id, ThreadId::from(&message_id));
     let thread = h
         .state
-        .services
-        .get_thread(&InboxId::new(TEST_INBOX), &message_id, 10, None)
+        .mailbox
+        .get_thread(
+            &InboxId::new(TEST_INBOX),
+            &ThreadId::new(message_id.as_str()),
+            10,
+            None,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -244,7 +261,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
 async fn a_refused_send_is_recorded_rejected_and_not_retried() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
         reason: "MessageRejected".to_owned(),
     });
 
@@ -259,8 +276,11 @@ async fn a_refused_send_is_recorded_rejected_and_not_retried() {
 
     let message = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -275,7 +295,7 @@ async fn a_refused_send_is_recorded_rejected_and_not_retried() {
 async fn a_retryable_outcome_hands_the_send_back() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
         reason: "Throttled".to_owned(),
     });
 
@@ -295,7 +315,7 @@ async fn a_retryable_outcome_hands_the_send_back() {
         .await
         .unwrap();
     assert_eq!(handled, Handled::Sent);
-    assert_eq!(h.state.services.sent.lock().unwrap().len(), 2);
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -307,7 +327,7 @@ async fn a_send_that_keeps_failing_is_eventually_abandoned() {
 
     let mut outcomes = 0;
     for _ in 0..8 {
-        *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+        *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
             reason: "Throttled".to_owned(),
         });
         let handled = handle_send(&h.state, &message_id, deadline())
@@ -328,9 +348,8 @@ async fn a_send_whose_spec_is_gone_fails_rather_than_looping() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
     h.state
-        .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::NotFound);
+        .inject(object_keys::spec(&message_id), ObjectFailure::NotFound);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -338,7 +357,7 @@ async fn a_send_whose_spec_is_gone_fails_rather_than_looping() {
 
     assert_eq!(handled, Handled::Failed);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -350,9 +369,8 @@ async fn an_unreachable_object_store_hands_the_send_back() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
     h.state
-        .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Transient);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Transient);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -365,7 +383,7 @@ async fn an_unreachable_object_store_hands_the_send_back() {
     assert!(state.requeued_at.is_some());
 
     // With the store back, the retry sends it.
-    h.state.services.objects.clear(&send::spec_key(&message_id));
+    h.state.objects.clear(&object_keys::spec(&message_id));
     assert_eq!(
         handle_send(&h.state, &message_id, deadline())
             .await
@@ -379,9 +397,8 @@ async fn an_object_store_that_stays_unavailable_eventually_fails_the_send() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
     h.state
-        .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Transient);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Transient);
 
     let mut attempts = 0;
     loop {
@@ -398,7 +415,7 @@ async fn an_object_store_that_stays_unavailable_eventually_fails_the_send() {
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Failed);
     assert_eq!(state.failure, Some(SendFailure::OutboxUnavailable));
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -407,9 +424,8 @@ async fn an_object_store_refusal_fails_the_send_without_retrying() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
     h.state
-        .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Permanent);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Permanent);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -419,10 +435,10 @@ async fn an_object_store_refusal_fails_the_send_without_retrying() {
     let state = state_of(&h, &message_id);
     assert_eq!(state.failure, Some(SendFailure::OutboxUnavailable));
     assert_eq!(state.transient_failures, 0);
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
     // The unreadable spec is the only record of the send's parts, so cleanup
     // keeps it rather than stranding them.
-    let deleted = h.state.services.objects.calls(Op::Delete);
+    let deleted = h.state.objects.calls(Op::Delete);
     assert!(deleted.is_empty(), "{deleted:?}");
 }
 
@@ -439,22 +455,16 @@ async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(&h, &request).await;
-    assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id))
-    );
+    assert!(h.state.objects.contains(&object_keys::spec(&message_id)));
     let part_key = h
         .state
-        .services
         .objects
         .calls(Op::Put)
         .into_iter()
         .find(|k| k.contains("/parts/"))
         .expect("enqueue uploads the part before the spec");
     assert!(
-        h.state.services.objects.contains(&part_key),
+        h.state.objects.contains(&part_key),
         "the part should be present before cleanup"
     );
 
@@ -462,8 +472,8 @@ async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
     // a partial write or a rolling deploy whose new binary cannot read the old
     // spec. `load_spec` treats this as a permanent `SendSpecMissing` failure,
     // which settles and routes through `clear_outbox`.
-    h.state.services.objects.seed(
-        send::spec_key(&message_id),
+    h.state.objects.seed(
+        object_keys::spec(&message_id),
         axum::body::Bytes::from_static(b"not json"),
         "application/json",
     );
@@ -482,17 +492,14 @@ async fn an_unparseable_spec_keeps_its_outbox_so_parts_are_not_orphaned() {
     // same outcome as `an_object_store_refusal_fails_the_send_without_retrying`
     // for the read-failure arm of the same `match`.
     assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        h.state.objects.contains(&object_keys::spec(&message_id)),
         "the unparseable spec is the only record of which parts exist; it must be kept"
     );
     assert!(
-        h.state.services.objects.contains(&part_key),
+        h.state.objects.contains(&part_key),
         "the part must not be orphaned"
     );
-    let deleted = h.state.services.objects.calls(Op::Delete);
+    let deleted = h.state.objects.calls(Op::Delete);
     assert!(
         deleted.is_empty(),
         "cleanup must keep the spec and parts when the spec cannot be parsed: {deleted:?}"
@@ -505,9 +512,8 @@ async fn a_load_that_outlasts_the_deadline_hands_the_send_back_without_sending()
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
     h.state
-        .services
         .objects
-        .inject(send::spec_key(&message_id), ObjectFailure::Hang);
+        .inject(object_keys::spec(&message_id), ObjectFailure::Hang);
 
     let handled = handle_send(&h.state, &message_id, deadline())
         .await
@@ -517,7 +523,7 @@ async fn a_load_that_outlasts_the_deadline_hands_the_send_back_without_sending()
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Queued);
     assert_eq!(state.transient_failures, 1);
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -526,12 +532,12 @@ async fn an_accepted_send_that_cannot_be_recorded_keeps_its_ses_call_mark() {
     // from sending it a second time.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    *h.state.services.store_failures_after_send.lock().unwrap() = 100;
+    *h.state.ses.store_failures_after_send.lock().unwrap() = 100;
 
     let result = handle_send(&h.state, &message_id, deadline()).await;
 
     assert!(result.is_err(), "{result:?}");
-    assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 1);
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Sending);
     assert!(state.ses_call_at.is_some());
@@ -543,13 +549,16 @@ async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
     let message_id = queued(&h, &body()).await;
     let claimed = h
         .state
-        .services
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap()
         .unwrap();
     h.state
-        .services
+        .mailbox
         .note_ses_call(&claimed, "2020-01-01T00:00:01.000Z")
         .await
         .unwrap()
@@ -560,7 +569,7 @@ async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
     assert_eq!(report.marked_unknown, 1);
     assert_eq!(report.released, 0);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -570,15 +579,15 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
     let second = queued(&h, &body()).await;
     for message_id in [&first, &second] {
         h.state
-            .services
-            .claim_send(message_id, "2020-01-01T00:00:00.000Z")
+            .mailbox
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
     }
-    h.state
-        .services
-        .mail
-        .inject(webhook_test_support::mail_memory::Injected::Transient);
+    h.mail.inject(mailbox_store::memory::Injected::Transient);
 
     let report = sweep(&h.state).await.unwrap();
 
@@ -602,7 +611,7 @@ async fn attachments_are_read_from_the_outbox_and_reach_ses() {
         .unwrap();
 
     assert_eq!(handled, Handled::Sent);
-    let sent = h.state.services.sent.lock().unwrap();
+    let sent = h.state.ses.sent.lock().unwrap();
     let raw = sent[0].raw_text();
     assert!(raw.contains("multipart/mixed"), "{raw}");
     assert!(raw.contains("notes.txt"), "{raw}");
@@ -619,7 +628,7 @@ async fn bcc_is_given_to_ses_but_stays_out_of_the_message() {
         .await
         .unwrap();
 
-    let sent = h.state.services.sent.lock().unwrap();
+    let sent = h.state.ses.sent.lock().unwrap();
     assert_eq!(sent[0].bcc, vec!["hidden@example.net"]);
     assert!(
         !sent[0].raw_text().contains("hidden@example.net"),
@@ -631,7 +640,7 @@ async fn bcc_is_given_to_ses_but_stays_out_of_the_message() {
 async fn a_url_attachment_is_fetched_and_reaches_ses() {
     let h = api_harness().await;
     h.state
-        .services
+        .fetcher
         .serve_url("https://example.com/report.pdf", b"report bytes");
     let mut request = body();
     request["attachments"] = json!([{
@@ -646,14 +655,14 @@ async fn a_url_attachment_is_fetched_and_reaches_ses() {
         .unwrap();
 
     assert_eq!(handled, Handled::Sent);
-    let sent = h.state.services.sent.lock().unwrap();
+    let sent = h.state.ses.sent.lock().unwrap();
     assert!(
         sent[0].raw_text().contains("report.pdf"),
         "{}",
         sent[0].raw_text()
     );
     assert_eq!(
-        h.state.services.fetched.lock().unwrap().as_slice(),
+        h.state.fetcher.fetched.lock().unwrap().as_slice(),
         ["https://example.com/report.pdf"]
     );
 }
@@ -664,13 +673,13 @@ async fn a_fetched_attachment_is_stored_so_a_retry_does_not_fetch_again() {
     // built once must stay the message that is sent.
     let h = api_harness().await;
     h.state
-        .services
+        .fetcher
         .serve_url("https://example.com/report.pdf", b"report bytes");
     let mut request = body();
     request["attachments"] = json!([{ "url": "https://example.com/report.pdf" }]);
     let message_id = queued(&h, &request).await;
 
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
         reason: "Throttled".to_owned(),
     });
     handle_send(&h.state, &message_id, deadline())
@@ -681,7 +690,7 @@ async fn a_fetched_attachment_is_stored_so_a_retry_does_not_fetch_again() {
         .unwrap();
 
     assert_eq!(
-        h.state.services.fetched.lock().unwrap().len(),
+        h.state.fetcher.fetched.lock().unwrap().len(),
         1,
         "the second attempt should reuse the stored bytes"
     );
@@ -700,19 +709,19 @@ async fn an_unfetchable_url_fails_the_send_rather_than_sending_without_it() {
         .unwrap();
 
     assert_eq!(handled, Handled::Failed);
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn an_unknown_message_is_skipped() {
     let h = api_harness().await;
 
-    let handled = handle_send(&h.state, "no-such-message", deadline())
+    let handled = handle_send(&h.state, &MessageId::new("no-such-message"), deadline())
         .await
         .unwrap();
 
     assert_eq!(handled, Handled::Skipped);
-    assert!(h.state.services.sent.lock().unwrap().is_empty());
+    assert!(h.state.ses.sent.lock().unwrap().is_empty());
 }
 
 /// Feeds one SES event for `ses_message_id` through the real webhook path.
@@ -738,8 +747,11 @@ async fn an_ses_delivery_event_labels_the_message_it_belongs_to() {
     assert_eq!(status, StatusCode::OK);
     let message = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -777,8 +789,11 @@ async fn later_events_add_labels_rather_than_replacing_them() {
 
     let message = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -793,8 +808,11 @@ async fn the_sweep_releases_a_claim_whose_sender_died() {
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
     h.state
-        .services
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sending);
@@ -822,8 +840,11 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
     let mut abandoned = 0;
     for _ in 0..(CAP + 2) {
         h.state
-            .services
-            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .mailbox
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
         let report = sweep(&h.state).await.unwrap();
@@ -869,8 +890,11 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
 
     for attempt in 0..(CAP - 1) {
         h.state
-            .services
-            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .mailbox
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
         let report = sweep(&h.state).await.unwrap();
@@ -886,8 +910,11 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
 
     // The fifth claim trips the cap and is failed rather than requeued.
     h.state
-        .services
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     let report = sweep(&h.state).await.unwrap();
@@ -905,11 +932,10 @@ async fn the_sweep_leaves_a_recent_claim_alone() {
     // message gets sent twice.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    let now =
-        aws_messaging_webhook::mail::time::format(aws_messaging_webhook::mail::time::now_ms());
+    let now = mailbox::time::format(mailbox::time::now_ms());
     h.state
-        .services
-        .claim_send(&message_id, &now)
+        .mailbox
+        .claim_send(&MessageId::new(message_id.as_str()), &now)
         .await
         .unwrap();
 
@@ -925,7 +951,7 @@ async fn the_sweep_reports_unknown_sends_without_touching_them() {
     // SES may hold these; releasing one could deliver it twice.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
         reason: "connection reset".to_owned(),
     });
     handle_send(&h.state, &message_id, deadline())
@@ -937,13 +963,13 @@ async fn the_sweep_reports_unknown_sends_without_touching_them() {
     assert_eq!(report.unknown, 1);
     assert_eq!(report.released, 0);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
-    assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 1);
 }
 
 /// Drives a send to `unknown`, which is the only state an operator resolves.
-async fn stuck_unknown(h: &Harness) -> String {
+async fn stuck_unknown(h: &Harness) -> MessageId {
     let message_id = queued(h, &body()).await;
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
         reason: "connection reset".to_owned(),
     });
     handle_send(&h.state, &message_id, deadline())
@@ -977,7 +1003,7 @@ async fn an_operator_can_send_an_unknown_message_again() {
             .unwrap(),
         Handled::Sent
     );
-    assert_eq!(h.state.services.sent.lock().unwrap().len(), 2);
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -992,14 +1018,17 @@ async fn an_operator_can_close_an_unknown_message_as_sent() {
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
     let message = h
         .state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), &message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(message.labels, vec!["sent"]);
     // Nothing was sent to close it.
-    assert_eq!(h.state.services.sent.lock().unwrap().len(), 1);
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1014,9 +1043,7 @@ async fn an_operator_can_close_an_unknown_message_as_failed() {
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Failed);
     assert_eq!(
-        state
-            .failure
-            .map(aws_messaging_webhook::mail::send::SendFailure::as_str),
+        state.failure.map(mailbox::send::SendFailure::as_str),
         Some("closed_by_operator")
     );
 }
@@ -1046,25 +1073,17 @@ async fn a_sent_message_leaves_no_outbox_objects_behind() {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(&h, &request).await;
-    assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id))
-    );
+    assert!(h.state.objects.contains(&object_keys::spec(&message_id)));
 
     handle_send(&h.state, &message_id, deadline())
         .await
         .unwrap();
 
     assert!(
-        !h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        !h.state.objects.contains(&object_keys::spec(&message_id)),
         "the spec should be gone once the message has gone out"
     );
-    let deleted = h.state.services.objects.calls(Op::Delete);
+    let deleted = h.state.objects.calls(Op::Delete);
     assert!(
         deleted.iter().any(|k| k.contains("/parts/")),
         "the attachment should be removed too: {deleted:?}"
@@ -1077,14 +1096,9 @@ async fn a_failed_send_leaves_no_outbox_objects_behind() {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(&h, &request).await;
-    assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id))
-    );
+    assert!(h.state.objects.contains(&object_keys::spec(&message_id)));
 
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Failed {
         reason: "MessageRejected".to_owned(),
     });
     let handled = handle_send(&h.state, &message_id, deadline())
@@ -1093,13 +1107,10 @@ async fn a_failed_send_leaves_no_outbox_objects_behind() {
     assert_eq!(handled, Handled::Failed);
 
     assert!(
-        !h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        !h.state.objects.contains(&object_keys::spec(&message_id)),
         "the spec should be gone once the message has failed permanently"
     );
-    let deleted = h.state.services.objects.calls(Op::Delete);
+    let deleted = h.state.objects.calls(Op::Delete);
     assert!(
         deleted.iter().any(|k| k.contains("/parts/")),
         "the attachment should be removed too: {deleted:?}"
@@ -1112,18 +1123,13 @@ async fn a_send_abandoned_after_repeated_transient_failures_clears_its_outbox() 
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(&h, &request).await;
-    assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id))
-    );
+    assert!(h.state.objects.contains(&object_keys::spec(&message_id)));
 
     let mut attempts = 0;
     let mut handled = Handled::Skipped;
     while handled != Handled::Failed && attempts < 8 {
         attempts += 1;
-        *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
+        *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Retryable {
             reason: "Throttled".to_owned(),
         });
         handled = handle_send(&h.state, &message_id, deadline())
@@ -1137,13 +1143,10 @@ async fn a_send_abandoned_after_repeated_transient_failures_clears_its_outbox() 
     );
 
     assert!(
-        !h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        !h.state.objects.contains(&object_keys::spec(&message_id)),
         "the spec should be gone once the message has failed permanently"
     );
-    let deleted = h.state.services.objects.calls(Op::Delete);
+    let deleted = h.state.objects.calls(Op::Delete);
     assert!(
         deleted.iter().any(|k| k.contains("/parts/")),
         "the attachment should be removed too: {deleted:?}"
@@ -1157,27 +1160,19 @@ async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
     let message_id = stuck_unknown(&h).await;
 
     assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        h.state.objects.contains(&object_keys::spec(&message_id)),
         "an unresolved send must keep what it would be rebuilt from"
     );
 }
 
 /// Drives a send that carries an attachment to `unknown`, so a resolution can
 /// be checked against both outbox objects a send leaves behind.
-async fn stuck_unknown_with_attachment(h: &Harness) -> String {
+async fn stuck_unknown_with_attachment(h: &Harness) -> MessageId {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(h, &request).await;
-    assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id))
-    );
-    *h.state.services.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
+    assert!(h.state.objects.contains(&object_keys::spec(&message_id)));
+    *h.state.ses.send_outcome.lock().unwrap() = Some(SendOutcome::Unknown {
         reason: "connection reset".to_owned(),
     });
     handle_send(&h.state, &message_id, deadline())
@@ -1188,15 +1183,12 @@ async fn stuck_unknown_with_attachment(h: &Harness) -> String {
 }
 
 /// Asserts the send's spec and its attachment part are both gone.
-fn assert_outbox_cleared(h: &Harness, message_id: &str) {
+fn assert_outbox_cleared(h: &Harness, message_id: &MessageId) {
     assert!(
-        !h.state
-            .services
-            .objects
-            .contains(&send::spec_key(message_id)),
+        !h.state.objects.contains(&object_keys::spec(message_id)),
         "the spec should be gone once the send has settled"
     );
-    let deleted = h.state.services.objects.calls(Op::Delete);
+    let deleted = h.state.objects.calls(Op::Delete);
     assert!(
         deleted.iter().any(|k| k.contains("/parts/")),
         "the attachment should be removed too: {deleted:?}"
@@ -1246,10 +1238,7 @@ async fn an_operator_resending_an_unknown_send_keeps_its_outbox() {
         .unwrap();
 
     assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        h.state.objects.contains(&object_keys::spec(&message_id)),
         "a resumed send must keep what it will be rebuilt from"
     );
     assert_eq!(
@@ -1269,17 +1258,15 @@ async fn a_send_the_sweep_abandons_clears_its_outbox() {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);
     let message_id = queued(&h, &request).await;
-    assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id))
-    );
+    assert!(h.state.objects.contains(&object_keys::spec(&message_id)));
 
     for _ in 0..CAP {
         h.state
-            .services
-            .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+            .mailbox
+            .claim_send(
+                &MessageId::new(message_id.as_str()),
+                "2020-01-01T00:00:00.000Z",
+            )
             .await
             .unwrap();
         sweep(&h.state).await.unwrap();
@@ -1299,8 +1286,11 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
     let message_id = queued(&h, &request).await;
 
     h.state
-        .services
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap();
     let report = sweep(&h.state).await.unwrap();
@@ -1308,14 +1298,11 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
     assert_eq!(report.released, 1);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Queued);
     assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        h.state.objects.contains(&object_keys::spec(&message_id)),
         "a requeued send must keep what it will be rebuilt from"
     );
     assert!(
-        h.state.services.objects.calls(Op::Delete).is_empty(),
+        h.state.objects.calls(Op::Delete).is_empty(),
         "a release must delete nothing"
     );
 }
@@ -1331,13 +1318,16 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
 
     let claimed = h
         .state
-        .services
-        .claim_send(&message_id, "2020-01-01T00:00:00.000Z")
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2020-01-01T00:00:00.000Z",
+        )
         .await
         .unwrap()
         .expect("the send was queued, so the claim wins");
     h.state
-        .services
+        .mailbox
         .note_ses_call(&claimed, "2020-01-01T00:00:00.000Z")
         .await
         .unwrap();
@@ -1346,10 +1336,7 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
     assert_eq!(report.marked_unknown, 1);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
     assert!(
-        h.state
-            .services
-            .objects
-            .contains(&send::spec_key(&message_id)),
+        h.state.objects.contains(&object_keys::spec(&message_id)),
         "an unresolved send must keep what it would be rebuilt from"
     );
 }

@@ -15,20 +15,20 @@
 //! checker does not implement, so a payload passes only if it is exactly the
 //! documented shape.
 
+use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use aws_messaging_webhook::mail::content::{self, MessageContent};
+use aws_messaging_webhook::mail::content;
 use aws_messaging_webhook::mail::sender::handle_send;
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{
-    AttachmentMeta, Direction, InboxId, MailMessage, ThreadSnapshot, keys, thread,
-};
 use axum::http::StatusCode;
+use mailbox::content::MessageContent;
+use mailbox::{AttachmentMeta, Direction, InboxId, MailMessage, ThreadSnapshot, thread};
+use mailbox_store::keys;
+use mailbox_store::memory::ReadFailure;
 use serde_dynamo::AttributeValue;
 use serde_json::{Map, Value, json};
-use webhook_test_support::mail_memory::ReadFailure;
 use webhook_test_support::{Harness, TEST_INBOX, api, api_harness, invoke};
 
 /// The schema keywords [`check`] implements. Anything else in a schema fails
@@ -238,7 +238,8 @@ fn assert_matches_schema(detail: &Value) {
 
 /// The `message.*` details published so far, in order.
 fn mailbox_details(h: &Harness) -> Vec<Value> {
-    h.fake()
+    h.state
+        .publisher
         .published
         .lock()
         .unwrap()
@@ -264,17 +265,20 @@ async fn sent_message(h: &Harness) -> MailMessage {
     let (status, sent) =
         api::post(h, &format!("/v0/inboxes/{TEST_INBOX}/messages/send"), &body).await;
     assert_eq!(status, StatusCode::OK);
-    let message_id = sent["message_id"].as_str().unwrap();
+    let message_id = MessageId::new(sent["message_id"].as_str().unwrap());
     handle_send(
         &h.state,
-        message_id,
+        &message_id,
         tokio::time::Instant::now() + std::time::Duration::from_secs(120),
     )
     .await
     .unwrap();
     h.state
-        .services
-        .get_message(&InboxId::new(TEST_INBOX), message_id)
+        .mailbox
+        .get_message(
+            &InboxId::new(TEST_INBOX),
+            &MessageId::new(message_id.as_str()),
+        )
         .await
         .unwrap()
         .unwrap()
@@ -283,14 +287,9 @@ async fn sent_message(h: &Harness) -> MailMessage {
 /// A message item's stream image, as the store writes it.
 fn message_image(msg: &MailMessage) -> Value {
     let mut item: serde_dynamo::Item = serde_dynamo::to_item(msg).unwrap();
-    item.insert(
-        "pk".to_owned(),
-        AttributeValue::S(keys::inbox_pk(msg.inbox_id.as_str())),
-    );
-    item.insert(
-        "sk".to_owned(),
-        AttributeValue::S(keys::message_sk(&msg.message_id)),
-    );
+    let key = keys::message(&msg.inbox_id, &msg.message_id);
+    item.insert("pk".to_owned(), AttributeValue::S(key.pk));
+    item.insert("sk".to_owned(), AttributeValue::S(key.sk));
     serde_json::to_value(&item).unwrap()
 }
 
@@ -322,9 +321,9 @@ fn received_message(labels: &[&str]) -> MailMessage {
     let now = "2026-01-15T09:30:00.000Z".to_owned();
     let mut msg = MailMessage {
         inbox_id: InboxId::new(TEST_INBOX),
-        thread_id: "tid-1".to_owned(),
-        message_id: "mid-1".to_owned(),
-        ses_message_id: Some("ses-in-1".to_owned()),
+        thread_id: ThreadId::new("tid-1"),
+        message_id: MessageId::new("mid-1"),
+        ses_message_id: Some(SesMessageId::new("ses-in-1")),
         direction: Direction::Inbound,
         rfc_message_id: "<orig-1@example.net>".to_owned(),
         in_reply_to: Some("<earlier@example.net>".to_owned()),
@@ -343,7 +342,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
             size: 10,
             filename: Some("notes.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: aws_messaging_webhook::mail::wire::ContentDisposition::Inline,
+            content_disposition: mailbox::wire::ContentDisposition::Inline,
             content_id: Some("<notes@example.net>".to_owned()),
         }],
         attachments_truncated: false,
@@ -363,7 +362,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
 
 async fn publish_received(h: &Harness, msg: &MailMessage) {
     content::store(
-        h.fake(),
+        &h.state.objects,
         &msg.inbox_id,
         &msg.message_id,
         &MessageContent {
@@ -505,7 +504,7 @@ async fn ses_driven_events_match_the_schema() {
         let sent = sent_message(&h).await;
         let ses_message_id = sent.ses_message_id.clone().unwrap();
 
-        publish_ses_example(&h, example, &ses_message_id).await;
+        publish_ses_example(&h, example, ses_message_id.as_str()).await;
 
         let details = mailbox_details(&h);
         match expected {
@@ -526,7 +525,7 @@ async fn ses_events_for_other_senders_publish_no_mailbox_event() {
     let h = api_harness().await;
     publish_ses_example(&h, "event-delivery.json", "ses-someone-else").await;
     assert_eq!(mailbox_details(&h), [] as [serde_json::Value; 0]);
-    assert_eq!(h.fake().published.lock().unwrap().len(), 1);
+    assert_eq!(h.state.publisher.published.lock().unwrap().len(), 1);
 }
 
 /// A transient failure resolving the SES message retries the record before
@@ -535,10 +534,7 @@ async fn ses_events_for_other_senders_publish_no_mailbox_event() {
 async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Transient);
+    h.mail.fail_next_resolve(ReadFailure::Transient);
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ses-events/event-delivery.json");
@@ -557,7 +553,7 @@ async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
         result,
         json!({ "batchItemFailures": [{ "itemIdentifier": "seq-retry" }] })
     );
-    assert!(h.fake().published.lock().unwrap().is_empty());
+    assert!(h.state.publisher.published.lock().unwrap().is_empty());
 }
 
 /// A lookup failure a retry can't fix still publishes the `ses.*` event;
@@ -566,14 +562,16 @@ async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
 async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Permanent);
+    h.mail.fail_next_resolve(ReadFailure::Permanent);
 
-    publish_ses_example(&h, "event-delivery.json", &sent.ses_message_id.unwrap()).await;
+    publish_ses_example(
+        &h,
+        "event-delivery.json",
+        sent.ses_message_id.unwrap().as_str(),
+    )
+    .await;
 
-    let published = h.fake().published.lock().unwrap();
+    let published = h.state.publisher.published.lock().unwrap();
     let types: Vec<&str> = published
         .iter()
         .map(|event| event.detail_type.as_str())
@@ -594,10 +592,7 @@ async fn a_permanent_mailbox_lookup_failure_still_publishes_the_ses_event() {
 async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Permanent); // permanent resolve_ses_message
+    h.mail.fail_next_resolve(ReadFailure::Permanent); // permanent resolve_ses_message
 
     let bounce = json!({
         "eventType": "Bounce",
@@ -609,7 +604,7 @@ async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
     let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    let calls = h.fake().calls();
+    let calls = h.calls();
     assert!(
         calls
             .iter()
@@ -624,10 +619,7 @@ async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
 async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Permanent);
+    h.mail.fail_next_resolve(ReadFailure::Permanent);
 
     let complaint = json!({
         "notificationType": "Complaint",
@@ -638,7 +630,7 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
     let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    let calls = h.fake().calls();
+    let calls = h.calls();
     assert!(
         calls
             .iter()
@@ -656,10 +648,7 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
 async fn transient_delivery_label_failure_suppresses_then_returns_500() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
-    h.state
-        .services
-        .mail
-        .fail_next_resolve(ReadFailure::Transient);
+    h.mail.fail_next_resolve(ReadFailure::Transient);
 
     let bounce = json!({
         "eventType": "Bounce",
@@ -675,7 +664,7 @@ async fn transient_delivery_label_failure_suppresses_then_returns_500() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "a transient label failure must drive a 5xx so SNS redelivers"
     );
-    let calls = h.fake().calls();
+    let calls = h.calls();
     assert!(
         calls
             .iter()

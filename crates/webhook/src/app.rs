@@ -16,7 +16,7 @@ use crate::entry::context_deadline;
 use crate::model::Source;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// SNS caps messages at 256 KiB; 1 MiB bounds abuse with headroom.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -52,13 +52,13 @@ where
     }
 }
 
-pub fn app<T: Services>(state: Arc<AppState<T>>) -> Router {
+pub fn app<B: Backend>(state: Arc<AppState<B>>) -> Router {
     let mut router = Router::new().route("/healthz", get(healthz));
     for source in Source::ALL {
         router = router.route(
             source.webhook_path(),
             post(
-                move |State(state): State<Arc<AppState<T>>>,
+                move |State(state): State<Arc<AppState<B>>>,
                       Deadline(deadline): Deadline,
                       verified: VerifiedSns| async move {
                     handle_sns(&state, Ingress::Http(source), verified, deadline).await

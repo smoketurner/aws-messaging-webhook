@@ -7,10 +7,13 @@
 use std::future::Future;
 
 use crate::mail::ingest::IngestOutcome;
+use crate::mail::objects::ObjectError;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
+use mailbox::SesMessageId;
+use mailbox_store::store::MailStoreError;
 
 /// How an action failure affects the request, per the SNS retry contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,34 @@ impl ActionError {
         Self {
             kind: ActionErrorKind::Permanent,
             source,
+        }
+    }
+}
+
+/// A mail-store failure mapped onto the action retry contract: a throttled
+/// or unreachable table is worth a redelivery, and so is a version conflict,
+/// which a redelivery re-reads and applies onto the other writer's result.
+/// Anything else is logged and does not block the event from publishing.
+impl From<MailStoreError> for ActionError {
+    fn from(error: MailStoreError) -> Self {
+        match error {
+            MailStoreError::Transient(source) => Self::transient(source),
+            MailStoreError::Conflict => Self::transient(anyhow::anyhow!("mail store conflict")),
+            other @ (MailStoreError::NotFound
+            | MailStoreError::InvalidPageToken
+            | MailStoreError::LabelLimit(_)
+            | MailStoreError::Permanent(_)) => Self::permanent(anyhow::Error::from(other)),
+        }
+    }
+}
+
+impl From<ObjectError> for ActionError {
+    fn from(error: ObjectError) -> Self {
+        match error {
+            ObjectError::Transient(source) => Self::transient(source),
+            other @ (ObjectError::NotFound
+            | ObjectError::TooLarge { .. }
+            | ObjectError::Permanent(_)) => Self::permanent(anyhow::Error::from(other)),
         }
     }
 }
@@ -193,8 +224,8 @@ pub fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> KeywordInten
 /// label is added, never removed: these events arrive out of order under
 /// at-least-once delivery, and a message that both bounced and was opened
 /// should say so.
-async fn apply_delivery_label<T: Services>(
-    state: &AppState<T>,
+async fn apply_delivery_label<B: Backend>(
+    state: &AppState<B>,
     event: &crate::model::ses_notification::SesNotification,
 ) -> Result<bool, ActionError> {
     let Some(label) = event.kind.mailbox_label() else {
@@ -206,43 +237,29 @@ async fn apply_delivery_label<T: Services>(
     }
 
     let resolved = state
-        .services
-        .resolve_ses_message(&event.mail.message_id)
+        .mailbox
+        .resolve_ses_message(&SesMessageId::new(event.mail.message_id.as_str()))
         .await
-        .map_err(mail_store_error)?;
+        .map_err(ActionError::from)?;
     let Some((inbox, message_id)) = resolved else {
         return Ok(false);
     };
 
-    let now = crate::mail::time::format(crate::mail::time::now_ms());
+    let now = mailbox::time::format(mailbox::time::now_ms());
     state
-        .services
+        .mailbox
         .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
         .await
-        .map_err(mail_store_error)?;
+        .map_err(ActionError::from)?;
 
     tracing::info!(
-        message_id,
+        %message_id,
         inbox_id = %inbox.as_str(),
         label = label.as_str(),
         event = "delivery_label_applied",
         "labelled a sent message from its SES event"
     );
     Ok(true)
-}
-
-/// A mail-store failure during the delivery join, mapped onto the action
-/// retry contract: a throttled or unreachable table is worth a redelivery,
-/// anything else is logged and does not block the event from publishing.
-fn mail_store_error(error: crate::mail::store::MailStoreError) -> ActionError {
-    use crate::mail::store::MailStoreError;
-    match error {
-        MailStoreError::Transient(source) => ActionError::transient(source),
-        // A version conflict means someone else was writing the same message;
-        // a redelivery re-reads and applies the label onto their result.
-        MailStoreError::Conflict => ActionError::transient(anyhow::anyhow!("mail store conflict")),
-        other => ActionError::permanent(anyhow::Error::from(other)),
-    }
 }
 
 /// Suppresses each recipient independently. `PutSuppressedDestination` is
@@ -253,14 +270,14 @@ fn mail_store_error(error: crate::mail::store::MailStoreError) -> ActionError {
 /// every recipient; a permanent failure is logged and counted (per recipient,
 /// since these errors never reach the action-level handler that normally
 /// records `ActionFailures`) and the remaining recipients are still attempted.
-async fn suppress_recipients<T: Services>(
-    state: &AppState<T>,
+async fn suppress_recipients<B: Backend>(
+    state: &AppState<B>,
     recipients: &[SesRecipient],
     reason: SuppressionReason,
 ) -> Result<(), ActionError> {
     for recipient in recipients {
         match state
-            .services
+            .ses
             .put_suppressed_destination(&recipient.email_address, reason)
             .await
         {
@@ -320,8 +337,8 @@ impl ActionTaken {
 ///
 /// Propagates [`ActionError`] from the underlying API call; the caller maps
 /// `Transient` to a 5xx and logs-and-continues on `Permanent`.
-pub async fn run<T: Services>(
-    state: &AppState<T>,
+pub async fn run<B: Backend>(
+    state: &AppState<B>,
     event: &DomainEvent,
     // Threaded through for inbound-ingest time-boxing; only the
     // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
@@ -343,14 +360,14 @@ pub async fn run<T: Services>(
             match (intent, list) {
                 (KeywordIntent::OptOut, Some(list)) => {
                     state
-                        .services
+                        .sms
                         .put_opted_out_number(list, &event.origination_number)
                         .await?;
                     Ok(ActionTaken::OptOut)
                 }
                 (KeywordIntent::OptIn, Some(list)) => {
                     state
-                        .services
+                        .sms
                         .delete_opted_out_number(list, &event.origination_number)
                         .await?;
                     Ok(ActionTaken::OptIn)
@@ -376,7 +393,7 @@ pub async fn run<T: Services>(
                 FeedbackStatus::Failed
             };
             state
-                .services
+                .sms
                 .put_message_feedback(&event.message_id, status)
                 .await?;
             Ok(ActionTaken::Feedback)
@@ -447,6 +464,34 @@ pub async fn run<T: Services>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mail_store_error_maps_onto_the_retry_contract() {
+        assert_eq!(
+            ActionError::from(MailStoreError::Transient(anyhow::anyhow!("x"))).kind,
+            ActionErrorKind::Transient
+        );
+        assert_eq!(
+            ActionError::from(MailStoreError::Conflict).kind,
+            ActionErrorKind::Transient
+        );
+        assert_eq!(
+            ActionError::from(MailStoreError::NotFound).kind,
+            ActionErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn an_object_error_maps_onto_the_retry_contract() {
+        assert_eq!(
+            ActionError::from(ObjectError::Transient(anyhow::anyhow!("x"))).kind,
+            ActionErrorKind::Transient
+        );
+        assert_eq!(
+            ActionError::from(ObjectError::NotFound).kind,
+            ActionErrorKind::Permanent
+        );
+    }
 
     /// The outcome log line's `action` field values are what dashboards
     /// and log queries match on.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aws_messaging_webhook::api::keys::KeyCache;
-use aws_messaging_webhook::aws::AwsServices;
+use aws_messaging_webhook::aws::{Aws, Components};
 use aws_messaging_webhook::config::Config;
 use aws_messaging_webhook::entry;
 use aws_messaging_webhook::state::AppState;
@@ -20,7 +20,16 @@ async fn main() -> Result<(), lambda_http::Error> {
         .map_err(|e| format!("failed to initialize metrics collector: {e}"))?;
 
     let sdk_config = aws_config::load_from_env().await;
-    let services = AwsServices::new(&sdk_config, config.clone());
+    let Components {
+        mailbox,
+        events,
+        publisher,
+        sms,
+        ses,
+        objects,
+        fetcher,
+        key_source,
+    } = Components::new(&sdk_config, &config);
 
     let mut verifier = SnsVerifier::builder();
     let mut dangerous_subscribe_url_prefix = None;
@@ -37,8 +46,15 @@ async fn main() -> Result<(), lambda_http::Error> {
     // confirming subscriptions — so they share a connection pool. It never
     // follows redirects, which both of them depend on.
     let http = sns_message_verifier::no_redirect_client()?;
-    let state = Arc::new(AppState {
-        services,
+    let state = Arc::new(AppState::<Aws> {
+        mailbox,
+        events,
+        publisher,
+        sms,
+        ses,
+        objects,
+        fetcher,
+        key_source,
         api_keys: KeyCache::new(),
         verifier: verifier.http_client(http.clone()).build()?,
         allowlist,

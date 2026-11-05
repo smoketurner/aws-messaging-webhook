@@ -7,6 +7,7 @@
 //! verbatim, so a value AWS adds later neither fails the parse nor changes
 //! what is stored or forwarded.
 
+#[macro_export]
 macro_rules! string_enum {
     (
         $(#[$meta:meta])*
@@ -35,6 +36,7 @@ macro_rules! string_enum {
     };
 }
 
+#[macro_export]
 macro_rules! open_string_enum {
     (
         $(#[$meta:meta])*

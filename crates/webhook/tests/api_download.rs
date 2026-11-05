@@ -2,11 +2,10 @@
 
 //! The presigned download routes: raw MIME and attachments.
 
-use aws_messaging_webhook::mail::AttachmentMeta;
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{ids, time};
 use axum::http::{Method, StatusCode};
-use webhook_test_support::mail_memory::sample_message;
+use mailbox::AttachmentMeta;
+use mailbox::{ids, time};
+use mailbox_store::memory::sample_message;
 use webhook_test_support::{
     Harness, TEST_AT, TEST_INBOX, api, grant_api_access, harness, mail_harness,
 };
@@ -18,7 +17,7 @@ fn attachment(id: &str, filename: Option<&str>, key: Option<&str>) -> Attachment
         size: 2_048,
         filename: filename.map(ToOwned::to_owned),
         content_type: "application/pdf".to_owned(),
-        content_disposition: aws_messaging_webhook::mail::wire::ContentDisposition::Attachment,
+        content_disposition: mailbox::wire::ContentDisposition::Attachment,
         content_id: None,
     }
 }
@@ -27,10 +26,7 @@ fn attachment(id: &str, filename: Option<&str>, key: Option<&str>) -> Attachment
 /// id. Seeding is split from harness construction so a test can build its own
 /// harness (e.g. [`mail_harness`] with a configured attachment URL TTL) and
 /// reuse the same setup.
-async fn seed_in(
-    h: Harness,
-    adjust: impl FnOnce(&mut aws_messaging_webhook::mail::MailMessage),
-) -> (Harness, String) {
+async fn seed_in(h: Harness, adjust: impl FnOnce(&mut mailbox::MailMessage)) -> (Harness, String) {
     grant_api_access(&h).await;
 
     let ms = time::parse(TEST_AT).unwrap();
@@ -38,14 +34,12 @@ async fn seed_in(
     let mut msg = sample_message(TEST_INBOX, &id, "t1");
     TEST_AT.clone_into(&mut msg.timestamp);
     adjust(&mut msg);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 
 /// Seeds one message in the plain (no-mail) harness, and returns its id.
-async fn seeded(
-    adjust: impl FnOnce(&mut aws_messaging_webhook::mail::MailMessage),
-) -> (Harness, String) {
+async fn seeded(adjust: impl FnOnce(&mut mailbox::MailMessage)) -> (Harness, String) {
     seed_in(harness().await, adjust).await
 }
 

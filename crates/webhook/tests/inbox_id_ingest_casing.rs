@@ -9,10 +9,11 @@
 //! including `normalized_recipients` and `resolve_recipient`) and then the
 //! real axum router for both the lowercased and mixed-case path spellings.
 
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, content, ids, time};
+use aws_messaging_webhook::mail::content;
 use axum::body::Bytes;
 use axum::http::StatusCode;
+use mailbox::MessageId;
+use mailbox::{InboxId, ids, time};
 use serde_json::{Value, json};
 use webhook_test_support::{Harness, MAIL_BUCKET, TEST_API_KEY, api, mail_harness, post, wrapped};
 
@@ -53,11 +54,8 @@ fn ses_inbound_s3(recipients: &[&str]) -> Value {
 
 async fn seeded() -> Harness {
     let h = mail_harness().await;
-    h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
-    h.fake().objects.seed(
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state.objects.seed(
         "inbound/msg-1",
         Bytes::from_static(RAW_MIXED_CASE),
         "message/rfc822",
@@ -84,9 +82,9 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     let message_id = ids::inbound_message_id(SES_ID, time::parse(TS).unwrap()).to_string();
     let inbox = InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("message was stored under the lowercased id");
@@ -98,7 +96,7 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     assert_eq!(stored.to, vec!["Support@Example.com"]);
 
     // The content document loads (ingest wrote it under the lowercased id).
-    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    let stored_content = content::load(&h.state.objects, &stored).await.unwrap();
     assert!(
         stored_content
             .text

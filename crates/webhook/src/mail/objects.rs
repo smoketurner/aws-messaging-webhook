@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 
-use crate::mail::{ObjectMeta, PutOutcome};
+use mailbox::{ObjectMeta, PutOutcome};
 
 /// The default presigned download URL lifetime, used when
 /// `ATTACHMENT_URL_TTL_SECONDS` is unset (see [`crate::config::MailConfig`]).

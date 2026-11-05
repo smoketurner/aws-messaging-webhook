@@ -27,7 +27,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, delete, get, post};
 
 use crate::api::unimplemented::{method_not_allowed, not_implemented, unknown_route};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// The largest send or reply request body: a Lambda Function URL accepts at
 /// most 6 MB, so nothing larger can arrive. Base64 makes inline attachments
@@ -37,31 +37,31 @@ const SEND_BODY_BYTES: usize = 6 * 1024 * 1024;
 /// The `/v0` router, ready to nest. Auth wraps every route including the
 /// fallbacks, so an unauthenticated caller learns nothing about which paths
 /// exist.
-pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
+pub fn router<B: Backend>(state: Arc<AppState<B>>) -> Router {
     Router::new()
         // Reads.
-        .route("/inboxes", get(read::list_inboxes::<T>))
-        .route("/inboxes/{inbox_id}", get(read::get_inbox::<T>))
+        .route("/inboxes", get(read::list_inboxes::<B>))
+        .route("/inboxes/{inbox_id}", get(read::get_inbox::<B>))
         .route(
             "/inboxes/{inbox_id}/messages",
-            get(read::list_messages::<T>),
+            get(read::list_messages::<B>),
         )
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}",
-            get(read::get_message::<T>).patch(labels::update_labels::<T>),
+            get(read::get_message::<B>).patch(labels::update_labels::<B>),
         )
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/raw",
-            get(read::get_raw::<T>),
+            get(read::get_raw::<B>),
         )
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/attachments/{attachment_id}",
-            get(read::get_attachment::<T>),
+            get(read::get_attachment::<B>),
         )
-        .route("/inboxes/{inbox_id}/threads", get(read::list_threads::<T>))
+        .route("/inboxes/{inbox_id}/threads", get(read::list_threads::<B>))
         .route(
             "/inboxes/{inbox_id}/threads/{thread_id}",
-            get(read::get_thread::<T>),
+            get(read::get_thread::<B>),
         )
         // Resource groups this service does not implement.
         .route("/inboxes/{inbox_id}/drafts", any(not_implemented))
@@ -90,17 +90,17 @@ pub fn router<T: Services>(state: Arc<AppState<T>>) -> Router {
         // request limit rather than the 1 MiB every other route has.
         .route(
             "/inboxes/{inbox_id}/messages/send",
-            post(send::send::<T>).layer(DefaultBodyLimit::max(SEND_BODY_BYTES)),
+            post(send::send::<B>).layer(DefaultBodyLimit::max(SEND_BODY_BYTES)),
         )
         .route(
             "/inboxes/{inbox_id}/messages/{message_id}/reply",
-            post(send::reply::<T>).layer(DefaultBodyLimit::max(SEND_BODY_BYTES)),
+            post(send::reply::<B>).layer(DefaultBodyLimit::max(SEND_BODY_BYTES)),
         )
         .fallback(unknown_route)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
-            auth::require_bearer::<T>,
+            auth::require_bearer::<B>,
         ))
         .with_state(state)
 }

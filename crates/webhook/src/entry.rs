@@ -44,7 +44,7 @@ use crate::config::FunctionMode;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
-use crate::state::{AppState, Services};
+use crate::state::{AppState, Backend};
 
 /// Tracks whether the `ColdStart` metric has been emitted for this execution
 /// environment. The first invocation flips it from `false` to `true` and emits
@@ -74,8 +74,8 @@ pub struct SnsRecord {
 /// # Errors
 ///
 /// Returns an error if the runtime cannot start or its event loop fails.
-pub async fn run<T: Services>(
-    state: Arc<AppState<T>>,
+pub async fn run<B: Backend>(
+    state: Arc<AppState<B>>,
     collector: &'static Collector,
 ) -> Result<(), lambda_http::Error> {
     let router = app(Arc::clone(&state));
@@ -113,8 +113,8 @@ pub async fn run<T: Services>(
 /// Returns an error when the payload matches neither pathway, or when a
 /// direct SNS delivery hit a transient (5xx-class) failure — failing the
 /// invocation is what recruits the async-invoke retry.
-pub async fn dispatch<T: Services>(
-    state: Arc<AppState<T>>,
+pub async fn dispatch<B: Backend>(
+    state: Arc<AppState<B>>,
     router: Router,
     event: LambdaEvent<Value>,
 ) -> Result<Value, lambda_http::Error> {
@@ -195,8 +195,8 @@ async fn serve_http(
     Ok(serde_json::to_value(response)?)
 }
 
-async fn handle_direct<T: Services>(
-    state: &AppState<T>,
+async fn handle_direct<B: Backend>(
+    state: &AppState<B>,
     event: SnsEvent,
     deadline: tokio::time::Instant,
 ) -> Result<(), lambda_http::Error> {
@@ -216,8 +216,8 @@ async fn handle_direct<T: Services>(
     Ok(())
 }
 
-async fn process_record<T: Services>(
-    state: &AppState<T>,
+async fn process_record<B: Backend>(
+    state: &AppState<B>,
     raw_body: Bytes,
     deadline: tokio::time::Instant,
 ) -> Response {

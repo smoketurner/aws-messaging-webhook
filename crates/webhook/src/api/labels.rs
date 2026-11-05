@@ -15,26 +15,13 @@ use axum::extract::{Path, State};
 use serde::Deserialize;
 
 use crate::api::error::{ApiError, FieldError};
-use crate::api::json::ApiJson;
-use crate::mail::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
-use crate::state::{AppState, Services};
+use crate::api::json::{ApiJson, OneOrMany};
+use crate::state::{AppState, Backend};
+use mailbox::MessageId;
+use mailbox::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
 
 /// One label or a list of them.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Labels {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Labels {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::One(label) => vec![label],
-            Self::Many(labels) => labels,
-        }
-    }
-}
+type Labels = OneOrMany<String>;
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateRequest {
@@ -111,9 +98,9 @@ pub(crate) fn normalize_labels(
 /// label, or one that would leave the message or its thread over its label
 /// cap; [`ApiError::NotFound`] when the inbox holds no such message; a
 /// store failure otherwise.
-pub async fn update_labels<T: Services>(
-    State(state): State<Arc<AppState<T>>>,
-    Path((inbox, message_id)): Path<(InboxId, String)>,
+pub async fn update_labels<B: Backend>(
+    State(state): State<Arc<AppState<B>>>,
+    Path((inbox, message_id)): Path<(InboxId, MessageId)>,
     ApiJson(request): ApiJson<UpdateRequest>,
 ) -> Result<Json<wire::MessageLabels>, ApiError> {
     let mut errors = Vec::new();
@@ -148,7 +135,7 @@ pub async fn update_labels<T: Services>(
 
     let now = time::format(time::now_ms());
     let labels = state
-        .services
+        .mailbox
         .update_labels(&inbox, &message_id, &add, &remove, &now)
         .await?
         .ok_or(ApiError::NotFound)?;

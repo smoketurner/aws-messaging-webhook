@@ -19,11 +19,11 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::mail::content::MessageContent;
-use crate::mail::labels::SystemLabel;
-use crate::mail::{MailMessage, ids, labels, time, wire};
 use crate::model::ses_notification::{SesEventKind, SesNotification};
 use crate::publish::{PUT_EVENTS_ENTRY_CAP_BYTES, detail_bytes};
+use mailbox::content::MessageContent;
+use mailbox::labels::SystemLabel;
+use mailbox::{MailMessage, ids, labels, time, wire};
 
 /// One outbound mailbox event, before publishing.
 #[derive(Debug, Clone)]
@@ -86,37 +86,6 @@ fn received_event_type(labels: &[String]) -> &'static str {
     }
 }
 
-/// The thread as of this message's arrival, from the snapshot stored on the
-/// message item.
-fn thread_item(msg: &MailMessage) -> wire::ThreadItem {
-    // A received message always carries a snapshot; an absent one falls back
-    // to its empty Default rather than failing the whole relay record over a
-    // data shape that shouldn't occur.
-    let snapshot = msg.thread_snapshot.clone().unwrap_or_default();
-    wire::ThreadItem {
-        inbox_id: msg.inbox_id.as_str().to_owned(),
-        thread_id: msg.thread_id.clone(),
-        labels: snapshot.labels,
-        timestamp: snapshot.timestamp,
-        received_timestamp: snapshot.received_timestamp,
-        sent_timestamp: snapshot.sent_timestamp,
-        senders: snapshot.senders,
-        recipients: snapshot.recipients,
-        last_message_id: snapshot.last_message_id,
-        message_count: snapshot.message_count,
-        size: snapshot.size,
-        created_at: snapshot.created_at,
-        updated_at: snapshot.updated_at,
-        subject: (!snapshot.subject.is_empty()).then_some(snapshot.subject),
-        preview: (!snapshot.preview.is_empty()).then_some(snapshot.preview),
-        attachments: snapshot
-            .attachments
-            .iter()
-            .map(wire::Attachment::from)
-            .collect(),
-    }
-}
-
 /// Builds the `message.received*` event for a newly-inserted message item on
 /// an INSERT: plain, `.spam`, or `.unauthenticated` depending on the
 /// message's labels. `None` for any other INSERT (e.g. a `queued` outbound
@@ -133,7 +102,12 @@ pub fn build_received_event(
     let event_type = received_event_type(&msg.labels);
     // ts_ms is the message's own timestamp for a received event.
     let ts_ms = time::parse(&msg.timestamp).unwrap_or(0);
-    let event_id = ids::event_id(msg.inbox_id.as_str(), &msg.message_id, event_type, ts_ms);
+    let event_id = ids::event_id(
+        msg.inbox_id.as_str(),
+        msg.message_id.as_str(),
+        event_type,
+        ts_ms,
+    );
 
     let mut message = wire::Message::new(msg, content);
     // A body larger than the whole entry cap cannot survive the ladder
@@ -153,7 +127,7 @@ pub fn build_received_event(
         "event_type": event_type,
         "event_id": event_id,
         "message": to_json(&message),
-        "thread": to_json(&thread_item(msg)),
+        "thread": to_json(&wire::ThreadItem::from(msg)),
     });
     cap_received_detail(&mut detail, event_type, event_source);
 
@@ -187,7 +161,7 @@ pub fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Option<Mail
     let detail = json!({
         "type": "event",
         "event_type": event_type,
-        "event_id": ids::event_id(msg.inbox_id.as_str(), &msg.message_id, event_type, ts_ms),
+        "event_id": ids::event_id(msg.inbox_id.as_str(), msg.message_id.as_str(), event_type, ts_ms),
         "send": {
             "inbox_id": msg.inbox_id.as_str(),
             "thread_id": msg.thread_id,
@@ -297,7 +271,7 @@ pub fn build_ses_event(
     let ts_ms = time::parse(notified_at).unwrap_or(0);
     let event_id = ids::ses_event_id(
         msg.inbox_id.as_str(),
-        &msg.message_id,
+        msg.message_id.as_str(),
         event_type,
         sns_message_id,
         ts_ms,
@@ -358,7 +332,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::mail::{AttachmentMeta, Direction, ThreadSnapshot, test_fixtures};
+    use mailbox::{AttachmentMeta, Direction, ThreadSnapshot, test_fixtures};
+    use mailbox::{MessageId, ThreadId};
 
     const EVENT_SOURCE: &str = "aws-messaging-webhook";
     const NOTIFIED_AT: &str = "2026-01-15T10:00:00.000Z";
@@ -379,7 +354,7 @@ mod tests {
 
     fn sample_snapshot() -> ThreadSnapshot {
         ThreadSnapshot {
-            thread_id: "tid-1".to_owned(),
+            thread_id: ThreadId::new("tid-1"),
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             message_count: 1,
@@ -389,7 +364,7 @@ mod tests {
             timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
             created_at: "2026-01-15T09:30:00.000Z".to_owned(),
             updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            last_message_id: "mid-1".to_owned(),
+            last_message_id: MessageId::new("mid-1"),
             size: 1234,
             received_timestamp: Some("2026-01-15T09:30:00.000Z".to_owned()),
             sent_timestamp: None,
@@ -502,7 +477,7 @@ mod tests {
             size: 10,
             filename: Some("a.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: crate::mail::wire::ContentDisposition::Attachment,
+            content_disposition: mailbox::wire::ContentDisposition::Attachment,
             content_id: None,
         }];
         msg.thread_snapshot = Some(snapshot);
@@ -833,7 +808,7 @@ mod tests {
                 size: 100,
                 filename: Some("f".repeat(5_000)),
                 content_type: "text/plain".to_owned(),
-                content_disposition: crate::mail::wire::ContentDisposition::Attachment,
+                content_disposition: mailbox::wire::ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();

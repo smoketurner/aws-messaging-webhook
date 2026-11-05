@@ -3,23 +3,24 @@
 //! `POST …/messages/{id}/reply`: what a reply inherits from the message it
 //! answers.
 
-use aws_messaging_webhook::mail::content::{self, MessageContent};
-use aws_messaging_webhook::mail::mime::parse_inbound;
-use aws_messaging_webhook::mail::send::SendSpec;
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{Direction, InboxId, MailMessage, ids, time};
+use aws_messaging_webhook::mail::content;
 use axum::http::StatusCode;
+use mailbox::MessageId;
+use mailbox::content::MessageContent;
+use mailbox::mime::parse_inbound;
+use mailbox::send::SendSpec;
+use mailbox::{Direction, InboxId, MailMessage, ids, time};
+use mailbox_store::memory::sample_message;
 use serde_json::{Value, json};
-use webhook_test_support::mail_memory::sample_message;
 use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, api_harness};
 
 /// Seeds one inbound message to reply to, letting the caller shape it.
 /// Stores the original message's content document, as ingest would have.
 async fn store_content(h: &Harness, message_id: &str, message_content: MessageContent) {
     content::store(
-        &h.state.services,
+        &h.state.objects,
         &InboxId::new(TEST_INBOX),
-        message_id,
+        &MessageId::new(message_id),
         &message_content,
     )
     .await
@@ -38,7 +39,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     "Order 42".clone_into(&mut msg.subject);
     "<original@example.net>".clone_into(&mut msg.rfc_message_id);
     adjust(&mut msg);
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }
 
@@ -369,7 +370,7 @@ async fn a_reply_reaches_the_mailbox_ingest_read_from_the_sender() {
              Message-ID: <rt@example.net>\r\n\r\nbody\r\n"
         );
         let stored = parse_inbound(raw.as_bytes()).unwrap().message.from;
-        assert!(stored.len() <= aws_messaging_webhook::mail::ADDRESS_MAX_BYTES);
+        assert!(stored.len() <= mailbox::ADDRESS_MAX_BYTES);
 
         let (h, original_id) = seeded(|m| m.from.clone_from(&stored)).await;
         let (status, response) = api::post(

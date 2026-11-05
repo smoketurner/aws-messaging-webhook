@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 //! Integration tests for inbound ingest: the real router,
-//! `FakeServices` (`MailMemoryStore` + `FakeObjectStore`), and the
+//! fakes (`MailMemoryStore` + `FakeObjectStore`), and the
 //! `.eml` fixtures.
 //!
 //! Router-driven tests run against `webhook_test_support::mail_harness`.
@@ -12,25 +12,26 @@
 //! `ingest_inbound` with a short, precisely controlled `tokio::time::Instant`
 //! deadline.
 
+use mailbox::{MessageId, ThreadId};
 use std::fmt::Write as _;
 use std::time::Duration;
 
 use aws_messaging_webhook::allowlist::TopicAllowlist;
 use aws_messaging_webhook::config::{Config, MailConfig};
-use aws_messaging_webhook::mail::ids::inbound_message_id;
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::time::parse as parse_ts;
-use aws_messaging_webhook::mail::{content, ids, ingest};
+use aws_messaging_webhook::mail::{content, ingest};
 use aws_messaging_webhook::model::ses_inbound::SesInboundNotification;
 use aws_messaging_webhook::state::AppState;
 use axum::body::Bytes;
 use axum::http::StatusCode;
+use mailbox::ids;
+use mailbox::ids::inbound_message_id;
+use mailbox::time::parse as parse_ts;
 use serde_json::{Value, json};
 use sns_message_verifier::SnsVerifier;
 use webhook_test_support::objects::{ObjectFailure, Op};
 use webhook_test_support::{
-    FakeServices, Harness, MAIL_BUCKET, direct_sns_event, invoke, mail_harness, post, test_config,
-    test_mail_config, wrapped,
+    Fakes, Harness, MAIL_BUCKET, direct_sns_event, fake_state, invoke, mail_harness, post,
+    test_config, test_mail_config, wrapped,
 };
 
 /// A `notificationType: "Received"` SNS payload with an S3 action pointer
@@ -71,8 +72,8 @@ const TS: &str = "2026-01-01T00:00:00.000Z";
 #[tokio::test]
 async fn plain_message_ingests_and_creates_a_thread() {
     let h = mail_harness().await;
-    let raw = include_bytes!("fixtures/mail/plain.eml");
-    h.fake()
+    let raw = include_bytes!("../../mailbox/tests/fixtures/mail/plain.eml");
+    h.state
         .objects
         .seed("inbound/msg-1", Bytes::from_static(raw), "message/rfc822");
     let body = wrapped(
@@ -93,11 +94,11 @@ async fn plain_message_ingests_and_creates_a_thread() {
     assert_eq!(status, StatusCode::OK);
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("message was inserted");
@@ -112,7 +113,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
 
     // The body, headers and verdicts live in the content document, not the
     // item.
-    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    let stored_content = content::load(&h.state.objects, &stored).await.unwrap();
     assert!(
         stored_content
             .text
@@ -128,7 +129,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
 
     // The item and its thread expire with the bucket's lifecycle.
     let retention_secs = 365 * 86_400;
-    let now_secs = aws_messaging_webhook::mail::time::now_ms() / 1_000;
+    let now_secs = mailbox::time::now_ms() / 1_000;
     assert!(
         stored.expires_at > now_secs + retention_secs - 60
             && stored.expires_at <= now_secs + retention_secs,
@@ -136,18 +137,18 @@ async fn plain_message_ingests_and_creates_a_thread() {
         stored.expires_at
     );
     let thread = h
-        .fake()
         .mail
-        .get_thread(&inbox, &message_id, 1, None)
+        .mailbox()
+        .get_thread(&inbox, &ThreadId::new(message_id.as_str()), 1, None)
         .await
         .unwrap()
         .unwrap()
         .thread;
     assert_eq!(thread.expires_at, stored.expires_at);
     assert!(
-        h.fake().calls().contains(&"persist:ses-1".to_owned()),
+        h.calls().contains(&"persist:ses-1".to_owned()),
         "the SES receipt is persisted as the outbox entry, keyed by the SES message id, before ingest runs: {:?}",
-        h.fake().calls()
+        h.calls()
     );
 }
 
@@ -162,8 +163,8 @@ async fn plain_message_ingests_and_creates_a_thread() {
 #[tokio::test]
 async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body() {
     let h = mail_harness().await;
-    let raw = include_bytes!("fixtures/mail/inline-image-mixed.eml");
-    h.fake().objects.seed(
+    let raw = include_bytes!("../../mailbox/tests/fixtures/mail/inline-image-mixed.eml");
+    h.state.objects.seed(
         "inbound/inline-img",
         Bytes::from_static(raw),
         "message/rfc822",
@@ -186,11 +187,11 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
     assert_eq!(status, StatusCode::OK);
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("message was inserted");
@@ -198,7 +199,7 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
     // The regression: before the fix the inline SVG and decoded PNG bytes
     // were appended to `content.text` after the real body, so `content.text`
     // was `"Hello body.\n<svg ...>...</svg>\nhello"`.
-    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    let stored_content = content::load(&h.state.objects, &stored).await.unwrap();
     assert_eq!(
         stored_content.text.as_deref(),
         Some("Hello body."),
@@ -224,12 +225,12 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
     let svg_key = format!("attachments/{message_id}/{svg_id}");
     let png_key = format!("attachments/{message_id}/{png_id}");
     let svg_bytes = h
-        .fake()
+        .state
         .objects
         .get(&svg_key)
         .expect("SVG attachment was put in the object store");
     let png_bytes = h
-        .fake()
+        .state
         .objects
         .get(&png_key)
         .expect("PNG attachment was put in the object store");
@@ -261,7 +262,7 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
          References: <{giant_id}>\r\nMIME-Version: 1.0\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
     );
-    h.fake()
+    h.state
         .objects
         .seed("inbound/giant-refs", Bytes::from(raw), "message/rfc822");
 
@@ -282,18 +283,18 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
     assert_eq!(status, StatusCode::OK, "ingest should accept the message");
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("the message was inserted");
 
     // The regression: before the fix `load` returned `ObjectError::TooLarge`
     // and every read of the message or its thread page failed with HTTP 500.
-    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    let stored_content = content::load(&h.state.objects, &stored).await.unwrap();
     assert!(
         stored_content
             .text
@@ -302,9 +303,7 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
         "the body survives because the giant references id is capped at parse time, not the body"
     );
     assert_eq!(stored_content.references.len(), 1);
-    assert!(
-        stored_content.references[0].len() <= aws_messaging_webhook::mail::REFERENCES_MAX_BYTES
-    );
+    assert!(stored_content.references[0].len() <= mailbox::REFERENCES_MAX_BYTES);
 }
 
 /// A `Message-ID` of ~500 KB — under the 40 MB SES receive limit but over the
@@ -325,7 +324,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
          Subject: giant message-id\r\nMessage-ID: <{giant_id}@example.com>\r\n\
          MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody\r\n"
     );
-    h.fake()
+    h.state
         .objects
         .seed("inbound/giant-mid", Bytes::from(raw), "message/rfc822");
 
@@ -346,11 +345,11 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
     assert_eq!(status, StatusCode::OK, "ingest should accept the message");
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .expect("the message was inserted, not silently dropped");
@@ -360,7 +359,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
     let stored_mid = &stored.rfc_message_id;
     assert_eq!(
         stored_mid.len(),
-        aws_messaging_webhook::mail::REFERENCES_MAX_BYTES,
+        mailbox::REFERENCES_MAX_BYTES,
         "the oversized Message-ID is capped at parse time"
     );
     assert!(stored_mid.starts_with('<'));
@@ -368,7 +367,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
 
     // The body survives in the S3 content document, which before the fix was
     // orphaned by the permanent transaction cancellation.
-    let stored_content = content::load(h.fake(), &stored).await.unwrap();
+    let stored_content = content::load(&h.state.objects, &stored).await.unwrap();
     assert!(
         stored_content
             .text
@@ -383,9 +382,11 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
 #[tokio::test]
 async fn direct_sns_invocation_also_ingests() {
     let h = mail_harness().await;
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-1",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
     let envelope = wrapped(
@@ -406,11 +407,11 @@ async fn direct_sns_invocation_also_ingests() {
     assert!(result.is_ok(), "{result:?}");
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     assert!(
-        h.fake()
-            .mail
-            .get_message(&inbox, &message_id)
+        h.mail
+            .mailbox()
+            .get_message(&inbox, &MessageId::new(message_id.as_str()))
             .await
             .unwrap()
             .is_some()
@@ -420,14 +421,18 @@ async fn direct_sns_invocation_also_ingests() {
 #[tokio::test]
 async fn reply_threads_under_its_parent() {
     let h = mail_harness().await;
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-1",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-2",
-        Bytes::from_static(include_bytes!("fixtures/mail/reply-references.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/reply-references.eml"
+        )),
         "message/rfc822",
     );
 
@@ -470,11 +475,11 @@ async fn reply_threads_under_its_parent() {
     );
     let reply_id = expected_message_id("ses-2", reply_ts);
 
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let reply = h
-        .fake()
         .mail
-        .get_message(&inbox, &reply_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(reply_id.as_str()))
         .await
         .unwrap()
         .expect("reply was inserted");
@@ -487,9 +492,11 @@ async fn reply_threads_under_its_parent() {
 #[tokio::test]
 async fn spam_message_gets_the_spam_label() {
     let h = mail_harness().await;
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-1",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
     let body = wrapped(
@@ -511,11 +518,11 @@ async fn spam_message_gets_the_spam_label() {
     );
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .unwrap();
@@ -526,9 +533,11 @@ async fn spam_message_gets_the_spam_label() {
 #[tokio::test]
 async fn unauthenticated_message_gets_the_unauthenticated_label() {
     let h = mail_harness().await;
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-1",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
     let body = wrapped(
@@ -550,11 +559,11 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
     );
 
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = h
-        .fake()
         .mail
-        .get_message(&inbox, &message_id)
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(message_id.as_str()))
         .await
         .unwrap()
         .unwrap();
@@ -565,9 +574,11 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
 #[tokio::test]
 async fn redelivery_is_idempotent() {
     let h = mail_harness().await;
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-1",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
     let body = wrapped(
@@ -590,7 +601,7 @@ async fn redelivery_is_idempotent() {
     );
     // Redelivery: every target inbox already has the (deterministic) id, so
     // this short-circuits to `ingest_duplicate` without re-fetching.
-    h.fake()
+    h.state
         .objects
         .inject("inbound/msg-1", ObjectFailure::Permanent);
     assert_eq!(
@@ -617,8 +628,8 @@ async fn missing_s3_pointer_skips() {
     );
     // No S3 pointer means nothing was ever fetched or inserted; a configured
     // inbox is never even created for a receipt that carries no pointer.
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
-    assert!(h.fake().mail.get_inbox(&inbox).await.unwrap().is_none());
+    let inbox = mailbox::InboxId::new("support@example.com");
+    assert!(h.mail.mailbox().get_inbox(&inbox).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -644,11 +655,11 @@ async fn wrong_bucket_is_a_permanent_skip() {
         StatusCode::OK
     );
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     assert!(
-        h.fake()
-            .mail
-            .get_message(&inbox, &message_id)
+        h.mail
+            .mailbox()
+            .get_message(&inbox, &MessageId::new(message_id.as_str()))
             .await
             .unwrap()
             .is_none()
@@ -678,11 +689,11 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
         "a permanent ingest failure is logged and counted, not surfaced as a 5xx"
     );
     let message_id = expected_message_id("ses-1", TS);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     assert!(
-        h.fake()
-            .mail
-            .get_message(&inbox, &message_id)
+        h.mail
+            .mailbox()
+            .get_message(&inbox, &MessageId::new(message_id.as_str()))
             .await
             .unwrap()
             .is_none()
@@ -692,7 +703,7 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
 #[tokio::test]
 async fn transient_s3_error_returns_500() {
     let h = mail_harness().await;
-    h.fake()
+    h.state
         .objects
         .inject("inbound/msg-1", ObjectFailure::Transient);
     let body = wrapped(
@@ -737,9 +748,9 @@ async fn the_ses_setup_notification_is_acknowledged_and_ignored() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        h.fake().calls().is_empty(),
+        h.calls().is_empty(),
         "nothing may be persisted or published: {:?}",
-        h.fake().calls()
+        h.calls()
     );
 }
 
@@ -750,13 +761,13 @@ async fn the_ses_setup_notification_is_acknowledged_and_ignored() {
 #[tokio::test]
 async fn a_message_reusing_a_known_message_id_joins_that_thread() {
     let h = mail_harness().await;
-    let raw = Bytes::from_static(include_bytes!("fixtures/mail/plain.eml"));
-    h.fake()
+    let raw = Bytes::from_static(include_bytes!(
+        "../../mailbox/tests/fixtures/mail/plain.eml"
+    ));
+    h.state
         .objects
         .seed("inbound/msg-1", raw.clone(), "message/rfc822");
-    h.fake()
-        .objects
-        .seed("inbound/msg-2", raw, "message/rfc822");
+    h.state.objects.seed("inbound/msg-2", raw, "message/rfc822");
     for (ses_id, key) in [("ses-1", "inbound/msg-1"), ("ses-2", "inbound/msg-2")] {
         let body = wrapped(
             &h,
@@ -777,12 +788,12 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
         );
     }
 
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let first = expected_message_id("ses-1", TS);
     let second = h
-        .fake()
         .mail
-        .get_message(&inbox, &expected_message_id("ses-2", TS))
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(expected_message_id("ses-2", TS)))
         .await
         .unwrap()
         .expect("the second delivery was stored");
@@ -792,9 +803,11 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
 #[tokio::test]
 async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
     let h = mail_harness().await;
-    h.fake().objects.seed(
+    h.state.objects.seed(
         "inbound/msg-1",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
     let body = wrapped(
@@ -821,12 +834,12 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
 
     let message_id = expected_message_id("ses-1", TS);
     let stored = |local: &str| {
-        let inbox = aws_messaging_webhook::mail::InboxId::new(local);
-        let fake = h.fake();
+        let inbox = mailbox::InboxId::new(local);
+        let mail = h.mail.clone();
         let message_id = message_id.clone();
         async move {
-            fake.mail
-                .get_message(&inbox, &message_id)
+            mail.mailbox()
+                .get_message(&inbox, &MessageId::new(message_id.as_str()))
                 .await
                 .unwrap()
                 .is_some()
@@ -845,22 +858,18 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
         "the inbox's local part at another domain is a different address"
     );
     assert!(
-        h.fake()
-            .mail
-            .get_inbox(&aws_messaging_webhook::mail::InboxId::new(
-                "sales@example.com"
-            ))
+        h.mail
+            .mailbox()
+            .get_inbox(&mailbox::InboxId::new("sales@example.com"))
             .await
             .unwrap()
             .is_none(),
         "no inbox may be created for an unconfigured recipient"
     );
     let created = h
-        .fake()
         .mail
-        .get_inbox(&aws_messaging_webhook::mail::InboxId::new(
-            "support@example.com",
-        ))
+        .mailbox()
+        .get_inbox(&mailbox::InboxId::new("support@example.com"))
         .await
         .unwrap()
         .unwrap();
@@ -869,14 +878,9 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
 
 /// A direct `mail::ingest::ingest_inbound` call — see the module doc for why
 /// this test cannot drive the deadline through the router.
-fn direct_state(bucket: &str) -> AppState<FakeServices> {
-    AppState {
-        services: FakeServices::default(),
-        api_keys: aws_messaging_webhook::api::keys::KeyCache::new(),
-        verifier: SnsVerifier::builder().build().unwrap(),
-        allowlist: TopicAllowlist::parse(""),
-        http: reqwest::Client::new(),
-        config: Config {
+fn direct_state(bucket: &str) -> AppState<Fakes> {
+    let (state, _, _) = fake_state(
+        Config {
             opt_out_list_name: None,
             mail: Some(MailConfig {
                 bucket: bucket.to_owned(),
@@ -884,8 +888,11 @@ fn direct_state(bucket: &str) -> AppState<FakeServices> {
             }),
             ..test_config()
         },
-        dangerous_subscribe_url_prefix: None,
-    }
+        SnsVerifier::builder().build().unwrap(),
+        TopicAllowlist::parse(""),
+        None,
+    );
+    state
 }
 
 fn notification(
@@ -934,10 +941,7 @@ fn notification_without_timestamps(
 #[tokio::test(start_paused = true)]
 async fn deadline_timeout_returns_transient() {
     let state = direct_state(MAIL_BUCKET);
-    state
-        .services
-        .objects
-        .inject("inbound/hang", ObjectFailure::Hang);
+    state.objects.inject("inbound/hang", ObjectFailure::Hang);
     let event = notification("ses-1", TS, &["support@example.com"], "inbound/hang");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -956,9 +960,8 @@ async fn deadline_timeout_returns_transient() {
 #[tokio::test]
 async fn resume_skips_an_already_present_part() {
     let state = direct_state(MAIL_BUCKET);
-    let raw = include_bytes!("fixtures/mail/attachment-content-id.eml");
+    let raw = include_bytes!("../../mailbox/tests/fixtures/mail/attachment-content-id.eml");
     state
-        .services
         .objects
         .seed("inbound/att-1", Bytes::from_static(raw), "message/rfc822");
 
@@ -972,7 +975,6 @@ async fn resume_skips_an_already_present_part() {
     // this part.
     let original = Bytes::from_static(b"hello world");
     state
-        .services
         .objects
         .seed(&object_key, original.clone(), "image/png");
 
@@ -982,26 +984,25 @@ async fn resume_skips_an_already_present_part() {
 
     // The pre-seeded content is untouched — `put_object_if_absent` never ran
     // against a differing body for this key.
-    assert_eq!(state.services.objects.get(&object_key), Some(original));
+    assert_eq!(state.objects.get(&object_key), Some(original));
     // Direct call-count assertions rather than outcome-only. The part
     // is HEADed (once to detect a redelivery, once more in the per-part
     // resume check) but never put, since it was already present.
     assert_eq!(
-        state.services.objects.call_count(Op::Head, &object_key),
+        state.objects.call_count(Op::Head, &object_key),
         2,
         "resume HEADs every part: once to detect a redelivery, once per part"
     );
     assert_eq!(
-        state.services.objects.call_count(Op::Put, &object_key),
+        state.objects.call_count(Op::Put, &object_key),
         0,
         "an already-present part is skipped, never put"
     );
 
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     let stored = state
-        .services
-        .mail
-        .get_message(&inbox, &message_id.to_string())
+        .mailbox
+        .get_message(&inbox, &MessageId::new(message_id.to_string()))
         .await
         .unwrap()
         .expect("message was inserted");
@@ -1028,7 +1029,7 @@ fn two_attachment_email() -> Vec<u8> {
 #[tokio::test(start_paused = true)]
 async fn no_put_still_pending_after_the_deadline() {
     let state = direct_state(MAIL_BUCKET);
-    state.services.objects.seed(
+    state.objects.seed(
         "inbound/two-atts",
         Bytes::from(two_attachment_email()),
         "message/rfc822",
@@ -1044,10 +1045,7 @@ async fn no_put_still_pending_after_the_deadline() {
         "attachments/{message_id}/{}",
         ids::attachment_id(&message_id, 1)
     );
-    state
-        .services
-        .objects
-        .inject(&hung_key, ObjectFailure::Hang);
+    state.objects.inject(&hung_key, ObjectFailure::Hang);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
@@ -1060,7 +1058,7 @@ async fn no_put_still_pending_after_the_deadline() {
         aws_messaging_webhook::actions::ActionErrorKind::Transient
     );
 
-    let count_at_timeout = state.services.objects.call_count(Op::Put, &hung_key);
+    let count_at_timeout = state.objects.call_count(Op::Put, &hung_key);
     assert_eq!(
         count_at_timeout, 1,
         "the hung put was attempted exactly once"
@@ -1069,12 +1067,12 @@ async fn no_put_still_pending_after_the_deadline() {
     // dropped on timeout, the hung put would still be polled and retried.
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(
-        state.services.objects.call_count(Op::Put, &hung_key),
+        state.objects.call_count(Op::Put, &hung_key),
         count_at_timeout,
         "no put is still pending after the deadline: the call count must not keep growing"
     );
     assert!(
-        !state.services.objects.contains(&hung_key),
+        !state.objects.contains(&hung_key),
         "the hung part never actually landed"
     );
 }
@@ -1086,9 +1084,11 @@ async fn no_put_still_pending_after_the_deadline() {
 #[tokio::test]
 async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     let state = direct_state(MAIL_BUCKET);
-    state.services.objects.seed(
+    state.objects.seed(
         "inbound/no-ts",
-        Bytes::from_static(include_bytes!("fixtures/mail/plain.eml")),
+        Bytes::from_static(include_bytes!(
+            "../../mailbox/tests/fixtures/mail/plain.eml"
+        )),
         "message/rfc822",
     );
     let event = notification_without_timestamps("ses-1", &["support@example.com"], "inbound/no-ts");
@@ -1099,12 +1099,11 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     assert_eq!(first.unwrap(), ingest::IngestOutcome::Ingested);
 
     let message_id = inbound_message_id("ses-1", envelope_ms);
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
+    let inbox = mailbox::InboxId::new("support@example.com");
     assert!(
         state
-            .services
-            .mail
-            .get_message(&inbox, &message_id.to_string())
+            .mailbox
+            .get_message(&inbox, &MessageId::new(message_id.to_string()))
             .await
             .unwrap()
             .is_some()
@@ -1131,7 +1130,7 @@ async fn missing_every_timestamp_source_skips_rather_than_inventing_one() {
     let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
     assert_eq!(result.unwrap(), ingest::IngestOutcome::Skipped);
     assert_eq!(
-        state.services.objects.call_count(Op::Get, "inbound/no-ts"),
+        state.objects.call_count(Op::Get, "inbound/no-ts"),
         0,
         "the message is skipped before ever fetching the raw object"
     );
@@ -1162,7 +1161,7 @@ async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
     let key = format!("inbound/thread-{n}");
     let ses_id = format!("ses-thread-{n}");
     let ts = format!("2026-01-01T00:{n:02}:00.000Z");
-    h.fake().objects.seed(&key, raw, "message/rfc822");
+    h.state.objects.seed(&key, raw, "message/rfc822");
     let body = wrapped(
         h,
         &ses_inbound_s3(
@@ -1180,14 +1179,15 @@ async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
         post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
-    let inbox = aws_messaging_webhook::mail::InboxId::new("support@example.com");
-    h.fake()
-        .mail
-        .get_message(&inbox, &expected_message_id(&ses_id, &ts))
+    let inbox = mailbox::InboxId::new("support@example.com");
+    h.mail
+        .mailbox()
+        .get_message(&inbox, &MessageId::new(expected_message_id(&ses_id, &ts)))
         .await
         .unwrap()
         .unwrap()
         .thread_id
+        .to_string()
 }
 
 #[tokio::test]

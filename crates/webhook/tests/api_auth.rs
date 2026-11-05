@@ -12,10 +12,7 @@ use webhook_test_support::{TEST_API_KEY, api, harness};
 #[tokio::test]
 async fn a_request_without_a_key_is_rejected() {
     let h = harness().await;
-    h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
 
     let (status, body) = api::call(&h, Method::GET, "/v0/pods", None, &[]).await;
 
@@ -26,10 +23,7 @@ async fn a_request_without_a_key_is_rejected() {
 #[tokio::test]
 async fn an_unknown_key_is_rejected() {
     let h = harness().await;
-    h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
 
     let (status, body) = api::call(
         &h,
@@ -49,7 +43,7 @@ async fn a_cold_cache_that_cannot_load_answers_503_not_401() {
     // The SDKs retry 503 and never retry 401, so an SSM outage must not look
     // like a bad key.
     let h = harness().await;
-    h.state.services.api_keys.make_unavailable();
+    h.state.key_source.make_unavailable();
 
     let (status, body) = api::get(&h, "/v0/pods").await;
 
@@ -60,10 +54,7 @@ async fn a_cold_cache_that_cannot_load_answers_503_not_401() {
 #[tokio::test]
 async fn an_authenticated_call_to_an_unimplemented_route_answers_501() {
     let h = harness().await;
-    h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
 
     let (status, body) = api::get(&h, "/v0/pods").await;
 
@@ -74,10 +65,7 @@ async fn an_authenticated_call_to_an_unimplemented_route_answers_501() {
 #[tokio::test]
 async fn an_unknown_v0_path_answers_the_contract_404_body() {
     let h = harness().await;
-    h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
 
     let (status, body) = api::get(&h, "/v0/nope").await;
 
@@ -89,10 +77,7 @@ async fn an_unknown_v0_path_answers_the_contract_404_body() {
 async fn auth_does_not_leak_which_v0_paths_exist() {
     // Without a key, a real path and a nonsense path must be indistinguishable.
     let h = harness().await;
-    h.state
-        .services
-        .api_keys
-        .set_keys(&[(TEST_API_KEY, "key_1")]);
+    h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
 
     let (real, _) = api::call(&h, Method::GET, "/v0/pods", None, &[]).await;
     let (nonsense, _) = api::call(&h, Method::GET, "/v0/nope", None, &[]).await;
@@ -105,7 +90,7 @@ async fn auth_does_not_leak_which_v0_paths_exist() {
 async fn the_webhook_paths_stay_unauthenticated() {
     // SNS cannot present a bearer key; /v0 auth must not cover /webhooks/*.
     let h = harness().await;
-    h.state.services.api_keys.make_unavailable();
+    h.state.key_source.make_unavailable();
 
     let response = aws_messaging_webhook::app::app(h.state.clone())
         .oneshot(
@@ -124,7 +109,7 @@ async fn the_webhook_paths_stay_unauthenticated() {
 #[tokio::test]
 async fn healthz_stays_open() {
     let h = harness().await;
-    h.state.services.api_keys.make_unavailable();
+    h.state.key_source.make_unavailable();
 
     let response = aws_messaging_webhook::app::app(h.state.clone())
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())

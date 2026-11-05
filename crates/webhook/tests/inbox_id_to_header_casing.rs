@@ -1,35 +1,34 @@
 //! The store-level mechanism behind the casing bug, and the `To:`-header
 //! client scenario it traps.
 //!
-//! DynamoDB partition keys are case-sensitive strings: `inbox_pk` does not fold
-//! case, so `Support@Example.com` and `support@example.com` address different
-//! rows. The fix does not change the keys (it can't — case-sensitivity is
-//! DynamoDB's contract); it normalizes the path at the API boundary using
-//! `InboxId::new`, the same rule ingest uses, so the keys the API
-//! builds always match the keys ingest wrote. This suite pins both halves:
-//! the keys still differ by casing (why the API must normalize), and
-//! `InboxId::new` folds any casing to the stored key (so the API does).
+//! DynamoDB partition keys are case-sensitive strings, so `Support@Example.com`
+//! and `support@example.com` would address different rows. The fix does not
+//! change the keys (it can't — case-sensitivity is DynamoDB's contract); it
+//! normalizes the path at the API boundary using `InboxId::new`, the same rule
+//! ingest uses, and the key builders take an `InboxId`, so the keys the API
+//! builds always match the keys ingest wrote. This suite pins that any casing
+//! builds the stored key, and the client scenario end to end.
 
-use aws_messaging_webhook::mail::keys;
-use aws_messaging_webhook::mail::store::MailStore as _;
+use mailbox::InboxId;
+
 use axum::http::StatusCode;
-use webhook_test_support::mail_memory::sample_message;
+use mailbox_store::keys;
+use mailbox_store::memory::sample_message;
 use webhook_test_support::{TEST_INBOX, api, grant_api_access, harness};
 
 /// DynamoDB string equality is case-sensitive, so the partition keys for two
-/// casings of the same address are different rows — not aliases. This is why
-/// the read API has to apply the same canonicalization ingest applies; it
-/// cannot rely on the store to fold case.
+/// casings of the same address would be different rows — not aliases. The key
+/// builders take an `InboxId`, so every key is built from the folded form and
+/// any casing addresses the row ingest wrote.
 #[test]
-fn inbox_pk_does_not_fold_case_so_casing_is_significant_in_the_key() {
-    assert_ne!(
-        keys::inbox_pk("Support@Example.com"),
-        keys::inbox_pk("support@example.com"),
-        "distinct casings must address distinct rows"
+fn inbox_keys_are_built_from_the_folded_id_whatever_the_casing() {
+    assert_eq!(
+        keys::inbox(&InboxId::new("Support@Example.com")).pk,
+        "INBOX#support@example.com",
     );
     assert_eq!(
-        keys::inbox_pk("support@example.com"),
-        keys::inbox_pk("support@example.com"),
+        keys::inbox(&InboxId::new("Support@Example.com")),
+        keys::inbox(&InboxId::new("support@example.com")),
     );
 }
 
@@ -47,7 +46,7 @@ async fn a_client_using_the_to_header_as_the_inbox_path_can_see_its_mail() {
     // the verbatim mixed-case header a client would copy.
     let mut msg = sample_message(TEST_INBOX, "mid-1", "mid-1");
     msg.to = vec!["Support@Example.com".to_owned()];
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 
     // The client copies the `To:` header verbatim into the path. Before the
     // fix: inbox 404, messages `count: 0`. After: both resolve.

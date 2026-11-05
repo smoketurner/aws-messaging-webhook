@@ -3,11 +3,11 @@
 //! `PATCH …/messages/{id}`: label changes, and what they do to the message's
 //! thread.
 
-use aws_messaging_webhook::mail::store::MailStore as _;
-use aws_messaging_webhook::mail::{InboxId, ids, time};
 use axum::http::{Method, StatusCode};
+use mailbox::MessageId;
+use mailbox::{InboxId, ids, time};
+use mailbox_store::memory::sample_message;
 use serde_json::{Value, json};
-use webhook_test_support::mail_memory::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
 
 async fn patch(h: &Harness, message_id: &str, body: Value) -> (StatusCode, Value) {
@@ -34,7 +34,7 @@ async fn seeded(thread: &str, count: usize) -> (Harness, Vec<String>) {
         msg.timestamp.clone_from(&at);
         msg.created_at.clone_from(&at);
         msg.updated_at.clone_from(&at);
-        h.state.services.insert_message(&msg, &[]).await.unwrap();
+        h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
         ids.push(id);
     }
     (h, ids)
@@ -113,7 +113,7 @@ async fn relabelling_does_not_move_the_thread_in_the_list() {
     msg.timestamp = at.to_owned();
     msg.created_at = at.to_owned();
     msg.updated_at = at.to_owned();
-    h.state.services.insert_message(&msg, &[]).await.unwrap();
+    h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 
     patch(&h, &ids[0], json!({"add_labels": ["urgent"]})).await;
 
@@ -164,10 +164,10 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
 
     let labels = h
         .state
-        .services
+        .mailbox
         .update_labels(
             &InboxId::new(TEST_INBOX),
-            &ids[0],
+            &MessageId::new(ids[0].as_str()),
             &["bounced".to_owned()],
             &[],
             "2026-01-02T00:00:00.000Z",

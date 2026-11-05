@@ -85,7 +85,7 @@ impl EventRecord {
 /// `days × 86_400` is bounded by `u32::MAX × 86_400` and cannot overflow
 /// `u64`. A `u64` retention value would let very large inputs overflow the
 /// multiply and wrap in release builds, producing a near-zero TTL DynamoDB
-/// eventually reaps — the same `u32`-then-widen idiom `crate::mail::time::expires_at`
+/// eventually reaps — the same `u32`-then-widen idiom `mailbox::time::expires_at`
 /// uses for mail retention.
 ///
 /// # Errors

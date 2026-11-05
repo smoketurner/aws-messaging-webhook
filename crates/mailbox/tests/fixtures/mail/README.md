@@ -1,6 +1,6 @@
 # Mail parse fixtures
 
-Synthetic `.eml` messages hand-written for `mail::mime::parse_inbound` tests
+Synthetic `.eml` messages hand-written for `mime::parse_inbound` tests
 — not sourced from any external documentation. Large messages (150 tiny
 parts, a ~30 MB message, a 1 MB body) are generated at test time rather than
 committed here.

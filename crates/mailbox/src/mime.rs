@@ -2,18 +2,18 @@
 
 use std::collections::BTreeMap;
 
-use axum::body::Bytes;
+use bytes::Bytes;
 use mail_parser::{
     AddressList, ContentType, Mailbox, Message as MimeMessage, MessageParser, MessagePart,
     MessageRef, PartKind, PartRole, TextList, preview_html, preview_text,
 };
 
-use crate::mail::content::MessageContent;
-use crate::mail::wire::ContentDisposition;
-use crate::mail::{
-    ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, Direction, HEADER_NAME_MAX,
-    HEADER_VALUE_MAX, HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, InboxId, MailMessage,
-    PREVIEW_CHARS, REFERENCES_MAX, REFERENCES_MAX_BYTES, SUBJECT_MAX_BYTES,
+use crate::content::MessageContent;
+use crate::wire::ContentDisposition;
+use crate::{
+    ADDRESS_MAX_BYTES, ATTACHMENT_FIELD_MAX, ATTACHMENTS_MAX, HEADER_NAME_MAX, HEADER_VALUE_MAX,
+    HEADERS_BUDGET, INBOUND_ADDRESS_LIST_MAX, PREVIEW_CHARS, REFERENCES_MAX, REFERENCES_MAX_BYTES,
+    SUBJECT_MAX_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -30,7 +30,7 @@ pub struct ParsedAttachment {
     pub content_type: String,
     pub content_disposition: ContentDisposition,
     pub content_id: Option<String>,
-    pub bytes: axum::body::Bytes,
+    pub bytes: bytes::Bytes,
 }
 
 /// A parsed inbound message, before thread resolution and item assembly:
@@ -47,9 +47,24 @@ pub struct ParsedAttachment {
 /// by ingest from the SES receipt.
 #[derive(Debug, Clone)]
 pub struct ParsedInbound {
-    pub message: MailMessage,
+    pub message: ParsedMessage,
     pub content: MessageContent,
     pub attachments: Vec<ParsedAttachment>,
+}
+
+/// The fields of an inbound message that come from its MIME alone.
+#[derive(Debug, Clone)]
+pub struct ParsedMessage {
+    pub rfc_message_id: String,
+    pub in_reply_to: Option<String>,
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub preview: String,
+    pub size: u64,
+    pub attachments_truncated: bool,
 }
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -138,16 +153,9 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         .map(|part| build_attachment(&part))
         .collect();
 
-    let message = MailMessage {
-        inbox_id: InboxId::new(""),
-        thread_id: String::new(),
-        message_id: String::new(),
-        ses_message_id: None,
-        direction: Direction::Inbound,
+    let message = ParsedMessage {
         rfc_message_id,
         in_reply_to,
-        labels: Vec::new(),
-        timestamp: String::new(),
         from,
         to,
         cc,
@@ -155,17 +163,7 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
         subject,
         preview,
         size: u64::try_from(raw.len()).unwrap_or(u64::MAX),
-        attachments: Vec::new(),
         attachments_truncated: attachment_count > ATTACHMENTS_MAX,
-        raw_s3_key: None,
-        thread_snapshot: None,
-        delivery: BTreeMap::new(),
-        send_status: None,
-        sent_at: None,
-        version: 0,
-        created_at: String::new(),
-        updated_at: String::new(),
-        expires_at: 0,
     };
 
     let content = MessageContent {
@@ -266,7 +264,7 @@ fn flatten_addresses(address: Option<AddressList<'_>>, cap: usize) -> Vec<String
 
 /// `Message-ID`/`In-Reply-To`/`References` are parsed by `mail-parser` with
 /// the angle brackets stripped; this re-wraps an id to the RFC form our
-/// own [`crate::mail::ids::our_rfc_message_id`] and [`crate::mail::ids::ses_rfc_ids`]
+/// own [`crate::ids::our_rfc_message_id`] and [`crate::ids::ses_rfc_ids`]
 /// produce. The id is truncated to [`REFERENCES_MAX_BYTES`] (leaving room
 /// for the `<>` wrapping) so a single oversized id — still under the SES raw
 /// receive limit but able to JSON-escape sixfold — can never push the stored
@@ -432,11 +430,11 @@ fn build_attachment(part: &MessagePart<'_>) -> ParsedAttachment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mail::ATTACHMENTS_MAX;
+    use crate::ATTACHMENTS_MAX;
 
     macro_rules! fixture {
         ($name:literal) => {
-            parse_inbound(include_bytes!(concat!("../../tests/fixtures/mail/", $name))).unwrap()
+            parse_inbound(include_bytes!(concat!("../tests/fixtures/mail/", $name))).unwrap()
         };
     }
 
@@ -569,7 +567,7 @@ mod tests {
     #[test]
     fn malformed_message_is_a_parse_error() {
         let error =
-            parse_inbound(include_bytes!("../../tests/fixtures/mail/malformed.eml")).unwrap_err();
+            parse_inbound(include_bytes!("../tests/fixtures/mail/malformed.eml")).unwrap_err();
         assert!(matches!(error, ParseError::Malformed));
     }
 

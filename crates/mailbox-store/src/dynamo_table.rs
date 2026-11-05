@@ -1,8 +1,8 @@
-//! [`MailStore`] for [`AwsServices`](crate::aws::AwsServices): the mail
-//! table's DynamoDB access.
+//! [`Table`] over `DynamoDB`: the mail table's `GetItem`, `BatchGetItem`,
+//! `Query`, conditional `PutItem` and `TransactWriteItems`.
 //!
 //! Every write goes through the transaction model
-//! ([`crate::mail::plan`]/[`crate::mail::txn`]): a planner builds
+//! ([`crate::plan`]/[`crate::txn`]): a planner builds
 //! role-tagged [`PlannedOp`]s from a pure, in-memory computation, this module
 //! renders them to a `TransactWriteItems` call, and
 //! [`decode_cancellation`] turns a cancellation into one of a handful of
@@ -15,100 +15,23 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
     AttributeValue as DynamoAv, KeysAndAttributes, Put, TransactWriteItem, Update,
 };
-use aws_smithy_types::error::display::DisplayErrorContext;
 
-use crate::aws::{self, AwsServices};
-use crate::mail::flows;
-use crate::mail::keys::{self, PageKey};
-use crate::mail::plan::{Check, Cond, PlannedOp, WriteOp};
-use crate::mail::send::{SendKey, SendState, SendStatus};
-use crate::mail::store::{
-    EnqueueOutcome, ListQuery, MailStore, MailStoreError, MarkOutcome, Page, ThreadView,
-};
-use crate::mail::thread::ThreadState;
-use crate::mail::txn::{CancellationReason, TxnDecision, decode_cancellation};
-use crate::mail::{Inbox, InboxId, InsertOutcome, MailMessage, RfcHit};
+use crate::keys::{PageKey, TableKey};
+use crate::plan::{Check, Cond, PlannedOp, WriteOp};
+use crate::sdk_error::FromSdkFailure;
+use crate::store::{MailStoreError, Page};
+use crate::table::{PageQuery, Read, Table, TxnOutcome};
+use crate::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use mailbox::PutOutcome;
 
 /// `BatchGetItem` loops on `UnprocessedKeys` at most this many times before
 /// surfacing a transient error.
 const MAX_BATCH_GET_ATTEMPTS: u32 = 5;
-
-impl AwsServices {
-    /// One page of a time-ordered index partition, deserialized into `T`.
-    ///
-    /// Both list indexes are keyed the same way — a partition string plus a
-    /// sort key that orders by time — so messages, threads and thread
-    /// membership share this. `before`/`after` become an exclusive sort-key
-    /// range, and the returned `next` is the last item's key so the caller's
-    /// post-filtering can stop mid-page.
-    async fn query_page<T: serde::de::DeserializeOwned>(
-        &self,
-        query: PageQuery<'_>,
-        context: &'static str,
-    ) -> Result<Page<T>, MailStoreError> {
-        let partition = query.partition;
-        let table_name = self.mail_table_name()?.to_owned();
-        let index = query.index.name();
-        let (pk_attr, sk_attr) = query.index.key_attributes();
-
-        let key = KeyCondition::new(pk_attr, sk_attr, partition, query.after, query.before);
-
-        let mut request = self
-            .dynamo
-            .query()
-            .table_name(&table_name)
-            .index_name(index)
-            .key_condition_expression(key.expression)
-            .set_expression_attribute_names(Some(key.names))
-            .set_expression_attribute_values(Some(key.values))
-            .scan_index_forward(query.ascending)
-            .limit(i32::try_from(query.limit).unwrap_or(i32::MAX));
-        if let Some(start) = query.start {
-            request = request
-                .exclusive_start_key("pk", DynamoAv::S(start.table_pk.clone()))
-                .exclusive_start_key("sk", DynamoAv::S(start.table_sk.clone()))
-                .exclusive_start_key(pk_attr, DynamoAv::S(start.partition.clone()))
-                .exclusive_start_key(sk_attr, DynamoAv::S(start.sort.clone()));
-        }
-
-        let output = request
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk(context, &e))?;
-
-        // The continuation comes from DynamoDB's own LastEvaluatedKey, which
-        // already holds both the index and table keys in the exact form the
-        // next ExclusiveStartKey needs.
-        let next = output
-            .last_evaluated_key
-            .as_ref()
-            .and_then(|key| page_key_from_last_evaluated(key, pk_attr, sk_attr));
-
-        let mut items = Vec::new();
-        for item in output.items.unwrap_or_default() {
-            items.push(
-                serde_dynamo::from_item(item)
-                    .map_err(|e| MailStoreError::Permanent(anyhow!("{context}: {e}")))?,
-            );
-        }
-        Ok(Page { items, next })
-    }
-
-    /// The mail table name, or a permanent error when mail is disabled —
-    /// every `MailStore` method is only ever called when it is enabled, but
-    /// this keeps that assumption from becoming a panic if it's ever
-    /// violated.
-    fn mail_table_name(&self) -> Result<&str, MailStoreError> {
-        self.mail_config()
-            .map(|config| config.table_name.as_str())
-            .ok_or_else(|| MailStoreError::Permanent(anyhow!("mail is not configured")))
-    }
-}
 
 /// A `Query` key condition with exactly the placeholders it uses: DynamoDB
 /// rejects a request whose `ExpressionAttributeNames` or
@@ -163,74 +86,6 @@ impl KeyCondition {
     }
 }
 
-/// One page of one index partition, independent of which collection is being
-/// listed: inboxes are not inbox-scoped, so this carries the partition rather
-/// than deriving it from a [`ListQuery`]'s inbox.
-struct PageQuery<'a> {
-    /// Which index to read. Named rather than inferred from `partition`:
-    /// guessing it from a string prefix silently sent status queries to the
-    /// wrong index, which returns an empty page rather than an error.
-    index: MailIndex,
-    partition: &'a str,
-    limit: usize,
-    before: Option<&'a str>,
-    after: Option<&'a str>,
-    ascending: bool,
-    start: Option<&'a PageKey>,
-}
-
-/// The mail table's secondary indexes, each with the attribute pair it is
-/// keyed by.
-///
-/// The names match the index names in `template.yaml`, which is why they
-/// share a prefix.
-#[expect(
-    clippy::enum_variant_names,
-    reason = "these are the index names the template declares"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MailIndex {
-    /// Inboxes, messages and threads, ordered by time.
-    ByTime,
-    /// One thread's messages.
-    ByThread,
-    /// Send states, by status. Sparse: only send-state items carry its keys.
-    ByStatus,
-}
-
-impl MailIndex {
-    fn name(self) -> &'static str {
-        match self {
-            Self::ByTime => "ByTime",
-            Self::ByThread => "ByThread",
-            Self::ByStatus => "ByStatus",
-        }
-    }
-
-    fn key_attributes(self) -> (&'static str, &'static str) {
-        match self {
-            Self::ByTime => ("gsi1pk", "gsi1sk"),
-            Self::ByThread => ("gsi2pk", "gsi2sk"),
-            Self::ByStatus => ("gsi3pk", "gsi3sk"),
-        }
-    }
-}
-
-impl<'a> PageQuery<'a> {
-    /// The inbox-scoped case: a [`ListQuery`] aimed at `partition`.
-    fn scoped(index: MailIndex, partition: &'a str, query: &'a ListQuery) -> Self {
-        Self {
-            index,
-            partition,
-            limit: query.limit,
-            before: query.before.as_deref(),
-            after: query.after.as_deref(),
-            ascending: query.ascending,
-            start: query.start.as_ref(),
-        }
-    }
-}
-
 /// Turns a `LastEvaluatedKey` into a [`PageKey`].
 ///
 /// Returns `None` when any of the four attributes is missing or is not a
@@ -254,19 +109,13 @@ fn page_key_from_last_evaluated(
     })
 }
 
-/// Maps an SDK failure to the mail-store retry policy: network faults,
-/// timeouts, throttling and 5xx are transient; everything else is permanent.
-/// Shares its transient/permanent classification with `aws.rs`'s
-/// `classify_action_error` via `aws::sdk_error_is_transient`.
-fn store_error_from_sdk<E>(context: &'static str, error: &SdkError<E>) -> MailStoreError
-where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-{
-    let source = anyhow!("{context}: {}", DisplayErrorContext(error));
-    if aws::sdk_error_is_transient(error) {
-        MailStoreError::Transient(source)
-    } else {
-        MailStoreError::Permanent(source)
+impl FromSdkFailure for MailStoreError {
+    fn transient(source: anyhow::Error) -> Self {
+        Self::Transient(source)
+    }
+
+    fn permanent(source: anyhow::Error) -> Self {
+        Self::Permanent(source)
     }
 }
 
@@ -475,72 +324,97 @@ fn alias_transact_item(
     Ok(TransactWriteItem::builder().put(put).build())
 }
 
-fn item_attribute_string(item: &HashMap<String, DynamoAv>, name: &str) -> Option<String> {
-    match item.get(name) {
-        Some(DynamoAv::S(value)) => Some(value.clone()),
-        _ => None,
+/// The mail table.
+pub struct DynamoTable {
+    client: aws_sdk_dynamodb::Client,
+    /// `None` when mail is not configured.
+    table_name: Option<String>,
+}
+
+impl DynamoTable {
+    #[must_use]
+    pub fn new(client: aws_sdk_dynamodb::Client, table_name: Option<String>) -> Self {
+        Self { client, table_name }
+    }
+
+    /// The mail table name, or a permanent error when mail is disabled —
+    /// every `Table` method is only ever called when it is enabled, but
+    /// this keeps that assumption from becoming a panic if it's ever
+    /// violated.
+    fn mail_table_name(&self) -> Result<&str, MailStoreError> {
+        self.table_name
+            .as_deref()
+            .ok_or_else(|| MailStoreError::Permanent(anyhow!("mail is not configured")))
     }
 }
 
-impl flows::TxnStore for AwsServices {
-    async fn read_item<T: serde::de::DeserializeOwned + Send>(
+/// The `pk`/`sk` an item returned by a read carries, so a batch read can
+/// say which key each item answers.
+fn item_key(item: &HashMap<String, DynamoAv>) -> Option<TableKey> {
+    let string = |name: &str| match item.get(name) {
+        Some(DynamoAv::S(value)) => Some(value.clone()),
+        _ => None,
+    };
+    Some(TableKey {
+        pk: string("pk")?,
+        sk: string("sk")?,
+    })
+}
+
+impl Table for DynamoTable {
+    async fn get<T: serde::de::DeserializeOwned + Send>(
         &self,
-        pk: &str,
-        sk: &str,
+        TableKey { pk, sk }: TableKey,
+        read: Read,
+        context: &'static str,
     ) -> Result<Option<T>, MailStoreError> {
         let table_name = self.mail_table_name()?.to_owned();
         let output = self
-            .dynamo
+            .client
             .get_item()
             .table_name(table_name)
-            .key("pk", DynamoAv::S(pk.to_owned()))
-            .key("sk", DynamoAv::S(sk.to_owned()))
-            // Consistent: what is read here conditions the next write.
-            .consistent_read(true)
+            .key("pk", DynamoAv::S(pk))
+            .key("sk", DynamoAv::S(sk))
+            .consistent_read(read == Read::Consistent)
             .send()
             .await
-            .map_err(|e| store_error_from_sdk("GetItem", &e))?;
+            .map_err(|e| MailStoreError::from_sdk(context, &e))?;
         output
             .item
             .map(|item| {
                 serde_dynamo::from_item(item)
-                    .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing item: {e}")))
+                    .map_err(|e| MailStoreError::Permanent(anyhow!("{context}: {e}")))
             })
             .transpose()
     }
 
-    async fn read_aliases(
+    async fn batch_get<T: serde::de::DeserializeOwned + Send>(
         &self,
-        inbox: &InboxId,
-        ids: &[String],
-    ) -> Result<HashMap<String, RfcHit>, MailStoreError> {
-        if ids.is_empty() {
+        keys: Vec<TableKey>,
+        read: Read,
+        context: &'static str,
+    ) -> Result<HashMap<TableKey, T>, MailStoreError> {
+        if keys.is_empty() {
             return Ok(HashMap::new());
         }
         let table_name = self.mail_table_name()?.to_owned();
 
-        let mut pending_keys: Vec<HashMap<String, DynamoAv>> = ids
-            .iter()
-            .map(|id| {
+        let mut pending_keys: Vec<HashMap<String, DynamoAv>> = keys
+            .into_iter()
+            .map(|TableKey { pk, sk }| {
                 HashMap::from([
-                    (
-                        "pk".to_owned(),
-                        DynamoAv::S(keys::rfc_alias_pk(inbox.as_str(), id)),
-                    ),
-                    (
-                        "sk".to_owned(),
-                        DynamoAv::S(keys::rfc_alias_sk().to_owned()),
-                    ),
+                    ("pk".to_owned(), DynamoAv::S(pk)),
+                    ("sk".to_owned(), DynamoAv::S(sk)),
                 ])
             })
             .collect();
 
-        let mut found: HashMap<String, RfcHit> = HashMap::new();
+        let mut found = HashMap::new();
         let mut attempts = 0u32;
         while !pending_keys.is_empty() {
             if attempts >= MAX_BATCH_GET_ATTEMPTS {
                 return Err(MailStoreError::Transient(anyhow!(
-                    "read_aliases: BatchGetItem left unprocessed keys after {MAX_BATCH_GET_ATTEMPTS} attempts"
+                    "{context}: BatchGetItem left unprocessed keys after {MAX_BATCH_GET_ATTEMPTS} attempts"
                 )));
             }
             if attempts > 0 {
@@ -548,42 +422,32 @@ impl flows::TxnStore for AwsServices {
             }
             attempts += 1;
 
-            // Consistent: the transaction planned from this read writes a
-            // placeholder for every id it misses, conditioned on the row
-            // being absent, so a stale miss is a cancelled attempt.
             let request_items = KeysAndAttributes::builder()
                 .set_keys(Some(pending_keys.clone()))
-                .consistent_read(true)
+                .consistent_read(read == Read::Consistent)
                 .build()
                 .map_err(|e| {
                     MailStoreError::Permanent(anyhow!("building KeysAndAttributes: {e}"))
                 })?;
             let output = self
-                .dynamo
+                .client
                 .batch_get_item()
                 .request_items(table_name.clone(), request_items)
                 .send()
                 .await
-                .map_err(|e| store_error_from_sdk("BatchGetItem(rfc_alias)", &e))?;
+                .map_err(|e| MailStoreError::from_sdk(context, &e))?;
 
             if let Some(mut responses) = output.responses
                 && let Some(items) = responses.remove(&table_name)
             {
                 for item in items {
-                    let Some(pk) = item_attribute_string(&item, "pk") else {
+                    let Some(key) = item_key(&item) else {
                         continue;
                     };
-                    let message_id = item_attribute_string(&item, "message_id");
-                    let Some(thread_id) = item_attribute_string(&item, "thread_id") else {
+                    let Ok(value) = serde_dynamo::from_item(item) else {
                         continue;
                     };
-                    found.insert(
-                        pk,
-                        RfcHit {
-                            message_id,
-                            thread_id,
-                        },
-                    );
+                    found.insert(key, value);
                 }
             }
 
@@ -593,25 +457,95 @@ impl flows::TxnStore for AwsServices {
                 .map(|attrs| attrs.keys().to_vec())
                 .unwrap_or_default();
         }
-
-        let mut by_id = HashMap::with_capacity(found.len());
-        for id in ids {
-            if let Some(hit) = found.remove(&keys::rfc_alias_pk(inbox.as_str(), id)) {
-                by_id.insert(id.clone(), hit);
-            }
-        }
-        Ok(by_id)
+        Ok(found)
     }
 
-    async fn run_txn(&self, ops: &[PlannedOp]) -> Result<flows::TxnOutcome, MailStoreError> {
+    async fn query<T: serde::de::DeserializeOwned + Send>(
+        &self,
+        query: PageQuery<'_>,
+    ) -> Result<Page<T>, MailStoreError> {
+        let context = query.context;
         let table_name = self.mail_table_name()?.to_owned();
-        let mut builder = self.dynamo.transact_write_items();
+        let index = query.index.name();
+        let (pk_attr, sk_attr) = query.index.key_attributes();
+
+        let key = KeyCondition::new(pk_attr, sk_attr, query.partition, query.after, query.before);
+
+        let mut request = self
+            .client
+            .query()
+            .table_name(&table_name)
+            .index_name(index)
+            .key_condition_expression(key.expression)
+            .set_expression_attribute_names(Some(key.names))
+            .set_expression_attribute_values(Some(key.values))
+            .scan_index_forward(query.ascending)
+            .limit(i32::try_from(query.limit).unwrap_or(i32::MAX));
+        if let Some(start) = query.start {
+            request = request
+                .exclusive_start_key("pk", DynamoAv::S(start.table_pk.clone()))
+                .exclusive_start_key("sk", DynamoAv::S(start.table_sk.clone()))
+                .exclusive_start_key(pk_attr, DynamoAv::S(start.partition.clone()))
+                .exclusive_start_key(sk_attr, DynamoAv::S(start.sort.clone()));
+        }
+
+        let output = request
+            .send()
+            .await
+            .map_err(|e| MailStoreError::from_sdk(context, &e))?;
+
+        // The continuation comes from DynamoDB's own LastEvaluatedKey, which
+        // already holds both the index and table keys in the exact form the
+        // next ExclusiveStartKey needs.
+        let next = output
+            .last_evaluated_key
+            .as_ref()
+            .and_then(|key| page_key_from_last_evaluated(key, pk_attr, sk_attr));
+
+        let mut items = Vec::new();
+        for item in output.items.unwrap_or_default() {
+            items.push(
+                serde_dynamo::from_item(item)
+                    .map_err(|e| MailStoreError::Permanent(anyhow!("{context}: {e}")))?,
+            );
+        }
+        Ok(Page { items, next })
+    }
+
+    async fn put_if_absent(
+        &self,
+        item: serde_dynamo::Item,
+        context: &'static str,
+    ) -> Result<PutOutcome, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let mut builder = self.client.put_item().table_name(table_name);
+        for (name, value) in item.into_inner() {
+            builder = builder.item(name, value.into());
+        }
+        let result = builder
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(PutOutcome::Created),
+            Err(SdkError::ServiceError(ctx))
+                if ctx.err().is_conditional_check_failed_exception() =>
+            {
+                Ok(PutOutcome::AlreadyExists)
+            }
+            Err(error) => Err(MailStoreError::from_sdk(context, &error)),
+        }
+    }
+
+    async fn transact(&self, ops: &[PlannedOp]) -> Result<TxnOutcome, MailStoreError> {
+        let table_name = self.mail_table_name()?.to_owned();
+        let mut builder = self.client.transact_write_items();
         for planned in ops {
             builder = builder.transact_items(to_transact_item(&table_name, &planned.op)?);
         }
 
         match builder.send().await {
-            Ok(_) => Ok(flows::TxnOutcome::Committed),
+            Ok(_) => Ok(TxnOutcome::Committed),
             Err(error) => {
                 if let SdkError::ServiceError(ctx) = &error {
                     match ctx.err() {
@@ -621,12 +555,10 @@ impl flows::TxnStore for AwsServices {
                                 .iter()
                                 .map(|reason| map_cancellation_reason(reason.code()))
                                 .collect();
-                            return Ok(flows::TxnOutcome::Cancelled(decode_cancellation(
-                                ops, &reasons,
-                            )));
+                            return Ok(TxnOutcome::Cancelled(decode_cancellation(ops, &reasons)));
                         }
                         TransactWriteItemsError::TransactionInProgressException(_) => {
-                            return Ok(flows::TxnOutcome::Cancelled(TxnDecision::Retry));
+                            return Ok(TxnOutcome::Cancelled(TxnDecision::Retry));
                         }
                         TransactWriteItemsError::IdempotentParameterMismatchException(_) => {
                             return Err(MailStoreError::Permanent(anyhow!(
@@ -636,7 +568,7 @@ impl flows::TxnStore for AwsServices {
                         _ => {}
                     }
                 }
-                Err(store_error_from_sdk("TransactWriteItems", &error))
+                Err(MailStoreError::from_sdk("TransactWriteItems", &error))
             }
         }
     }
@@ -655,376 +587,13 @@ impl flows::TxnStore for AwsServices {
     }
 }
 
-impl AwsServices {
-    /// Reads the inbox item. `consistent` is set only where a stale miss
-    /// would be wrong rather than merely late: a strongly consistent read
-    /// costs twice the capacity.
-    async fn read_inbox(
-        &self,
-        inbox: &InboxId,
-        consistent: bool,
-    ) -> Result<Option<Inbox>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
-            .key("sk", DynamoAv::S(keys::inbox_sk().to_owned()))
-            .consistent_read(consistent)
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(inbox)", &e))?;
-        match output.item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item)
-                .map(Some)
-                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing inbox: {e}"))),
-        }
-    }
-}
-
-impl MailStore for AwsServices {
-    async fn get_inbox(&self, inbox: &InboxId) -> Result<Option<Inbox>, MailStoreError> {
-        // Eventually consistent: a stale miss only sends the caller to
-        // `ensure_inbox`, whose conditional put settles it.
-        self.read_inbox(inbox, false).await
-    }
-
-    async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let (record, item) = crate::mail::plan::inbox_item(inbox, now)?;
-
-        let mut builder = self.dynamo.put_item().table_name(table_name.clone());
-        for (name, value) in item.inner() {
-            builder = builder.item(name.clone(), value.clone().into());
-        }
-        let result = builder
-            .condition_expression("attribute_not_exists(pk)")
-            .send()
-            .await;
-        match result {
-            Ok(_) => Ok(record),
-            Err(SdkError::ServiceError(ctx))
-                if ctx.err().is_conditional_check_failed_exception() =>
-            {
-                // The failed condition proves the inbox exists, so this rare
-                // path reads consistently: a stale replica would report it
-                // missing. Absent even so means it was removed between the two
-                // calls; a retry recreates it, where a permanent error would
-                // ack the notification and drop the message.
-                self.read_inbox(inbox, true).await?.ok_or_else(|| {
-                    MailStoreError::Transient(anyhow!(
-                        "inbox disappeared after a conditional check failure"
-                    ))
-                })
-            }
-            Err(error) => Err(store_error_from_sdk("PutItem(inbox)", &error)),
-        }
-    }
-
-    async fn message_exists(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> Result<bool, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
-            .key("sk", DynamoAv::S(keys::message_sk(message_id)))
-            .projection_expression("pk")
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(message_exists)", &e))?;
-        Ok(output.item.is_some())
-    }
-
-    async fn insert_message(
-        &self,
-        msg: &MailMessage,
-        candidates: &[String],
-    ) -> Result<InsertOutcome, MailStoreError> {
-        flows::insert_message(self, msg, candidates).await
-    }
-
-    async fn get_message(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-    ) -> Result<Option<MailMessage>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
-            .key("sk", DynamoAv::S(keys::message_sk(message_id)))
-            // Consistent: the version read here conditions the next write.
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(message)", &e))?;
-        match output.item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item)
-                .map(Some)
-                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing message: {e}"))),
-        }
-    }
-
-    async fn get_send_key(&self, key_hash: &str) -> Result<Option<SendKey>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::send_key_pk(key_hash)))
-            .key("sk", DynamoAv::S(keys::send_key_sk().to_owned()))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(send key)", &e))?;
-        match output.item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item)
-                .map(Some)
-                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing send key: {e}"))),
-        }
-    }
-
-    async fn enqueue_send(
-        &self,
-        msg: &MailMessage,
-        state: &SendState,
-        key: Option<&SendKey>,
-        now_epoch: u64,
-    ) -> Result<EnqueueOutcome, MailStoreError> {
-        flows::enqueue_send(self, msg, state, key, now_epoch).await
-    }
-
-    async fn resolve_ses_message(
-        &self,
-        ses_message_id: &str,
-    ) -> Result<Option<(InboxId, String)>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::ses_ref_pk(ses_message_id)))
-            .key("sk", DynamoAv::S(keys::ses_ref_sk().to_owned()))
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(ses ref)", &e))?;
-        let Some(item) = output.item else {
-            return Ok(None);
-        };
-        let inbox = match item.get("inbox_id") {
-            Some(DynamoAv::S(value)) => value.clone(),
-            _ => return Ok(None),
-        };
-        let message_id = match item.get("message_id") {
-            Some(DynamoAv::S(value)) => value.clone(),
-            _ => return Ok(None),
-        };
-        Ok(Some((InboxId::new(&inbox), message_id)))
-    }
-
-    async fn list_by_status(
-        &self,
-        status: SendStatus,
-        limit: usize,
-    ) -> Result<Vec<SendState>, MailStoreError> {
-        let page: Page<SendState> = self
-            .query_page(
-                PageQuery {
-                    index: MailIndex::ByStatus,
-                    partition: &format!("SENDSTATUS#{}", status.as_str()),
-                    limit,
-                    before: None,
-                    after: None,
-                    ascending: true,
-                    start: None,
-                },
-                "listing sends by status",
-            )
-            .await?;
-        Ok(page.items)
-    }
-
-    async fn get_send_state(&self, message_id: &str) -> Result<Option<SendState>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        let output = self
-            .dynamo
-            .get_item()
-            .table_name(table_name)
-            .key("pk", DynamoAv::S(keys::outbox_pk(message_id)))
-            .key("sk", DynamoAv::S(keys::outbox_sk().to_owned()))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| store_error_from_sdk("GetItem(send state)", &e))?;
-        match output.item {
-            None => Ok(None),
-            Some(item) => serde_dynamo::from_item(item)
-                .map(Some)
-                .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing send state: {e}"))),
-        }
-    }
-
-    async fn claim_send(
-        &self,
-        message_id: &str,
-        now: &str,
-    ) -> Result<Option<SendState>, MailStoreError> {
-        flows::claim_send(self, message_id, now).await
-    }
-
-    async fn note_ses_call(
-        &self,
-        claimed: &SendState,
-        now: &str,
-    ) -> Result<Option<SendState>, MailStoreError> {
-        flows::note_ses_call(self, claimed, now).await
-    }
-
-    async fn mark_send(
-        &self,
-        state: &SendState,
-        outcome: MarkOutcome<'_>,
-        now: &str,
-    ) -> Result<(), MailStoreError> {
-        flows::mark_send(self, state, outcome, now).await
-    }
-
-    async fn update_labels(
-        &self,
-        inbox: &InboxId,
-        message_id: &str,
-        add: &[String],
-        remove: &[String],
-        now: &str,
-    ) -> Result<Option<Vec<String>>, MailStoreError> {
-        flows::update_labels(self, inbox, message_id, add, remove, now).await
-    }
-
-    async fn list_inboxes(
-        &self,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> Result<Page<Inbox>, MailStoreError> {
-        self.query_page(
-            PageQuery {
-                index: MailIndex::ByTime,
-                partition: keys::inboxes_partition(),
-                limit,
-                before: None,
-                after: None,
-                ascending: true,
-                start: start.as_ref(),
-            },
-            "listing inboxes",
-        )
-        .await
-    }
-
-    async fn list_messages(&self, query: &ListQuery) -> Result<Page<MailMessage>, MailStoreError> {
-        let partition = keys::messages_partition(query.inbox.as_str());
-        self.query_page(
-            PageQuery::scoped(MailIndex::ByTime, &partition, query),
-            "listing messages",
-        )
-        .await
-    }
-
-    async fn list_threads(&self, query: &ListQuery) -> Result<Page<ThreadState>, MailStoreError> {
-        let partition = keys::threads_partition(query.inbox.as_str());
-        self.query_page(
-            PageQuery::scoped(MailIndex::ByTime, &partition, query),
-            "listing threads",
-        )
-        .await
-    }
-
-    async fn get_thread(
-        &self,
-        inbox: &InboxId,
-        thread_id: &str,
-        limit: usize,
-        start: Option<PageKey>,
-    ) -> Result<Option<ThreadView>, MailStoreError> {
-        let table_name = self.mail_table_name()?.to_owned();
-        // Messages of one thread, oldest first: ByThread is keyed by the
-        // message id, which orders by time. The thread item and its messages
-        // are independent reads, so they go out together rather than one
-        // after the other.
-        let partition = keys::thread_messages_partition(inbox.as_str(), thread_id);
-        let read_thread = self
-            .dynamo
-            .get_item()
-            .table_name(&table_name)
-            .key("pk", DynamoAv::S(keys::inbox_pk(inbox.as_str())))
-            .key("sk", DynamoAv::S(keys::thread_sk(thread_id)))
-            .send();
-        let read_messages = self.query_page(
-            PageQuery {
-                index: MailIndex::ByThread,
-                partition: &partition,
-                limit,
-                before: None,
-                after: None,
-                ascending: true,
-                start: start.as_ref(),
-            },
-            "listing thread messages",
-        );
-        let (thread, messages) = tokio::join!(read_thread, read_messages);
-
-        let thread = thread
-            .map_err(|e| store_error_from_sdk("GetItem(thread)", &e))?
-            .item;
-        assemble_thread_view(thread.map(serde_dynamo::Item::from), messages)
-    }
-}
-
-/// Assembles a `ThreadView` from the two reads [`AwsServices::get_thread`] runs
-/// concurrently via `tokio::join!`: the base-table thread `GetItem` and the
-/// `ByThread` GSI `Query` for the thread's messages.
-///
-/// Extracted pure so the divergent-result decision — what to do when one read
-/// succeeded and the other failed — is unit-testable without an AWS client.
-/// The load-bearing rule: a `messages` failure coinciding with an absent thread
-/// is surfaced, not dropped. `tokio::join!` drives both reads to completion, so
-/// by the time the thread item is known to be absent the `messages` `Result` is
-/// already resolved; returning `Ok(None)` without applying `?` would mask a
-/// retry-exhausted `ByThread` failure as a definitive `404 NotFound` (the API
-/// handler maps `Ok(None)` to `NotFound`) instead of `MailStoreError::Transient`
-/// /`Permanent` (`502`/`500`), hiding it from the service's internal-error
-/// metrics.
-fn assemble_thread_view(
-    thread: Option<serde_dynamo::Item>,
-    messages: Result<Page<MailMessage>, MailStoreError>,
-) -> Result<Option<ThreadView>, MailStoreError> {
-    let Some(thread) = thread else {
-        // The messages query may have run for nothing; a thread that doesn't
-        // exist is the rarer case than one that does — but its result must be
-        // surfaced first so a `ByThread` failure coinciding with an absent
-        // thread is not masked as a definitive 404.
-        messages?;
-        return Ok(None);
-    };
-    let thread: ThreadState = serde_dynamo::from_item(thread)
-        .map_err(|e| MailStoreError::Permanent(anyhow!("deserializing thread: {e}")))?;
-    let messages = messages?;
-    Ok(Some(ThreadView { thread, messages }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys;
+    use crate::mailbox::Mailbox;
+    use mailbox::{Inbox, InboxId};
+    use mailbox::{MessageId, SesMessageId, ThreadId};
 
     fn alias_put(message_id: Option<&str>) -> aws_sdk_dynamodb::types::Put {
         let op = WriteOp::AliasFirstWriter {
@@ -1122,42 +691,6 @@ mod tests {
         }
     }
 
-    // --- get_thread: assemble_thread_view ---------------------------------
-    //
-    // `get_thread` runs the base-table thread `GetItem` and the `ByThread` GSI
-    // `Query` concurrently via `tokio::join!`, so by the time the thread item
-    // is known to be absent the messages `Result` is already resolved. These
-    // tests pin the divergent-result contract the AWS client hands to
-    // `assemble_thread_view`: a dependency failure on the messages read must
-    // not be masked as a definitive `Ok(None)` (which the `get_thread` API
-    // handler maps to a non-retryable `404 NotFound`) just because the thread
-    // happened to be absent.
-
-    /// The regression: a retry-exhausted `ByThread` `Query` (throttle/5xx/transport)
-    /// that coincides with an absent thread surfaces as `Transient` (`502`),
-    /// not a dropped `Result` reported as `Ok(None)` → `404`.
-    #[test]
-    fn thread_absent_with_transient_messages_failure_surfaces_the_error() {
-        let messages: Result<Page<MailMessage>, MailStoreError> = Err(MailStoreError::Transient(
-            anyhow!("listing thread messages: throttled"),
-        ));
-        assert!(matches!(
-            assemble_thread_view(None, messages),
-            Err(MailStoreError::Transient(_))
-        ));
-    }
-
-    /// A healthy, empty `Query` alongside a genuinely-absent thread is still a
-    /// routine `404`: the fix surfaces errors only, it never invents a thread.
-    #[test]
-    fn thread_absent_with_healthy_empty_messages_returns_none() {
-        let empty: Page<MailMessage> = Page {
-            items: vec![],
-            next: None,
-        };
-        assert!(matches!(assemble_thread_view(None, Ok(empty)), Ok(None)));
-    }
-
     // --- inbox reads: consistent_read guard ---------------------------------
     //
     // `ensure_inbox`'s `PutItem` condition is evaluated strongly consistently,
@@ -1210,45 +743,18 @@ mod tests {
         }
     }
 
-    /// Builds an `AwsServices` whose DynamoDB client records every `GetItem`
-    /// input it would send and short-circuits before transmission.
-    fn aws_with_capturing_dynamo(captured: Arc<Mutex<Vec<GetItemInput>>>) -> AwsServices {
+    /// Builds a `DynamoTable` whose client records every `GetItem` input it
+    /// would send and short-circuits before transmission.
+    fn aws_with_capturing_dynamo(captured: Arc<Mutex<Vec<GetItemInput>>>) -> DynamoTable {
         let dynamo_conf = aws_sdk_dynamodb::Config::builder()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
             .interceptor(CaptureGetItemInput(captured))
             .build();
-        let sdk = aws_config::SdkConfig::builder()
-            .behavior_version(aws_config::BehaviorVersion::latest())
-            .build();
-        let mut aws = AwsServices::new(
-            &sdk,
-            crate::config::Config {
-                table_name: "events".to_owned(),
-                event_bus_name: "bus".to_owned(),
-                event_source: "aws-messaging-webhook".to_owned(),
-                auto_resubscribe: false,
-                opt_out_list_name: None,
-                raw_event_retention_days: 30,
-                aggregate_retention_days: 365,
-                mode: crate::config::FunctionMode::Webhook,
-                mail: Some(crate::config::MailConfig {
-                    domain: "example.com".to_owned(),
-                    table_name: MAIL_TABLE_NAME.to_owned(),
-                    bucket: "mail-bucket".to_owned(),
-                    inbox: "support@example.com".to_owned(),
-                    configuration_set: "config-set".to_owned(),
-                    identity_arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com"
-                        .to_owned(),
-                    api_keys_parameter: "/example/api-keys".to_owned(),
-                    attachment_url_ttl: std::time::Duration::from_secs(3600),
-                    region: "us-east-1".to_owned(),
-                    retention_days: 365,
-                }),
-            },
-        );
-        aws.dynamo = aws_sdk_dynamodb::Client::from_conf(dynamo_conf);
-        aws
+        DynamoTable::new(
+            aws_sdk_dynamodb::Client::from_conf(dynamo_conf),
+            Some(MAIL_TABLE_NAME.to_owned()),
+        )
     }
 
     /// Only the `ensure_inbox` recovery read pays for strong consistency.
@@ -1260,8 +766,14 @@ mod tests {
         let inbox = InboxId::new("support@example.com");
         // The interceptor short-circuits every request with an error; only
         // the emitted requests are asserted on.
-        let _ = MailStore::get_inbox(&aws, &inbox).await;
-        let _ = aws.read_inbox(&inbox, true).await;
+        let _ = Mailbox::new(&aws).get_inbox(&inbox).await;
+        let _ = Table::get::<Inbox>(
+            &aws,
+            keys::inbox(&inbox),
+            Read::Consistent,
+            "GetItem(inbox)",
+        )
+        .await;
 
         let requests: Vec<GetItemInput> = captured
             .lock()
@@ -1283,13 +795,74 @@ mod tests {
         let key = request.key();
         let pk = key.and_then(|k| k.get("pk"));
         let sk = key.and_then(|k| k.get("sk"));
-        assert_eq!(pk, Some(&DynamoAv::S(keys::inbox_pk(inbox.as_str()))));
-        assert_eq!(sk, Some(&DynamoAv::S(keys::inbox_sk().to_owned())));
+        assert_eq!(
+            pk,
+            Some(&DynamoAv::S("INBOX#support@example.com".to_owned()))
+        );
+        assert_eq!(sk, Some(&DynamoAv::S("META".to_owned())));
     }
 
-    // --- store_error_from_sdk: classifying DynamoDB throttles ------------
+    /// Each single-item read keeps its key and its consistency: the reads
+    /// that condition a write are consistent, the others are not.
+    #[tokio::test]
+    async fn single_item_reads_keep_their_keys_and_consistency() {
+        let captured = Arc::new(Mutex::new(Vec::<GetItemInput>::new()));
+        let aws = aws_with_capturing_dynamo(Arc::clone(&captured));
+        let inbox = InboxId::new("support@example.com");
+
+        let mailbox = Mailbox::new(&aws);
+        let _ = mailbox.get_message(&inbox, &MessageId::new("mid-1")).await;
+        let _ = mailbox.get_send_key("keyhash").await;
+        let _ = mailbox.get_send_state(&MessageId::new("mid-1")).await;
+        let _ = mailbox
+            .resolve_ses_message(&SesMessageId::new("ses-1"))
+            .await;
+        let _ = mailbox
+            .get_thread(&inbox, &ThreadId::new("tid-1"), 10, None)
+            .await;
+        let _ = mailbox
+            .message_exists(&inbox, &MessageId::new("mid-1"))
+            .await;
+        let _ = mailbox
+            .update_labels(
+                &inbox,
+                &MessageId::new("mid-1"),
+                &[],
+                &[],
+                "2026-01-01T00:00:00.000Z",
+            )
+            .await;
+
+        let requests: Vec<GetItemInput> = captured
+            .lock()
+            .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let seen: Vec<(String, String, Option<bool>)> = requests
+            .iter()
+            .map(|request| {
+                let string = |name: &str| match request.key().and_then(|key| key.get(name)) {
+                    Some(DynamoAv::S(value)) => value.clone(),
+                    _ => String::new(),
+                };
+                (string("pk"), string("sk"), request.consistent_read())
+            })
+            .collect();
+        let expected = [
+            ("INBOX#support@example.com", "MSG#mid-1", Some(true)),
+            ("SENDKEY#keyhash", "KEY", Some(true)),
+            ("OUTBOX#mid-1", "STATE", Some(true)),
+            ("SESMSG#ses-1", "REF", Some(false)),
+            ("INBOX#support@example.com", "THR#tid-1", Some(false)),
+            ("INBOX#support@example.com", "MSG#mid-1", Some(false)),
+            ("INBOX#support@example.com", "MSG#mid-1", Some(true)),
+        ]
+        .map(|(pk, sk, consistent)| (pk.to_owned(), sk.to_owned(), consistent));
+        assert_eq!(seen, expected);
+    }
+
+    // --- MailStoreError::from_sdk: classifying DynamoDB throttles ------------
     //
-    // `store_error_from_sdk` stamps every non-transient SDK error
+    // `MailStoreError::from_sdk` stamps every non-transient SDK error
     // `Permanent`; `actions::run`'s `Ses` arm then swallows a permanent
     // delivery-label failure with a 200, so a misclassified throttle
     // silently drops the label with no SNS redelivery. DynamoDB serves its
@@ -1297,8 +870,8 @@ mod tests {
     // only one that can catch them. These tests pin both legs of
     // `apply_delivery_label`: the `GetItem` read (`resolve_ses_message`) and
     // the top-level `TransactWriteItems` write (`RequestLimitExceeded` falls
-    // through `run_txn`'s explicit variant arms to
-    // `store_error_from_sdk`).
+    // through `transact`'s explicit variant arms to
+    // `MailStoreError::from_sdk`).
 
     use aws_sdk_dynamodb::config::http::HttpResponse;
     use aws_sdk_dynamodb::operation::get_item::GetItemError;
@@ -1335,8 +908,8 @@ mod tests {
     /// The account-level `RequestLimitExceeded` as a top-level
     /// `TransactWriteItems` error: the realistic write-leg trigger, surfaced
     /// on the request itself (not as a cancellation reason) and so falling
-    /// through `run_txn`'s explicit variant arms to
-    /// `store_error_from_sdk`.
+    /// through `transact`'s explicit variant arms to
+    /// `MailStoreError::from_sdk`.
     fn transact_write_request_limit_exceeded(status: u16) -> SdkError<TransactWriteItemsError> {
         let meta = ErrorMetadata::builder()
             .code("RequestLimitExceeded")
@@ -1358,7 +931,7 @@ mod tests {
         let error = get_item_service_error("ProvisionedThroughputExceededException", 400);
         assert!(
             matches!(
-                store_error_from_sdk("GetItem", &error),
+                MailStoreError::from_sdk("GetItem", &error),
                 MailStoreError::Transient(_)
             ),
             "a throttled GetItem must be transient so the delivery label is retried"
@@ -1372,7 +945,7 @@ mod tests {
         let error = get_item_service_error("RequestLimitExceeded", 400);
         assert!(
             matches!(
-                store_error_from_sdk("GetItem", &error),
+                MailStoreError::from_sdk("GetItem", &error),
                 MailStoreError::Transient(_)
             ),
             "an account-level request limit on GetItem must be transient"
@@ -1382,13 +955,13 @@ mod tests {
     /// Write leg: a top-level `RequestLimitExceeded` on `TransactWriteItems`
     /// is transient. This is the realistic write-leg trigger — it surfaces on
     /// the request, not as a `TransactionCanceledException` cancellation
-    /// reason, so it reaches `store_error_from_sdk` via the fall-through arm.
+    /// reason, so it reaches `MailStoreError::from_sdk` via the fall-through arm.
     #[test]
     fn request_limit_exceeded_on_the_write_leg_is_transient() {
         let error = transact_write_request_limit_exceeded(400);
         assert!(
             matches!(
-                store_error_from_sdk("TransactWriteItems", &error),
+                MailStoreError::from_sdk("TransactWriteItems", &error),
                 MailStoreError::Transient(_)
             ),
             "an account-level request limit on TransactWriteItems must be transient"
@@ -1402,7 +975,7 @@ mod tests {
     fn a_transaction_conflict_on_a_plain_write_is_transient() {
         let error = get_item_service_error("TransactionConflictException", 400);
         assert!(matches!(
-            store_error_from_sdk("PutItem(inbox)", &error),
+            MailStoreError::from_sdk("PutItem(inbox)", &error),
             MailStoreError::Transient(_)
         ));
     }
@@ -1415,7 +988,7 @@ mod tests {
         let error = get_item_service_error("ValidationException", 400);
         assert!(
             matches!(
-                store_error_from_sdk("GetItem", &error),
+                MailStoreError::from_sdk("GetItem", &error),
                 MailStoreError::Permanent(_)
             ),
             "a non-throttling 400 must remain permanent"
