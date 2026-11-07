@@ -9,15 +9,15 @@ inclusion: auto
 
 - Handler tests ARE the integration suite - they drive the real Axum router with properly signed SNS envelopes
 - No AWS account needed for any test
-- Trait-based services (`Services` trait in `state.rs`) enable `FakeServices` test doubles
-- All new downstream calls must go through the `Services` trait so tests stay AWS-free
+- The `Backend` trait + `AppState<B>` seam in `state.rs` names one component type per external system; tests supply in-process fakes (`webhook_test_support::Fakes`)
+- All new downstream calls must go through a `Backend` seam (`EventStore`, `PublishEvents`, `SmsVoiceApi`, `SesApi`, `ObjectStore`, `AttachmentFetcher`, `ApiKeySource`, or the `Table` seam) so tests stay AWS-free
 
 ## Test structure
 
 ### Handler tests (`crates/webhook/tests/handlers.rs`)
 
 - End-to-end tests against the real router
-- Use `FakeServices` implementing the `Services` trait
+- Use `webhook_test_support::Fakes` as the `Backend` (one fake per seam), via the harness and request helpers in the `webhook-test-support` crate
 - SNS envelopes are properly signed using the `sns-message-verifier` crate's `test-fixtures` feature
 - Cover both Function URL (HTTPS) and direct-invoke pathways
 - Run a specific test: `cargo test -p aws-messaging-webhook --test handlers <test_name>`
@@ -27,6 +27,18 @@ inclusion: auto
 - Pin the classification ordering with verbatim AWS-documented payloads
 - Ensure `DomainEvent::classify` try-parse ordering stays correct (SesInbound before Ses, etc.)
 - Located in `crates/webhook/tests/fixtures/` directory
+
+### Mailbox API and mail tests (`crates/webhook/tests/`)
+
+- The `api_*` suites (`api_auth.rs`, `api_read.rs`, `api_send.rs`, `api_reply.rs`, `api_patch.rs`, `api_download.rs`) exercise the bearer-authenticated `/v0` mailbox API against fakes
+- The `mail_*` suites (`mail_ingest.rs`, `mail_sender.rs`, `mail_stream.rs`) cover inbound ingest, the sender, and the mail-table stream relay
+- `mailbox_event_schemas.rs` pins the emitted mailbox event schemas
+- Run a specific test: `cargo test -p aws-messaging-webhook --test <suite> <test_name>`
+
+### Store-behaviour tests (`crates/mailbox-store`)
+
+- `crates/mailbox-store/tests/mailbox_behaviour.rs` drives the mailbox through its public API against `MailMemoryStore` (the `memory` feature)
+- Run a specific test: `cargo test -p mailbox-store --test mailbox_behaviour <test_name>`
 
 ### Verifier tests (`crates/sns-message-verifier`)
 
@@ -42,8 +54,8 @@ The `sns-message-verifier` crate has a `test-fixtures` Cargo feature that:
 
 ## Writing new tests
 
-1. Add new downstream calls through the `Services` trait
-2. Implement the new trait method in `FakeServices`
+1. Add new downstream calls through a `Backend` seam trait
+2. Implement the new behaviour in the matching fake in `webhook-test-support`
 3. Write handler tests that exercise the full pipeline (verify, persist, act, publish)
 4. For new event families: add a fixture in `tests/fixtures/`, add a classification test in `model_fixtures.rs`
 

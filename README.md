@@ -80,8 +80,13 @@ prek run                 # fmt, clippy, deny, actionlint, zizmor
 
 | Crate | Purpose |
 |---|---|
-| `crates/webhook` | The Lambda function |
+| `crates/mailbox` | Pure mailbox domain: message/thread/send types, ids, labels, MIME parsing and building, wire shapes |
+| `crates/mailbox-store` | The mail table: keys, transaction planner, the `Table` seam and the `Mailbox` over it |
 | `crates/sns-message-verifier` | SNS signature verification. The `test-fixtures` feature signs test messages |
+| `crates/webhook` | The Lambda function (package `aws-messaging-webhook`) |
+| `crates/webhook-test-support` | Fakes and request harness shared by the webhook crate's integration tests |
+
+Dependency direction: `aws-messaging-webhook` -> `mailbox-store` -> `mailbox`.
 
 Debug builds read `SNS_CERT_HOST_OVERRIDE` to run against a local fake SNS under
 `cargo lambda watch`. Release builds always verify.
