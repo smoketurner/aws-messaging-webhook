@@ -204,7 +204,7 @@ reference API's webhook payload exactly, checked by `tests/mailbox_event_schemas
 
 Receiving, reading, labeling, downloads, sending and the operator paths are implemented and
 tested against in-memory fakes. `POST /v0/inboxes`, the `DELETE` routes, and the `drafts`,
-`labels`, `domains` and `webhooks` groups answer `501`.
+`labels`, `pods`, `domains` and `webhooks` groups answer `501`.
 
 **Nothing here has been deployed.** Two bugs found during the build (a continuation key missing
 its table half, and a status query sent to the wrong index) are the kind only real DynamoDB

@@ -26,8 +26,9 @@ cargo lambda invoke aws-messaging-webhook --data-file events/function-url-sms-in
 - The direct SNS invoke payloads use the `Records` array shape and are dispatched
   without going through the Axum router.
 - The Function URL payloads wrap the SNS JSON in a Lambda Function URL event envelope
-  (API Gateway V2 / HTTP API format) and are routed through the Axum router at the
-  `/webhooks/{family}` paths.
+  (API Gateway V2 / HTTP API format) and are routed through the Axum router at one of the
+  four `/webhooks/...` paths (`/webhooks/sms/inbound`, `/webhooks/sms/events`,
+  `/webhooks/ses/events`, `/webhooks/ses/inbound`).
 - Signatures are placeholder values (`EXAMPLE`) -- they will fail verification unless
   `ALLOWED_TOPICS` is empty (accept-all mode) or you use properly signed envelopes
   from the test-fixtures feature.

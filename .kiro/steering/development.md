@@ -17,7 +17,7 @@ inclusion: auto
 ## Build
 
 ```bash
-sam build --config-env dev          # Full Lambda build (uses cargo-lambda)
+sam build                           # Full Lambda build (uses cargo-lambda)
 cargo build --workspace             # Local workspace build
 ```
 
@@ -51,10 +51,10 @@ In debug builds, set `SNS_CERT_HOST_OVERRIDE` to point at a local fake SNS for t
 ## Deploy
 
 ```bash
-sam build --config-env dev && sam deploy --config-env dev
+sam build && sam deploy
 ```
 
-Key parameters: `Stage`, `AllowedTopics`, `AutoResubscribe`, `OptOutListName`, `EventSource`, `RawEventRetentionDays`, `AggregateRetentionDays`, `LogLevel`, `LogRetentionDays`, `ConsumerAccountIds`. See `docs/deploy.md` for defaults and notes.
+Key parameters: `pStage`, `pAllowedTopics`, `pAutoResubscribe`, `pOptOutListName`, `pEventSource`, `pRawEventRetentionDays`, `pAggregateRetentionDays`, `pLogLevel`, `pLogRetentionDays`, `pConsumerAccountIds`. Mailbox parameters (enabled by `pMailDomain`) include `pMailInbox`, `pMailBucketName`, `pMailRetentionDays`, and `pApiKeysParameterName`. See `docs/deploy.md` for defaults and notes.
 
 ## End-to-end verification (deployed stack)
 

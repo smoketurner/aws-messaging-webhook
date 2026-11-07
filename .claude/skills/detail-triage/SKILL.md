@@ -355,7 +355,7 @@ showing the wrong output does not.
 - When trimming narrative comments, keep every spec or documentation citation.
   Cut the history, not the requirement; fix an imprecise citation rather than
   deleting it.
-- Confirm new downstream calls go through the `Services` trait (`state.rs`) and
+- Confirm new downstream calls go through a `Backend` seam trait (`state.rs`) and
   tests use the `webhook-test-support` fakes, not ad-hoc stubs.
 - Confirm no single-caller helpers were added.
 

@@ -36,14 +36,14 @@ Enforced via `[workspace.lints.clippy]`:
 
 - Module names: snake_case, match their domain concept
 - Types: PascalCase, descriptive (e.g., `DomainEvent`, `PersistOutcome`, `VerifiedSns`)
-- Trait-based services pattern: trait in `state.rs`, implementations separate
+- Dependency-injection pattern: the `Backend` trait + `AppState<B>` in `state.rs` name one component type per external system; implementations are separate (`aws::Aws` in production, `webhook_test_support::Fakes` in tests)
 
 ## Code style
 
 - `rustfmt.toml` controls formatting (run `cargo fmt`)
 - No `unwrap()` or `panic!()` in non-test code
 - Structured logging via `tracing` (JSON output in Lambda)
-- All new downstream calls must go through the `Services` trait for testability
+- All new downstream calls must go through a `Backend` seam trait for testability
 
 ## Security rules
 
