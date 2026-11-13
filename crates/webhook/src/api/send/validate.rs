@@ -238,7 +238,7 @@ fn addresses(
     errors: &mut Vec<FieldError>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for address in input.map(Addresses::into_vec).unwrap_or_default() {
+    for address in input.map_or_default(Addresses::into_vec) {
         let address = address.trim().to_owned();
         if address.is_empty() {
             errors.push(FieldError::new(path, "an address cannot be empty"));
