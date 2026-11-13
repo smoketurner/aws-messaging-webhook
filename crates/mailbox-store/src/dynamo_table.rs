@@ -454,8 +454,7 @@ impl Table for DynamoTable {
             pending_keys = output
                 .unprocessed_keys
                 .and_then(|mut m| m.remove(&table_name))
-                .map(|attrs| attrs.keys().to_vec())
-                .unwrap_or_default();
+                .map_or_default(|attrs| attrs.keys().to_vec());
         }
         Ok(found)
     }
@@ -777,8 +776,7 @@ mod tests {
 
         let requests: Vec<GetItemInput> = captured
             .lock()
-            .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .map_or_default(|guard| guard.iter().cloned().collect::<Vec<_>>());
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].consistent_read(),
@@ -835,8 +833,7 @@ mod tests {
 
         let requests: Vec<GetItemInput> = captured
             .lock()
-            .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .map_or_default(|guard| guard.iter().cloned().collect::<Vec<_>>());
         let seen: Vec<(String, String, Option<bool>)> = requests
             .iter()
             .map(|request| {

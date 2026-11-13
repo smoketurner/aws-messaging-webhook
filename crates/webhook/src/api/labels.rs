@@ -105,15 +105,12 @@ pub(crate) async fn update_labels<B: Backend>(
 ) -> Result<Json<wire::MessageLabels>, ApiError> {
     let mut errors = Vec::new();
     let add = normalize_labels(
-        request.add_labels.map(Labels::into_vec).unwrap_or_default(),
+        request.add_labels.map_or_default(Labels::into_vec),
         "add_labels",
         &mut errors,
     );
     let remove = normalize_labels(
-        request
-            .remove_labels
-            .map(Labels::into_vec)
-            .unwrap_or_default(),
+        request.remove_labels.map_or_default(Labels::into_vec),
         "remove_labels",
         &mut errors,
     );
@@ -202,7 +199,7 @@ mod tests {
     fn an_absent_field_is_an_empty_list() {
         let mut errors = Vec::new();
         let absent: Option<Labels> = None;
-        let labels = absent.map(Labels::into_vec).unwrap_or_default();
+        let labels = absent.map_or_default(Labels::into_vec);
         assert_eq!(
             normalize_labels(labels, "add_labels", &mut errors),
             [] as [String; 0]
@@ -217,7 +214,7 @@ mod tests {
         let mut errors = Vec::new();
         assert_eq!(
             normalize_labels(
-                request.add_labels.map(Labels::into_vec).unwrap_or_default(),
+                request.add_labels.map_or_default(Labels::into_vec),
                 "add_labels",
                 &mut errors
             ),
@@ -225,10 +222,7 @@ mod tests {
         );
         assert_eq!(
             normalize_labels(
-                request
-                    .remove_labels
-                    .map(Labels::into_vec)
-                    .unwrap_or_default(),
+                request.remove_labels.map_or_default(Labels::into_vec),
                 "remove_labels",
                 &mut errors
             ),

@@ -180,10 +180,7 @@ async fn enqueue<B: Backend>(
         // replay, and drop what this one uploaded.
         Ok(EnqueueOutcome::KeyExists) => {
             discard_uploads(&state.objects, &spec).await;
-            let hash = key
-                .as_ref()
-                .map(|key| key.key_hash.as_str())
-                .unwrap_or_default();
+            let hash = key.as_ref().map_or_default(|key| key.key_hash.as_str());
             match replay_key(state, hash, &request_hash).await? {
                 Some(replayed) => Ok(Json(replayed)),
                 // Gone again already (expired): a retry will queue it afresh.

@@ -108,7 +108,7 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     // oversized `Message-ID` would push the DynamoDB message item past the
     // 400 KB item limit — a permanent transaction cancellation that drops
     // the message and orphans its already-written content document.
-    let rfc_message_id = parsed.message_id().map(wrap_id).unwrap_or_default();
+    let rfc_message_id = parsed.message_id().map_or_default(wrap_id);
     let in_reply_to = id_list(parsed.in_reply_to()).into_iter().next();
     let mut references = id_list(parsed.references());
     if references.len() > REFERENCES_MAX {
@@ -280,9 +280,7 @@ fn wrap_id(id: &str) -> String {
 /// Every id in an `In-Reply-To`/`References` header, each through
 /// [`wrap_id`].
 fn id_list(value: Option<TextList<'_>>) -> Vec<String> {
-    value
-        .map(|ids| ids.iter().map(wrap_id).collect())
-        .unwrap_or_default()
+    value.map_or_default(|ids| ids.iter().map(wrap_id).collect())
 }
 
 /// A message's listing snippet: `preview_text` over the text body, else
@@ -292,9 +290,7 @@ fn id_list(value: Option<TextList<'_>>) -> Vec<String> {
 pub fn preview(text: Option<&str>, html: Option<&str>) -> String {
     match text {
         Some(text) => preview_text(text, PREVIEW_CHARS).into_owned(),
-        None => html
-            .map(|html| preview_html(html, PREVIEW_CHARS))
-            .unwrap_or_default(),
+        None => html.map_or_default(|html| preview_html(html, PREVIEW_CHARS)),
     }
 }
 
