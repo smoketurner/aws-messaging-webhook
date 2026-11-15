@@ -56,10 +56,15 @@ make lint   # fmt-check + clippy + deny
 
 1. Create a feature branch off `main`
 2. Make changes, run `make check`
-3. Open a PR -- CI must pass (lint, test, deny, sam validate, actionlint, zizmor)
+3. Open a PR -- CI must pass (lint, test, deny, sam validate, actionlint, zizmor, actions lockfile)
 4. Squash merge to `main`
 
 Never push directly to `main`.
+
+Workflows reference actions by tag; `.github/workflows/actions.lock` pins each tag to a commit.
+After adding or changing a `uses:` line, run `gh actions-lock` (the
+[`github/gh-actions-lock`](https://github.com/github/gh-actions-lock) extension) and commit the
+updated lockfile.
 
 ## Local development
 

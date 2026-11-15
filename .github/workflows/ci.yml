@@ -14,19 +14,19 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: 1.100.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           # Dependencies compile the same whether or not deny/clippy/tests pass;
           # without this, a streak of red runs means every run builds cold.
           cache-on-failure: true
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@v2.89.1
         with:
           tool: cargo-deny@0.20.2
       - run: cargo fmt --all -- --check
@@ -45,10 +45,10 @@ jobs:
     env:
       SAM_CLI_TELEMETRY: "0"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: aws-actions/setup-sam@341eee193f458fa5aae5d52c94b0c5cf3a1c5a52 # v3
+      - uses: aws-actions/setup-sam@v3
       - run: sam validate --lint
 
   workflow-lint:
@@ -57,12 +57,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+      - uses: taiki-e/install-action@v2.89.1
         with:
-          tool: zizmor@1.28.0
+          tool: zizmor@1.32.0
       # actionlint is a Go tool; install-action only carries Rust-ecosystem manifests.
       - name: Install actionlint
         run: |
@@ -72,3 +72,19 @@ jobs:
           tar -C /tmp -xzf /tmp/actionlint.tar.gz actionlint
       - run: /tmp/actionlint
       - run: zizmor --no-online-audits .github/workflows/
+
+  # Fails when .github/workflows/actions.lock is out of sync with the
+  # workflows or a locked pin no longer verifies upstream.
+  lockfile:
+    name: Actions lockfile
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: gh extension install github/gh-actions-lock --pin v0.4.1
+      - run: gh actions-lock --verify
