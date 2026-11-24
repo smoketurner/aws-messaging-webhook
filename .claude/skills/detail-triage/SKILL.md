@@ -173,7 +173,7 @@ repeats.
 in opposite directions, or a fix that reverses a decision already on record —
 most often here, a fix that moves a failure from one side of the
 transient/permanent split to the other. Resolve the governing AWS documentation
-or recorded decision once — memory, `docs/design/`, the PR that made the
+or recorded decision once — memory, the PR that made the
 decision — then dispose of the whole set against it.
 
 A class fix that lands without a guardrail will regress, so step 4 is part of

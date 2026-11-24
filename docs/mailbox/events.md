@@ -17,8 +17,8 @@ event object.
 Other SES events, label edits and internal writes publish no mailbox event.
 
 `event_id` is deterministic: redeliveries and replays produce the same id. Deduplicate on it.
-`tests/fixtures/mailbox-events/schemas.json` holds each event's schema, and
-`tests/mailbox_event_schemas.rs` checks every event against it.
+`crates/webhook/tests/fixtures/mailbox-events/schemas.json` holds each event's schema, and
+`crates/webhook/tests/mailbox_event_schemas.rs` checks every event against it.
 
 ## Received mail
 
