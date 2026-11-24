@@ -28,6 +28,7 @@ sam deploy --parameter-overrides \
 |---|---|---|
 | `pMailDomain` | *(empty)* | Receiving domain and sending identity. Empty disables every mail resource |
 | `pMailInbox` | *(empty)* | Local part of the one inbox (`hello` for `hello@<pMailDomain>`). Required with `pMailDomain` |
+| `pMailSenderMaxConcurrency` | `2` | Reserved concurrency of the sender, 0–100: the ceiling on concurrent SES calls. Raise it only alongside the account's sending quota. `0` reserves nothing |
 | `pMailBucketName` | *(empty)* | Empty lets CloudFormation name the bucket |
 | `pMailRetentionDays` | `365` | How long a message is kept, in S3 and in the mail table |
 | `pHostedZoneId` | *(empty)* | Route 53 zone. Set it and the stack publishes DNS; otherwise the `DnsRecords` output lists the records |

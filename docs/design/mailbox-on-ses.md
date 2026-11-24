@@ -187,7 +187,7 @@ can't have a second Function URL that uses `AWS_IAM` auth.
 ## Events
 
 The relay publishes mailbox events from the mail table's stream. Each detail matches the
-reference API's webhook payload exactly, checked by `tests/mailbox_event_schemas.rs`. Setting
+reference API's webhook payload exactly, checked by `crates/webhook/tests/mailbox_event_schemas.rs`. Setting
 `pMailWebhookUrl` delivers them over HTTPS through an EventBridge API destination.
 
 - `message.received*` carries the thread as it was at ingest, stored on the message item, so the
@@ -206,10 +206,11 @@ Receiving, reading, labeling, downloads, sending and the operator paths are impl
 tested against in-memory fakes. `POST /v0/inboxes`, the `DELETE` routes, and the `drafts`,
 `labels`, `pods`, `domains` and `webhooks` groups answer `501`.
 
-**Nothing here has been deployed.** Two bugs found during the build (a continuation key missing
-its table half, and a status query sent to the wrong index) are the kind only real DynamoDB
-reveals. Both returned plausible empty results instead of errors. Deploying to staging and
-moving real mail in both directions is the next step.
+The mailbox is deployed and moving real mail in both directions in three stacks: quakecstudio,
+fairfieldct-ai and smoketurner. The in-memory fakes don't replace that: two bugs found during the
+build (a continuation key missing its table half, and a status query sent to the wrong index)
+were the kind only real DynamoDB reveals, because both returned plausible empty results instead
+of errors.
 
 Accepted limits:
 

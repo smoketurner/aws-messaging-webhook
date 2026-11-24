@@ -17,6 +17,7 @@ dimension:
 | `MessagesReceived`, `Duplicates` | Messages handled; redeliveries caught by the conditional write |
 | `SignatureRejections`, `AllowlistRejections` | Messages refused at the security boundary |
 | `UnclassifiedPayloads` | Payloads matching no known shape |
+| `StatusTransitionsSuppressed` | Out-of-order events that would have moved `current_status` backwards; the event is stored, the status kept |
 | `EventsPublished`, `PublishFailures` | Relay publishes to EventBridge |
 | `ActionFailures`, `InternalErrors` | Failed lifecycle actions; unexpected errors |
 | `Resubscribes`, `SubscriptionsLost` | Re-subscriptions; cancellations left in place |
