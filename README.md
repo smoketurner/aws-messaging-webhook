@@ -68,7 +68,7 @@ in S3 and DynamoDB, threaded, and exposed through a `/v0` API that also sends ma
 | [Events](docs/events.md) | EventBridge detail types and payloads |
 | [Data model](docs/data-model.md) | Events table and cross-account read access |
 | [Operations](docs/operations.md) | Logs, metrics, alarms and an end-to-end check |
-| [Mailbox design](docs/design/mailbox-on-ses.md) | Why the mailbox is built the way it is |
+| [Mailbox architecture](docs/mailbox/architecture.md) | How the mailbox receives, stores, sends and publishes mail |
 
 ## Development
 
