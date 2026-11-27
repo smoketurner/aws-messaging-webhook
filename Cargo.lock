@@ -81,9 +81,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-config"
-version = "1.13.2"
+version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16ec023cac0d0c0432e606a2d14f04eb70d09c71a739a406141e7be6b923ab95"
+checksum = "5a3a314ce5fe1e5bdfbc6495e5e1f9ad066d34e567b26c41864eef40c22bfe16"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -210,9 +210,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.139.0"
+version = "1.140.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22fedb4ba5f51528c2607fc0a4c8504c9a80852842e1599b4c2e40f928867336"
+checksum = "661040c0a1165acbe71d05b0ad5f718b7535aeff0e442719605f8137a9c03b0e"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -236,9 +236,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-eventbridge"
-version = "1.129.0"
+version = "1.130.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8b2067bab445a52b507400f47326c38d19ccf45761753640e8210aa134feb61"
+checksum = "153bad41dab9ae6acdb1b1b331cd7a0f9506aa0a4f3fe99b5d8cb38e4580f773"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -261,9 +261,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-pinpointsmsvoicev2"
-version = "1.136.0"
+version = "1.137.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca944b72b5c94fddb8ab134c42bf67e6e8dba3a4cbe13c5461f77b7e2c77e193"
+checksum = "782ca71b397565344c7dba61f53ae123ffd61bd039c4c7a7cb373c6df5f206b9"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -322,9 +322,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sesv2"
-version = "1.147.0"
+version = "1.149.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efbfdfcb6064947c80c92a31f0a2abefbaf68eddf7d9b013f8ccd0eaf3ddaf1a"
+checksum = "5d6c3db49c925ae4d9b59554de73d8f97fa66b683bd5417f6a261b8d5455fed0"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -347,9 +347,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-ssm"
-version = "1.136.0"
+version = "1.138.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "915984b39468a5d9cf36d1813e1847a2fa67ab3ca9fda1a1e17735a30b6b1b24"
+checksum = "b97fbd52f5ad80815f4d9b65e0c2175941898c6405dfc1d1b050cebc433e83c5"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -370,9 +370,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.126.0"
+version = "1.128.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c667da7839295125cfe23280f798c07ba694a9fed191af804edb4bda09ac7f10"
+checksum = "29c357588cdf8c9ae96c0d9930fff757f9b678d06b8f68d8e37a1278fe034912"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -482,9 +482,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-http-client"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "859a81364f8185349c584fb41cd8765a400cf982f447adada590cf008a9f3b85"
+checksum = "203e36a754ced29dab0d710dab8c4fecf181d78f229e90fa6e75c6406ecb55a3"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
@@ -541,9 +541,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.16.3"
+version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bc688673e282f42d3152dcd9cacc1a9a75734d7cd39d02e58989276fc750f3c"
+checksum = "7ed38b842f93dd8220cc8816750c72ce914b22c6eb3df02beb9632333ccb366d"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-http",
@@ -564,9 +564,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0467a2414e84b1b01e37452896fb3562b93926e81c619eba6ecf27ce9e682a0e"
+checksum = "c0b79dbb5331ccd297686df811d50ab3f39db171f5c765372a69272a0990b014"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -781,9 +781,9 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytes"
-version = "1.12.1"
+version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 dependencies = [
  "serde",
 ]
@@ -3261,9 +3261,9 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "uuid"
-version = "1.29.2"
+version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
+checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
