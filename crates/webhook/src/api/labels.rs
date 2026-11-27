@@ -32,6 +32,16 @@ pub(crate) struct UpdateRequest {
     remove_labels: Option<Labels>,
 }
 
+/// What a request's labels are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LabelUse {
+    /// Put on a message: held to [`labels::is_valid`].
+    Set,
+    /// Taken off one. Not held to the character rule, so a label stored
+    /// before the rule existed can still be removed.
+    Remove,
+}
+
 /// Normalizes and validates a list of caller-supplied labels.
 ///
 /// Labels are trimmed, lowercased and deduplicated so `Unread` and `unread`
@@ -44,6 +54,7 @@ pub(crate) struct UpdateRequest {
 pub(crate) fn normalize_labels(
     labels_in: Vec<String>,
     field: &'static str,
+    purpose: LabelUse,
     errors: &mut Vec<FieldError>,
 ) -> Vec<String> {
     let mut cleaned: Vec<String> = Vec::new();
@@ -57,6 +68,13 @@ pub(crate) fn normalize_labels(
             errors.push(FieldError::new(
                 field,
                 format!("`{label}` is longer than {LABEL_MAX_BYTES} bytes"),
+            ));
+            continue;
+        }
+        if purpose == LabelUse::Set && !labels::is_valid(&label) {
+            errors.push(FieldError::new(
+                field,
+                format!("`{label}` may contain only `a-z`, `0-9`, `_` and `-`"),
             ));
             continue;
         }
@@ -109,11 +127,13 @@ pub(crate) async fn update_labels<B: Backend>(
     let add = normalize_labels(
         request.add_labels.map_or_default(Labels::into_vec),
         "add_labels",
+        LabelUse::Set,
         &mut errors,
     );
     let remove = normalize_labels(
         request.remove_labels.map_or_default(Labels::into_vec),
         "remove_labels",
+        LabelUse::Remove,
         &mut errors,
     );
 
@@ -148,7 +168,7 @@ mod tests {
     fn clean_all(values: &[&str]) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let values: Vec<String> = values.iter().map(|v| (*v).to_owned()).collect();
-        let cleaned = normalize_labels(values, "add_labels", &mut errors);
+        let cleaned = normalize_labels(values, "add_labels", LabelUse::Set, &mut errors);
         (
             cleaned,
             errors.into_iter().map(|error| error.message).collect(),
@@ -186,12 +206,37 @@ mod tests {
     }
 
     #[test]
+    fn a_label_outside_the_character_set_is_rejected_when_set() {
+        for label in ["bad#label", "two words", "new\nline", "dot.ted", "café"] {
+            let (cleaned, errors) = clean_all(&[label]);
+            assert_eq!(cleaned, Vec::<String>::new(), "{label:?}");
+            assert_eq!(errors.len(), 1, "{label:?}");
+        }
+        let (cleaned, errors) = clean_all(&["Follow-Up", "q3_2026"]);
+        assert_eq!(cleaned, vec!["follow-up", "q3_2026"]);
+        assert_eq!(errors, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_label_outside_the_character_set_can_still_be_removed() {
+        let mut errors = Vec::new();
+        let removed = normalize_labels(
+            vec!["bad#label".to_owned()],
+            "remove_labels",
+            LabelUse::Remove,
+            &mut errors,
+        );
+        assert_eq!(removed, vec!["bad#label"]);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn a_single_label_and_a_list_of_one_are_the_same_request() {
         let mut errors = Vec::new();
         let one = Labels::One("Urgent".to_owned()).into_vec();
         let many = Labels::Many(vec!["Urgent".to_owned()]).into_vec();
-        let one = normalize_labels(one, "add", &mut errors);
-        let many = normalize_labels(many, "add", &mut errors);
+        let one = normalize_labels(one, "add", LabelUse::Set, &mut errors);
+        let many = normalize_labels(many, "add", LabelUse::Set, &mut errors);
         assert_eq!(one, many);
         assert!(errors.is_empty());
     }
@@ -202,7 +247,7 @@ mod tests {
         let absent: Option<Labels> = None;
         let labels = absent.map_or_default(Labels::into_vec);
         assert_eq!(
-            normalize_labels(labels, "add_labels", &mut errors),
+            normalize_labels(labels, "add_labels", LabelUse::Set, &mut errors),
             Vec::<String>::new()
         );
         assert!(errors.is_empty());
@@ -217,6 +262,7 @@ mod tests {
             normalize_labels(
                 request.add_labels.map_or_default(Labels::into_vec),
                 "add_labels",
+                LabelUse::Set,
                 &mut errors
             ),
             vec!["read"]
@@ -225,6 +271,7 @@ mod tests {
             normalize_labels(
                 request.remove_labels.map_or_default(Labels::into_vec),
                 "remove_labels",
+                LabelUse::Remove,
                 &mut errors
             ),
             vec!["unread"]

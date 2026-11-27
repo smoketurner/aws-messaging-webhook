@@ -110,6 +110,18 @@ pub fn is_reserved(label: &str) -> bool {
     SystemLabel::parse(label).is_some_and(|label| !label.is_settable_by_request())
 }
 
+/// Whether `label` uses only `a-z`, `0-9`, `_` and `-`, the characters a
+/// label set by a request may contain. Keeping `#` out matters beyond
+/// tidiness: it separates the parts of every mail-table key, so a label could
+/// never be a key segment if it could contain one.
+#[must_use]
+pub fn is_valid(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
 /// The inbound classification label an ingested message gets beyond
 /// `received`/`unread`: spam takes precedence over an authentication
 /// failure, which takes precedence over neither.
@@ -150,6 +162,35 @@ pub fn classify_inbound(spam_or_virus_failed: bool, auth_failed: bool) -> Inboun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_lowercase_ascii_letters_digits_underscore_and_hyphen_are_valid() {
+        for label in ["billing", "follow-up", "q3_2026", "a", "0"] {
+            assert!(is_valid(label), "{label}");
+        }
+        for label in [
+            "",
+            "bad#label",
+            "two words",
+            "tab\t",
+            "new\nline",
+            "nul\0",
+            "Upper",
+            "dot.ted",
+            "slash/ed",
+            "café",
+            "emoji🙂",
+        ] {
+            assert!(!is_valid(label), "{label:?}");
+        }
+    }
+
+    #[test]
+    fn every_system_label_is_valid() {
+        for label in SystemLabel::ALL {
+            assert!(is_valid(label.as_str()), "{}", label.as_str());
+        }
+    }
 
     #[test]
     fn unread_spam_trash_are_not_reserved() {

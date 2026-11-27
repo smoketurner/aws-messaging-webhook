@@ -11,7 +11,7 @@ carry a JSON body with `name` and `message`.
 | `GET /v0/inboxes/{inbox_id}/messages/{message_id}` | The full message, including `text`, `html`, `headers` and `references` |
 | `GET /v0/inboxes/{inbox_id}/threads` | `{count, limit, threads[], next_page_token?}`, by last activity |
 | `GET /v0/inboxes/{inbox_id}/threads/{thread_id}` | One thread with its `messages[]`, oldest first |
-| `GET …/messages/{message_id}/raw` | `{message_id, size, download_url, expires_at}` |
+| `GET …/messages/{message_id}/raw` | `{message_id, size, download_url, expires_at}`. Received messages only; a sent message is a `404` |
 | `GET …/messages/{message_id}/attachments/{attachment_id}` | The same, plus `filename`, `content_type`, `content_disposition`, `content_id` |
 | `PATCH /v0/inboxes/{inbox_id}/messages/{message_id}` | `{message_id, labels}` |
 | `POST /v0/inboxes/{inbox_id}/messages/send` | `{message_id, thread_id}` once queued |
@@ -27,6 +27,10 @@ past retention, and attachments dropped for size, answer `404`.
 
 `PATCH` takes `{"add_labels": …, "remove_labels": …}`, each a label or a list. Labels are
 lowercased, trimmed and deduplicated. Remove `unread` to mark a message read.
+
+- A label is 1–64 characters of `a-z`, `0-9`, `_` and `-`, checked after lowercasing, so
+  `Follow-Up` is stored as `follow-up`. Anything else in `add_labels` or a send's `labels` is a
+  `400`. `remove_labels` isn't held to the character set.
 
 - A message holds at most 20 of your labels, and a thread 20 across its messages. A request
   names at most 20 of your labels. Exceeding a cap is a `400`.

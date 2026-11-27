@@ -241,6 +241,17 @@ async fn service_owned_labels_are_rejected() {
 }
 
 #[tokio::test]
+async fn a_label_outside_the_character_set_is_rejected() {
+    let (h, ids) = seeded("t1", 1).await;
+
+    let (status, body) = patch(&h, &ids[0], json!({"add_labels": ["bad#label"]})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["name"], "ValidationError");
+    assert_eq!(body["errors"][0]["path"], "add_labels");
+}
+
+#[tokio::test]
 async fn adding_and_removing_the_same_label_is_rejected() {
     let (h, ids) = seeded("t1", 1).await;
 

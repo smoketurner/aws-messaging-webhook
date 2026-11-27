@@ -41,7 +41,7 @@ use crate::wire::ContentDisposition;
 
 pub const MESSAGE_USER_LABEL_CAP: usize = 20;
 pub const THREAD_USER_LABEL_CAP: usize = 20;
-/// Non-empty, no `#`, whitespace or control characters.
+/// The longest label, in bytes; [`labels::is_valid`] says which characters it may use.
 pub const LABEL_MAX_BYTES: usize = 64;
 pub const SUBJECT_MAX_BYTES: usize = 2_000;
 pub const ADDRESS_MAX_BYTES: usize = 320;
