@@ -14,6 +14,7 @@ pub(crate) mod reply;
 pub(crate) mod spec;
 pub(crate) mod validate;
 
+use mailbox::content::MessageContent;
 use std::sync::Arc;
 
 use axum::Json;
@@ -80,7 +81,7 @@ async fn enqueue<B: Backend>(
     inbox: InboxId,
     request: SendRequest,
     headers: &HeaderMap,
-    original: Option<(&MailMessage, &mailbox::content::MessageContent)>,
+    original: Option<(&MailMessage, &MessageContent)>,
     route: &str,
     at: Timestamp,
 ) -> Result<Json<SendAccepted>, ApiError> {
@@ -129,7 +130,7 @@ async fn enqueue<B: Backend>(
     if let Err(error) = upload_spec(&state.objects, &spec, &validated).await {
         return Err(discard_and_fail(&state.objects, &spec, error).await);
     }
-    let message_content = mailbox::content::MessageContent {
+    let message_content = MessageContent {
         text: validated.text.clone(),
         html: validated.html.clone(),
         headers: validated.headers.clone(),

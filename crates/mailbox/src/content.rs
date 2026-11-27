@@ -108,6 +108,7 @@ pub fn serialize_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mime;
 
     #[test]
     fn a_document_within_the_cap_keeps_its_bodies() {
@@ -215,7 +216,7 @@ mod tests {
             raw.len() < 40_000_000,
             "raw email is under the SES receive limit"
         );
-        let parsed = crate::mime::parse_inbound(raw.as_bytes()).unwrap();
+        let parsed = mime::parse_inbound(raw.as_bytes()).unwrap();
         assert_eq!(parsed.content.references.len(), 1);
         assert_eq!(
             parsed.content.references[0].len(),

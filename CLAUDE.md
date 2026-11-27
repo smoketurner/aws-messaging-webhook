@@ -117,7 +117,12 @@ moves inline rather than making the item public.
   is stamped with the time AWS put on the event it is serving — a Function URL request's
   `requestContext.timeEpoch` (the `RequestTime` extractor), a direct SNS delivery's envelope
   `Timestamp`, a scheduled sweep's `time` — and threaded down as a `jiff::Timestamp`
-  (`mailbox::time::Timestamp`); the `mailbox` crate never reads the clock. `clock.rs` says
+  (`mailbox::time::Timestamp`); the `mailbox` crate never reads the clock. Text becomes a
+  `Timestamp` once, where it enters (the event, a query parameter, a stored item), and stays
+  one: stored and wire structs hold `Timestamp` fields under `#[serde(with = "time::fixed")]`,
+  which writes the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form sort keys depend on. Don't pass
+  a formatted string between functions, and never `Display` a `Timestamp` (its width varies)
+  — `time::format` is for a key or a JSON literal being built by hand. `clock.rs` says
   where each comes from and holds the one `now()`, for what no event can supply: the sender's
   claim on a send (a lease the sweep judges by age — the stream record that triggered the
   sender may be far older than the attempt, so dating the claim by it would make a live claim
@@ -169,6 +174,12 @@ Workspace `Cargo.toml` pins exact versions (`=x.y.z`) with `default-features = f
 everything, listed alphabetically and without commentary; each crate opts into only the
 features it uses. Workspace lints deny `unwrap`/`panic`/etc.; `clippy.toml` relaxes them for
 test code.
+
+Items from the workspace's own crates are imported, not spelled inline: `clippy::absolute_paths`
+is denied with `absolute-paths-max-segments = 2`, so `crate::mail::sender::sweep` or
+`mailbox::time::Timestamp` in an expression is an error — `use` the type, or a function's
+parent module. External crates are exempt through `absolute-paths-allowed-crates` in
+`clippy.toml`; a new dependency named by an absolute path is added there.
 
 Dates and times are `jiff`, never `chrono`: `deny.toml` bans `chrono` outright, which is why
 the DynamoDB stream event is read into `stream.rs`'s own structs rather than through

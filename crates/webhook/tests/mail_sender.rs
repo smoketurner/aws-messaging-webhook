@@ -1072,7 +1072,7 @@ async fn an_operator_can_close_an_unknown_message_as_failed() {
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Failed);
     assert_eq!(
-        state.failure.map(mailbox::send::SendFailure::as_str),
+        state.failure.map(SendFailure::as_str),
         Some("closed_by_operator")
     );
 }

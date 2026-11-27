@@ -3,6 +3,7 @@
 //! [`TEST_API_KEY`](crate::TEST_API_KEY); [`call`] sends exactly the headers
 //! it is given, for the unauthenticated cases.
 
+use aws_messaging_webhook::app;
 use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
@@ -12,10 +13,7 @@ use crate::{Harness, TEST_API_KEY};
 
 /// Sends `request` through the router and returns the status and raw body.
 pub async fn send(h: &Harness, request: Request<Body>) -> (StatusCode, Bytes) {
-    let response = aws_messaging_webhook::app::app(h.state.clone())
-        .oneshot(request)
-        .await
-        .unwrap();
+    let response = app::app(h.state.clone()).oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

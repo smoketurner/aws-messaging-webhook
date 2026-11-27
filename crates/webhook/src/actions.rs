@@ -4,6 +4,8 @@
 //! truth — the persisted raw event is the audit trail. Actions never suppress
 //! the EventBridge event.
 
+use crate::mail::ingest;
+use crate::model::ses_notification::SesNotification;
 use std::future::Future;
 
 use crate::mail::ingest::IngestOutcome;
@@ -227,7 +229,7 @@ pub(crate) fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> Keywo
 /// should say so.
 async fn apply_delivery_label<B: Backend>(
     state: &AppState<B>,
-    event: &crate::model::ses_notification::SesNotification,
+    event: &SesNotification,
     at: Timestamp,
 ) -> Result<bool, ActionError> {
     let Some(label) = event.kind.mailbox_label() else {
@@ -456,7 +458,7 @@ pub(crate) async fn run<B: Backend>(
             })
         }
         DomainEvent::SesInbound { event, .. } => {
-            crate::mail::ingest::ingest_inbound(state, event, deadline, at, envelope_at)
+            ingest::ingest_inbound(state, event, deadline, at, envelope_at)
                 .await
                 .map(ActionTaken::Ingest)
         }

@@ -6,6 +6,7 @@ use axum::http::{Method, StatusCode};
 use mailbox::AttachmentMeta;
 use mailbox::test_fixtures::at;
 use mailbox::time::Timestamp;
+use mailbox::wire::ContentDisposition;
 use mailbox::{ids, time};
 use mailbox_store::sample_message;
 use webhook_test_support::{
@@ -19,7 +20,7 @@ fn attachment(id: &str, filename: Option<&str>, key: Option<&str>) -> Attachment
         size: 2_048,
         filename: filename.map(ToOwned::to_owned),
         content_type: "application/pdf".to_owned(),
-        content_disposition: mailbox::wire::ContentDisposition::Attachment,
+        content_disposition: ContentDisposition::Attachment,
         content_id: None,
     }
 }

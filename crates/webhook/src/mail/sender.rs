@@ -20,6 +20,10 @@
 //! already hold the message, and sending it again is worse than leaving it
 //! for an operator to resolve.
 
+use crate::stream;
+use crate::stream::StreamEvent;
+use crate::stream::StreamRecord;
+use mailbox::send::SpecAttachment;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -88,7 +92,7 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
     payload: serde_json::Value,
     deadline: Instant,
 ) -> Result<serde_json::Value, lambda_http::Error> {
-    let event: crate::stream::StreamEvent = serde_json::from_value(payload)
+    let event: StreamEvent = serde_json::from_value(payload)
         .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
 
     let mut failures = Vec::new();
@@ -112,18 +116,16 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
 }
 
 /// The message id a record is asking to be sent, if it is asking at all.
-fn queued_send_id(record: &crate::stream::StreamRecord) -> Option<MessageId> {
+fn queued_send_id(record: &StreamRecord) -> Option<MessageId> {
     let new_image = &record.change.new_image;
-    if crate::stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
+    if stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
         return None;
     }
-    if crate::stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
+    if stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
         return None;
     }
 
-    let message_id = MessageId::new(keys::parse_outbox_pk(crate::stream::image_str(
-        new_image, "pk",
-    )?)?);
+    let message_id = MessageId::new(keys::parse_outbox_pk(stream::image_str(new_image, "pk")?)?);
 
     match record.event_name.as_str() {
         "INSERT" => Some(message_id),
@@ -131,9 +133,8 @@ fn queued_send_id(record: &crate::stream::StreamRecord) -> Option<MessageId> {
         // `requeued_at` appearing. Acting on every MODIFY would re-enter the
         // sender on its own claim and mark writes.
         "MODIFY" => {
-            let was_absent =
-                crate::stream::image_str(&record.change.old_image, "requeued_at").is_none();
-            let is_present = crate::stream::image_str(new_image, "requeued_at").is_some();
+            let was_absent = stream::image_str(&record.change.old_image, "requeued_at").is_none();
+            let is_present = stream::image_str(new_image, "requeued_at").is_some();
             (was_absent && is_present).then_some(message_id)
         }
         _ => None,
@@ -872,7 +873,7 @@ async fn load_spec<B: Backend>(
 /// One attachment's bytes, owned so the borrow checker does not tie them to
 /// the loop that fetched them.
 struct LoadedPart {
-    spec: mailbox::send::SpecAttachment,
+    spec: SpecAttachment,
     bytes: Vec<u8>,
 }
 

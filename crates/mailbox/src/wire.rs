@@ -8,6 +8,7 @@
 //! minus the fields a list response omits (`headers`, `references`, body
 //! content, and the embedded `messages[]`).
 
+use crate::thread::ThreadState;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
@@ -228,7 +229,7 @@ impl Thread {
     /// messages, oldest first.
     #[must_use]
     pub fn new(
-        thread: &crate::thread::ThreadState,
+        thread: &ThreadState,
         messages: Vec<Message>,
         limit: usize,
         next_page_token: Option<String>,
@@ -337,8 +338,8 @@ impl From<&MailMessage> for ThreadItem {
     }
 }
 
-impl From<&crate::thread::ThreadState> for ThreadItem {
-    fn from(thread: &crate::thread::ThreadState) -> Self {
+impl From<&ThreadState> for ThreadItem {
+    fn from(thread: &ThreadState) -> Self {
         Self {
             inbox_id: thread.inbox_id.as_str().to_owned(),
             thread_id: thread.thread_id.clone(),

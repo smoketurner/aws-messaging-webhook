@@ -24,6 +24,10 @@
 //! second. The record deserializes straight into the verifier's envelope,
 //! keeping all signed field values verbatim.
 
+use crate::mail::sender;
+use crate::mail::sender::Command;
+use crate::metrics::emit_cold_start;
+use crate::stream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime};
@@ -90,7 +94,7 @@ pub async fn run<B: Backend>(
             // as a standalone EMF document. The `metrics_cloudwatch_embedded`
             // library only emits it through its own tower middleware, which this
             // handler does not use, so it is emitted explicitly here.
-            crate::metrics::emit_cold_start(&COLD_START_EMITTED, collector, std::io::stdout());
+            emit_cold_start(&COLD_START_EMITTED, collector, std::io::stdout());
             let start = Instant::now();
             let result = dispatch(state, router, event).await;
             // Record per-invocation latency as a histogram (milliseconds).
@@ -129,13 +133,13 @@ pub async fn dispatch<B: Backend>(
     // and no other pathway produces either shape.
     if state.config.mode == FunctionMode::Sender && payload.get("Records").is_none() {
         if payload.get("command").is_some() {
-            let command: crate::mail::sender::Command = serde_json::from_value(payload)
+            let command: Command = serde_json::from_value(payload)
                 .map_err(|e| format!("not a sender command: {e}"))?;
-            crate::mail::sender::handle_command(&state, &command).await?;
+            sender::handle_command(&state, &command).await?;
             return Ok(serde_json::json!({ "ok": true }));
         }
         let at = clock::scheduled_time(&payload).unwrap_or_else(clock::now);
-        let report = crate::mail::sender::sweep(&state, at).await?;
+        let report = sender::sweep(&state, at).await?;
         return Ok(serde_json::to_value(report)?);
     }
 
@@ -148,14 +152,9 @@ pub async fn dispatch<B: Backend>(
             // ignores the records the other owns: the relay publishes message
             // inserts, the sender acts on send-state items.
             return match state.config.mode {
-                FunctionMode::Webhook => crate::stream::handle_stream(&state, payload).await,
+                FunctionMode::Webhook => stream::handle_stream(&state, payload).await,
                 FunctionMode::Sender => {
-                    crate::mail::sender::handle_sender_stream(
-                        &state,
-                        payload,
-                        context_deadline(&context),
-                    )
-                    .await
+                    sender::handle_sender_stream(&state, payload, context_deadline(&context)).await
                 }
             };
         }

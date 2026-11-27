@@ -673,6 +673,8 @@ mod tests {
 
     use super::*;
     use mailbox::ThreadId;
+    use mailbox::send::Envelope;
+    use mailbox::send::SendFailure;
     use mailbox::test_fixtures::at;
     use mailbox::thread::{apply_message, new_thread};
     use mailbox::{Direction, InboxId, test_fixtures};
@@ -835,9 +837,9 @@ mod tests {
             msg.inbox_id.clone(),
             msg.message_id.clone(),
             msg.thread_id.clone(),
-            mailbox::send::Envelope {
+            Envelope {
                 to: vec!["recipient@example.com".to_owned()],
-                ..mailbox::send::Envelope::default()
+                ..Envelope::default()
             },
             key_pk.map(ToOwned::to_owned),
             at("2026-01-01T00:00:00.000Z"),
@@ -859,10 +861,7 @@ mod tests {
             (queued.claimed(now), true),
             (queued.unknown(now), true),
             (queued.sent(now), false),
-            (
-                queued.failed(mailbox::send::SendFailure::Rejected, now),
-                false,
-            ),
+            (queued.failed(SendFailure::Rejected, now), false),
         ] {
             let item = to_item(&state).unwrap();
             assert_eq!(
@@ -888,7 +887,7 @@ mod tests {
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, Some("SENDKEY#abc"));
-        let key = mailbox::send::SendKey {
+        let key = SendKey {
             key_hash: "keyhash".to_owned(),
             inbox_id: msg.inbox_id.clone(),
             message_id: msg.message_id.clone(),
@@ -979,7 +978,7 @@ mod tests {
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, None);
-        let key = mailbox::send::SendKey {
+        let key = SendKey {
             key_hash: "keyhash".to_owned(),
             inbox_id: msg.inbox_id.clone(),
             message_id: msg.message_id.clone(),

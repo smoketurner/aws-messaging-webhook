@@ -7,6 +7,7 @@ pub(crate) mod extractor;
 use anyhow::{Context as _, anyhow};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use mailbox::time;
 use mailbox::time::Timestamp;
 use serde_json::json;
 use sns_message_verifier::{MessageType, SnsEnvelope};
@@ -168,7 +169,7 @@ async fn process_notification<B: Backend>(
     // a direct delivery, and is the inbound message id's third time source
     // (after `mail.timestamp`/`receipt.timestamp`): content, where a request
     // time differs on every HTTPS redelivery.
-    let envelope_at = mailbox::time::parse_rfc3339(&envelope.timestamp);
+    let envelope_at = time::parse_rfc3339(&envelope.timestamp);
     let at = request_at
         .or(envelope_at)
         .ok_or(AppError::InvalidTimestamp)?;

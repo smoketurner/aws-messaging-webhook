@@ -349,6 +349,7 @@ mod tests {
 
     use super::*;
     use crate::test_fixtures::at;
+    use crate::wire::ContentDisposition;
     use crate::{AttachmentMeta, Direction, test_fixtures};
 
     fn message(direction: Direction, labels: &[&str]) -> MailMessage {
@@ -641,7 +642,7 @@ mod tests {
                 size: 10,
                 filename: None,
                 content_type: "text/plain".to_owned(),
-                content_disposition: crate::wire::ContentDisposition::Attachment,
+                content_disposition: ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();
@@ -656,7 +657,7 @@ mod tests {
             size: 10,
             filename: None,
             content_type: "text/plain".to_owned(),
-            content_disposition: crate::wire::ContentDisposition::Attachment,
+            content_disposition: ContentDisposition::Attachment,
             content_id: None,
         }];
         let after = apply_message(&before, &second);

@@ -16,6 +16,7 @@
 //! it during a send does not touch the message — so the relay sees at most
 //! one message change per outcome rather than one per attempt.
 
+use crate::labels;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
@@ -491,7 +492,7 @@ pub fn mark_transition<'a>(
             .filter(|label| label.as_str() != remove.as_str())
             .cloned()
             .collect();
-        if !crate::labels::has(&labels, add) {
+        if !labels::has(&labels, add) {
             labels.push(add.to_label());
         }
         labels.sort();
@@ -533,6 +534,7 @@ pub fn mark_transition<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures;
 
     #[test]
     fn statuses_serialize_as_the_stored_strings() {
@@ -589,7 +591,7 @@ mod tests {
                 ..Envelope::default()
             },
             None,
-            crate::test_fixtures::at("2026-01-01T00:00:00.000Z"),
+            test_fixtures::at("2026-01-01T00:00:00.000Z"),
         );
         assert_eq!(state.send_status, SendStatus::Queued);
         assert_eq!(state.version, 0);
@@ -610,7 +612,7 @@ mod tests {
                 bcc: Vec::new(),
             },
             Some("SENDKEY#abc".to_owned()),
-            crate::test_fixtures::at("2026-01-01T00:00:00.000Z"),
+            test_fixtures::at("2026-01-01T00:00:00.000Z"),
         );
         let item: serde_dynamo::Item = serde_dynamo::to_item(&state).unwrap();
         let back: SendState = serde_dynamo::from_item(item).unwrap();

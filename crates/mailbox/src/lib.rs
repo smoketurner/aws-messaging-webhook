@@ -27,6 +27,7 @@ pub mod wire;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures;
 
+use crate::send::SendStatus;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
@@ -345,7 +346,7 @@ pub struct MailMessage {
 
     // Outbound-only mirror of the send state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub send_status: Option<crate::send::SendStatus>,
+    pub send_status: Option<SendStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "crate::time::fixed::option")]
     pub sent_at: Option<Timestamp>,

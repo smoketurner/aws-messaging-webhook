@@ -1,3 +1,4 @@
+use crate::api;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
@@ -70,7 +71,7 @@ pub fn app<B: Backend>(state: Arc<AppState<B>>) -> Router {
     }
     router
         .with_state(Arc::clone(&state))
-        .merge(Router::new().nest("/v0", crate::api::router(state)))
+        .merge(Router::new().nest("/v0", api::router(state)))
         .layer(TraceLayer::new_for_http())
         // Outside the trace layer, so a bearer key can never reach a log
         // line: the header is redacted before tracing records the request.

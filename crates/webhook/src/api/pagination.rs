@@ -417,7 +417,7 @@ mod tests {
 
         // A real id minted inside the window falls between the two bounds.
         let inside = time::parse("2026-01-15T09:30:00.000Z").unwrap();
-        let id = mailbox::ids::inbound_message_id("ses-1", inside).to_string();
+        let id = ids::inbound_message_id("ses-1", inside).to_string();
         assert!(after < id && id < before, "{id} should fall inside");
     }
 

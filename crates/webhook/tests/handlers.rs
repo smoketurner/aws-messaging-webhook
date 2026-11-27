@@ -3,6 +3,8 @@
 // functions that needed an explicit `unwrap_used` expectation live in the
 // `webhook-test-support` dev-dependency crate.
 
+use aws_messaging_webhook::allowlist::TopicAllowlist;
+use sns_message_verifier::fixtures::SnsFixture;
 use std::sync::atomic::Ordering;
 
 use aws_messaging_webhook::actions::ActionErrorKind;
@@ -617,7 +619,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     // A cold-start cert fetch that fails transiently must not be a permanent
     // 4xx — that would make SNS drop a correctly-signed message. The verifier
     // has no cached cert and the cert server 500s, so verify() -> CertFetch.
-    let fixture = sns_message_verifier::fixtures::SnsFixture::new();
+    let fixture = SnsFixture::new();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/cert.pem"))
@@ -628,9 +630,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     let (state, _, _) = webhook_test_support::fake_state(
         webhook_test_support::test_config(),
         webhook_test_support::test_verifier(&server),
-        aws_messaging_webhook::allowlist::TopicAllowlist::parse(
-            webhook_test_support::ALLOWED_ACCOUNT,
-        ),
+        TopicAllowlist::parse(webhook_test_support::ALLOWED_ACCOUNT),
         Some(server.uri()),
     );
     let state = std::sync::Arc::new(state);

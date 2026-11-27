@@ -14,6 +14,7 @@
     clippy::must_use_candidate,
     reason = "test double: callers always use the return value directly"
 )]
+use crate::plan::Check;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -215,7 +216,7 @@ impl MailMemoryStore {
         }
     }
 
-    fn check_holds(existing: Option<&Item>, check: &crate::plan::Check) -> bool {
+    fn check_holds(existing: Option<&Item>, check: &Check) -> bool {
         use crate::plan::Check;
         let Check::Eq(name, expected) = check;
         existing
@@ -561,6 +562,7 @@ impl Table for MailMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mailbox::MAX_TXN_RETRIES;
     use crate::store::ListQuery;
     use mailbox::send::MarkOutcome;
     use mailbox::send::SendState;
@@ -950,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn insert_message_gives_up_after_max_retries_on_persistent_throttling() {
         let store = MailMemoryStore::default();
-        for _ in 0..=crate::mailbox::MAX_TXN_RETRIES {
+        for _ in 0..=MAX_TXN_RETRIES {
             store.inject(Injected::Throttle);
         }
         let msg = message("mid-1", "mid-1");

@@ -15,6 +15,7 @@
 
 use mailbox::test_fixtures::at;
 use mailbox::{MessageId, SesMessageId, ThreadId};
+use sns_message_verifier::fixtures;
 use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content;
@@ -471,7 +472,7 @@ async fn a_transient_publish_failure_is_retried() {
 #[tokio::test]
 async fn events_table_records_are_unaffected_by_the_mail_branch() {
     let h = harness().await;
-    let mut body = sns_message_verifier::fixtures::notification(&h.cert_url);
+    let mut body = fixtures::notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
     let raw = serde_json::to_vec(&body).unwrap();
     let event = webhook_test_support::dynamodb_insert_event(

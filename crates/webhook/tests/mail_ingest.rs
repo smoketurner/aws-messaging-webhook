@@ -12,6 +12,8 @@
 //! `ingest_inbound` with a short, precisely controlled `tokio::time::Instant`
 //! deadline.
 
+use aws_messaging_webhook::actions::ActionErrorKind;
+use mailbox::time;
 use mailbox::time::Timestamp;
 use mailbox::{MessageId, ThreadId};
 use std::fmt::Write as _;
@@ -130,7 +132,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
 
     // The item and its thread expire with the bucket's lifecycle.
     let retention_secs = 365 * 86_400;
-    let now_secs = mailbox::time::unix_ms(Timestamp::now()) / 1_000;
+    let now_secs = time::unix_ms(Timestamp::now()) / 1_000;
     assert!(
         stored.expires_at > now_secs + retention_secs - 60
             && stored.expires_at <= now_secs + retention_secs,
@@ -953,7 +955,7 @@ async fn deadline_timeout_returns_transient() {
     };
     assert_eq!(
         error.kind,
-        aws_messaging_webhook::actions::ActionErrorKind::Transient,
+        ActionErrorKind::Transient,
         "a deadline elapse must be transient (5xx-equivalent) so it redelivers"
     );
 }
@@ -1054,10 +1056,7 @@ async fn no_put_still_pending_after_the_deadline() {
     let Err(error) = &result else {
         panic!("expected a transient timeout error, got {result:?}");
     };
-    assert_eq!(
-        error.kind,
-        aws_messaging_webhook::actions::ActionErrorKind::Transient
-    );
+    assert_eq!(error.kind, ActionErrorKind::Transient);
 
     let count_at_timeout = state.objects.call_count(Op::Put, &hung_key);
     assert_eq!(

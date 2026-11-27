@@ -36,6 +36,8 @@
 //! writes.
 
 use axum::body::Bytes;
+use mailbox::content::MessageContent;
+use mailbox::labels;
 use serde::{Deserialize, Deserializer};
 use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
@@ -426,7 +428,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
     // A queued send's INSERT publishes nothing (its lifecycle starts at the
     // `sent` relabel), and reading its content document first would be an S3
     // GET for an event that is never built.
-    if !mailbox::labels::has(&msg.labels, SystemLabel::Received) {
+    if !labels::has(&msg.labels, SystemLabel::Received) {
         return RelayOutcome::Settled;
     }
     let content = match content::load(&state.objects, &msg).await {
@@ -450,7 +452,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
                 event = "stream_bad_mail_content",
                 "message content document could not be read; publishing without it"
             );
-            mailbox::content::MessageContent::default()
+            MessageContent::default()
         }
     };
 

@@ -333,6 +333,7 @@ mod tests {
 
     use super::*;
     use mailbox::test_fixtures::at;
+    use mailbox::wire::ContentDisposition;
     use mailbox::{AttachmentMeta, Direction, ThreadSnapshot, test_fixtures};
     use mailbox::{MessageId, ThreadId};
 
@@ -478,7 +479,7 @@ mod tests {
             size: 10,
             filename: Some("a.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: mailbox::wire::ContentDisposition::Attachment,
+            content_disposition: ContentDisposition::Attachment,
             content_id: None,
         }];
         msg.thread_snapshot = Some(snapshot);
@@ -809,7 +810,7 @@ mod tests {
                 size: 100,
                 filename: Some("f".repeat(5_000)),
                 content_type: "text/plain".to_owned(),
-                content_disposition: mailbox::wire::ContentDisposition::Attachment,
+                content_disposition: ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();

@@ -2,6 +2,8 @@
 //! per-inbox thread resolution and insert, all bounded by the invocation
 //! deadline.
 
+use crate::actions::ActionErrorKind;
+use mailbox::content::MessageContent;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -218,7 +220,7 @@ fn record_ingest_error(
     ses_message_id: &str,
     message_id: &MessageId,
 ) -> ActionError {
-    if error.kind == crate::actions::ActionErrorKind::Permanent {
+    if error.kind == ActionErrorKind::Permanent {
         metrics::counter!(names::INGEST_FAILURES).increment(1);
         tracing::error!(
             error = ?error.source,
@@ -314,8 +316,8 @@ async fn resolve_recipient<B: Backend>(
 fn record_resolution_error(resolution: &mut InboxResolution, error: MailStoreError) {
     let error = ActionError::from(error);
     match error.kind {
-        crate::actions::ActionErrorKind::Transient => resolution.had_transient = true,
-        crate::actions::ActionErrorKind::Permanent => {
+        ActionErrorKind::Transient => resolution.had_transient = true,
+        ActionErrorKind::Permanent => {
             resolution.had_permanent = true;
             metrics::counter!(names::INGEST_FAILURES).increment(1);
             tracing::error!(
@@ -414,14 +416,7 @@ async fn fetch_parse_and_extract<B: Backend>(
     key: &str,
     uuid: Uuid,
     message_id: &MessageId,
-) -> Result<
-    (
-        ParsedMessage,
-        mailbox::content::MessageContent,
-        Vec<AttachmentMeta>,
-    ),
-    ActionError,
-> {
+) -> Result<(ParsedMessage, MessageContent, Vec<AttachmentMeta>), ActionError> {
     let raw = state
         .objects
         .get_object(key, MAX_INBOUND_RAW_BYTES)
@@ -525,7 +520,7 @@ impl InboundDraft {
 async fn insert_into_all_targets<B: Backend>(
     state: &AppState<B>,
     draft: &InboundDraft,
-    content: &mailbox::content::MessageContent,
+    content: &MessageContent,
     targets: Vec<InboxId>,
 ) -> Result<bool, ActionError> {
     let mut had_transient = false;
@@ -535,7 +530,7 @@ async fn insert_into_all_targets<B: Backend>(
         match insert_into_inbox(state, draft, content, &inbox_id).await {
             Ok(()) => inserted_any = true,
             Err(ActionError {
-                kind: crate::actions::ActionErrorKind::Transient,
+                kind: ActionErrorKind::Transient,
                 ..
             }) => {
                 had_transient = true;
@@ -568,7 +563,7 @@ async fn insert_into_all_targets<B: Backend>(
 async fn insert_into_inbox<B: Backend>(
     state: &AppState<B>,
     draft: &InboundDraft,
-    content: &mailbox::content::MessageContent,
+    content: &MessageContent,
     inbox_id: &InboxId,
 ) -> Result<(), ActionError> {
     let msg = draft.to_message(inbox_id);

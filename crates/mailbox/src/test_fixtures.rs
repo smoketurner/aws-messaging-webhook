@@ -1,5 +1,6 @@
 //! Shared unit-test fixtures for the mail types.
 
+use crate::time;
 use std::collections::BTreeMap;
 
 use super::{Direction, InboxId, MailMessage};
@@ -13,7 +14,7 @@ use crate::time::Timestamp;
 #[must_use]
 #[expect(clippy::unwrap_used, reason = "a test fixture panics on a bad literal")]
 pub fn at(literal: &str) -> Timestamp {
-    crate::time::parse_rfc3339(literal).unwrap()
+    time::parse_rfc3339(literal).unwrap()
 }
 
 /// A received, unread inbound message `mid-1` in thread `tid-1` of

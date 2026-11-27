@@ -10,6 +10,7 @@
 //! writer moved a version, so anything computed from the previous read is
 //! stale.
 
+use mailbox::send;
 use mailbox::time::Timestamp;
 use std::collections::HashMap;
 
@@ -565,7 +566,7 @@ impl<T: Table> Mailbox<T> {
                     state.message_id
                 )));
             };
-            let (after, labels, ses) = mailbox::send::mark_transition(state, &msg, outcome, now);
+            let (after, labels, ses) = send::mark_transition(state, &msg, outcome, now);
             let (added, removed) = label_changes(&msg.labels, &labels);
             let thread = if added.is_empty() && removed.is_empty() {
                 None
