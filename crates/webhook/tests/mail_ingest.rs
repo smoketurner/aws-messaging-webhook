@@ -14,6 +14,7 @@
 
 use aws_messaging_webhook::actions::ActionErrorKind;
 use aws_messaging_webhook::store::Delivery;
+use mailbox::test_fixtures::label;
 use mailbox::time;
 use mailbox::time::Timestamp;
 use mailbox::{MessageId, ThreadId};
@@ -112,9 +113,9 @@ async fn plain_message_ingests_and_creates_a_thread() {
         "a new thread roots at its own id"
     );
     assert_eq!(stored.subject, "Plain text hello");
-    assert!(stored.labels.contains(&"received".to_owned()));
-    assert!(stored.labels.contains(&"unread".to_owned()));
-    assert!(!stored.labels.contains(&"spam".to_owned()));
+    assert!(stored.labels.contains(&label("received")));
+    assert!(stored.labels.contains(&label("unread")));
+    assert!(!stored.labels.contains(&label("spam")));
 
     // The body, headers and verdicts live in the content document, not the
     // item.
@@ -531,8 +532,8 @@ async fn spam_message_gets_the_spam_label() {
         .await
         .unwrap()
         .unwrap();
-    assert!(stored.labels.contains(&"spam".to_owned()));
-    assert!(!stored.labels.contains(&"unauthenticated".to_owned()));
+    assert!(stored.labels.contains(&label("spam")));
+    assert!(!stored.labels.contains(&label("unauthenticated")));
 }
 
 #[tokio::test]
@@ -572,8 +573,8 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
         .await
         .unwrap()
         .unwrap();
-    assert!(stored.labels.contains(&"unauthenticated".to_owned()));
-    assert!(!stored.labels.contains(&"spam".to_owned()));
+    assert!(stored.labels.contains(&label("unauthenticated")));
+    assert!(!stored.labels.contains(&label("spam")));
 }
 
 #[tokio::test]

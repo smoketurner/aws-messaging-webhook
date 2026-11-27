@@ -1,6 +1,7 @@
 //! Turning a validated send into what the outbox holds: the spec and its
 //! inline parts in S3, and the queued message item the sender picks up.
 
+use mailbox::labels::Label;
 use mailbox::time::Timestamp;
 use std::collections::BTreeMap;
 
@@ -125,7 +126,7 @@ pub(super) fn queued_message(
     now: Timestamp,
 ) -> MailMessage {
     let mut labels = send.labels.clone();
-    labels.push(SystemLabel::Queued.to_label());
+    labels.push(Label::from(SystemLabel::Queued));
     labels.sort();
     labels.dedup();
 

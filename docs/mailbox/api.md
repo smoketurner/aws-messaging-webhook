@@ -29,8 +29,8 @@ past retention, and attachments dropped for size, answer `404`.
 lowercased, trimmed and deduplicated. Remove `unread` to mark a message read.
 
 - A label is 1–64 characters of `a-z`, `0-9`, `_` and `-`, checked after lowercasing, so
-  `Follow-Up` is stored as `follow-up`. Anything else in `add_labels` or a send's `labels` is a
-  `400`. `remove_labels` isn't held to the character set.
+  `Follow-Up` is stored as `follow-up`. Anything else in `add_labels`, `remove_labels` or a send's
+  `labels` is a `400`.
 
 - A message holds at most 20 of your labels, and a thread 20 across its messages. A request
   names at most 20 of your labels. Exceeding a cap is a `400`.

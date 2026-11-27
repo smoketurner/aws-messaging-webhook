@@ -5,8 +5,9 @@
 //! failure. What insertion leaves in the alias rows is tested inline, in
 //! `src/alias_tests.rs`, because reading those rows needs crate internals.
 
+use mailbox::labels::Label;
 use mailbox::send::{Envelope, MarkOutcome, SendKey, SendState, SendStatus, SesSent};
-use mailbox::test_fixtures::at;
+use mailbox::test_fixtures::{at, label};
 use mailbox::{
     Direction, InboxId, InsertOutcome, MESSAGE_USER_LABEL_CAP, MailMessage, SesMessageId,
     THREAD_USER_LABEL_CAP,
@@ -29,8 +30,10 @@ fn message(message_id: &str, thread_id: &str) -> MailMessage {
     msg
 }
 
-fn user_labels(count: usize) -> Vec<String> {
-    (0..count).map(|i| format!("label-{i:03}")).collect()
+fn user_labels(count: usize) -> Vec<Label> {
+    (0..count)
+        .map(|i| label(&format!("label-{i:03}")))
+        .collect()
 }
 
 /// A thread full of user labels must still take the system labels an
@@ -53,11 +56,7 @@ async fn an_inbound_reply_lands_in_a_thread_full_of_user_labels() {
         .unwrap();
 
     let mut reply = message("mid-2", "tid-1");
-    reply.labels = vec![
-        "received".to_owned(),
-        "spam".to_owned(),
-        "unread".to_owned(),
-    ];
+    reply.labels = vec![label("received"), label("spam"), label("unread")];
     reply.timestamp = at("2026-01-01T00:00:02.000Z");
     assert_eq!(
         mailbox.insert_message(&reply, &[]).await.unwrap(),
@@ -91,7 +90,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
         .update_labels(
             &inbox(),
             &MessageId::new("mid-2"),
-            &["one-more".to_owned()],
+            &[label("one-more")],
             &[],
             at(NOW),
         )
@@ -105,7 +104,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
             .update_labels(
                 &inbox(),
                 &MessageId::new("mid-2"),
-                &["spam".to_owned()],
+                &[label("spam")],
                 &[],
                 at(NOW)
             )
@@ -190,7 +189,7 @@ fn queued(msg: &MailMessage) -> SendState {
 fn outbound(message_id: &str) -> MailMessage {
     let mut msg = message(message_id, "tid-1");
     msg.direction = Direction::Outbound;
-    msg.labels = vec!["queued".to_owned()];
+    msg.labels = vec![label("queued")];
     msg
 }
 
@@ -384,13 +383,7 @@ async fn a_label_patch_is_stored_on_the_message() {
     mailbox.insert_message(&msg, &[]).await.unwrap();
 
     let labels = mailbox
-        .update_labels(
-            &inbox(),
-            &msg.message_id,
-            &["work".to_owned()],
-            &[],
-            at(NOW),
-        )
+        .update_labels(&inbox(), &msg.message_id, &[label("work")], &[], at(NOW))
         .await
         .unwrap()
         .unwrap();

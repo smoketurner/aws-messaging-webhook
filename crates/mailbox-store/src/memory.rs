@@ -25,6 +25,7 @@ use crate::plan::{Cond, PlannedOp, WriteOp};
 use crate::store::{MailStoreError, Page};
 use crate::table::{PageQuery, Read, Table, TxnOutcome};
 use crate::txn::{CancellationReason, TxnDecision, decode_cancellation};
+use mailbox::labels::{Label, SystemLabel};
 use mailbox::send::SendKey;
 use mailbox::time::Timestamp;
 use mailbox::{InboxId, MailMessage, MessageId, PutOutcome, ThreadId};
@@ -92,7 +93,10 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         direction: mailbox::Direction::Inbound,
         rfc_message_id: format!("<{message_id}@example.com>"),
         in_reply_to: None,
-        labels: vec!["received".to_owned(), "unread".to_owned()],
+        labels: vec![
+            Label::from(SystemLabel::Received),
+            Label::from(SystemLabel::Unread),
+        ],
         // 2026-01-01T00:00:01Z, a second after it was created.
         timestamp: Timestamp::constant(1_767_225_601, 0),
         from: "sender@example.com".to_owned(),
@@ -570,6 +574,7 @@ mod tests {
     use mailbox::send::MarkOutcome;
     use mailbox::send::SendState;
     use mailbox::test_fixtures::at;
+    use mailbox::test_fixtures::label;
     use mailbox::{InsertOutcome, RfcHit};
 
     fn message(message_id: &str, thread_id: &str) -> MailMessage {
@@ -819,7 +824,7 @@ mod tests {
         use mailbox::send::Envelope;
 
         let mut msg = message("mid-1", "mid-1");
-        msg.labels = vec!["queued".to_owned()];
+        msg.labels = vec![label("queued")];
         let state = SendState::queued(
             msg.inbox_id.clone(),
             msg.message_id.clone(),
@@ -879,7 +884,7 @@ mod tests {
     async fn a_patch_that_changes_nothing_leaves_the_version_alone() {
         let store = MailMemoryStore::default();
         let mut msg = message("mid-1", "mid-1");
-        msg.labels = vec!["received".to_owned(), "unread".to_owned()];
+        msg.labels = vec![label("received"), label("unread")];
         let inbox = msg.inbox_id.clone();
         Mailbox::new(&store)
             .insert_message(&msg, &[])
@@ -895,8 +900,8 @@ mod tests {
             .update_labels(
                 &inbox,
                 &MessageId::new("mid-1"),
-                &["unread".to_owned()],
-                &["spam".to_owned()],
+                &[label("unread")],
+                &[label("spam")],
                 at("2026-01-01T00:00:05.000Z"),
             )
             .await

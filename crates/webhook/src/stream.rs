@@ -37,6 +37,7 @@ use aws_lambda_events::dynamodb::Event;
 use axum::body::Bytes;
 use mailbox::content::MessageContent;
 use mailbox::labels;
+use mailbox::labels::Label;
 use mailbox::time::{self, Timestamp};
 use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
@@ -444,7 +445,11 @@ async fn publish_mail_sent<B: Backend>(
     // An old image without readable labels (a stream configured for new
     // images only) would make `sent` look new on every later write, so it
     // publishes nothing rather than re-announcing the send each time.
-    let Some(old_labels) = image_strings(old_image, "labels") else {
+    let Some(old_labels) = image_strings(old_image, "labels").and_then(|raw| {
+        raw.iter()
+            .map(|label| Label::parse(label).ok())
+            .collect::<Option<Vec<Label>>>()
+    }) else {
         return RelayOutcome::Settled;
     };
     let Some(event) = build_sent_event(&msg, &old_labels) else {

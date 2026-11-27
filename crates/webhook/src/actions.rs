@@ -16,6 +16,7 @@ use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
 use crate::store::Delivery;
+use mailbox::labels::Label;
 use mailbox::time;
 use mailbox::time::Timestamp;
 use mailbox::{MessageId, SesMessageId};
@@ -284,7 +285,7 @@ async fn apply_delivery_label<B: Backend>(
 
     state
         .mailbox
-        .update_labels(&inbox, &message_id, &[label.to_label()], &[], at)
+        .update_labels(&inbox, &message_id, &[Label::from(label)], &[], at)
         .await
         .map_err(ActionError::from)?;
 

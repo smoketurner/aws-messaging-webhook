@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::InboxId;
-use crate::labels::SystemLabel;
+use crate::labels::{Label, SystemLabel};
 use crate::wire::ContentDisposition;
 use crate::{MessageId, ThreadId};
 
@@ -416,7 +416,7 @@ impl SendState {
 /// Labels present in `after` but not `before`, and the reverse: the patch
 /// a status transition applies to the message's thread.
 #[must_use]
-pub fn label_changes(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
+pub fn label_changes(before: &[Label], after: &[Label]) -> (Vec<Label>, Vec<Label>) {
     let mut added = Vec::new();
     for label in after {
         if !before.contains(label) {
@@ -492,16 +492,16 @@ pub fn mark_transition<'a>(
     msg: &crate::MailMessage,
     outcome: MarkOutcome<'a>,
     now: Timestamp,
-) -> (SendState, Vec<String>, Option<SesSent<'a>>) {
+) -> (SendState, Vec<Label>, Option<SesSent<'a>>) {
     let relabel = |remove: SystemLabel, add: SystemLabel| {
-        let mut labels: Vec<String> = msg
+        let mut labels: Vec<Label> = msg
             .labels
             .iter()
-            .filter(|label| label.as_str() != remove.as_str())
+            .filter(|label| **label != remove)
             .cloned()
             .collect();
         if !labels::has(&labels, add) {
-            labels.push(add.to_label());
+            labels.push(Label::from(add));
         }
         labels.sort();
         labels

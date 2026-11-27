@@ -4,6 +4,7 @@
 
 use crate::actions::ActionErrorKind;
 use mailbox::content::MessageContent;
+use mailbox::labels::Label;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -461,7 +462,7 @@ struct InboundDraft {
     parsed: ParsedMessage,
     message_id: MessageId,
     ses_message_id: SesMessageId,
-    labels: Vec<String>,
+    labels: Vec<Label>,
     /// When the mail was received.
     timestamp: Timestamp,
     now: Timestamp,
@@ -609,11 +610,11 @@ async fn insert_into_inbox<B: Backend>(
 /// The labels an inbound message carries: `received` and `unread`, plus
 /// whatever the verdict adds, sorted (matching `plan_insert`'s sorted-labels
 /// invariant).
-fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<String> {
-    let mut labels: Vec<String> = [SystemLabel::Received, SystemLabel::Unread]
+fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<Label> {
+    let mut labels: Vec<Label> = [SystemLabel::Received, SystemLabel::Unread]
         .into_iter()
         .chain(verdict.label())
-        .map(SystemLabel::to_label)
+        .map(Label::from)
         .collect();
     labels.sort_unstable();
     labels

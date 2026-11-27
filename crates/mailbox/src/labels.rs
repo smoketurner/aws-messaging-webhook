@@ -1,12 +1,126 @@
-//! System labels, and inbound verdict classification.
+//! Labels, system labels, and inbound verdict classification.
 //!
 //! A message's labels are an open set — the system labels below plus
-//! whatever the caller adds — so they are stored, indexed and published as
-//! strings. [`SystemLabel`] is the closed half: every label the pipeline
-//! itself applies, so the compiler asks what a new one means everywhere it
-//! matters instead of leaving a literal to be typo'd.
+//! whatever the caller adds — held as [`Label`]s and stored, indexed and
+//! published as strings. [`SystemLabel`] is the closed half: every label the
+//! pipeline itself applies, so the compiler asks what a new one means
+//! everywhere it matters instead of leaving a literal to be typo'd.
 
+use std::borrow::Borrow;
 use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::LABEL_MAX_BYTES;
+
+/// One label: 1 to [`LABEL_MAX_BYTES`] bytes of `a-z`, `0-9`, `_` and `-`.
+///
+/// Keeping `#` out matters beyond tidiness: it separates the parts of every
+/// mail-table key, so a label could never be a key segment if it could
+/// contain one. Deserializing applies the same check, so a stored or
+/// requested label that breaks it fails to read rather than spreading.
+/// Orders by its string, which is the order items store their labels in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Label(String);
+
+/// Why a string is not a [`Label`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a label is 1 to {LABEL_MAX_BYTES} bytes of `a-z`, `0-9`, `_` and `-`")]
+pub struct InvalidLabel;
+
+impl Label {
+    /// `raw` as a label, unchanged: no trimming or case folding, which is
+    /// the request layer's job.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidLabel`] when `raw` is empty, longer than
+    /// [`LABEL_MAX_BYTES`], or uses any other character.
+    pub fn parse(raw: &str) -> Result<Self, InvalidLabel> {
+        let valid = !raw.is_empty()
+            && raw.len() <= LABEL_MAX_BYTES
+            && raw
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+        if valid {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(InvalidLabel)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The system label this is, or `None` for a caller's own label.
+    #[must_use]
+    pub fn system(&self) -> Option<SystemLabel> {
+        SystemLabel::ALL
+            .into_iter()
+            .find(|known| known.as_str() == self.0)
+    }
+
+    /// Every system label except `unread`, `spam` and `trash` — rejected on
+    /// a PATCH request and in a send's `labels`.
+    #[must_use]
+    pub fn is_reserved(&self) -> bool {
+        self.system()
+            .is_some_and(|label| !label.is_settable_by_request())
+    }
+}
+
+impl From<SystemLabel> for Label {
+    fn from(label: SystemLabel) -> Self {
+        Self(label.as_str().to_owned())
+    }
+}
+
+impl PartialEq<SystemLabel> for Label {
+    fn eq(&self, other: &SystemLabel) -> bool {
+        self.0 == other.as_str()
+    }
+}
+
+impl PartialEq<str> for Label {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Label {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// Lets a label-keyed map be read by `&str`. Sound because `Label`'s
+/// `Eq`, `Ord` and `Hash` are its string's.
+impl Borrow<str> for Label {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Label {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for Label {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Label {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 string_enum! {
     /// A label the pipeline applies itself.
@@ -43,12 +157,6 @@ string_enum! {
 }
 
 impl SystemLabel {
-    /// The system label `label` names, or `None` for a caller's own label.
-    #[must_use]
-    pub fn parse(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|known| known.as_str() == label)
-    }
-
     /// Whether a request may set or clear this label. `unread`, `spam` and
     /// `trash` are the mailbox state a caller owns; every other system label
     /// is a record of something that happened, which a request must not be
@@ -68,12 +176,6 @@ impl SystemLabel {
             | Self::Opened => false,
         }
     }
-
-    /// This label's own owned `String`, for the label vectors items carry.
-    #[must_use]
-    pub fn to_label(self) -> String {
-        self.as_str().to_owned()
-    }
 }
 
 impl fmt::Display for SystemLabel {
@@ -82,44 +184,19 @@ impl fmt::Display for SystemLabel {
     }
 }
 
-impl PartialEq<SystemLabel> for String {
-    fn eq(&self, other: &SystemLabel) -> bool {
-        self == other.as_str()
-    }
-}
-
 /// Whether `labels` carries `label`.
 #[must_use]
-pub fn has(labels: &[String], label: SystemLabel) -> bool {
-    labels.iter().any(|existing| existing == label.as_str())
+pub fn has(labels: &[Label], label: SystemLabel) -> bool {
+    labels.iter().any(|existing| *existing == label)
 }
 
 /// How many of `labels` are the caller's own rather than system labels.
 #[must_use]
-pub fn user_label_count(labels: &[String]) -> usize {
+pub fn user_label_count(labels: &[Label]) -> usize {
     labels
         .iter()
-        .filter(|label| SystemLabel::parse(label).is_none())
+        .filter(|label| label.system().is_none())
         .count()
-}
-
-/// Every system label except `unread`, `spam` and `trash` — rejected on a
-/// PATCH request and in a send's `labels`.
-#[must_use]
-pub fn is_reserved(label: &str) -> bool {
-    SystemLabel::parse(label).is_some_and(|label| !label.is_settable_by_request())
-}
-
-/// Whether `label` uses only `a-z`, `0-9`, `_` and `-`, the characters a
-/// label set by a request may contain. Keeping `#` out matters beyond
-/// tidiness: it separates the parts of every mail-table key, so a label could
-/// never be a key segment if it could contain one.
-#[must_use]
-pub fn is_valid(label: &str) -> bool {
-    !label.is_empty()
-        && label
-            .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
 /// The inbound classification label an ingested message gets beyond
@@ -163,12 +240,18 @@ pub fn classify_inbound(spam_or_virus_failed: bool, auth_failed: bool) -> Inboun
 mod tests {
     use super::*;
 
+    fn label(raw: &str) -> Label {
+        Label::parse(raw).unwrap()
+    }
+
     #[test]
-    fn only_lowercase_ascii_letters_digits_underscore_and_hyphen_are_valid() {
-        for label in ["billing", "follow-up", "q3_2026", "a", "0"] {
-            assert!(is_valid(label), "{label}");
+    fn only_lowercase_ascii_letters_digits_underscore_and_hyphen_parse() {
+        for raw in ["billing", "follow-up", "q3_2026", "a", "0"] {
+            assert_eq!(Label::parse(raw).map(|l| l.to_string()), Ok(raw.to_owned()));
         }
-        for label in [
+        let longest = "x".repeat(LABEL_MAX_BYTES);
+        assert!(Label::parse(&longest).is_ok());
+        for raw in [
             "",
             "bad#label",
             "two words",
@@ -180,46 +263,54 @@ mod tests {
             "slash/ed",
             "café",
             "emoji🙂",
+            &"x".repeat(LABEL_MAX_BYTES + 1),
         ] {
-            assert!(!is_valid(label), "{label:?}");
+            assert_eq!(Label::parse(raw), Err(InvalidLabel), "{raw:?}");
         }
     }
 
     #[test]
-    fn every_system_label_is_valid() {
-        for label in SystemLabel::ALL {
-            assert!(is_valid(label.as_str()), "{}", label.as_str());
-        }
-    }
-
-    #[test]
-    fn unread_spam_trash_are_not_reserved() {
-        assert!(!is_reserved("unread"));
-        assert!(!is_reserved("spam"));
-        assert!(!is_reserved("trash"));
-    }
-
-    #[test]
-    fn other_system_labels_are_reserved() {
-        assert!(is_reserved("received"));
-        assert!(is_reserved("sent"));
-        assert!(is_reserved("delivered"));
-    }
-
-    #[test]
-    fn a_users_own_label_is_never_reserved() {
-        assert!(!is_reserved("invoices"));
-        assert!(!is_reserved("Received"));
+    fn deserializing_applies_the_same_rule() {
+        let parsed: Vec<Label> = serde_json::from_str(r#"["sent","follow-up"]"#).unwrap();
+        assert_eq!(parsed, vec![label("sent"), label("follow-up")]);
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            r#"["sent","follow-up"]"#
+        );
+        assert!(serde_json::from_str::<Label>(r#""bad#label""#).is_err());
+        assert!(serde_json::from_str::<Label>(r#""""#).is_err());
     }
 
     /// Round-tripping every variant is what keeps the stored strings and the
     /// enum from drifting when a variant is added.
     #[test]
-    fn every_system_label_parses_back_to_itself() {
-        for label in SystemLabel::ALL {
-            assert_eq!(SystemLabel::parse(label.as_str()), Some(label));
+    fn every_system_label_is_a_label_that_names_itself() {
+        for system in SystemLabel::ALL {
+            let parsed = Label::parse(system.as_str()).unwrap();
+            assert_eq!(parsed, Label::from(system));
+            assert_eq!(parsed.system(), Some(system));
+            assert_eq!(parsed, system);
         }
-        assert_eq!(SystemLabel::parse("invoices"), None);
+        assert_eq!(label("invoices").system(), None);
+    }
+
+    #[test]
+    fn unread_spam_trash_are_not_reserved() {
+        assert!(!label("unread").is_reserved());
+        assert!(!label("spam").is_reserved());
+        assert!(!label("trash").is_reserved());
+    }
+
+    #[test]
+    fn other_system_labels_are_reserved() {
+        assert!(label("received").is_reserved());
+        assert!(label("sent").is_reserved());
+        assert!(label("delivered").is_reserved());
+    }
+
+    #[test]
+    fn a_users_own_label_is_never_reserved() {
+        assert!(!label("invoices").is_reserved());
     }
 
     #[test]
@@ -234,10 +325,10 @@ mod tests {
     #[test]
     fn user_labels_are_the_ones_outside_the_enum() {
         let labels = vec![
-            "received".to_owned(),
-            "invoices".to_owned(),
-            "unread".to_owned(),
-            "q3".to_owned(),
+            label("received"),
+            label("invoices"),
+            label("unread"),
+            label("q3"),
         ];
         assert_eq!(user_label_count(&labels), 2);
         assert!(has(&labels, SystemLabel::Received));

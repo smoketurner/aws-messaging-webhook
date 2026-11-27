@@ -13,7 +13,7 @@
 // doesn't extend to code outside that crate).
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-use mailbox::test_fixtures::at;
+use mailbox::test_fixtures::{at, label};
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use sns_message_verifier::fixtures;
 use std::collections::BTreeMap;
@@ -48,7 +48,7 @@ fn sample_message() -> MailMessage {
         direction: Direction::Inbound,
         rfc_message_id: "<mid-1@example.com>".to_owned(),
         in_reply_to: None,
-        labels: vec!["received".to_owned(), "unread".to_owned()],
+        labels: vec![label("received"), label("unread")],
         timestamp: at("2026-01-15T09:30:00.000Z"),
         from: "sender@example.com".to_owned(),
         to: vec!["support@example.com".to_owned()],
@@ -65,7 +65,7 @@ fn sample_message() -> MailMessage {
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             message_count: 1,
-            labels: vec!["received".to_owned(), "unread".to_owned()],
+            labels: vec![label("received"), label("unread")],
             senders: vec!["sender@example.com".to_owned()],
             recipients: vec!["support@example.com".to_owned()],
             timestamp: at("2026-01-15T09:30:00.000Z"),
@@ -211,7 +211,7 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
         subject: "Hello".to_owned(),
         preview: "Second message body".to_owned(),
         message_count: 2,
-        labels: vec!["received".to_owned(), "unread".to_owned()],
+        labels: vec![label("received"), label("unread")],
         senders: vec![
             "other@example.com".to_owned(),
             "sender@example.com".to_owned(),
@@ -244,7 +244,7 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
 async fn insert_spam_publishes_the_spam_variant() {
     let h = harness().await;
     let mut msg = sample_message();
-    msg.labels = vec!["received".to_owned(), "spam".to_owned()];
+    msg.labels = vec![label("received"), label("spam")];
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-2");
 
     invoke(Arc::clone(&h.state), event).await.unwrap();
@@ -258,7 +258,7 @@ async fn insert_spam_publishes_the_spam_variant() {
 async fn insert_unauthenticated_publishes_the_unauthenticated_variant() {
     let h = harness().await;
     let mut msg = sample_message();
-    msg.labels = vec!["received".to_owned(), "unauthenticated".to_owned()];
+    msg.labels = vec![label("received"), label("unauthenticated")];
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-3");
 
     invoke(Arc::clone(&h.state), event).await.unwrap();
@@ -272,11 +272,7 @@ async fn insert_unauthenticated_publishes_the_unauthenticated_variant() {
 async fn spam_takes_precedence_over_unauthenticated_on_the_stream_path() {
     let h = harness().await;
     let mut msg = sample_message();
-    msg.labels = vec![
-        "received".to_owned(),
-        "spam".to_owned(),
-        "unauthenticated".to_owned(),
-    ];
+    msg.labels = vec![label("received"), label("spam"), label("unauthenticated")];
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-4");
 
     invoke(Arc::clone(&h.state), event).await.unwrap();
@@ -292,9 +288,9 @@ async fn spam_takes_precedence_over_unauthenticated_on_the_stream_path() {
 async fn modify_publishes_the_send_but_not_a_delivery_label() {
     let h = harness().await;
     let mut queued = sample_message();
-    queued.labels = vec!["queued".to_owned()];
+    queued.labels = vec![label("queued")];
     let mut sent = queued.clone();
-    sent.labels = vec!["sent".to_owned()];
+    sent.labels = vec![label("sent")];
 
     let event = mail_modify_event(
         &message_new_image(&queued),
@@ -304,7 +300,7 @@ async fn modify_publishes_the_send_but_not_a_delivery_label() {
     invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let mut delivered = sent.clone();
-    delivered.labels = vec!["sent".to_owned(), "delivered".to_owned()];
+    delivered.labels = vec![label("sent"), label("delivered")];
     let event = mail_modify_event(
         &message_new_image(&sent),
         &message_new_image(&delivered),
@@ -329,7 +325,7 @@ async fn modify_without_a_new_system_label_publishes_nothing() {
     let h = harness().await;
     let msg = sample_message();
     let mut read = msg.clone();
-    read.labels = vec!["received".to_owned(), "invoices".to_owned()];
+    read.labels = vec![label("received"), label("invoices")];
 
     let event = mail_modify_event(&message_new_image(&msg), &message_new_image(&read), "seq-5");
     let result = invoke(Arc::clone(&h.state), event).await.unwrap();

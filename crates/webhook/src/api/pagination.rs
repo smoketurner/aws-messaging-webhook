@@ -10,7 +10,7 @@
 //! by `<timestamp>#<thread_id>`. Each gets its own boundary encoding.
 
 use crate::api::error::{ApiError, FieldError};
-use mailbox::labels::SystemLabel;
+use mailbox::labels::{Label, SystemLabel};
 use mailbox::thread::ThreadState;
 use mailbox::time::Timestamp;
 use mailbox::{MailMessage, ids, time};
@@ -62,7 +62,7 @@ pub(crate) struct Filters {
 }
 
 impl Filters {
-    fn labels_match(&self, labels: &[String]) -> bool {
+    fn labels_match(&self, labels: &[Label]) -> bool {
         if self
             .excluded
             .iter()
@@ -72,7 +72,7 @@ impl Filters {
         }
         self.labels
             .iter()
-            .all(|wanted| labels.iter().any(|label| label == wanted))
+            .all(|wanted| labels.iter().any(|label| label == wanted.as_str()))
     }
 
     #[must_use]

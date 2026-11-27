@@ -10,7 +10,7 @@
 //! overridden at all, so a caller cannot rewrite `From` and send as another
 //! inbox.
 
-use crate::api::labels::{self, LabelUse};
+use crate::api::labels;
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
@@ -20,6 +20,7 @@ use serde::Deserialize;
 use crate::api::error::{ApiError, FieldError};
 use crate::api::json::OneOrMany;
 use mailbox::address::envelope_address;
+use mailbox::labels::Label;
 use mailbox::url_policy::{self, AttachmentUrl};
 use mailbox::wire::ContentDisposition;
 use mailbox::{
@@ -144,7 +145,7 @@ pub(crate) struct ValidatedSend {
     pub subject: String,
     pub text: Option<String>,
     pub html: Option<String>,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     pub headers: BTreeMap<String, String>,
     pub attachments: Vec<ValidatedAttachment>,
 }
@@ -198,12 +199,8 @@ pub(crate) fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> 
         ));
     }
 
-    let labels = labels::normalize_labels(
-        request.labels.unwrap_or_default(),
-        "labels",
-        LabelUse::Set,
-        &mut errors,
-    );
+    let labels =
+        labels::normalize_labels(request.labels.unwrap_or_default(), "labels", &mut errors);
     let headers = headers(request.headers, &mut errors);
     let attachments = attachments(request.attachments, &mut errors);
 

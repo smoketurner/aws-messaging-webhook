@@ -4,6 +4,7 @@
 //! version-conditioned, in the same transaction as whatever changed it, so
 //! two messages arriving at once cannot each overwrite the other's effect.
 
+use crate::labels::Label;
 use crate::time::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 
@@ -63,9 +64,9 @@ pub struct ThreadState {
         skip_serializing_if = "Vec::is_empty",
         with = "serde_dynamo::string_set"
     )]
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub label_counts: BTreeMap<String, u64>,
+    pub label_counts: BTreeMap<Label, u64>,
     pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
@@ -148,9 +149,9 @@ fn bump(count: &mut u64) {
     *count = count.saturating_add(1);
 }
 
-fn add_label(labels: &mut Vec<String>, label: &str) {
-    if let Err(index) = labels.binary_search_by(|l| l.as_str().cmp(label)) {
-        labels.insert(index, label.to_owned());
+fn add_label(labels: &mut Vec<Label>, label: &Label) {
+    if let Err(index) = labels.binary_search(label) {
+        labels.insert(index, label.clone());
     }
 }
 
@@ -287,8 +288,8 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
 #[must_use]
 pub fn apply_label_patch(
     existing: &ThreadState,
-    added: &[String],
-    removed: &[String],
+    added: &[Label],
+    removed: &[Label],
     now: Timestamp,
 ) -> ThreadState {
     let mut next = existing.clone();
@@ -362,7 +363,7 @@ mod tests {
         MailMessage {
             ses_message_id: None,
             direction,
-            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            labels: labels.iter().map(|l| Label::parse(l).unwrap()).collect(),
             timestamp: at("2026-01-01T00:00:01.000Z"),
             size: 1_000,
             version: 0,

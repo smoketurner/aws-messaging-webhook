@@ -16,6 +16,7 @@
 //! documented shape.
 
 use mailbox::test_fixtures;
+use mailbox::test_fixtures::label;
 use mailbox::wire::ContentDisposition;
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeSet;
@@ -346,7 +347,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
         direction: Direction::Inbound,
         rfc_message_id: "<orig-1@example.net>".to_owned(),
         in_reply_to: Some("<earlier@example.net>".to_owned()),
-        labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        labels: labels.iter().map(|raw| label(raw)).collect(),
         timestamp: now,
         from: "Sender <sender@example.net>".to_owned(),
         to: vec![TEST_INBOX.to_owned()],
@@ -467,7 +468,7 @@ async fn the_sent_event_matches_the_schema() {
     let h = api_harness().await;
     let sent = sent_message(&h).await;
     let mut queued = sent.clone();
-    queued.labels = vec!["queued".to_owned()];
+    queued.labels = vec![label("queued")];
 
     let result = invoke(
         Arc::clone(&h.state),

@@ -14,8 +14,9 @@ use aws_messaging_webhook::mail::sender::{
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use mailbox::labels::Label;
 use mailbox::send::{SendFailure, SendState, SendStatus};
-use mailbox::test_fixtures::at;
+use mailbox::test_fixtures::{at, label};
 use mailbox::time::Timestamp;
 use mailbox::{InboxId, ids, time};
 use mailbox::{MessageId, SesMessageId, ThreadId};
@@ -45,7 +46,7 @@ async fn queued(h: &Harness, body: &Value) -> MessageId {
 }
 
 /// The labels on a thread, which roll up its messages' labels.
-async fn thread_labels(h: &Harness, thread_id: &ThreadId) -> Vec<String> {
+async fn thread_labels(h: &Harness, thread_id: &ThreadId) -> Vec<Label> {
     h.state
         .mailbox
         .get_thread(&InboxId::new(TEST_INBOX), thread_id, 1, None)
@@ -793,11 +794,11 @@ async fn an_ses_delivery_event_labels_the_message_it_belongs_to() {
         .unwrap()
         .unwrap();
     assert!(
-        message.labels.contains(&"delivered".to_owned()),
+        message.labels.contains(&label("delivered")),
         "{:?}",
         message.labels
     );
-    assert!(message.labels.contains(&"sent".to_owned()));
+    assert!(message.labels.contains(&label("sent")));
 }
 
 #[tokio::test]
@@ -834,8 +835,8 @@ async fn later_events_add_labels_rather_than_replacing_them() {
         .await
         .unwrap()
         .unwrap();
-    assert!(message.labels.contains(&"delivered".to_owned()));
-    assert!(message.labels.contains(&"opened".to_owned()));
+    assert!(message.labels.contains(&label("delivered")));
+    assert!(message.labels.contains(&label("opened")));
 }
 
 #[tokio::test]
@@ -1062,13 +1063,13 @@ async fn an_ses_event_settles_an_unknown_send_as_sent() {
     assert_eq!(state.send_status, SendStatus::Sent);
     assert!(state.expires_at.is_some(), "a settled send ages out");
     let message = stored_message(&h, &message_id).await;
-    assert!(message.labels.contains(&"sent".to_owned()));
-    assert!(!message.labels.contains(&"queued".to_owned()));
+    assert!(message.labels.contains(&label("sent")));
+    assert!(!message.labels.contains(&label("queued")));
     // Dated by when SES took the message, not by when the event arrived.
     assert_eq!(message.sent_at, Some(at("2026-01-01T00:00:30.000Z")));
     // The same event is then labelled onto it, as any later one will be.
     assert!(
-        message.labels.contains(&"delivered".to_owned()),
+        message.labels.contains(&label("delivered")),
         "{:?}",
         message.labels
     );
@@ -1112,7 +1113,7 @@ async fn an_ses_event_settles_a_send_whose_outcome_was_never_recorded() {
 
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
     let message = stored_message(&h, &message_id).await;
-    assert!(message.labels.contains(&"sent".to_owned()));
+    assert!(message.labels.contains(&label("sent")));
 
     // The sweep then has nothing left to recover.
     let report = sweep(&h.state, at("2026-01-01T01:00:00.000Z"))
@@ -1144,8 +1145,8 @@ async fn an_ses_event_cannot_settle_a_send_that_never_reached_ses() {
     assert_eq!(state_of(&h, &claimed).send_status, SendStatus::Sending);
     for message_id in [&waiting, &claimed] {
         let message = stored_message(&h, message_id).await;
-        assert!(message.labels.contains(&"queued".to_owned()));
-        assert!(!message.labels.contains(&"delivered".to_owned()));
+        assert!(message.labels.contains(&label("queued")));
+        assert!(!message.labels.contains(&label("delivered")));
     }
 }
 

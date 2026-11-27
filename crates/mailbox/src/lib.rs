@@ -27,6 +27,7 @@ pub mod wire;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures;
 
+use crate::labels::Label;
 use crate::send::SendStatus;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
@@ -41,7 +42,7 @@ use crate::wire::ContentDisposition;
 
 pub const MESSAGE_USER_LABEL_CAP: usize = 20;
 pub const THREAD_USER_LABEL_CAP: usize = 20;
-/// The longest label, in bytes; [`labels::is_valid`] says which characters it may use.
+/// The longest label, in bytes; [`labels::Label`] says which characters it may use.
 pub const LABEL_MAX_BYTES: usize = 64;
 pub const SUBJECT_MAX_BYTES: usize = 2_000;
 pub const ADDRESS_MAX_BYTES: usize = 320;
@@ -265,7 +266,7 @@ pub struct ThreadSnapshot {
     pub preview: String,
     pub message_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub senders: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -314,7 +315,7 @@ pub struct MailMessage {
         skip_serializing_if = "Vec::is_empty",
         with = "serde_dynamo::string_set"
     )]
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     /// Fixed-width (`mail::time::format`).
     #[serde(with = "crate::time::fixed")]
     pub timestamp: Timestamp,
