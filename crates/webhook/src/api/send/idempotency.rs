@@ -116,7 +116,7 @@ pub(super) async fn replay_key<B: Backend>(
     // lazily, so a row past its TTL may still be returned here. Treat it as
     // absent — matching `Cond::NotExistsOrExpired` on the write path — so the
     // request falls through to enqueue and reclaims the slot.
-    if existing.expires_at < time::unix_ms(at) / 1_000 {
+    if existing.expires_at < time::unix_seconds(at) {
         return Ok(None);
     }
     if existing.request_hash == request_hash {

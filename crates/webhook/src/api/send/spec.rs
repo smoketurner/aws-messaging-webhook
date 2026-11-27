@@ -1,6 +1,7 @@
 //! Turning a validated send into what the outbox holds: the spec and its
 //! inline parts in S3, and the queued message item the sender picks up.
 
+use mailbox::time::Timestamp;
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
@@ -20,7 +21,7 @@ pub(super) fn build_spec(
     send: &ValidatedSend,
     uuid: uuid::Uuid,
     thread_id: &ThreadId,
-    now: &str,
+    now: Timestamp,
 ) -> SendSpec {
     let message_id = MessageId::from(uuid);
     let attachments = send
@@ -72,7 +73,7 @@ pub(super) fn build_spec(
         references: Vec::new(),
         headers: send.headers.clone(),
         attachments,
-        created_at: now.to_owned(),
+        created_at: now,
     }
 }
 
@@ -121,7 +122,7 @@ pub(super) fn queued_message(
     inbox: &InboxId,
     send: &ValidatedSend,
     spec: &SendSpec,
-    now: &str,
+    now: Timestamp,
 ) -> MailMessage {
     let mut labels = send.labels.clone();
     labels.push(SystemLabel::Queued.to_label());
@@ -137,7 +138,7 @@ pub(super) fn queued_message(
         rfc_message_id: spec.rfc_message_id.clone(),
         in_reply_to: spec.in_reply_to.clone(),
         labels,
-        timestamp: now.to_owned(),
+        timestamp: now,
         from: spec.from.clone(),
         to: send.to.clone(),
         cc: send.cc.clone(),
@@ -165,8 +166,8 @@ pub(super) fn queued_message(
         send_status: Some(SendStatus::Queued),
         sent_at: None,
         version: 0,
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
+        created_at: now,
+        updated_at: now,
         expires_at: 0,
     }
 }

@@ -10,6 +10,7 @@
 //! so all variants address the same row.
 
 use axum::http::StatusCode;
+use mailbox::test_fixtures::at;
 use mailbox::{ids, time};
 use mailbox_store::sample_message;
 use webhook_test_support::{Harness, TEST_AT, TEST_INBOX, api, grant_api_access, harness};
@@ -23,9 +24,9 @@ async fn seeded() -> (Harness, String) {
     let ms = time::parse(TEST_AT).unwrap();
     let id = ids::inbound_message_id("ses-casing-router", ms).to_string();
     let mut msg = sample_message(TEST_INBOX, &id, &id);
-    TEST_AT.clone_into(&mut msg.timestamp);
-    TEST_AT.clone_into(&mut msg.created_at);
-    TEST_AT.clone_into(&mut msg.updated_at);
+    msg.timestamp = at(TEST_AT);
+    msg.created_at = at(TEST_AT);
+    msg.updated_at = at(TEST_AT);
     h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
     (h, id)
 }

@@ -102,7 +102,7 @@ pub(crate) fn build_received_event(
     }
     let event_type = received_event_type(&msg.labels);
     // A received event is dated by the message's own timestamp.
-    let at = time::parse(&msg.timestamp).unwrap_or(Timestamp::UNIX_EPOCH);
+    let at = msg.timestamp;
     let event_id = ids::event_id(
         msg.inbox_id.as_str(),
         msg.message_id.as_str(),
@@ -150,8 +150,7 @@ pub(crate) fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Opti
     let event_type = "message.sent";
     // `sent_at` is written by the same relabel; `updated_at` is that write's
     // time too, and only stands in for an item that somehow lacks it.
-    let timestamp = msg.sent_at.as_deref().unwrap_or(&msg.updated_at);
-    let at = time::parse(timestamp).unwrap_or(Timestamp::UNIX_EPOCH);
+    let at = msg.sent_at.unwrap_or(msg.updated_at);
     let recipients: Vec<&str> = msg
         .to
         .iter()
@@ -167,7 +166,7 @@ pub(crate) fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Opti
             "inbox_id": msg.inbox_id.as_str(),
             "thread_id": msg.thread_id,
             "message_id": msg.message_id,
-            "timestamp": timestamp,
+            "timestamp": time::format(at),
             "recipients": recipients,
         },
     });
@@ -333,6 +332,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use mailbox::test_fixtures::at;
     use mailbox::{AttachmentMeta, Direction, ThreadSnapshot, test_fixtures};
     use mailbox::{MessageId, ThreadId};
 
@@ -362,12 +362,12 @@ mod tests {
             labels: vec!["received".to_owned(), "unread".to_owned()],
             senders: vec!["sender@example.com".to_owned()],
             recipients: vec!["support@example.com".to_owned()],
-            timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
-            created_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+            timestamp: at("2026-01-15T09:30:00.000Z"),
+            created_at: at("2026-01-15T09:30:00.000Z"),
+            updated_at: at("2026-01-15T09:30:00.000Z"),
             last_message_id: MessageId::new("mid-1"),
             size: 1234,
-            received_timestamp: Some("2026-01-15T09:30:00.000Z".to_owned()),
+            received_timestamp: Some(at("2026-01-15T09:30:00.000Z")),
             sent_timestamp: None,
             attachments: Vec::new(),
         }
@@ -390,7 +390,7 @@ mod tests {
         msg.cc = vec!["b@example.net".to_owned()];
         msg.bcc = vec!["c@example.net".to_owned()];
         msg.thread_snapshot = None;
-        msg.sent_at = Some("2026-01-15T09:45:00.000Z".to_owned());
+        msg.sent_at = Some(at("2026-01-15T09:45:00.000Z"));
         msg
     }
 

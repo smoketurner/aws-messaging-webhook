@@ -13,6 +13,7 @@
 // doesn't extend to code outside that crate).
 #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
+use mailbox::test_fixtures::at;
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeMap;
 
@@ -46,7 +47,7 @@ fn sample_message() -> MailMessage {
         rfc_message_id: "<mid-1@example.com>".to_owned(),
         in_reply_to: None,
         labels: vec!["received".to_owned(), "unread".to_owned()],
-        timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
+        timestamp: at("2026-01-15T09:30:00.000Z"),
         from: "sender@example.com".to_owned(),
         to: vec!["support@example.com".to_owned()],
         cc: Vec::new(),
@@ -65,12 +66,12 @@ fn sample_message() -> MailMessage {
             labels: vec!["received".to_owned(), "unread".to_owned()],
             senders: vec!["sender@example.com".to_owned()],
             recipients: vec!["support@example.com".to_owned()],
-            timestamp: "2026-01-15T09:30:00.000Z".to_owned(),
-            created_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+            timestamp: at("2026-01-15T09:30:00.000Z"),
+            created_at: at("2026-01-15T09:30:00.000Z"),
+            updated_at: at("2026-01-15T09:30:00.000Z"),
             last_message_id: MessageId::new("mid-1"),
             size: 1234,
-            received_timestamp: Some("2026-01-15T09:30:00.000Z".to_owned()),
+            received_timestamp: Some(at("2026-01-15T09:30:00.000Z")),
             sent_timestamp: None,
             attachments: Vec::new(),
         }),
@@ -78,8 +79,8 @@ fn sample_message() -> MailMessage {
         send_status: None,
         sent_at: None,
         version: 1,
-        created_at: "2026-01-15T09:30:00.000Z".to_owned(),
-        updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+        created_at: at("2026-01-15T09:30:00.000Z"),
+        updated_at: at("2026-01-15T09:30:00.000Z"),
         expires_at: 0,
     }
 }
@@ -211,12 +212,12 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
             "sender@example.com".to_owned(),
         ],
         recipients: vec!["support@example.com".to_owned()],
-        timestamp: "2026-01-15T09:31:00.000Z".to_owned(),
-        created_at: "2026-01-15T09:30:00.000Z".to_owned(),
-        updated_at: "2026-01-15T09:31:00.000Z".to_owned(),
+        timestamp: at("2026-01-15T09:31:00.000Z"),
+        created_at: at("2026-01-15T09:30:00.000Z"),
+        updated_at: at("2026-01-15T09:31:00.000Z"),
         last_message_id: MessageId::new("mid-2"),
         size: 2468,
-        received_timestamp: Some("2026-01-15T09:31:00.000Z".to_owned()),
+        received_timestamp: Some(at("2026-01-15T09:31:00.000Z")),
         sent_timestamp: None,
         attachments: Vec::new(),
     });

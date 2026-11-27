@@ -318,7 +318,7 @@ fn mail_record(event_name: &str, new_image: &Value, old_image: Option<&Value>) -
 /// A received message with every optional field populated, so the check
 /// covers each one's shape.
 fn received_message(labels: &[&str]) -> MailMessage {
-    let now = "2026-01-15T09:30:00.000Z".to_owned();
+    let now = mailbox::test_fixtures::at("2026-01-15T09:30:00.000Z");
     let mut msg = MailMessage {
         inbox_id: InboxId::new(TEST_INBOX),
         thread_id: ThreadId::new("tid-1"),
@@ -328,7 +328,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
         rfc_message_id: "<orig-1@example.net>".to_owned(),
         in_reply_to: Some("<earlier@example.net>".to_owned()),
         labels: labels.iter().map(|label| (*label).to_owned()).collect(),
-        timestamp: now.clone(),
+        timestamp: now,
         from: "Sender <sender@example.net>".to_owned(),
         to: vec![TEST_INBOX.to_owned()],
         cc: vec!["cc@example.net".to_owned()],
@@ -352,7 +352,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
         send_status: None,
         sent_at: None,
         version: 1,
-        created_at: now.clone(),
+        created_at: now,
         updated_at: now,
         expires_at: 0,
     };

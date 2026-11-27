@@ -42,8 +42,8 @@ impl Ingress {
 }
 
 /// Entry point for both ingress pathways; input is already allowlisted and
-/// signature-verified. `at` is when the delivery arrived, taken from the
-/// Lambda event that carried it.
+/// signature-verified. `request_at` is when the Function URL received the
+/// delivery; a direct invoke has none, and is dated by the envelope instead.
 ///
 /// # Errors
 ///
@@ -54,7 +54,7 @@ pub(crate) async fn handle_sns<B: Backend>(
     ingress: Ingress,
     verified: VerifiedSns,
     deadline: tokio::time::Instant,
-    at: Timestamp,
+    request_at: Option<Timestamp>,
 ) -> Result<Response, AppError> {
     match verified.envelope.message_type {
         MessageType::SubscriptionConfirmation => {
@@ -64,7 +64,7 @@ pub(crate) async fn handle_sns<B: Backend>(
             handle_unsubscribe(state, ingress, &verified.envelope).await
         }
         MessageType::Notification => {
-            process_notification(state, ingress, &verified, deadline, at).await
+            process_notification(state, ingress, &verified, deadline, request_at).await
         }
     }
 }
@@ -161,9 +161,17 @@ async fn process_notification<B: Backend>(
     ingress: Ingress,
     verified: &VerifiedSns,
     deadline: tokio::time::Instant,
-    at: Timestamp,
+    request_at: Option<Timestamp>,
 ) -> Result<Response, AppError> {
     let envelope = &verified.envelope;
+    // The one place the envelope's `Timestamp` becomes an instant. It dates
+    // a direct delivery, and is the inbound message id's third time source
+    // (after `mail.timestamp`/`receipt.timestamp`): content, where a request
+    // time differs on every HTTPS redelivery.
+    let envelope_at = mailbox::time::parse_rfc3339(&envelope.timestamp);
+    let at = request_at
+        .or(envelope_at)
+        .ok_or(AppError::InvalidTimestamp)?;
     let event = DomainEvent::classify(&envelope.message);
     // SES sends this whenever a receipt rule changes. It is not mail, so it is
     // acknowledged without being persisted, ingested or published.
@@ -220,11 +228,6 @@ async fn process_notification<B: Backend>(
     // if a prior attempt persisted but died before acting. Publishing the event
     // to EventBridge is the stream relay's job (see `crate::stream`), not the
     // request path's: the persisted item is the outbox entry.
-    // The verified envelope's own `Timestamp` is the inbound message id's
-    // third time source (after `mail.timestamp`/`receipt.timestamp`). It is
-    // content, where `at` on the HTTPS pathway is the delivery attempt's
-    // time, so a redelivery computes the same deterministic id.
-    let envelope_at = mailbox::time::parse(&envelope.timestamp);
     let action = match actions::run(state, &event, deadline, at, envelope_at).await {
         Ok(action) => action,
         Err(error) => match error.kind {

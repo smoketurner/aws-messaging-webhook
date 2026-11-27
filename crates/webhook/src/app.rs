@@ -63,7 +63,7 @@ pub fn app<B: Backend>(state: Arc<AppState<B>>) -> Router {
                       Deadline(deadline): Deadline,
                       RequestTime(at): RequestTime,
                       verified: VerifiedSns| async move {
-                    handle_sns(&state, Ingress::Http(source), verified, deadline, at).await
+                    handle_sns(&state, Ingress::Http(source), verified, deadline, Some(at)).await
                 },
             ),
         );

@@ -247,10 +247,9 @@ async fn apply_delivery_label<B: Backend>(
         return Ok(false);
     };
 
-    let now = mailbox::time::format(at);
     state
         .mailbox
-        .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
+        .update_labels(&inbox, &message_id, &[label.to_label()], &[], at)
         .await
         .map_err(ActionError::from)?;
 

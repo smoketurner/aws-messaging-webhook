@@ -4,6 +4,7 @@
 
 use axum::http::{Method, StatusCode};
 use mailbox::AttachmentMeta;
+use mailbox::test_fixtures::at;
 use mailbox::time::Timestamp;
 use mailbox::{ids, time};
 use mailbox_store::sample_message;
@@ -33,7 +34,7 @@ async fn seed_in(h: Harness, adjust: impl FnOnce(&mut mailbox::MailMessage)) -> 
     let ms = time::parse(TEST_AT).unwrap();
     let id = ids::inbound_message_id("ses-1", ms).to_string();
     let mut msg = sample_message(TEST_INBOX, &id, "t1");
-    TEST_AT.clone_into(&mut msg.timestamp);
+    msg.timestamp = at(TEST_AT);
     adjust(&mut msg);
     h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
     (h, id)

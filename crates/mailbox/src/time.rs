@@ -17,7 +17,14 @@ pub use jiff::Timestamp;
 /// wider type would let a huge value wrap to a near-zero TTL.
 #[must_use]
 pub fn expires_at(at: Timestamp, retention_days: u32) -> u64 {
-    unix_ms(at) / 1_000 + u64::from(retention_days) * 86_400
+    unix_seconds(at) + u64::from(retention_days) * 86_400
+}
+
+/// `at` as whole seconds since the Unix epoch, the unit of a DynamoDB TTL.
+/// An instant before the epoch clamps to zero.
+#[must_use]
+pub fn unix_seconds(at: Timestamp) -> u64 {
+    u64::try_from(at.as_second()).unwrap_or(0)
 }
 
 /// `at` as milliseconds since the Unix epoch, the resolution ids and sort
@@ -51,10 +58,84 @@ pub fn parse(s: &str) -> Option<Timestamp> {
 
 /// Parses any RFC 3339 timestamp, as AWS writes them in the events it
 /// delivers (an SNS envelope's `Timestamp`, a scheduled event's `time`),
-/// where the number of fraction digits varies by service.
+/// where the number of fraction digits varies by service. Anything finer
+/// than a millisecond is dropped: see [`to_millis`].
 #[must_use]
 pub fn parse_rfc3339(s: &str) -> Option<Timestamp> {
-    s.parse().ok()
+    s.parse().ok().map(to_millis)
+}
+
+/// `at` with anything finer than a millisecond dropped. Every instant enters
+/// the program through this, so one that has been stored and read back
+/// equals the one that was written.
+#[must_use]
+pub fn to_millis(at: Timestamp) -> Timestamp {
+    Timestamp::from_millisecond(at.as_millisecond()).unwrap_or(at)
+}
+
+/// Serde for an instant stored or sent as a string: `#[serde(with =
+/// "time::fixed")]`. This is the one place an instant becomes text or text
+/// an instant; between a read and a write it stays a [`Timestamp`].
+///
+/// Writes [`format`]'s fixed-width shape, which sort keys and clients rely
+/// on. Reads any RFC 3339 timestamp, so an item written by something less
+/// strict still loads.
+pub mod fixed {
+    use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+    use super::Timestamp;
+
+    /// # Errors
+    ///
+    /// Only what the serializer itself returns.
+    pub fn serialize<S: Serializer>(at: &Timestamp, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&super::format(*at))
+    }
+
+    /// # Errors
+    ///
+    /// When the value is not a string holding an RFC 3339 timestamp.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        super::parse_rfc3339(&text)
+            .ok_or_else(|| D::Error::custom(format_args!("not an RFC 3339 timestamp: {text}")))
+    }
+
+    /// The same for an optional instant: `#[serde(default, skip_serializing_if
+    /// = "Option::is_none", with = "time::fixed::option")]`.
+    pub mod option {
+        use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+        use super::super::Timestamp;
+
+        /// # Errors
+        ///
+        /// Only what the serializer itself returns.
+        pub fn serialize<S: Serializer>(
+            at: &Option<Timestamp>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match at {
+                Some(at) => serializer.serialize_some(&super::super::format(*at)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        /// # Errors
+        ///
+        /// When the value is neither null nor an RFC 3339 timestamp.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Timestamp>, D::Error> {
+            Option::<String>::deserialize(deserializer)?
+                .map(|text| {
+                    super::super::parse_rfc3339(&text).ok_or_else(|| {
+                        D::Error::custom(format_args!("not an RFC 3339 timestamp: {text}"))
+                    })
+                })
+                .transpose()
+        }
+    }
 }
 
 #[cfg(test)]

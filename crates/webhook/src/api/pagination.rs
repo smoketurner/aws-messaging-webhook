@@ -266,15 +266,9 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// emits and the whole-second form clients commonly send. Any other shape is
 /// rejected, an offset other than `Z` included.
 fn parse_instant(value: &str) -> Option<Timestamp> {
-    if let Some(at) = time::parse(value) {
-        return Some(at);
-    }
-    // `YYYY-MM-DDTHH:MM:SSZ` — the same shape without the fraction.
-    let seconds = value.strip_suffix('Z')?;
-    if seconds.len() != 19 {
-        return None;
-    }
-    time::parse(&format!("{seconds}.000Z"))
+    // `YYYY-MM-DDTHH:MM:SS.sssZ` or `YYYY-MM-DDTHH:MM:SSZ`.
+    let shaped = matches!(value.len(), 20 | 24) && value.ends_with('Z') && !value.contains(' ');
+    shaped.then(|| time::parse_rfc3339(value)).flatten()
 }
 
 #[cfg(test)]

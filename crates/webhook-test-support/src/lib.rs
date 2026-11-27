@@ -26,6 +26,7 @@ pub mod api;
 pub mod api_keys;
 pub mod objects;
 
+use mailbox::test_fixtures::at;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -548,7 +549,7 @@ pub async fn grant_api_access(h: &Harness) {
     h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
     h.state
         .mailbox
-        .ensure_inbox(&InboxId::new(TEST_INBOX), TEST_INBOX_CREATED_AT)
+        .ensure_inbox(&InboxId::new(TEST_INBOX), at(TEST_INBOX_CREATED_AT))
         .await
         .unwrap();
 }

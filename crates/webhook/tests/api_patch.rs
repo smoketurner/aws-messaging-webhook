@@ -5,6 +5,7 @@
 
 use axum::http::{Method, StatusCode};
 use mailbox::MessageId;
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, ids, time};
 use mailbox_store::sample_message;
 use serde_json::{Value, json};
@@ -31,9 +32,9 @@ async fn seeded(thread: &str, count: usize) -> (Harness, Vec<String>) {
         let ms = time::parse(&at).unwrap();
         let id = ids::inbound_message_id(&format!("ses-{at}"), ms).to_string();
         let mut msg = sample_message(TEST_INBOX, &id, thread);
-        msg.timestamp.clone_from(&at);
-        msg.created_at.clone_from(&at);
-        msg.updated_at.clone_from(&at);
+        msg.timestamp = ms;
+        msg.created_at = ms;
+        msg.updated_at = ms;
         h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
         ids.push(id);
     }
@@ -110,9 +111,9 @@ async fn relabelling_does_not_move_the_thread_in_the_list() {
     let ms = time::parse(at).unwrap();
     let id = ids::inbound_message_id("ses-later", ms).to_string();
     let mut msg = sample_message(TEST_INBOX, &id, "t2");
-    msg.timestamp = at.to_owned();
-    msg.created_at = at.to_owned();
-    msg.updated_at = at.to_owned();
+    msg.timestamp = ms;
+    msg.created_at = ms;
+    msg.updated_at = ms;
     h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 
     patch(&h, &ids[0], json!({"add_labels": ["urgent"]})).await;
@@ -170,7 +171,7 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
             &MessageId::new(ids[0].as_str()),
             &["bounced".to_owned()],
             &[],
-            "2026-01-02T00:00:00.000Z",
+            at("2026-01-02T00:00:00.000Z"),
         )
         .await
         .unwrap()

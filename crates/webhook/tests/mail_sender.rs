@@ -15,6 +15,7 @@ use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mailbox::send::{SendFailure, SendState, SendStatus};
+use mailbox::test_fixtures::at;
 use mailbox::time::Timestamp;
 use mailbox::{InboxId, ids, time};
 use mailbox::{MessageId, SesMessageId, ThreadId};
@@ -554,25 +555,22 @@ async fn the_sweep_judges_a_claim_against_the_time_it_is_given() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2026-01-01T00:00:00.000Z",
+            at("2026-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
 
-    let fourteen_minutes_on = time::parse("2026-01-01T00:14:00.000Z").unwrap();
+    let fourteen_minutes_on = at("2026-01-01T00:14:00.000Z");
     let report = sweep(&h.state, fourteen_minutes_on).await.unwrap();
     assert_eq!(report.still_working, 1);
     assert_eq!(report.released, 0);
 
-    let sixteen_minutes_on = time::parse("2026-01-01T00:16:00.000Z").unwrap();
+    let sixteen_minutes_on = at("2026-01-01T00:16:00.000Z");
     let report = sweep(&h.state, sixteen_minutes_on).await.unwrap();
     assert_eq!(report.released, 1);
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Queued);
-    assert_eq!(
-        state.requeued_at.as_deref(),
-        Some("2026-01-01T00:16:00.000Z")
-    );
+    assert_eq!(state.requeued_at, Some(at("2026-01-01T00:16:00.000Z")));
 }
 
 #[tokio::test]
@@ -584,14 +582,14 @@ async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap()
         .unwrap();
     h.state
         .mailbox
-        .note_ses_call(&claimed, "2020-01-01T00:00:01.000Z")
+        .note_ses_call(&claimed, at("2020-01-01T00:00:01.000Z"))
         .await
         .unwrap()
         .unwrap();
@@ -614,7 +612,7 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
@@ -843,7 +841,7 @@ async fn the_sweep_releases_a_claim_whose_sender_died() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
@@ -875,7 +873,7 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
@@ -925,7 +923,7 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
@@ -945,7 +943,7 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
@@ -964,10 +962,9 @@ async fn the_sweep_leaves_a_recent_claim_alone() {
     // message gets sent twice.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    let now = mailbox::time::format(Timestamp::now());
     h.state
         .mailbox
-        .claim_send(&MessageId::new(message_id.as_str()), &now)
+        .claim_send(&MessageId::new(message_id.as_str()), Timestamp::now())
         .await
         .unwrap();
 
@@ -1297,7 +1294,7 @@ async fn a_send_the_sweep_abandons_clears_its_outbox() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
@@ -1321,7 +1318,7 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
@@ -1353,14 +1350,14 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap()
         .expect("the send was queued, so the claim wins");
     h.state
         .mailbox
-        .note_ses_call(&claimed, "2020-01-01T00:00:00.000Z")
+        .note_ses_call(&claimed, at("2020-01-01T00:00:00.000Z"))
         .await
         .unwrap();
     let report = sweep(&h.state, Timestamp::now()).await.unwrap();

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use mailbox::InboxId;
 use mailbox::send::SendStatus;
+use mailbox::time::{self, Timestamp};
 
 /// A mail-table item's primary key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -147,8 +148,9 @@ pub fn thread_messages_partition(
 /// A thread's `ByTime` sort key: last activity, then id, so a thread list
 /// orders by most recent activity.
 #[must_use]
-pub fn thread_time_sort(timestamp: &str, thread_id: &(impl AsRef<str> + ?Sized)) -> String {
+pub fn thread_time_sort(timestamp: Timestamp, thread_id: &(impl AsRef<str> + ?Sized)) -> String {
     let thread_id = thread_id.as_ref();
+    let timestamp = time::format(timestamp);
     format!("{timestamp}#{thread_id}")
 }
 
@@ -240,6 +242,7 @@ pub fn decode_page_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailbox::test_fixtures::at;
     use proptest::prelude::*;
 
     fn key(pk: &str, sk: &str) -> TableKey {
@@ -290,7 +293,7 @@ mod tests {
             "THREAD#support@example.com#tid-1"
         );
         assert_eq!(
-            thread_time_sort("2026-01-01T00:00:00.000Z", "tid-1"),
+            thread_time_sort(at("2026-01-01T00:00:00.000Z"), "tid-1"),
             "2026-01-01T00:00:00.000Z#tid-1"
         );
         for (status, partition) in [

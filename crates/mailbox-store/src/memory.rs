@@ -25,6 +25,7 @@ use crate::store::{MailStoreError, Page};
 use crate::table::{PageQuery, Read, Table, TxnOutcome};
 use crate::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use mailbox::send::SendKey;
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, MailMessage, MessageId, PutOutcome, ThreadId};
 use serde_dynamo::{AttributeValue, Item};
 
@@ -91,7 +92,7 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         rfc_message_id: format!("<{message_id}@example.com>"),
         in_reply_to: None,
         labels: vec!["received".to_owned(), "unread".to_owned()],
-        timestamp: "00000001-0000".to_owned(),
+        timestamp: at("2026-01-01T00:00:01.000Z"),
         from: "sender@example.com".to_owned(),
         to: vec![format!("{inbox}@example.com")],
         cc: Vec::new(),
@@ -107,8 +108,8 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         send_status: None,
         sent_at: None,
         version: 0,
-        created_at: "2026-01-01T00:00:00.000Z".to_owned(),
-        updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        created_at: at("2026-01-01T00:00:00.000Z"),
+        updated_at: at("2026-01-01T00:00:00.000Z"),
         expires_at: 0,
     }
 }
@@ -574,7 +575,7 @@ mod tests {
         let store = MailMemoryStore::default();
         let inbox = InboxId::new("support@example.com");
         let created = Mailbox::new(&store)
-            .ensure_inbox(&inbox, "2026-01-01T00:00:00.000Z")
+            .ensure_inbox(&inbox, at("2026-01-01T00:00:00.000Z"))
             .await
             .unwrap();
         assert_eq!(created.inbox_id, inbox);
@@ -588,7 +589,7 @@ mod tests {
         assert_eq!(fetched.created_at, created.created_at);
 
         let ensured_again = Mailbox::new(&store)
-            .ensure_inbox(&inbox, "2026-01-02T00:00:00.000Z")
+            .ensure_inbox(&inbox, at("2026-01-02T00:00:00.000Z"))
             .await
             .unwrap();
         assert_eq!(ensured_again.created_at, created.created_at);
@@ -822,7 +823,7 @@ mod tests {
                 ..Envelope::default()
             },
             None,
-            "2026-01-01T00:00:00.000Z",
+            at("2026-01-01T00:00:00.000Z"),
         );
         Mailbox::new(&store)
             .enqueue_send(&msg, &state, None, 1_800_000_000)
@@ -842,7 +843,7 @@ mod tests {
 
         // Another sender claims it, moving the version on.
         Mailbox::new(&store)
-            .claim_send(&MessageId::new("mid-1"), "2026-01-01T00:00:01.000Z")
+            .claim_send(&MessageId::new("mid-1"), at("2026-01-01T00:00:01.000Z"))
             .await
             .unwrap()
             .unwrap();
@@ -855,7 +856,7 @@ mod tests {
                     message_id: "ses-1",
                     region: "us-east-1",
                 }),
-                "2026-01-01T00:00:02.000Z",
+                at("2026-01-01T00:00:02.000Z"),
             )
             .await
             .unwrap_err();
@@ -890,7 +891,7 @@ mod tests {
                 &MessageId::new("mid-1"),
                 &["unread".to_owned()],
                 &["spam".to_owned()],
-                "2026-01-01T00:00:05.000Z",
+                at("2026-01-01T00:00:05.000Z"),
             )
             .await
             .unwrap()
@@ -990,7 +991,7 @@ mod tests {
             thread_id: ThreadId::new("tid-1"),
             request_hash: "abc".to_owned(),
             route: "send".to_owned(),
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            created_at: at("2026-01-01T00:00:00.000Z"),
             expires_at: 1, // expired in the past
         };
         store.seed_send_key(&key);

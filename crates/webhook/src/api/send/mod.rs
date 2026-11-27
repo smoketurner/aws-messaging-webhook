@@ -111,15 +111,14 @@ async fn enqueue<B: Backend>(
         return Ok(Json(replayed));
     }
 
-    let now = time::format(at);
-    let now_epoch = time::unix_ms(at) / 1_000;
+    let now_epoch = time::unix_seconds(at);
     let uuid = ids::outbound_message_id();
     let message_id = MessageId::from(uuid);
     // A reply joins the original's thread; anything else starts its own.
     let thread_id =
         original.map_or_else(|| ThreadId::from(&message_id), |(o, _)| o.thread_id.clone());
 
-    let mut spec = build_spec(&inbox, &validated, uuid, &thread_id, &now);
+    let mut spec = build_spec(&inbox, &validated, uuid, &thread_id, at);
     if let Some((original, original_content)) = original {
         spec.in_reply_to = Some(original.rfc_message_id.clone());
         spec.references = threading_references(original, &original_content.references);
@@ -155,9 +154,9 @@ async fn enqueue<B: Backend>(
             bcc: validated.bcc.clone(),
         },
         key_hash.as_ref().map(|hash| keys::send_key_pk(hash)),
-        &now,
+        at,
     );
-    let mut message = queued_message(&inbox, &validated, &spec, &now);
+    let mut message = queued_message(&inbox, &validated, &spec, at);
     message.expires_at = time::expires_at(at, config.retention_days);
     let key = key_hash.map(|hash| SendKey {
         key_hash: hash,
@@ -166,7 +165,7 @@ async fn enqueue<B: Backend>(
         thread_id: thread_id.clone(),
         request_hash: request_hash.clone(),
         route: route.to_owned(),
-        created_at: now.clone(),
+        created_at: at,
         expires_at: now_epoch + KEY_TTL_SECONDS,
     });
 

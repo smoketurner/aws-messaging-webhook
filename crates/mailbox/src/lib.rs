@@ -27,6 +27,7 @@ pub mod wire;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures;
 
+use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -215,8 +216,10 @@ pub struct Inbox {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
 }
 
 /// A first-writer-wins RFC alias hit: the thread the alias points to, and
@@ -266,18 +269,23 @@ pub struct ThreadSnapshot {
     pub senders: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipients: Vec<String>,
-    pub timestamp: String,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
     // Defaulted so a snapshot stored before these fields existed still reads.
     #[serde(default)]
     pub last_message_id: MessageId,
     #[serde(default)]
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub received_timestamp: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub received_timestamp: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sent_timestamp: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub sent_timestamp: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentMeta>,
 }
@@ -307,7 +315,8 @@ pub struct MailMessage {
     )]
     pub labels: Vec<String>,
     /// Fixed-width (`mail::time::format`).
-    pub timestamp: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
     pub from: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
@@ -338,12 +347,15 @@ pub struct MailMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_status: Option<crate::send::SendStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sent_at: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub sent_at: Option<Timestamp>,
 
     // Bookkeeping.
     pub version: u64,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
     /// DynamoDB TTL (epoch seconds), matching the mail bucket's lifecycle
     /// expiry so the item and its S3 objects age out together.
     pub expires_at: u64,

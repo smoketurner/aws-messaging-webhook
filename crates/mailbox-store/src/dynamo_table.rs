@@ -591,6 +591,7 @@ mod tests {
     use super::*;
     use crate::keys;
     use crate::mailbox::Mailbox;
+    use mailbox::test_fixtures::at;
     use mailbox::{Inbox, InboxId};
     use mailbox::{MessageId, SesMessageId, ThreadId};
 
@@ -827,7 +828,7 @@ mod tests {
                 &MessageId::new("mid-1"),
                 &[],
                 &[],
-                "2026-01-01T00:00:00.000Z",
+                at("2026-01-01T00:00:00.000Z"),
             )
             .await;
 

@@ -27,10 +27,10 @@ use lambda_http::request::RequestContext;
 use mailbox::time::{self, Timestamp};
 use serde_json::Value;
 
-/// The current time, read from the clock. See the module docs for when that
+/// The current time, read from the clock, to the millisecond. See the module docs for when that
 /// is the right source; everywhere else, take the event's time.
 pub(crate) fn now() -> Timestamp {
-    Timestamp::now()
+    time::to_millis(Timestamp::now())
 }
 
 /// When the Function URL received the request being served: its

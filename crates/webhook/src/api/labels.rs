@@ -19,7 +19,7 @@ use crate::api::json::{ApiJson, OneOrMany};
 use crate::clock::RequestTime;
 use crate::state::{AppState, Backend};
 use mailbox::MessageId;
-use mailbox::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, time, wire};
+use mailbox::{InboxId, LABEL_MAX_BYTES, MESSAGE_USER_LABEL_CAP, labels, wire};
 
 /// One label or a list of them.
 type Labels = OneOrMany<String>;
@@ -132,10 +132,9 @@ pub(crate) async fn update_labels<B: Backend>(
         return Err(ApiError::Validation(errors));
     }
 
-    let now = time::format(at);
     let labels = state
         .mailbox
-        .update_labels(&inbox, &message_id, &add, &remove, &now)
+        .update_labels(&inbox, &message_id, &add, &remove, at)
         .await?
         .ok_or(ApiError::NotFound)?;
 

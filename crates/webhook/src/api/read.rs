@@ -26,7 +26,7 @@ use crate::state::{AppState, Backend};
 use mailbox::thread::ThreadState;
 use mailbox::time::Timestamp;
 use mailbox::wire;
-use mailbox::{InboxId, MailMessage, time};
+use mailbox::{InboxId, MailMessage};
 use mailbox::{MessageId, ThreadId};
 use mailbox_store::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
 use mailbox_store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
@@ -326,8 +326,8 @@ fn download_ttl(config: &Config) -> Duration {
 /// When the URL just issued stops working: the request's time plus `ttl`.
 /// The URL is signed moments after the request arrived, so it outlives this
 /// by that much and never falls short of it.
-fn expires_at(at: Timestamp, ttl: Duration) -> String {
-    time::format(at.saturating_add(ttl).unwrap_or(Timestamp::MAX))
+fn expires_at(at: Timestamp, ttl: Duration) -> Timestamp {
+    at.saturating_add(ttl).unwrap_or(Timestamp::MAX)
 }
 
 /// `GET /v0/inboxes/{inbox_id}/threads`
@@ -362,7 +362,7 @@ pub(crate) async fn list_threads<B: Backend>(
             let TableKey { pk, sk } = keys::thread(&thread.inbox_id, &thread.thread_id);
             PageKey {
                 partition: keys::threads_partition(&thread.inbox_id),
-                sort: keys::thread_time_sort(&thread.timestamp, &thread.thread_id),
+                sort: keys::thread_time_sort(thread.timestamp, &thread.thread_id),
                 table_pk: pk,
                 table_sk: sk,
             }

@@ -9,6 +9,7 @@
 //! caller from consistent reads; this module only turns that data into
 //! `WriteOp`s.
 
+use mailbox::time::{self, Timestamp};
 use serde_dynamo::AttributeValue;
 
 use crate::keys::{self, TableKey};
@@ -191,7 +192,7 @@ impl Keyed for ThreadState {
             ),
             (
                 "gsi1sk",
-                AttributeValue::S(keys::thread_time_sort(&self.timestamp, &self.thread_id)),
+                AttributeValue::S(keys::thread_time_sort(self.timestamp, &self.thread_id)),
             ),
         ]
     }
@@ -346,7 +347,7 @@ impl Txn {
         &mut self,
         msg: &MailMessage,
         new_labels: &[String],
-        now: &str,
+        now: Timestamp,
         extra: Vec<(String, AttributeValue)>,
     ) {
         let mut set = vec![
@@ -354,7 +355,10 @@ impl Txn {
                 "version".to_owned(),
                 AttributeValue::N((msg.version + 1).to_string()),
             ),
-            ("updated_at".to_owned(), AttributeValue::S(now.to_owned())),
+            (
+                "updated_at".to_owned(),
+                AttributeValue::S(time::format(now)),
+            ),
         ];
         let mut remove = Vec::new();
         if new_labels.is_empty() {
@@ -384,15 +388,15 @@ impl Txn {
 /// Propagates a serialization failure as [`MailStoreError::Permanent`].
 pub(crate) fn inbox_item(
     inbox: &InboxId,
-    now: &str,
+    now: Timestamp,
 ) -> Result<(Inbox, serde_dynamo::Item), MailStoreError> {
     let record = Inbox {
         inbox_id: inbox.clone(),
         email: inbox.as_str().to_owned(),
         display_name: None,
         metadata: None,
-        created_at: now.to_owned(),
-        updated_at: now.to_owned(),
+        created_at: now,
+        updated_at: now,
     };
     let item = to_item(&record)?;
     Ok((record, item))
@@ -547,7 +551,7 @@ pub(crate) fn plan_mark(
     new_labels: &[String],
     thread: Option<(&ThreadState, &ThreadState)>,
     ses: Option<SesSent<'_>>,
-    now: &str,
+    now: Timestamp,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
     debug_assert!(
         is_sorted_and_deduped(new_labels),
@@ -566,7 +570,7 @@ pub(crate) fn plan_mark(
             "ses_message_id".to_owned(),
             AttributeValue::S(ses.message_id.to_owned()),
         ));
-        extra.push(("sent_at".to_owned(), AttributeValue::S(now.to_owned())));
+        extra.push(("sent_at".to_owned(), AttributeValue::S(time::format(now))));
     }
     txn.update_message_labels(msg, new_labels, now, extra);
 
@@ -618,7 +622,7 @@ pub(crate) fn plan_patch(
     new_labels: &[String],
     thread_before: &ThreadState,
     thread_after: &ThreadState,
-    now: &str,
+    now: Timestamp,
 ) -> Result<Vec<PlannedOp>, MailStoreError> {
     check_user_labels(new_labels, thread_after)?;
     debug_assert!(
@@ -669,6 +673,7 @@ mod tests {
 
     use super::*;
     use mailbox::ThreadId;
+    use mailbox::test_fixtures::at;
     use mailbox::thread::{apply_message, new_thread};
     use mailbox::{Direction, InboxId, test_fixtures};
 
@@ -680,11 +685,11 @@ mod tests {
             ses_message_id: None,
             rfc_message_id: format!("<{message_id}@example.com>"),
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),
-            timestamp: "00000001-0000".to_owned(),
+            timestamp: at("2026-01-01T00:00:01.000Z"),
             size: 1_000,
             version: 0,
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            created_at: at("2026-01-01T00:00:00.000Z"),
+            updated_at: at("2026-01-01T00:00:00.000Z"),
             ..test_fixtures::message()
         }
     }
@@ -739,8 +744,8 @@ mod tests {
         let mut outbound = msg.clone();
         outbound.direction = Direction::Outbound;
         outbound.labels = vec!["queued".to_owned()];
-        let claimed = queued_state(&outbound, None).claimed("2026-01-01T00:00:01.000Z");
-        let sent = claimed.sent("2026-01-01T00:00:02.000Z");
+        let claimed = queued_state(&outbound, None).claimed(at("2026-01-01T00:00:01.000Z"));
+        let sent = claimed.sent(at("2026-01-01T00:00:02.000Z"));
         let ops = plan_mark(
             &claimed,
             &sent,
@@ -751,7 +756,7 @@ mod tests {
                 message_id: "ses-1",
                 region: "eu-west-1",
             }),
-            "2026-01-01T00:00:02.000Z",
+            at("2026-01-01T00:00:02.000Z"),
         )
         .unwrap();
 
@@ -814,7 +819,7 @@ mod tests {
             "mid-2",
             &["received", "unread"],
         );
-        second.timestamp = "00000002-0000".to_owned();
+        second.timestamp = at("2026-01-01T00:00:02.000Z");
         let after = apply_message(&before, &second);
 
         let ops = plan_insert(&second, Some(&before), &after, &AliasLookup::default()).unwrap();
@@ -835,7 +840,7 @@ mod tests {
                 ..mailbox::send::Envelope::default()
             },
             key_pk.map(ToOwned::to_owned),
-            "2026-01-01T00:00:00.000Z",
+            at("2026-01-01T00:00:00.000Z"),
         )
     }
 
@@ -847,7 +852,7 @@ mod tests {
         let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
         msg.direction = Direction::Outbound;
         let queued = queued_state(&msg, None);
-        let now = "2026-01-01T00:00:10.000Z";
+        let now = at("2026-01-01T00:00:10.000Z");
 
         for (state, indexed) in [
             (queued.clone(), true),
@@ -890,7 +895,7 @@ mod tests {
             thread_id: msg.thread_id.clone(),
             request_hash: "abc".to_owned(),
             route: "send".to_owned(),
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            created_at: at("2026-01-01T00:00:00.000Z"),
             expires_at: 1_800_000_000,
         };
 
@@ -981,12 +986,12 @@ mod tests {
             thread_id: msg.thread_id.clone(),
             request_hash: "abc".to_owned(),
             route: "send".to_owned(),
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            created_at: at("2026-01-01T00:00:00.000Z"),
             expires_at: 1_800_000_000,
         };
         let ops = plan_enqueue(&msg, &state, Some(&key), None, &thread, 1_700_000_000).unwrap();
 
-        let thread_sort = format!("{}#tid-1", thread.timestamp);
+        let thread_sort = format!("{}#tid-1", time::format(thread.timestamp));
         let expected = [
             (
                 OpRole::IdempotencyKey,
@@ -1038,7 +1043,7 @@ mod tests {
 
         let (_, inbox) = inbox_item(
             &InboxId::new("support@example.com"),
-            "2026-01-01T00:00:00.000Z",
+            at("2026-01-01T00:00:00.000Z"),
         )
         .unwrap();
         assert_eq!(
@@ -1089,7 +1094,7 @@ mod tests {
             before.version = 5;
 
             let mut after = before.clone();
-            after.timestamp = "00000002-0000".to_owned();
+            after.timestamp = at("2026-01-01T00:00:02.000Z");
             after.version += 1;
 
             let ops = plan_insert(&msg, Some(&before), &after, &AliasLookup::default()).unwrap();

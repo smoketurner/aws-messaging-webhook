@@ -300,11 +300,7 @@ async fn resolve_recipient<B: Backend>(
         }
     }
 
-    match state
-        .mailbox
-        .ensure_inbox(&inbox_id, &time::format(at))
-        .await
-    {
+    match state.mailbox.ensure_inbox(&inbox_id, at).await {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }
@@ -387,8 +383,8 @@ async fn ingest_into_targets<B: Backend>(
         message_id: message_id.clone(),
         ses_message_id: SesMessageId::new(event.mail.message_id.as_str()),
         labels: verdict_labels(verdict),
-        timestamp: time::format(instants.received),
-        now: time::format(instants.at),
+        timestamp: instants.received,
+        now: instants.at,
         raw_s3_key: key.to_owned(),
         attachments,
         expires_at: state
@@ -472,9 +468,9 @@ struct InboundDraft {
     message_id: MessageId,
     ses_message_id: SesMessageId,
     labels: Vec<String>,
-    /// Fixed-width (`mail::time::format`) receipt time.
-    timestamp: String,
-    now: String,
+    /// When the mail was received.
+    timestamp: Timestamp,
+    now: Timestamp,
     raw_s3_key: String,
     attachments: Vec<AttachmentMeta>,
     expires_at: u64,
@@ -499,7 +495,7 @@ impl InboundDraft {
             rfc_message_id: parsed.rfc_message_id,
             in_reply_to: parsed.in_reply_to,
             labels: self.labels.clone(),
-            timestamp: self.timestamp.clone(),
+            timestamp: self.timestamp,
             from: parsed.from,
             to: parsed.to,
             cc: parsed.cc,
@@ -515,8 +511,8 @@ impl InboundDraft {
             send_status: None,
             sent_at: None,
             version: 0,
-            created_at: self.now.clone(),
-            updated_at: self.now.clone(),
+            created_at: self.now,
+            updated_at: self.now,
             expires_at: self.expires_at,
         }
     }

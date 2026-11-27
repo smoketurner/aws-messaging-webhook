@@ -42,7 +42,6 @@ use serde_json::Value;
 use crate::app::app;
 use crate::clock;
 use crate::config::FunctionMode;
-use crate::error::AppError;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
@@ -228,12 +227,9 @@ async fn process_record<B: Backend>(
         Ok(verified) => verified,
         Err(error) => return error.into_response(),
     };
-    // A direct invoke has no request to time, so the delivery is dated by
-    // the envelope SNS signed.
-    let Some(at) = mailbox::time::parse_rfc3339(&verified.envelope.timestamp) else {
-        return AppError::InvalidTimestamp.into_response();
-    };
-    match handle_sns(state, Ingress::Direct, verified, deadline, at).await {
+    // A direct invoke has no request to time: the envelope SNS signed dates
+    // the delivery.
+    match handle_sns(state, Ingress::Direct, verified, deadline, None).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }

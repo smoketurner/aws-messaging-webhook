@@ -16,6 +16,7 @@
 //! it during a send does not touch the message — so the relay sees at most
 //! one message change per outcome rather than one per attempt.
 
+use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -136,17 +137,20 @@ pub struct SendState {
     /// When the current claim was taken. The sweep uses it to tell a live
     /// send from one whose sender died.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sending_at: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub sending_at: Option<Timestamp>,
     /// When the sender, holding the current claim, was about to call SES.
     /// Written before the call, so a claim that went stale with this set may
     /// already have been sent, and the sweep treats it as `unknown` rather
     /// than sending it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ses_call_at: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub ses_call_at: Option<Timestamp>,
     /// Set by a release to hand the record back for another attempt; its
     /// absent-to-present transition is what re-triggers the sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requeued_at: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub requeued_at: Option<Timestamp>,
     /// Consecutive transient failures, so repeated unavailability eventually
     /// stops rather than looping forever.
     #[serde(default)]
@@ -155,15 +159,18 @@ pub struct SendState {
     /// item: nothing reads it, but a duplicate delivery is exactly the sort
     /// of thing someone later has to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_resend_at: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub operator_resend_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<SendFailure>,
     /// The `SENDKEY#` partition this send was committed under, recorded so
     /// an operator can trace a send back to the request that made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key_pk: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
     /// DynamoDB TTL (epoch seconds), set only once the send has settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
@@ -178,7 +185,7 @@ impl SendState {
         thread_id: ThreadId,
         envelope: Envelope,
         idempotency_key_pk: Option<String>,
-        now: &str,
+        now: Timestamp,
     ) -> Self {
         Self {
             inbox_id,
@@ -194,8 +201,8 @@ impl SendState {
             operator_resend_at: None,
             failure: None,
             idempotency_key_pk,
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
+            created_at: now,
+            updated_at: now,
             expires_at: None,
         }
     }
@@ -225,7 +232,8 @@ pub struct SendKey {
     /// the caller did not ask for.
     pub request_hash: String,
     pub route: String,
-    pub created_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
     pub expires_at: u64,
 }
 
@@ -283,7 +291,8 @@ pub struct SendSpec {
     pub headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<SpecAttachment>,
-    pub created_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
 }
 
 impl SendState {
@@ -293,52 +302,52 @@ impl SendState {
     /// conditioned on the status still being `queued`, so of two senders
     /// looking at the same stream record, exactly one proceeds.
     #[must_use]
-    pub fn claimed(&self, now: &str) -> Self {
+    pub fn claimed(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Sending,
             version: self.version + 1,
-            sending_at: Some(now.to_owned()),
+            sending_at: Some(now),
             ses_call_at: None,
             // Cleared so a later release can set it again and re-trigger the
             // sender through its absent-to-present transition.
             requeued_at: None,
-            updated_at: now.to_owned(),
+            updated_at: now,
             ..self.clone()
         }
     }
 
     /// The state just before the claimed send calls SES.
     #[must_use]
-    pub fn calling_ses(&self, now: &str) -> Self {
+    pub fn calling_ses(&self, now: Timestamp) -> Self {
         Self {
             version: self.version + 1,
-            ses_call_at: Some(now.to_owned()),
-            updated_at: now.to_owned(),
+            ses_call_at: Some(now),
+            updated_at: now,
             ..self.clone()
         }
     }
 
     /// The state after SES accepted the message.
     #[must_use]
-    pub fn sent(&self, now: &str) -> Self {
+    pub fn sent(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Sent,
             version: self.version + 1,
             sending_at: None,
-            updated_at: now.to_owned(),
+            updated_at: now,
             ..self.clone()
         }
     }
 
     /// The state after SES refused the message for good.
     #[must_use]
-    pub fn failed(&self, failure: SendFailure, now: &str) -> Self {
+    pub fn failed(&self, failure: SendFailure, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Failed,
             version: self.version + 1,
             sending_at: None,
             failure: Some(failure),
-            updated_at: now.to_owned(),
+            updated_at: now,
             ..self.clone()
         }
     }
@@ -348,12 +357,12 @@ impl SendState {
     /// Nothing is cleaned up: the outbox objects stay, because an operator
     /// may later decide to resend, and that has to rebuild the same message.
     #[must_use]
-    pub fn unknown(&self, now: &str) -> Self {
+    pub fn unknown(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Unknown,
             version: self.version + 1,
             sending_at: None,
-            updated_at: now.to_owned(),
+            updated_at: now,
             ..self.clone()
         }
     }
@@ -365,31 +374,31 @@ impl SendState {
     /// send and decided, so the attempts that led to `unknown` should not
     /// count against the fresh one.
     #[must_use]
-    pub fn resumed(&self, now: &str) -> Self {
+    pub fn resumed(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Queued,
             version: self.version + 1,
             sending_at: None,
             ses_call_at: None,
-            requeued_at: Some(now.to_owned()),
+            requeued_at: Some(now),
             transient_failures: 0,
-            operator_resend_at: Some(now.to_owned()),
-            updated_at: now.to_owned(),
+            operator_resend_at: Some(now),
+            updated_at: now,
             ..self.clone()
         }
     }
 
     /// The state after handing the record back for another attempt.
     #[must_use]
-    pub fn released(&self, now: &str) -> Self {
+    pub fn released(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Queued,
             version: self.version + 1,
             sending_at: None,
             ses_call_at: None,
-            requeued_at: Some(now.to_owned()),
+            requeued_at: Some(now),
             transient_failures: self.transient_failures + 1,
-            updated_at: now.to_owned(),
+            updated_at: now,
             ..self.clone()
         }
     }
@@ -473,7 +482,7 @@ pub fn mark_transition<'a>(
     state: &SendState,
     msg: &crate::MailMessage,
     outcome: MarkOutcome<'a>,
-    now: &str,
+    now: Timestamp,
 ) -> (SendState, Vec<String>, Option<SesSent<'a>>) {
     let relabel = |remove: SystemLabel, add: SystemLabel| {
         let mut labels: Vec<String> = msg
@@ -580,7 +589,7 @@ mod tests {
                 ..Envelope::default()
             },
             None,
-            "2026-01-01T00:00:00.000Z",
+            crate::test_fixtures::at("2026-01-01T00:00:00.000Z"),
         );
         assert_eq!(state.send_status, SendStatus::Queued);
         assert_eq!(state.version, 0);
@@ -601,7 +610,7 @@ mod tests {
                 bcc: Vec::new(),
             },
             Some("SENDKEY#abc".to_owned()),
-            "2026-01-01T00:00:00.000Z",
+            crate::test_fixtures::at("2026-01-01T00:00:00.000Z"),
         );
         let item: serde_dynamo::Item = serde_dynamo::to_item(&state).unwrap();
         let back: SendState = serde_dynamo::from_item(item).unwrap();
