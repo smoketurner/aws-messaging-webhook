@@ -10,9 +10,10 @@ cargo test -p aws-messaging-webhook --test handlers <name>   # one handler test
 cargo test -p sns-message-verifier <name>                    # one verifier test
 cargo test -p mailbox-store --test mailbox_behaviour <name>  # one store-behaviour test
 cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --all-features   # rustdoc lints (runs in CI)
 cargo fmt --all -- --check
 cargo deny check                                        # advisories/licenses/bans (runs in CI)
-prek run                                                # all pre-commit hooks: fmt, clippy, deny, actionlint, zizmor
+prek run                                                # all pre-commit hooks: fmt, clippy, doc, deny, actionlint, zizmor
 ```
 
 Deploy (needs `cargo-lambda` and the AWS SAM CLI; toolchain pinned in `rust-toolchain.toml`):
@@ -185,8 +186,18 @@ moves inline rather than making the item public.
 
 Workspace `Cargo.toml` pins exact versions (`=x.y.z`) with `default-features = false` on
 everything, listed alphabetically and without commentary; each crate opts into only the
-features it uses. Workspace lints deny `unwrap`/`panic`/etc.; `clippy.toml` relaxes them for
-test code.
+features it uses.
+
+`[workspace.lints]` denies panicking code (`unwrap`/`expect`/`panic`, indexing and string
+slicing, `arithmetic_side_effects`, lossy casts), silently dropped results, and `#[allow]` —
+an opt-out is a narrow `#[expect(lint, reason = "...")]` on the item that needs it. Use
+`saturating_*`/`checked_*` arithmetic and `.get()`/`split_at`/`strip_prefix` rather than
+`expect`ing the lint, and reserve `#[expect]` for code that is provably in range (a JSON
+literal being filled in, say). `clippy.toml` relaxes unwrap, expect, panic and indexing inside
+`#[test]` functions and `#[cfg(test)]` modules; integration-test helpers outside a `#[test]`
+function and `webhook-test-support` opt out per item. The rustdoc link lints run only under
+`cargo doc`, which the `cargo-doc` hook and CI run with warnings denied: a public doc may not
+link to a private item or to another crate's internals.
 
 Items from the workspace's own crates are imported, not spelled inline: `clippy::absolute_paths`
 is denied with `absolute-paths-max-segments = 2`, so `crate::mail::sender::sweep` or
