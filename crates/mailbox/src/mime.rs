@@ -30,11 +30,11 @@ pub struct ParsedAttachment {
     pub content_type: String,
     pub content_disposition: ContentDisposition,
     pub content_id: Option<String>,
-    pub bytes: bytes::Bytes,
+    pub bytes: Bytes,
 }
 
 /// A parsed inbound message, before thread resolution and item assembly:
-/// [`MailMessage`]'s summary fields, the [`MessageContent`] document, and the
+/// [`MailMessage`](crate::MailMessage)'s summary fields, the [`MessageContent`] document, and the
 /// kept attachment parts, which have not yet been written to S3 or given
 /// deterministic ids.
 ///
@@ -114,7 +114,7 @@ pub fn parse_inbound(raw: &[u8]) -> Result<ParsedInbound, ParseError> {
     if references.len() > REFERENCES_MAX {
         // Keep the nearest (last) ids — thread resolution walks References
         // nearest-first.
-        let start = references.len() - REFERENCES_MAX;
+        let start = references.len().saturating_sub(REFERENCES_MAX);
         references = references.split_off(start);
     }
 
@@ -187,7 +187,8 @@ fn truncate_bytes(input: &str, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
         input.to_owned()
     } else {
-        input[..input.floor_char_boundary(max_bytes)].to_owned()
+        let (kept, _) = input.split_at(input.floor_char_boundary(max_bytes));
+        kept.to_owned()
     }
 }
 
@@ -203,7 +204,7 @@ fn truncate_bytes(input: &str, max_bytes: usize) -> String {
 /// control characters (a decoded `=0A`) folded to spaces.
 fn format_addr(addr: &Mailbox<'_>) -> Option<String> {
     let address = addr.address()?;
-    let framing = " <".len() + address.len() + ">".len();
+    let framing = address.len().saturating_add(" <>".len());
     let name = addr
         .name()
         .zip(ADDRESS_MAX_BYTES.checked_sub(framing))
@@ -237,7 +238,12 @@ fn display_name(name: &str, budget: usize) -> Option<String> {
     let mut quoted = String::from("\"");
     for c in name.chars() {
         let escape = matches!(c, '"' | '\\');
-        if quoted.len() + usize::from(escape) + c.len_utf8() + "\"".len() > budget {
+        let needed = quoted
+            .len()
+            .saturating_add(usize::from(escape))
+            .saturating_add(c.len_utf8())
+            .saturating_add("\"".len());
+        if needed > budget {
             break;
         }
         if escape {
@@ -245,7 +251,10 @@ fn display_name(name: &str, budget: usize) -> Option<String> {
         }
         quoted.push(c);
     }
-    (quoted.len() > 1).then(|| quoted + "\"")
+    (quoted.len() > 1).then(|| {
+        quoted.push('"');
+        quoted
+    })
 }
 
 /// Flattens an address header (a plain list, or a group — whose member
@@ -319,7 +328,9 @@ fn collect_headers(message: &MimeMessage<'_>) -> BTreeMap<String, String> {
         let name = truncate_bytes(header.raw_name().trim(), HEADER_NAME_MAX);
         let value = String::from_utf8_lossy(header.raw_value());
         let value = truncate_bytes(value.trim(), HEADER_VALUE_MAX);
-        budget += name.len() + value.len();
+        budget = budget
+            .saturating_add(name.len())
+            .saturating_add(value.len());
         headers.insert(name, value);
     }
     headers
@@ -593,10 +604,10 @@ mod tests {
             "From: alice@example.com\r\nTo: bob@example.com\r\nSubject: many parts\r\nMessage-ID: <many-1@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n",
         );
         for i in 0..150 {
-            let _ = write!(
+            write!(
                 raw,
                 "--b\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"part{i}.bin\"\r\n\r\naGVsbG8=\r\n"
-            );
+            ).unwrap();
         }
         raw.push_str("--b--\r\n");
 

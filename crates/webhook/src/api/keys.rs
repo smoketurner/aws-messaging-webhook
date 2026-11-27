@@ -13,14 +13,14 @@
 //!   exit, so response timing says nothing about how much of a key matched.
 //! - **A miss cannot drive unlimited fetches.** An unauthenticated caller
 //!   presenting junk would otherwise trigger a parameter read per request; a
-//!   miss refreshes at most once per [`MISS_REFRESH_FLOOR`], and the stamp is
+//!   miss refreshes at most once per `MISS_REFRESH_FLOOR`, and the stamp is
 //!   taken *before* the fetch so concurrent misses collapse into one.
 //! - **A cold cache is retryable, not a rejection.** If the cache has never
 //!   loaded and the fetch fails, callers get 503; a valid key must never be
 //!   answered with 401 because the parameter store blinked.
 //! - **An outage cannot drive unlimited scheduled fetches.** A failed refresh
 //!   keeps the last good cache in use but re-arms the scheduled-refresh gate
-//!   for [`FAILURE_BACKOFF`], so a sustained outage yields at most one
+//!   for `FAILURE_BACKOFF`, so a sustained outage yields at most one
 //!   scheduled fetch per window — not one per request — until SSM recovers.
 
 use std::future::Future;
@@ -100,7 +100,7 @@ pub(crate) enum Verdict {
 #[derive(Default)]
 struct CacheState {
     /// `None` until the first successful load.
-    hashes: Option<Arc<Vec<KeyHash>>>,
+    hashes: Option<Arc<[KeyHash]>>,
     /// When the scheduled-refresh gate was last armed: advanced to `now` on a
     /// successful load, or rewound on a failed one so a failing source does not
     /// re-enter `refresh` on every request. `None` until the first successful
@@ -152,7 +152,7 @@ impl KeyCache {
     }
 
     /// Current hashes plus whether the scheduled refresh is due.
-    fn snapshot(&self) -> (Option<Arc<Vec<KeyHash>>>, bool) {
+    fn snapshot(&self) -> (Option<Arc<[KeyHash]>>, bool) {
         let state = self
             .state
             .lock()
@@ -186,13 +186,13 @@ impl KeyCache {
     async fn refresh<S: ApiKeySource>(
         &self,
         source: &S,
-        previous: Option<Arc<Vec<KeyHash>>>,
-    ) -> Option<Arc<Vec<KeyHash>>> {
+        previous: Option<Arc<[KeyHash]>>,
+    ) -> Option<Arc<[KeyHash]>> {
         // The lock is never held across this await (clippy::await_holding_lock).
         let fetched = source.fetch().await;
         match fetched.and_then(|raw| parse_document(&raw)) {
             Ok(keys) => {
-                let keys = Arc::new(keys);
+                let keys: Arc<[KeyHash]> = Arc::from(keys);
                 let mut state = self
                     .state
                     .lock()
@@ -281,7 +281,7 @@ fn decode_hex_digest(hex: &str) -> Option<[u8; 32]> {
     for (slot, [high, low]) in out.iter_mut().zip(pairs) {
         let high = char::from(*high).to_digit(16)?;
         let low = char::from(*low).to_digit(16)?;
-        *slot = u8::try_from(high * 16 + low).ok()?;
+        *slot = u8::try_from(high.checked_mul(16)?.checked_add(low)?).ok()?;
     }
     Some(out)
 }

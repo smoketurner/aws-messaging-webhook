@@ -8,6 +8,8 @@
 //! creating a duplicate. Outbound message ids have no source content to
 //! derive from, so they use the standard random `now_v7()`.
 
+use std::time::Duration;
+
 use sha2::{Digest as _, Sha256};
 use uuid::{Builder, Uuid};
 
@@ -18,9 +20,11 @@ use crate::time::{Timestamp, unix_ms};
 /// a plain `Uuid::now_v7()` would use — this is what makes the id
 /// deterministic in its source content.
 fn deterministic_seed(input: &str) -> [u8; 10] {
-    let digest = Sha256::digest(input.as_bytes());
+    let digest: [u8; 32] = Sha256::digest(input.as_bytes()).into();
     let mut seed = [0u8; 10];
-    seed.copy_from_slice(&digest[..10]);
+    for (slot, byte) in seed.iter_mut().zip(digest) {
+        *slot = byte;
+    }
     seed
 }
 
@@ -60,7 +64,7 @@ pub fn attachment_id(message_id: &Uuid, ordinal: usize) -> String {
     // total rather than panicking on a hypothetical non-v7 input.
     let ts_ms = message_id.get_timestamp().map_or(0, |ts| {
         let (secs, nanos) = ts.to_unix();
-        secs.saturating_mul(1000) + u64::from(nanos) / 1_000_000
+        u64::try_from(Duration::new(secs, nanos).as_millis()).unwrap_or(u64::MAX)
     });
     let seed = deterministic_seed(&format!("att\n{message_id}\n{ordinal}"));
     let uuid = Builder::from_unix_timestamp_millis(ts_ms, &seed).into_uuid();
@@ -182,9 +186,8 @@ mod tests {
     fn attachment_id_has_the_documented_shape() {
         let mid = inbound_message_id("ses-1", at(1_700_000_000_000));
         let id = attachment_id(&mid, 0);
-        assert!(id.starts_with("att_"));
         assert_eq!(id.len(), 36);
-        let hex = &id[4..];
+        let hex = id.strip_prefix("att_").unwrap();
         assert!(
             hex.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
@@ -197,9 +200,9 @@ mod tests {
     fn attachment_id_embeds_the_message_id_timestamp() {
         let mid = inbound_message_id("ses-1", at(1_700_000_000_000));
         let id = attachment_id(&mid, 0);
-        let uuid = Uuid::parse_str(&id[4..]).unwrap();
+        let uuid = Uuid::parse_str(id.strip_prefix("att_").unwrap()).unwrap();
         let (secs, nanos) = uuid.get_timestamp().unwrap().to_unix();
-        let ts_ms = secs * 1000 + u64::from(nanos) / 1_000_000;
+        let ts_ms = Duration::new(secs, nanos).as_millis();
         assert_eq!(ts_ms, 1_700_000_000_000);
     }
 
@@ -286,7 +289,7 @@ mod tests {
         ) {
             let low = base & !0xffff; // clear the low 16 bits so base+delta can't overflow into the high half
             let a = time_prefix(at(low));
-            let b = time_prefix(at(low + delta));
+            let b = time_prefix(at(low | delta));
             prop_assert!(a < b);
         }
 

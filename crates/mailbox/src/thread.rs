@@ -142,6 +142,12 @@ impl AliasLookup {
 
 /// Builds the sorted, deduplicated union of `existing` and `label`,
 /// respecting no cap (the planner checks the user-label caps).
+/// Counts one more. Saturates: a stored count can't realistically reach
+/// `u64::MAX`, and wrapping would make it read as zero.
+fn bump(count: &mut u64) {
+    *count = count.saturating_add(1);
+}
+
 fn add_label(labels: &mut Vec<String>, label: &str) {
     if let Err(index) = labels.binary_search_by(|l| l.as_str().cmp(label)) {
         labels.insert(index, label.to_owned());
@@ -180,7 +186,7 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
     let mut label_counts = BTreeMap::new();
     for label in &msg.labels {
         add_label(&mut labels, label);
-        *label_counts.entry(label.clone()).or_insert(0) += 1;
+        bump(label_counts.entry(label.clone()).or_insert(0));
     }
 
     let attachments: Vec<AttachmentMeta> = msg
@@ -236,11 +242,11 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
 
     for label in &msg.labels {
         add_label(&mut next.labels, label);
-        *next.label_counts.entry(label.clone()).or_insert(0) += 1;
+        bump(next.label_counts.entry(label.clone()).or_insert(0));
     }
 
-    next.message_count += 1;
-    next.size += msg.size;
+    bump(&mut next.message_count);
+    next.size = next.size.saturating_add(msg.size);
     let direction_timestamp = match msg.direction {
         Direction::Inbound => &mut next.received_timestamp,
         Direction::Outbound => &mut next.sent_timestamp,
@@ -264,7 +270,7 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
         next.last_message_id.clone_from(&msg.message_id);
         next.preview.clone_from(&msg.preview);
     }
-    next.version += 1;
+    bump(&mut next.version);
     next.updated_at.clone_from(&msg.updated_at);
     next.expires_at = next.expires_at.max(msg.expires_at);
     next
@@ -289,7 +295,7 @@ pub fn apply_label_patch(
 
     for label in added {
         add_label(&mut next.labels, label);
-        *next.label_counts.entry(label.clone()).or_insert(0) += 1;
+        bump(next.label_counts.entry(label.clone()).or_insert(0));
     }
 
     for label in removed {
@@ -303,14 +309,14 @@ pub fn apply_label_patch(
         }
     }
 
-    next.version += 1;
+    bump(&mut next.version);
     next.updated_at = now;
     next
 }
 
 /// Builds the message-embedded snapshot from the thread's full state,
-/// capping `senders`/`recipients` at [`THREAD_SNAPSHOT_ADDRESS_CAP`] (lower
-/// than the thread's own [`THREAD_ADDRESS_SET_CAP`]).
+/// capping `senders`/`recipients` at `THREAD_SNAPSHOT_ADDRESS_CAP` (lower
+/// than the thread's own `THREAD_ADDRESS_SET_CAP`).
 impl From<&ThreadState> for ThreadSnapshot {
     fn from(thread: &ThreadState) -> Self {
         Self {
@@ -416,7 +422,7 @@ mod tests {
 
     #[test]
     fn candidate_ids_with_no_headers_is_empty() {
-        assert_eq!(candidate_ids(None, &[]), [] as [String; 0]);
+        assert_eq!(candidate_ids(None, &[]), Vec::<String>::new());
     }
 
     #[test]

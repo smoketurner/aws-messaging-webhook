@@ -1,5 +1,5 @@
 //! The normalized EventBridge detail and the trait that publishes it. The
-//! stream relay ([`crate::stream`]) is the sole publisher of event-item
+//! stream relay (`crate::stream`) is the sole publisher of event-item
 //! details; the request path only publishes control-plane notices
 //! (`subscription.changed`).
 
@@ -78,6 +78,10 @@ pub(crate) fn detail_bytes(detail: &Value) -> usize {
 /// from `Config::event_source`). It counts toward the same 256 KiB entry cap
 /// as `Detail` and `DetailType`, so Step 3 reserves it as envelope headroom.
 #[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "assigns into `meta` and `detail`, both built by `json!` object literals here; serde_json's IndexMut panics only on a non-object"
+)]
 pub(crate) fn build_outbound(
     record: &EventRecord,
     event: &DomainEvent,
@@ -169,7 +173,7 @@ pub(crate) fn build_outbound(
     // `source`), or a `detail` in the just-under-the-cap window yields an
     // entry just over it that AWS rejects. `saturating_sub` keeps an absurdly
     // large `source` from underflowing into a huge threshold.
-    let envelope = record.detail_type.len() + event_source.len();
+    let envelope = record.detail_type.len().saturating_add(event_source.len());
     if detail_bytes(&detail) > PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(envelope)
         && let Some(meta) = detail.get_mut("meta").and_then(Value::as_object_mut)
     {
@@ -212,7 +216,9 @@ mod tests {
     /// fields `EventBridgePublisher::publish` always sets on the builder), mirroring the
     /// 256 KiB *entry* cap rather than the `detail`-only size the old tests used.
     fn entry_bytes(detail: &Value, detail_type: &str, source: &str) -> usize {
-        detail_bytes(detail) + detail_type.len() + source.len()
+        detail_bytes(detail)
+            .saturating_add(detail_type.len())
+            .saturating_add(source.len())
     }
 
     fn record(source: Option<Source>, detail_type: &str) -> EventRecord {
@@ -275,7 +281,8 @@ mod tests {
             }
         });
         let overhead = notification.to_string().len();
-        notification["mail"]["commonHeaders"]["subject"] = json!("x".repeat(262_144 - overhead));
+        notification["mail"]["commonHeaders"]["subject"] =
+            json!("x".repeat(262_144_usize.checked_sub(overhead).unwrap()));
         notification.to_string()
     }
 

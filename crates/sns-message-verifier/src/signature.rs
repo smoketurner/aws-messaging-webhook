@@ -1,4 +1,3 @@
-use crate::cert;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rsa::RsaPublicKey;
@@ -10,21 +9,6 @@ use sha2::Sha256;
 use crate::canonical::build_string_to_sign;
 use crate::envelope::SnsEnvelope;
 use crate::error::VerifyError;
-
-/// Verifies an envelope's signature against an already-obtained PEM
-/// certificate, without any network access. The async
-/// [`SnsVerifier`](crate::SnsVerifier) methods are the production surface;
-/// this exists for offline use and tests.
-///
-/// # Errors
-///
-/// Returns [`VerifyError`] if the certificate is unparseable or outside its
-/// validity window, the `SignatureVersion` is unsupported, the signature is
-/// not valid base64, or verification fails.
-pub fn verify_with_cert(envelope: &SnsEnvelope, cert_pem: &[u8]) -> Result<(), VerifyError> {
-    let key = cert::parse_cert_pem(cert_pem)?;
-    verify_with_key(envelope, &key)
-}
 
 pub(crate) fn verify_with_key(
     envelope: &SnsEnvelope,
@@ -50,5 +34,34 @@ pub(crate) fn verify_with_key(
         Ok(())
     } else {
         Err(VerifyError::SignatureMismatch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::verify_with_key;
+    use crate::cert;
+    use crate::envelope::SnsEnvelope;
+    use crate::error::VerifyError;
+    use crate::fixtures::{SnsFixture, notification};
+
+    #[test]
+    fn accepts_a_valid_signature_and_rejects_a_tampered_message() {
+        let fixture = SnsFixture::new();
+        let key = cert::parse_cert_pem(fixture.cert_pem.as_bytes()).unwrap();
+        let mut body = notification("https://sns.us-east-1.amazonaws.com/cert.pem");
+        fixture.sign(&mut body, "2");
+
+        let envelope: SnsEnvelope = serde_json::from_value(body.clone()).unwrap();
+        verify_with_key(&envelope, &key).unwrap();
+
+        body["Message"] = json!("tampered after signing");
+        let tampered: SnsEnvelope = serde_json::from_value(body).unwrap();
+        assert!(matches!(
+            verify_with_key(&tampered, &key),
+            Err(VerifyError::SignatureMismatch)
+        ));
     }
 }

@@ -28,7 +28,7 @@ use mailbox::time::Timestamp;
 use mailbox::wire;
 use mailbox::{InboxId, MailMessage};
 use mailbox::{MessageId, ThreadId};
-use mailbox_store::keys::{self, PageKey, TableKey, decode_page_token, encode_page_token};
+use mailbox_store::keys::{self, PageKey, decode_page_token, encode_page_token};
 use mailbox_store::{ListQuery, MAX_LIMIT, MailStoreError, Page};
 
 /// How many store round-trips one list request may spend filling a page.
@@ -181,15 +181,7 @@ pub(crate) async fn list_messages<B: Backend>(
     let (messages, next) = fill(
         &query,
         |msg: &MailMessage| request.filters.matches_message(msg),
-        |msg: &MailMessage| {
-            let TableKey { pk, sk } = keys::message(&msg.inbox_id, &msg.message_id);
-            PageKey {
-                partition: keys::messages_partition(&msg.inbox_id),
-                sort: msg.message_id.to_string(),
-                table_pk: pk,
-                table_sk: sk,
-            }
-        },
+        keys::message_page_key,
         |round| async move { mailbox.list_messages(&round).await },
     )
     .await?;
@@ -358,15 +350,7 @@ pub(crate) async fn list_threads<B: Backend>(
     let (threads, next) = fill(
         &query,
         |thread: &ThreadState| request.filters.matches_thread(thread),
-        |thread: &ThreadState| {
-            let TableKey { pk, sk } = keys::thread(&thread.inbox_id, &thread.thread_id);
-            PageKey {
-                partition: keys::threads_partition(&thread.inbox_id),
-                sort: keys::thread_time_sort(thread.timestamp, &thread.thread_id),
-                table_pk: pk,
-                table_sk: sk,
-            }
-        },
+        keys::thread_page_key,
         |round| async move { mailbox.list_threads(&round).await },
     )
     .await?;
@@ -441,14 +425,13 @@ mod tests {
     /// Pages through `0..ITEMS` the way the store does: resume after the
     /// start key, return at most `limit`, and a key only when more remain.
     async fn page(round: ListQuery) -> Result<Page<u32>, MailStoreError> {
-        let from = round
-            .start
-            .as_ref()
-            .map_or(0, |start| start.sort.parse::<u32>().unwrap() + 1);
+        let from = round.start.as_ref().map_or(0, |start| {
+            start.sort.parse::<u32>().unwrap().checked_add(1).unwrap()
+        });
         let items: Vec<u32> = (from..ITEMS).take(round.limit).collect();
         let next = items
             .last()
-            .filter(|last| **last + 1 < ITEMS)
+            .filter(|last| last.checked_add(1).unwrap() < ITEMS)
             .map(|last| key(*last));
         Ok(Page { items, next })
     }

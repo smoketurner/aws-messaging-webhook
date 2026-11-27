@@ -1,6 +1,7 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
 doc-valid-idents = ["DynamoDB", "EventBridge", "GovCloud", "SNS", "SES", ".."]
 disallowed-methods = [
     { path = "mail_parser::Message::text_body", reason = "lists inline media parts; read bodies through mime::parse_inbound's filtered text/html" },

@@ -43,8 +43,12 @@ impl SnsFixture {
 
     #[must_use]
     pub fn expired() -> Self {
-        let not_before = SystemTime::now() - Duration::from_hours(2);
-        let not_after = SystemTime::now() - Duration::from_hours(1);
+        let not_before = SystemTime::now()
+            .checked_sub(Duration::from_hours(2))
+            .unwrap();
+        let not_after = SystemTime::now()
+            .checked_sub(Duration::from_hours(1))
+            .unwrap();
         Self::with_validity(Validity {
             not_before: Time::try_from(not_before).unwrap(),
             not_after: Time::try_from(not_after).unwrap(),
@@ -53,8 +57,12 @@ impl SnsFixture {
 
     #[must_use]
     pub fn not_yet_valid() -> Self {
-        let not_before = SystemTime::now() + Duration::from_hours(1);
-        let not_after = SystemTime::now() + Duration::from_hours(2);
+        let not_before = SystemTime::now()
+            .checked_add(Duration::from_hours(1))
+            .unwrap();
+        let not_after = SystemTime::now()
+            .checked_add(Duration::from_hours(2))
+            .unwrap();
         Self::with_validity(Validity {
             not_before: Time::try_from(not_before).unwrap(),
             not_after: Time::try_from(not_after).unwrap(),

@@ -21,15 +21,22 @@ use mailbox::{InboxId, ids, time};
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use mailbox_store::keys::TableKey;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use webhook_test_support::objects::{ObjectFailure, Op};
 use webhook_test_support::{Harness, TEST_INBOX, api, api_harness};
 
 /// A deadline far enough off that no send runs out of time.
 fn deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + std::time::Duration::from_secs(120)
+    tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(120))
+        .unwrap()
 }
 
 /// Queues one send through the real API and returns its message id.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 async fn queued(h: &Harness, body: &Value) -> MessageId {
     let (status, value) =
         api::post(h, &format!("/v0/inboxes/{TEST_INBOX}/messages/send"), body).await;
@@ -225,7 +232,7 @@ async fn a_send_to_this_inbox_arrives_back_in_its_thread() {
         },
     });
     let status = webhook_test_support::post(
-        h.state.clone(),
+        Arc::clone(&h.state),
         "/webhooks/ses/inbound",
         &webhook_test_support::wrapped(&h, &inner),
     )
@@ -761,7 +768,7 @@ async fn ses_event(h: &Harness, kind: &str, ses_message_id: &str) -> StatusCode 
         "mail": { "messageId": ses_message_id },
     });
     let body = webhook_test_support::wrapped(h, &inner);
-    webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await
+    webhook_test_support::post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await
 }
 
 #[tokio::test]
@@ -1028,7 +1035,7 @@ async fn tagged_ses_event(
         },
     });
     let body = webhook_test_support::wrapped(h, &inner);
-    webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await
+    webhook_test_support::post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await
 }
 
 async fn stored_message(h: &Harness, message_id: &MessageId) -> mailbox::MailMessage {
@@ -1342,6 +1349,10 @@ async fn an_unknown_send_keeps_its_outbox_so_it_can_be_resent() {
 
 /// Drives a send that carries an attachment to `unknown`, so a resolution can
 /// be checked against both outbox objects a send leaves behind.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 async fn stuck_unknown_with_attachment(h: &Harness) -> MessageId {
     let mut request = body();
     request["attachments"] = json!([{ "content": STANDARD.encode("file bytes") }]);

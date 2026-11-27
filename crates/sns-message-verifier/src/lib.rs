@@ -25,11 +25,9 @@ mod signature;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use canonical::build_string_to_sign;
 pub use cert::validate_sns_url;
 pub use envelope::{MessageType, SnsEnvelope};
 pub use error::{CertUrlRejection, VerifyError};
-pub use signature::verify_with_cert;
 
 /// Verifies SNS messages, fetching and caching signing certificates.
 pub struct SnsVerifier {

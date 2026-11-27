@@ -31,6 +31,10 @@ jobs:
           tool: cargo-deny@0.20.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The rustdoc lints in [workspace.lints.rustdoc] only run under rustdoc.
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
       # The suite runs once. Coverage is a local tool (`cargo llvm-cov`): in
       # CI it rebuilt the workspace instrumented, which doubled the wait for
       # an lcov report nothing consumed.

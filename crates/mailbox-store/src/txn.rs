@@ -491,11 +491,11 @@ mod tests {
             let len = role_seed.len().min(reason_seed.len());
             let mut ops: Vec<PlannedOp> = role_seed[..len]
                 .iter()
-                .map(|&i| not_exists_put(roles[i as usize % roles.len()]))
+                .map(|&i| not_exists_put(roles[usize::from(i)]))
                 .collect();
             let reasons: Vec<CancellationReason> = reason_seed[..len]
                 .iter()
-                .map(|&i| reasons_pool[i as usize % reasons_pool.len()])
+                .map(|&i| reasons_pool[usize::from(i)])
                 .collect();
 
             if has_send_key {

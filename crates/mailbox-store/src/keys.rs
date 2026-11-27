@@ -5,9 +5,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use mailbox::InboxId;
 use mailbox::send::SendStatus;
+use mailbox::thread::ThreadState;
 use mailbox::time::{self, Timestamp};
+use mailbox::{InboxId, MailMessage};
 
 /// A mail-table item's primary key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -128,7 +129,7 @@ pub fn messages_partition(inbox: &InboxId) -> String {
 }
 
 /// The `ByTime` partition listing an inbox's threads, sorted by
-/// [`thread_time_sort`].
+/// last activity, then thread id.
 #[must_use]
 pub fn threads_partition(inbox: &InboxId) -> String {
     format!("INBOX#{}#THR", inbox.as_str())
@@ -148,7 +149,10 @@ pub fn thread_messages_partition(
 /// A thread's `ByTime` sort key: last activity, then id, so a thread list
 /// orders by most recent activity.
 #[must_use]
-pub fn thread_time_sort(timestamp: Timestamp, thread_id: &(impl AsRef<str> + ?Sized)) -> String {
+pub(crate) fn thread_time_sort(
+    timestamp: Timestamp,
+    thread_id: &(impl AsRef<str> + ?Sized),
+) -> String {
     let thread_id = thread_id.as_ref();
     let timestamp = time::format(timestamp);
     format!("{timestamp}#{thread_id}")
@@ -176,6 +180,31 @@ pub struct PageKey {
     pub sort: String,
     pub table_pk: String,
     pub table_sk: String,
+}
+
+/// The key that resumes an inbox's message listing just after `msg`, for a
+/// caller that stops partway through a page (dropping filtered items, say).
+#[must_use]
+pub fn message_page_key(msg: &MailMessage) -> PageKey {
+    let TableKey { pk, sk } = message(&msg.inbox_id, &msg.message_id);
+    PageKey {
+        partition: messages_partition(&msg.inbox_id),
+        sort: msg.message_id.to_string(),
+        table_pk: pk,
+        table_sk: sk,
+    }
+}
+
+/// The key that resumes an inbox's thread listing just after `thread`.
+#[must_use]
+pub fn thread_page_key(state: &ThreadState) -> PageKey {
+    let TableKey { pk, sk } = thread(&state.inbox_id, &state.thread_id);
+    PageKey {
+        partition: threads_partition(&state.inbox_id),
+        sort: thread_time_sort(state.timestamp, &state.thread_id),
+        table_pk: pk,
+        table_sk: sk,
+    }
 }
 
 /// The opaque page token: base64url JSON of the last *returned* item's
@@ -242,7 +271,8 @@ pub fn decode_page_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mailbox::test_fixtures::at;
+    use mailbox::test_fixtures::{self, at};
+    use mailbox::thread;
     use proptest::prelude::*;
 
     fn key(pk: &str, sk: &str) -> TableKey {
@@ -274,6 +304,32 @@ mod tests {
         assert_eq!(ses_ref("ses-1"), key("SESMSG#ses-1", "REF"));
         assert_eq!(send_key("deadbeef"), key("SENDKEY#deadbeef", "KEY"));
         assert_eq!(send_key_pk("deadbeef"), "SENDKEY#deadbeef");
+    }
+
+    /// A resume key must name the item exactly as the index stores it, or a
+    /// page cut short would skip or repeat items.
+    #[test]
+    fn page_keys_match_the_planned_index_attributes() {
+        let msg = test_fixtures::message();
+        assert_eq!(
+            message_page_key(&msg),
+            PageKey {
+                partition: "INBOX#support@example.com#MSG".to_owned(),
+                sort: "mid-1".to_owned(),
+                table_pk: "INBOX#support@example.com".to_owned(),
+                table_sk: "MSG#mid-1".to_owned(),
+            }
+        );
+        let state = thread::new_thread(&msg);
+        assert_eq!(
+            thread_page_key(&state),
+            PageKey {
+                partition: "INBOX#support@example.com#THR".to_owned(),
+                sort: "2026-01-15T09:30:00.000Z#tid-1".to_owned(),
+                table_pk: "INBOX#support@example.com".to_owned(),
+                table_sk: "THR#tid-1".to_owned(),
+            }
+        );
     }
 
     #[test]

@@ -213,10 +213,7 @@ impl HttpAttachmentFetcher {
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .user_agent(concat!("aws-messaging-webhook/", env!("CARGO_PKG_VERSION")));
-        #[cfg(not(test))]
-        {
-            builder = builder.https_only(true);
-        }
+        builder = builder.https_only(!cfg!(test));
         if let Some(domain) = domain {
             builder = builder.resolve_to_addrs(domain, addresses);
         }
@@ -298,7 +295,7 @@ impl AttachmentFetcher for HttpAttachmentFetcher {
                 .await
                 .map_err(|e| FetchError::Transient(anyhow::anyhow!("reading: {e}")))?
             {
-                if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+                if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
                     return Err(FetchError::TooLarge);
                 }
                 bytes.extend_from_slice(&chunk);

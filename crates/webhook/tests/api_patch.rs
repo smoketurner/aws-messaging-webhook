@@ -28,7 +28,7 @@ async fn seeded(thread: &str, count: usize) -> (Harness, Vec<String>) {
 
     let mut ids = Vec::new();
     for index in 0..count {
-        let at = format!("2026-01-01T{:02}:00:00.000Z", 9 + index);
+        let at = format!("2026-01-01T{:02}:00:00.000Z", index.checked_add(9).unwrap());
         let ms = time::parse(&at).unwrap();
         let id = ids::inbound_message_id(&format!("ses-{at}"), ms).to_string();
         let mut msg = sample_message(TEST_INBOX, &id, thread);

@@ -15,6 +15,7 @@ use axum::http::StatusCode;
 use mailbox::MessageId;
 use mailbox::{InboxId, ids, time};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use webhook_test_support::{Harness, MAIL_BUCKET, TEST_API_KEY, api, mail_harness, post, wrapped};
 
 const TS: &str = "2026-01-01T00:00:00.000Z";
@@ -72,7 +73,7 @@ async fn mixed_case_envelope_rcpt_ingests_under_lowercased_id_and_api_reads_it_b
     // `support@example.com`, passes the `address != mail_config.inbox` gate,
     // and stores the message under `InboxId("support@example.com")`.
     let body = wrapped(&h, &ses_inbound_s3(&["Support@Example.com"]));
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
     assert_eq!(
         status,
         StatusCode::OK,

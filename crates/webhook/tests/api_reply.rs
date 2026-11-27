@@ -182,7 +182,7 @@ async fn without_reply_all_only_the_sender_is_addressed() {
 
     let spec = h.send_spec(response["message_id"].as_str().unwrap());
     assert_eq!(spec.envelope.to, vec!["customer@example.net"]);
-    assert_eq!(spec.envelope.cc, [] as [String; 0]);
+    assert_eq!(spec.envelope.cc, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -431,6 +431,10 @@ async fn seeded_sent(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String)
     .await
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 async fn reply_to_sent(
     adjust: impl FnOnce(&mut MailMessage),
     reply_all: bool,
@@ -462,8 +466,8 @@ async fn a_reply_to_a_sent_message_goes_to_its_to_recipients() {
     assert_eq!(status, StatusCode::OK, "{response}");
     let spec = spec.unwrap();
     assert_eq!(spec.envelope.to, vec!["primary@example.net"]);
-    assert_eq!(spec.envelope.cc, [] as [String; 0]);
-    assert_eq!(spec.envelope.bcc, [] as [String; 0]);
+    assert_eq!(spec.envelope.cc, Vec::<String>::new());
+    assert_eq!(spec.envelope.bcc, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -494,7 +498,7 @@ async fn a_reply_to_a_cc_only_sent_message_goes_to_its_cc_recipients() {
         assert_eq!(status, StatusCode::OK, "reply_all={reply_all}: {response}");
         let spec = spec.unwrap();
         assert_eq!(spec.envelope.to, vec!["group@example.net"]);
-        assert_eq!(spec.envelope.cc, [] as [String; 0]);
+        assert_eq!(spec.envelope.cc, Vec::<String>::new());
         assert_eq!(response["thread_id"], "thread-1");
     }
 }
@@ -517,8 +521,8 @@ async fn a_reply_to_a_bcc_only_sent_message_goes_to_its_bcc_recipients() {
 
         assert_eq!(status, StatusCode::OK, "reply_all={reply_all}: {response}");
         let spec = spec.unwrap();
-        assert_eq!(spec.envelope.to, [] as [String; 0]);
-        assert_eq!(spec.envelope.cc, [] as [String; 0]);
+        assert_eq!(spec.envelope.to, Vec::<String>::new());
+        assert_eq!(spec.envelope.cc, Vec::<String>::new());
         assert_eq!(
             spec.envelope.bcc,
             vec!["hidden-1@example.net", "hidden-2@example.net"]
@@ -616,6 +620,10 @@ async fn reply_all_never_copies_a_reply_to_recipient_into_cc_in_a_different_spel
 }
 
 /// Replies to `original_id` and returns the queued spec.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 async fn reply_spec(h: &Harness, original_id: &str, reply_all: bool) -> SendSpec {
     let mut request = body();
     request["reply_all"] = json!(reply_all);

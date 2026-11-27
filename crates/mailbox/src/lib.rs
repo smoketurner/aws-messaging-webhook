@@ -252,12 +252,12 @@ pub struct AttachmentMeta {
 /// of this message's arrival, so a reader of the message alone (e.g. an
 /// EventBridge consumer) doesn't need a second read to show thread context.
 ///
-/// Populated by [`plan::plan_insert`] from the caller-computed
-/// `thread_after` state (`mail::thread::ThreadState`), so it always reflects
+/// Populated by `mailbox-store`'s insert planner from the caller-computed
+/// `thread_after` state ([`thread::ThreadState`]), so it always reflects
 /// the thread **including** the message it's attached to — a reply's
 /// `message_count` is the thread's real count, not 1. `senders`/`recipients`
 /// are capped at 20 even though the thread's own address sets may hold up
-/// to 50 (`mail::thread::THREAD_ADDRESS_SET_CAP`).
+/// to 50 (`thread::THREAD_ADDRESS_SET_CAP`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadSnapshot {
     pub thread_id: ThreadId,
@@ -362,7 +362,7 @@ pub struct MailMessage {
     pub expires_at: u64,
 }
 
-/// Outcome of [`mailbox::Mailbox::insert_message`]. A redelivered ingest
+/// Outcome of `mailbox_store::Mailbox::insert_message`. A redelivered ingest
 /// (same deterministic message id) is a `Duplicate`, which the ingest flow
 /// counts as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,13 +371,13 @@ pub enum InsertOutcome {
     Duplicate,
 }
 
-/// Metadata returned by [`objects::ObjectStore::head_object`].
+/// Metadata returned by the binary's `ObjectStore::head_object`.
 #[derive(Debug, Clone, Copy)]
 pub struct ObjectMeta {
     pub size: u64,
 }
 
-/// Outcome of [`objects::ObjectStore::put_object_if_absent`].
+/// Outcome of the binary's `ObjectStore::put_object_if_absent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutOutcome {
     Created,

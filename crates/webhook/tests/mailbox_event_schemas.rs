@@ -21,6 +21,7 @@ use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aws_messaging_webhook::mail::content;
 use aws_messaging_webhook::mail::sender::handle_send;
@@ -48,6 +49,10 @@ const SUPPORTED_KEYWORDS: [&str; 10] = [
     "description",
 ];
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 fn schemas() -> Map<String, Value> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/mailbox-events/schemas.json");
@@ -99,13 +104,15 @@ fn is_date_time(value: &str) -> bool {
     {
         return false;
     }
-    let mut rest = &value[19..];
+    let Some(mut rest) = value.get(19..) else {
+        return false;
+    };
     if let Some(fraction) = rest.strip_prefix('.') {
-        let len = fraction.bytes().take_while(u8::is_ascii_digit).count();
-        if len == 0 {
+        let after = fraction.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after.len() == fraction.len() {
             return false;
         }
-        rest = &fraction[len..];
+        rest = after;
     }
     match rest.as_bytes() {
         [b'Z' | b'z'] => true,
@@ -256,6 +263,10 @@ fn mailbox_details(h: &Harness) -> Vec<Value> {
 
 /// Sends one message through the real API and sender and returns it as
 /// stored.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 async fn sent_message(h: &Harness) -> MailMessage {
     let body = json!({
         "to": ["a@example.net", "Bee <b@example.net>"],
@@ -271,7 +282,9 @@ async fn sent_message(h: &Harness) -> MailMessage {
     handle_send(
         &h.state,
         &message_id,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(120))
+            .unwrap(),
     )
     .await
     .unwrap();
@@ -295,6 +308,10 @@ fn message_image(msg: &MailMessage) -> Value {
     serde_json::to_value(&item).unwrap()
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 fn mail_record(event_name: &str, new_image: &Value, old_image: Option<&Value>) -> Value {
     let mut change = json!({
         "ApproximateCreationDateTime": 1_754_265_600.0,
@@ -379,7 +396,7 @@ async fn publish_received(h: &Harness, msg: &MailMessage) {
     .await
     .unwrap();
     let result = invoke(
-        h.state.clone(),
+        Arc::clone(&h.state),
         mail_record("INSERT", &message_image(msg), None),
     )
     .await
@@ -389,6 +406,10 @@ async fn publish_received(h: &Harness, msg: &MailMessage) {
 
 /// The documented SES example `name`, re-addressed to `ses_message_id`,
 /// fed through the events-table relay.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 async fn publish_ses_example(h: &Harness, name: &str, ses_message_id: &str) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ses-events")
@@ -402,7 +423,7 @@ async fn publish_ses_example(h: &Harness, name: &str, ses_message_id: &str) {
         "EVT#2026-01-15T09:46:00.000Z#sns-1",
         "seq-ses",
     );
-    let result = invoke(h.state.clone(), record).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), record).await.unwrap();
     assert_eq!(result, json!({ "batchItemFailures": [] }), "{name}");
 }
 
@@ -449,7 +470,7 @@ async fn the_sent_event_matches_the_schema() {
     queued.labels = vec!["queued".to_owned()];
 
     let result = invoke(
-        h.state.clone(),
+        Arc::clone(&h.state),
         mail_record(
             "MODIFY",
             &message_image(&sent),
@@ -526,7 +547,7 @@ async fn ses_driven_events_match_the_schema() {
 async fn ses_events_for_other_senders_publish_no_mailbox_event() {
     let h = api_harness().await;
     publish_ses_example(&h, "event-delivery.json", "ses-someone-else").await;
-    assert_eq!(mailbox_details(&h), [] as [serde_json::Value; 0]);
+    assert_eq!(mailbox_details(&h), Vec::<Value>::new());
     assert_eq!(h.state.publisher.published.lock().unwrap().len(), 1);
 }
 
@@ -549,7 +570,7 @@ async fn a_transient_mailbox_lookup_failure_retries_before_publishing() {
         "seq-retry",
     );
 
-    let result = invoke(h.state.clone(), record).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), record).await.unwrap();
 
     assert_eq!(
         result,
@@ -603,7 +624,8 @@ async fn permanent_delivery_label_failure_does_not_skip_bounce_suppression() {
         "mail": {"messageId": sent.ses_message_id.unwrap()}
     });
     let body = webhook_test_support::wrapped(&h, &bounce);
-    let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status =
+        webhook_test_support::post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -629,7 +651,8 @@ async fn permanent_delivery_label_failure_does_not_skip_complaint_suppression() 
         "mail": {"messageId": sent.ses_message_id.unwrap()}
     });
     let body = webhook_test_support::wrapped(&h, &complaint);
-    let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status =
+        webhook_test_support::post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -659,7 +682,8 @@ async fn transient_delivery_label_failure_suppresses_then_returns_500() {
         "mail": {"messageId": sent.ses_message_id.unwrap()}
     });
     let body = webhook_test_support::wrapped(&h, &bounce);
-    let status = webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status =
+        webhook_test_support::post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(
         status,
@@ -731,7 +755,7 @@ fn the_checker_rejects_departures_from_the_schema() {
             "timestamp": "2026-01-15T09:50:00.000Z",
         },
     });
-    assert_eq!(violations(&valid), [] as [String; 0]);
+    assert_eq!(violations(&valid), Vec::<String>::new());
 
     let mut extra = valid.clone();
     extra["meta"] = json!({});

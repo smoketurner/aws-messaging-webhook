@@ -8,6 +8,8 @@ use aws_messaging_webhook::config::Config;
 use aws_messaging_webhook::entry;
 use aws_messaging_webhook::state::AppState;
 use sns_message_verifier::SnsVerifier;
+#[cfg(debug_assertions)]
+use sns_message_verifier::SnsVerifierBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_http::Error> {
@@ -33,16 +35,10 @@ async fn main() -> Result<(), lambda_http::Error> {
         key_source,
     } = Components::new(&sdk_config, &config);
 
-    let mut verifier = SnsVerifier::builder();
-    let mut dangerous_subscribe_url_prefix = None;
-    // Local development against a fake SNS (`cargo lambda watch`): honored in
-    // debug builds only, so no release binary can bypass verification.
     #[cfg(debug_assertions)]
-    if let Ok(prefix) = std::env::var("SNS_CERT_HOST_OVERRIDE") {
-        tracing::warn!(prefix, "SNS cert host override active (debug build only)");
-        verifier = verifier.dangerous_allow_cert_url_prefix(prefix.clone());
-        dangerous_subscribe_url_prefix = Some(prefix);
-    }
+    let (verifier, dangerous_subscribe_url_prefix) = cert_host_override(SnsVerifier::builder());
+    #[cfg(not(debug_assertions))]
+    let (verifier, dangerous_subscribe_url_prefix) = (SnsVerifier::builder(), None);
 
     // One client for both users — fetching signing certificates and
     // confirming subscriptions — so they share a connection pool. It never
@@ -66,4 +62,18 @@ async fn main() -> Result<(), lambda_http::Error> {
     });
 
     entry::run(state, collector).await
+}
+
+/// Local development against a fake SNS (`cargo lambda watch`): honored in
+/// debug builds only, so no release binary can bypass verification.
+#[cfg(debug_assertions)]
+fn cert_host_override(verifier: SnsVerifierBuilder) -> (SnsVerifierBuilder, Option<String>) {
+    let Ok(prefix) = std::env::var("SNS_CERT_HOST_OVERRIDE") else {
+        return (verifier, None);
+    };
+    tracing::warn!(prefix, "SNS cert host override active (debug build only)");
+    (
+        verifier.dangerous_allow_cert_url_prefix(prefix.clone()),
+        Some(prefix),
+    )
 }

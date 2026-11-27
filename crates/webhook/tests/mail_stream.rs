@@ -17,6 +17,7 @@ use mailbox::test_fixtures::at;
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use sns_message_verifier::fixtures;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use aws_messaging_webhook::mail::content;
 use mailbox::content::MessageContent;
@@ -123,6 +124,10 @@ fn mail_stream_event(event_name: &str, new_image: &Value, sequence: &str) -> Val
 
 /// One MODIFY record carrying both images, the shape the relay diffs labels
 /// from (the table streams `NEW_AND_OLD_IMAGES`).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 fn mail_modify_event(old_image: &Value, new_image: &Value, sequence: &str) -> Value {
     let mut event = mail_stream_event("MODIFY", new_image, sequence);
     event["Records"][0]["dynamodb"]["OldImage"] = old_image.clone();
@@ -133,16 +138,15 @@ fn mail_modify_event(old_image: &Value, new_image: &Value, sequence: &str) -> Va
 /// One stream event carrying several records, each an INSERT of `msg` with
 /// its own sequence number.
 fn mail_stream_batch(messages: &[MailMessage]) -> Value {
-    let records: Vec<Value> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, msg)| {
+    let records: Vec<Value> = (1..)
+        .zip(messages)
+        .map(|(sequence, msg)| {
             let event = mail_stream_event(
                 "INSERT",
                 &message_new_image(msg),
-                &format!("seq-{}", index + 1),
+                &format!("seq-{sequence}"),
             );
-            event["Records"][0].clone()
+            event.pointer("/Records/0").unwrap().clone()
         })
         .collect();
     json!({ "Records": records })
@@ -170,7 +174,7 @@ async fn insert_received_publishes_one_event_with_the_golden_payload() {
     .await;
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-1");
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.state.publisher.published.lock().unwrap();
@@ -224,7 +228,7 @@ async fn insert_of_a_reply_publishes_the_accumulated_thread_state() {
     });
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-reply");
 
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
@@ -243,7 +247,7 @@ async fn insert_spam_publishes_the_spam_variant() {
     msg.labels = vec!["received".to_owned(), "spam".to_owned()];
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-2");
 
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
@@ -257,7 +261,7 @@ async fn insert_unauthenticated_publishes_the_unauthenticated_variant() {
     msg.labels = vec!["received".to_owned(), "unauthenticated".to_owned()];
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-3");
 
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
@@ -275,7 +279,7 @@ async fn spam_takes_precedence_over_unauthenticated_on_the_stream_path() {
     ];
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-4");
 
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published[0].detail_type, "message.received.spam");
@@ -297,7 +301,7 @@ async fn modify_publishes_the_send_but_not_a_delivery_label() {
         &message_new_image(&sent),
         "seq-sent",
     );
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let mut delivered = sent.clone();
     delivered.labels = vec!["sent".to_owned(), "delivered".to_owned()];
@@ -306,7 +310,7 @@ async fn modify_publishes_the_send_but_not_a_delivery_label() {
         &message_new_image(&delivered),
         "seq-delivered",
     );
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.state.publisher.published.lock().unwrap();
@@ -328,7 +332,7 @@ async fn modify_without_a_new_system_label_publishes_nothing() {
     read.labels = vec!["received".to_owned(), "invoices".to_owned()];
 
     let event = mail_modify_event(&message_new_image(&msg), &message_new_image(&read), "seq-5");
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     assert!(h.state.publisher.published.lock().unwrap().is_empty());
@@ -342,7 +346,7 @@ async fn modify_without_an_old_image_publishes_nothing() {
     let msg = sample_message();
     let event = mail_stream_event("MODIFY", &message_new_image(&msg), "seq-5");
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     assert!(h.state.publisher.published.lock().unwrap().is_empty());
@@ -368,7 +372,7 @@ async fn a_batch_stops_at_its_first_failed_record() {
     // The second record's publish fails; the first has already succeeded.
     *h.state.publisher.fail_publish_at.lock().unwrap() = Some(1);
 
-    let result = invoke(h.state.clone(), mail_stream_batch(&messages))
+    let result = invoke(Arc::clone(&h.state), mail_stream_batch(&messages))
         .await
         .unwrap();
 
@@ -396,7 +400,7 @@ async fn send_state_marker_ref_and_key_items_publish_nothing() {
     ] {
         let h = harness().await;
         let event = mail_stream_event("INSERT", &key_only_image(pk, sk), "seq-key");
-        let result = invoke(h.state.clone(), event).await.unwrap();
+        let result = invoke(Arc::clone(&h.state), event).await.unwrap();
         assert_eq!(
             result,
             json!({ "batchItemFailures": [] }),
@@ -415,9 +419,9 @@ async fn event_id_is_stable_across_a_replay_of_the_same_record() {
     let msg = sample_message();
 
     let first = mail_stream_event("INSERT", &message_new_image(&msg), "seq-a");
-    invoke(h.state.clone(), first).await.unwrap();
+    invoke(Arc::clone(&h.state), first).await.unwrap();
     let second = mail_stream_event("INSERT", &message_new_image(&msg), "seq-b");
-    invoke(h.state.clone(), second).await.unwrap();
+    invoke(Arc::clone(&h.state), second).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 2);
@@ -443,7 +447,7 @@ async fn oversized_html_is_dropped_before_falling_back() {
     .await;
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-big");
 
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
@@ -461,7 +465,7 @@ async fn a_transient_publish_failure_is_retried() {
     let msg = sample_message();
     let event = mail_stream_event("INSERT", &message_new_image(&msg), "seq-fail");
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(
         result,
@@ -481,7 +485,7 @@ async fn events_table_records_are_unaffected_by_the_mail_branch() {
         "seq-evt",
     );
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.state.publisher.published.lock().unwrap();
@@ -496,7 +500,7 @@ async fn aggregate_status_relay_is_unaffected_by_the_mail_branch() {
     let h = harness().await;
     let event = webhook_test_support::dynamodb_agg_event("INSERT", Some("sent"), None);
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.state.publisher.published.lock().unwrap();
@@ -517,7 +521,7 @@ async fn a_message_item_that_fails_to_deserialize_settles_without_retry() {
     });
     let event = mail_stream_event("INSERT", &bad_image, "seq-broken");
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     assert!(h.state.publisher.published.lock().unwrap().is_empty());

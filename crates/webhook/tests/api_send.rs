@@ -300,7 +300,7 @@ async fn a_send_that_fails_to_commit_leaves_no_outbox_uploads_behind() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
-    assert_ne!(uploaded, [] as [String; 0]);
+    assert_ne!(uploaded, Vec::<String>::new());
 
     // Every outbox/ upload is gone: the cleanup is the only thing that reclaims
     // this prefix, so stranding any of it would leak forever.
@@ -355,7 +355,7 @@ async fn the_loser_of_an_idempotency_key_race_cleans_up_its_outbox_uploads() {
 
     let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
-    assert_ne!(uploaded, [] as [String; 0]);
+    assert_ne!(uploaded, Vec::<String>::new());
     for key in uploaded.iter().filter(|k| k.starts_with("outbox/")) {
         assert!(!objects.contains(key), "{key} was left behind");
     }
@@ -407,7 +407,7 @@ async fn a_content_store_failure_discards_the_outbox_uploads() {
 
     let objects = &h.state.objects;
     let uploaded = objects.calls(Op::Put);
-    assert_ne!(uploaded, [] as [String; 0]);
+    assert_ne!(uploaded, Vec::<String>::new());
 
     // Every outbox/ upload (the part and the spec) was reclaimed: the
     // cleanup is the only thing that reclaims this prefix, so stranding
@@ -616,7 +616,7 @@ async fn an_invalid_request_queues_nothing() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(response["name"], "ValidationError");
     // Nothing was uploaded on the way to the rejection.
-    assert_eq!(h.state.objects.calls(Op::Put), [] as [String; 0]);
+    assert_eq!(h.state.objects.calls(Op::Put), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -908,7 +908,7 @@ async fn a_send_with_a_malformed_envelope_address_is_rejected_before_queueing() 
         // Nothing was uploaded on the way to the rejection.
         assert_eq!(
             h.state.objects.calls(Op::Put),
-            [] as [String; 0],
+            Vec::<String>::new(),
             "{bad_to:?}: nothing should be uploaded for a rejected send"
         );
     }
@@ -989,7 +989,7 @@ async fn a_non_ascii_local_part_is_rejected_before_queueing() {
         response["errors"][0]["message"],
         "`üser@example.com` has a non-ASCII local part, which SES cannot deliver to"
     );
-    assert_eq!(h.state.objects.calls(Op::Put), [] as [String; 0]);
+    assert_eq!(h.state.objects.calls(Op::Put), Vec::<String>::new());
 }
 
 /// A quoted local part is a mailbox RFC 5321 delivers to, sent with the

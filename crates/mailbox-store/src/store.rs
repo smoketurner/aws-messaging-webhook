@@ -25,7 +25,7 @@ pub const MAX_LIMIT: usize = 100;
 
 /// One page of results, plus the key that continues it. `next` is `None` on
 /// the last page.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next: Option<PageKey>,

@@ -2,9 +2,7 @@
 
 use serde_json::json;
 use sns_message_verifier::fixtures::{SnsFixture, notification, subscription_confirmation};
-use sns_message_verifier::{
-    CertUrlRejection, SnsEnvelope, SnsVerifier, VerifyError, verify_with_cert,
-};
+use sns_message_verifier::{CertUrlRejection, SnsVerifier, VerifyError};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -150,23 +148,6 @@ async fn rejects_oversized_certificate_response() {
         }
         other => panic!("expected CertParse(too large), got {other:?}"),
     }
-}
-
-#[test]
-fn verify_with_cert_accepts_valid_and_rejects_tampered() {
-    let fixture = SnsFixture::new();
-    let mut body = notification("https://sns.us-east-1.amazonaws.com/cert.pem");
-    fixture.sign(&mut body, "2");
-
-    let envelope: SnsEnvelope = serde_json::from_value(body.clone()).unwrap();
-    verify_with_cert(&envelope, fixture.cert_pem.as_bytes()).unwrap();
-
-    body["Message"] = json!("tampered after signing");
-    let tampered: SnsEnvelope = serde_json::from_value(body).unwrap();
-    assert!(matches!(
-        verify_with_cert(&tampered, fixture.cert_pem.as_bytes()),
-        Err(VerifyError::SignatureMismatch)
-    ));
 }
 
 #[tokio::test]

@@ -353,7 +353,7 @@ impl Txn {
         let mut set = vec![
             (
                 "version".to_owned(),
-                AttributeValue::N((msg.version + 1).to_string()),
+                AttributeValue::N(msg.version.saturating_add(1).to_string()),
             ),
             (
                 "updated_at".to_owned(),
@@ -664,7 +664,7 @@ fn check_user_labels(
 }
 
 fn is_sorted_and_deduped(values: &[String]) -> bool {
-    values.windows(2).all(|pair| pair[0] < pair[1])
+    values.is_sorted_by(|a, b| a < b)
 }
 
 #[cfg(test)]
@@ -1094,7 +1094,7 @@ mod tests {
 
             let mut after = before.clone();
             after.timestamp = at("2026-01-01T00:00:02.000Z");
-            after.version += 1;
+            after.version = before.version.saturating_add(1);
 
             let ops = plan_insert(&msg, Some(&before), &after, &AliasLookup::default()).unwrap();
             prop_assert_eq!(ops.len(), 3);

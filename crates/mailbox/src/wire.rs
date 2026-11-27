@@ -25,7 +25,7 @@ pub enum ContentDisposition {
     Attachment,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub attachment_id: String,
     pub size: u64,
@@ -52,7 +52,7 @@ impl From<&AttachmentMeta> for Attachment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub inbox_id: String,
     pub thread_id: ThreadId,
@@ -132,7 +132,7 @@ impl Message {
 
 /// The list view: the same fields as [`Message`] minus `headers`,
 /// `references`, `reply_to` and the body content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageItem {
     pub inbox_id: String,
     pub thread_id: ThreadId,
@@ -187,7 +187,7 @@ impl From<&MailMessage> for MessageItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thread {
     pub inbox_id: String,
     pub thread_id: ThreadId,
@@ -279,7 +279,7 @@ impl Thread {
 
 /// The list view: the same fields as [`Thread`] minus the embedded
 /// `messages[]`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadItem {
     pub inbox_id: String,
     pub thread_id: ThreadId,
@@ -361,7 +361,7 @@ impl From<&ThreadState> for ThreadItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inbox {
     /// Always `"pod_default"` (v1 has one pod).
     pub pod_id: String,
@@ -401,7 +401,7 @@ impl From<&crate::Inbox> for Inbox {
 /// Each collection gets its own type because the contract names the array
 /// after the collection (`inboxes`, `messages`, `threads`) rather than using
 /// a shared key.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxList {
     pub count: usize,
     pub limit: usize,
@@ -410,7 +410,7 @@ pub struct InboxList {
     pub next_page_token: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageList {
     pub count: usize,
     pub limit: usize,
@@ -419,7 +419,7 @@ pub struct MessageList {
     pub next_page_token: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadList {
     pub count: usize,
     pub limit: usize,
@@ -429,7 +429,7 @@ pub struct ThreadList {
 }
 
 /// A presigned download: the raw MIME of a message, or one attachment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Download {
     pub download_url: String,
     #[serde(with = "crate::time::fixed")]
@@ -450,7 +450,7 @@ pub struct Download {
 }
 
 /// The `PATCH …/messages/{id}` response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageLabels {
     pub message_id: MessageId,
     pub labels: Vec<String>,

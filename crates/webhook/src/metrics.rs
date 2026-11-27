@@ -8,7 +8,7 @@
 //! The [`metrics_cloudwatch_embedded`] backend handles batching and the EMF
 //! JSON schema. Per-invocation metrics are flushed to stdout at the end of
 //! each Lambda invocation (see [`crate::entry`]); the `ColdStart` metric is
-//! emitted once per execution environment via [`emit_cold_start`] on the first
+//! emitted once per execution environment via `emit_cold_start` on the first
 //! invocation. The library only emits `ColdStart` through its own tower
 //! middleware (`MetricsLayer`/`MetricsService`), which this application does
 //! not use, so it is emitted explicitly here instead.
@@ -54,7 +54,7 @@ pub(crate) mod names {
 /// The `ColdStart` metric is **not** emitted automatically by this collector.
 /// The `metrics_cloudwatch_embedded` library only emits it when its
 /// `MetricsLayer`/`MetricsService` tower middleware wraps the Lambda handler,
-/// which this application does not use; [`emit_cold_start`] writes it once per
+/// which this application does not use; `emit_cold_start` writes it once per
 /// execution environment on the first invocation instead.
 ///
 /// # Errors

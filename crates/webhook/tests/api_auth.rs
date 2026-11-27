@@ -7,6 +7,7 @@
 use aws_messaging_webhook::app;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use std::sync::Arc;
 use tower::ServiceExt as _;
 use webhook_test_support::{TEST_API_KEY, api, harness};
 
@@ -93,7 +94,7 @@ async fn the_webhook_paths_stay_unauthenticated() {
     let h = harness().await;
     h.state.key_source.make_unavailable();
 
-    let response = app::app(h.state.clone())
+    let response = app::app(Arc::clone(&h.state))
         .oneshot(
             Request::post("/webhooks/ses/events")
                 .body(Body::from("{}"))
@@ -112,7 +113,7 @@ async fn healthz_stays_open() {
     let h = harness().await;
     h.state.key_source.make_unavailable();
 
-    let response = app::app(h.state.clone())
+    let response = app::app(Arc::clone(&h.state))
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
         .unwrap();

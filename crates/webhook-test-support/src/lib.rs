@@ -1,4 +1,8 @@
-#![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+#![expect(
+    clippy::unwrap_used,
+    clippy::unwrap_in_result,
+    reason = "test code panics on setup failure"
+)]
 // Pedantic doc and must_use lints assume a public API with its own contract
 // to document; every item here exists only for a `#[tokio::test]` body to
 // call directly and unwrap, so they add no signal. Declared at the crate
@@ -101,7 +105,8 @@ impl CallLog {
 
 /// The scripted outcome of an SMS or SES action call.
 fn action_result(action_error: &Mutex<Option<ActionErrorKind>>) -> Result<(), ActionError> {
-    match *action_error.lock().unwrap() {
+    let scripted = *action_error.lock().unwrap();
+    match scripted {
         Some(ActionErrorKind::Transient) => Err(ActionError::transient(anyhow!(
             "simulated transient action failure"
         ))),
@@ -238,7 +243,8 @@ impl SesApi for FakeSes {
     fn send_raw(&self, request: &RawSend<'_>) -> impl Future<Output = SendOutcome> + Send {
         self.calls
             .record(format!("send_raw:{}", request.message_id));
-        for _ in 0..std::mem::take(&mut *self.store_failures_after_send.lock().unwrap()) {
+        let failures = std::mem::take(&mut *self.store_failures_after_send.lock().unwrap());
+        for _ in 0..failures {
             self.mail.inject(Injected::Transient);
         }
         self.sent.lock().unwrap().push(SentMessage {
@@ -330,7 +336,8 @@ impl AttachmentFetcher for FakeFetcher {
         max_bytes: u64,
     ) -> impl Future<Output = Result<Fetched, FetchError>> + Send {
         self.fetched.lock().unwrap().push(url.as_str().to_owned());
-        let result = match self.fetchable.lock().unwrap().get(url.as_str()).cloned() {
+        let body = self.fetchable.lock().unwrap().get(url.as_str()).cloned();
+        let result = match body {
             None => Err(FetchError::Rejected { status: 404 }),
             Some(body) if body.len() as u64 > max_bytes => Err(FetchError::TooLarge),
             Some(body) => Ok(Fetched { bytes: body }),
@@ -544,7 +551,7 @@ pub const TEST_INBOX: &str = "support@example.com";
 pub const TEST_AT: &str = "2026-01-01T09:00:00.000Z";
 
 /// When [`grant_api_access`] creates [`TEST_INBOX`].
-pub const TEST_INBOX_CREATED_AT: &str = "2026-01-01T00:00:00.000Z";
+const TEST_INBOX_CREATED_AT: &str = "2026-01-01T00:00:00.000Z";
 
 /// Authorizes [`TEST_API_KEY`] on `h` and creates [`TEST_INBOX`].
 pub async fn grant_api_access(h: &Harness) {
@@ -576,6 +583,10 @@ pub async fn post(state: Arc<AppState<Fakes>>, route: &str, body: &Value) -> Sta
 }
 
 /// Wraps an inner AWS payload as the SNS `Message` of a signed notification.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: assigns into a JSON object literal; a panic is the test failing"
+)]
 pub fn wrapped(h: &Harness, inner: &Value) -> Value {
     let mut body = fixtures::notification(&h.cert_url);
     body["Message"] = json!(inner.to_string());
@@ -584,7 +595,7 @@ pub fn wrapped(h: &Harness, inner: &Value) -> Value {
 }
 
 /// Re-keys a signed envelope to the casing a direct SNS → Lambda record uses.
-pub fn lambda_record_casing(mut envelope: Value) -> Value {
+fn lambda_record_casing(mut envelope: Value) -> Value {
     let record = envelope.as_object_mut().unwrap();
     if let Some(url) = record.remove("SigningCertURL") {
         record.insert("SigningCertUrl".to_owned(), url);
@@ -657,7 +668,7 @@ pub fn test_context() -> Context {
     // `Context` is `#[non_exhaustive]`, so even `..Default::default()` struct
     // update syntax is rejected outside its crate — mutate the field instead.
     let mut ctx = Context::default();
-    ctx.deadline = now_ms + 60_000;
+    ctx.deadline = now_ms.saturating_add(60_000);
     ctx
 }
 
@@ -666,7 +677,7 @@ pub async fn invoke(
     state: Arc<AppState<Fakes>>,
     payload: Value,
 ) -> Result<Value, lambda_http::Error> {
-    let router: Router = app(state.clone());
+    let router: Router = app(Arc::clone(&state));
     dispatch(state, router, LambdaEvent::new(payload, test_context())).await
 }
 
@@ -697,6 +708,10 @@ pub fn dynamodb_insert_event(raw_body: &[u8], sk: &str, sequence: &str) -> Value
 
 /// A DynamoDB Streams event for one aggregate (`sk = AGG`) record with the given
 /// new/old `current_status` values (None = attribute absent).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: assigns into JSON object literals; a panic is the test failing"
+)]
 pub fn dynamodb_agg_event(
     event_name: &str,
     new_status: Option<&str>,
