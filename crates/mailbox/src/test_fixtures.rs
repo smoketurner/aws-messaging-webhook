@@ -4,7 +4,7 @@ use crate::time;
 use std::collections::BTreeMap;
 
 use super::{Direction, InboxId, MailMessage};
-use crate::labels::{Label, SystemLabel};
+use crate::labels::Label;
 use crate::time::Timestamp;
 
 /// The instant an RFC 3339 literal names.
@@ -41,10 +41,7 @@ pub fn message() -> MailMessage {
         direction: Direction::Inbound,
         rfc_message_id: "<mid-1@example.com>".to_owned(),
         in_reply_to: None,
-        labels: vec![
-            Label::from(SystemLabel::Received),
-            Label::from(SystemLabel::Unread),
-        ],
+        labels: vec![Label::Received, Label::Unread],
         timestamp: at("2026-01-15T09:30:00.000Z"),
         from: "sender@example.com".to_owned(),
         to: vec!["support@example.com".to_owned()],

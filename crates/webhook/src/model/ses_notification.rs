@@ -5,11 +5,10 @@
 
 use std::collections::HashMap;
 
-use mailbox::open_string_enum;
 use mailbox::send::SES_MESSAGE_TAG;
 use serde::{Deserialize, Serialize};
 
-use mailbox::labels::SystemLabel;
+use mailbox::labels::Label;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,20 +185,78 @@ impl SesEngagement {
     }
 }
 
-open_string_enum! {
-    /// The SES event kind, from `eventType` or `notificationType`.
-    pub enum SesEventKind {
-        Send = "Send",
-        Delivery = "Delivery",
-        Bounce = "Bounce",
-        Complaint = "Complaint",
-        Reject = "Reject",
-        Open = "Open",
-        Click = "Click",
-        /// Really does contain a space on the wire.
-        RenderingFailure = "Rendering Failure",
-        DeliveryDelay = "DeliveryDelay",
-        Subscription = "Subscription",
+/// The SES event kind, from `eventType` or `notificationType`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum SesEventKind {
+    Send,
+    Delivery,
+    Bounce,
+    Complaint,
+    Reject,
+    Open,
+    Click,
+    /// Really does contain a space on the wire.
+    RenderingFailure,
+    DeliveryDelay,
+    Subscription,
+    /// A value this service has no variant for, kept verbatim.
+    Other(String),
+}
+
+impl SesEventKind {
+    /// The value as AWS sent it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Send => "Send",
+            Self::Delivery => "Delivery",
+            Self::Bounce => "Bounce",
+            Self::Complaint => "Complaint",
+            Self::Reject => "Reject",
+            Self::Open => "Open",
+            Self::Click => "Click",
+            Self::RenderingFailure => "Rendering Failure",
+            Self::DeliveryDelay => "DeliveryDelay",
+            Self::Subscription => "Subscription",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl From<String> for SesEventKind {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "Send" => Self::Send,
+            "Delivery" => Self::Delivery,
+            "Bounce" => Self::Bounce,
+            "Complaint" => Self::Complaint,
+            "Reject" => Self::Reject,
+            "Open" => Self::Open,
+            "Click" => Self::Click,
+            "Rendering Failure" => Self::RenderingFailure,
+            "DeliveryDelay" => Self::DeliveryDelay,
+            "Subscription" => Self::Subscription,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<SesEventKind> for String {
+    fn from(value: SesEventKind) -> Self {
+        match value {
+            SesEventKind::Send => "Send".to_owned(),
+            SesEventKind::Delivery => "Delivery".to_owned(),
+            SesEventKind::Bounce => "Bounce".to_owned(),
+            SesEventKind::Complaint => "Complaint".to_owned(),
+            SesEventKind::Reject => "Reject".to_owned(),
+            SesEventKind::Open => "Open".to_owned(),
+            SesEventKind::Click => "Click".to_owned(),
+            SesEventKind::RenderingFailure => "Rendering Failure".to_owned(),
+            SesEventKind::DeliveryDelay => "DeliveryDelay".to_owned(),
+            SesEventKind::Subscription => "Subscription".to_owned(),
+            SesEventKind::Other(value) => value,
+        }
     }
 }
 
@@ -229,13 +286,13 @@ impl SesEventKind {
     /// sent, and a `Send` event arriving afterwards would say nothing new.
     /// `Click` has no mailbox label in the vocabulary this service uses.
     #[must_use]
-    pub fn mailbox_label(&self) -> Option<SystemLabel> {
+    pub fn mailbox_label(&self) -> Option<Label> {
         match self {
-            Self::Delivery => Some(SystemLabel::Delivered),
-            Self::Bounce => Some(SystemLabel::Bounced),
-            Self::Complaint => Some(SystemLabel::Complained),
-            Self::Reject => Some(SystemLabel::Rejected),
-            Self::Open => Some(SystemLabel::Opened),
+            Self::Delivery => Some(Label::Delivered),
+            Self::Bounce => Some(Label::Bounced),
+            Self::Complaint => Some(Label::Complained),
+            Self::Reject => Some(Label::Rejected),
+            Self::Open => Some(Label::Opened),
             Self::Send
             | Self::Click
             | Self::RenderingFailure
@@ -284,20 +341,91 @@ impl SesEventKind {
     }
 }
 
-open_string_enum! {
-    /// A bounce's `bounceType`.
-    pub enum BounceType {
-        Undetermined = "Undetermined",
-        Permanent = "Permanent",
-        Transient = "Transient",
+/// A bounce's `bounceType`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum BounceType {
+    Undetermined,
+    Permanent,
+    Transient,
+    /// A value this service has no variant for, kept verbatim.
+    Other(String),
+}
+
+impl BounceType {
+    /// The value as AWS sent it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Undetermined => "Undetermined",
+            Self::Permanent => "Permanent",
+            Self::Transient => "Transient",
+            Self::Other(value) => value,
+        }
     }
 }
 
-open_string_enum! {
-    /// An engagement's `isBotEvent`.
-    pub enum BotFlag {
-        Likely = "Likely",
-        Unlikely = "Unlikely",
+impl From<String> for BounceType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "Undetermined" => Self::Undetermined,
+            "Permanent" => Self::Permanent,
+            "Transient" => Self::Transient,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<BounceType> for String {
+    fn from(value: BounceType) -> Self {
+        match value {
+            BounceType::Undetermined => "Undetermined".to_owned(),
+            BounceType::Permanent => "Permanent".to_owned(),
+            BounceType::Transient => "Transient".to_owned(),
+            BounceType::Other(value) => value,
+        }
+    }
+}
+
+/// An engagement's `isBotEvent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum BotFlag {
+    Likely,
+    Unlikely,
+    /// A value this service has no variant for, kept verbatim.
+    Other(String),
+}
+
+impl BotFlag {
+    /// The value as AWS sent it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Likely => "Likely",
+            Self::Unlikely => "Unlikely",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl From<String> for BotFlag {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "Likely" => Self::Likely,
+            "Unlikely" => Self::Unlikely,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<BotFlag> for String {
+    fn from(value: BotFlag) -> Self {
+        match value {
+            BotFlag::Likely => "Likely".to_owned(),
+            BotFlag::Unlikely => "Unlikely".to_owned(),
+            BotFlag::Other(value) => value,
+        }
     }
 }
 
@@ -530,25 +658,17 @@ mod tests {
         for (kind, label, event_type) in [
             (
                 SesEventKind::Delivery,
-                SystemLabel::Delivered,
+                Label::Delivered,
                 "message.delivered",
             ),
-            (
-                SesEventKind::Bounce,
-                SystemLabel::Bounced,
-                "message.bounced",
-            ),
+            (SesEventKind::Bounce, Label::Bounced, "message.bounced"),
             (
                 SesEventKind::Complaint,
-                SystemLabel::Complained,
+                Label::Complained,
                 "message.complained",
             ),
-            (
-                SesEventKind::Reject,
-                SystemLabel::Rejected,
-                "message.rejected",
-            ),
-            (SesEventKind::Open, SystemLabel::Opened, "message.opened"),
+            (SesEventKind::Reject, Label::Rejected, "message.rejected"),
+            (SesEventKind::Open, Label::Opened, "message.opened"),
         ] {
             assert_eq!(kind.mailbox_label(), Some(label));
             assert_eq!(kind.mailbox_event_type(), Some(event_type));

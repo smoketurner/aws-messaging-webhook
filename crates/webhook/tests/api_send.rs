@@ -11,8 +11,9 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use mailbox::labels::Label;
 use mailbox::send::{SendState, SendStatus};
-use mailbox::test_fixtures::{at, label};
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, MESSAGE_USER_LABEL_CAP, labels};
 use mailbox::{MessageId, ThreadId};
 use mailbox_store::keys::TableKey;
@@ -123,8 +124,8 @@ async fn a_send_with_a_full_set_of_user_labels_and_a_system_toggle_is_queued() {
         MESSAGE_USER_LABEL_CAP
     );
     assert_eq!(message.labels.len(), MESSAGE_USER_LABEL_CAP + 2);
-    assert!(message.labels.contains(&label("queued")));
-    assert!(message.labels.contains(&label("spam")));
+    assert!(message.labels.contains(&Label::Queued));
+    assert!(message.labels.contains(&Label::Spam));
 }
 
 #[tokio::test]

@@ -56,7 +56,7 @@ async fn an_inbound_reply_lands_in_a_thread_full_of_user_labels() {
         .unwrap();
 
     let mut reply = message("mid-2", "tid-1");
-    reply.labels = vec![label("received"), label("spam"), label("unread")];
+    reply.labels = vec![Label::Received, Label::Spam, Label::Unread];
     reply.timestamp = at("2026-01-01T00:00:02.000Z");
     assert_eq!(
         mailbox.insert_message(&reply, &[]).await.unwrap(),
@@ -104,7 +104,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
             .update_labels(
                 &inbox(),
                 &MessageId::new("mid-2"),
-                &[label("spam")],
+                &[Label::Spam],
                 &[],
                 at(NOW)
             )
@@ -189,7 +189,7 @@ fn queued(msg: &MailMessage) -> SendState {
 fn outbound(message_id: &str) -> MailMessage {
     let mut msg = message(message_id, "tid-1");
     msg.direction = Direction::Outbound;
-    msg.labels = vec![label("queued")];
+    msg.labels = vec![Label::Queued];
     msg
 }
 

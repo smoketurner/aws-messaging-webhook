@@ -789,11 +789,11 @@ mod tests {
 
     #[test]
     fn a_patch_reports_only_the_changes_it_made() {
-        let current = vec![label("received"), label("unread")];
+        let current = vec![Label::Received, Label::Unread];
         let patch = patch_labels(
             &current,
-            &[label("unread"), label("invoices")],
-            &[label("spam"), label("received")],
+            &[Label::Unread, label("invoices")],
+            &[Label::Spam, Label::Received],
         );
         assert_eq!(patch.labels, vec!["invoices", "unread"]);
         assert_eq!(patch.added, vec!["invoices"]);
@@ -802,8 +802,8 @@ mod tests {
 
     #[test]
     fn a_patch_that_changes_nothing_reports_nothing() {
-        let current = vec![label("received")];
-        let patch = patch_labels(&current, &[label("received")], &[label("spam")]);
+        let current = vec![Label::Received];
+        let patch = patch_labels(&current, &[Label::Received], &[Label::Spam]);
         assert_eq!(patch.added, Vec::<Label>::new());
         assert_eq!(patch.removed, Vec::<Label>::new());
         assert_eq!(patch.labels, current);

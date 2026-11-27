@@ -19,7 +19,6 @@ use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
 use crate::state::{AppState, Backend};
 use crate::store::Delivery;
-use mailbox::labels::SystemLabel;
 use mailbox::mime::{ParseError, ParsedAttachment, ParsedMessage, parse_inbound};
 use mailbox::time::Timestamp;
 use mailbox::{
@@ -611,10 +610,9 @@ async fn insert_into_inbox<B: Backend>(
 /// whatever the verdict adds, sorted (matching `plan_insert`'s sorted-labels
 /// invariant).
 fn verdict_labels(verdict: labels::InboundVerdict) -> Vec<Label> {
-    let mut labels: Vec<Label> = [SystemLabel::Received, SystemLabel::Unread]
+    let mut labels: Vec<Label> = [Label::Received, Label::Unread]
         .into_iter()
         .chain(verdict.label())
-        .map(Label::from)
         .collect();
     labels.sort_unstable();
     labels

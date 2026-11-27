@@ -36,7 +36,6 @@
 use aws_lambda_events::dynamodb::Event;
 use axum::body::Bytes;
 use mailbox::content::MessageContent;
-use mailbox::labels;
 use mailbox::labels::Label;
 use mailbox::time::{self, Timestamp};
 use serde_dynamo::{AttributeValue, Item};
@@ -56,7 +55,6 @@ use crate::state::{AppState, Backend};
 use crate::store::EventRecord;
 use mailbox::MailMessage;
 use mailbox::SesMessageId;
-use mailbox::labels::SystemLabel;
 use mailbox_store::MailStoreError;
 use mailbox_store::keys;
 
@@ -395,7 +393,7 @@ async fn publish_mail_record<B: Backend>(state: &AppState<B>, image: &Item) -> R
     // A queued send's INSERT publishes nothing (its lifecycle starts at the
     // `sent` relabel), and reading its content document first would be an S3
     // GET for an event that is never built.
-    if !labels::has(&msg.labels, SystemLabel::Received) {
+    if !msg.labels.contains(&Label::Received) {
         return RelayOutcome::Settled;
     }
     let content = match content::load(&state.objects, &msg).await {

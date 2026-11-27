@@ -439,15 +439,13 @@ mod tests {
     use super::*;
     use crate::ATTACHMENTS_MAX;
 
-    macro_rules! fixture {
-        ($name:literal) => {
-            parse_inbound(include_bytes!(concat!("../tests/fixtures/mail/", $name))).unwrap()
-        };
+    fn fixture(bytes: &[u8]) -> ParsedInbound {
+        parse_inbound(bytes).unwrap()
     }
 
     #[test]
     fn plain_text_message() {
-        let parsed = fixture!("plain.eml");
+        let parsed = fixture(include_bytes!("../tests/fixtures/mail/plain.eml"));
         assert_eq!(parsed.message.from, "Alice Sender <alice@example.com>");
         assert_eq!(parsed.message.to, ["Bob Recipient <bob@example.com>"]);
         assert_eq!(parsed.message.subject, "Plain text hello");
@@ -460,14 +458,18 @@ mod tests {
 
     #[test]
     fn multipart_alternative_keeps_both_bodies() {
-        let parsed = fixture!("multipart-alternative.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/multipart-alternative.eml"
+        ));
         assert_eq!(parsed.content.text.unwrap().trim(), "Plain body.");
         assert!(parsed.content.html.unwrap().contains("HTML body."));
     }
 
     #[test]
     fn attachment_with_content_id() {
-        let parsed = fixture!("attachment-content-id.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/attachment-content-id.eml"
+        ));
         assert_eq!(parsed.attachments.len(), 1);
         let attachment = &parsed.attachments[0];
         assert_eq!(attachment.content_id.as_deref(), Some("logo123"));
@@ -479,7 +481,9 @@ mod tests {
 
     #[test]
     fn reply_captures_in_reply_to_and_references() {
-        let parsed = fixture!("reply-references.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/reply-references.eml"
+        ));
         assert_eq!(
             parsed.message.in_reply_to.as_deref(),
             Some("<plain-1@example.com>")
@@ -535,13 +539,15 @@ mod tests {
 
     #[test]
     fn inline_text_parts_are_concatenated_with_newline() {
-        let parsed = fixture!("inline-text-parts.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/inline-text-parts.eml"
+        ));
         assert_eq!(parsed.content.text.unwrap(), "First part.\nSecond part.");
     }
 
     #[test]
     fn nested_message_is_stored_whole_not_flattened() {
-        let parsed = fixture!("nested-rfc822.eml");
+        let parsed = fixture(include_bytes!("../tests/fixtures/mail/nested-rfc822.eml"));
         assert_eq!(parsed.attachments.len(), 1);
         let attachment = &parsed.attachments[0];
         assert_eq!(attachment.content_type, "message/rfc822");
@@ -555,14 +561,16 @@ mod tests {
 
     #[test]
     fn rfc2231_encoded_filename_is_decoded() {
-        let parsed = fixture!("encoded-word-filename.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/encoded-word-filename.eml"
+        ));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].filename.as_deref(), Some("été.pdf"));
     }
 
     #[test]
     fn attachment_with_no_filename_is_omitted() {
-        let parsed = fixture!("no-filename.eml");
+        let parsed = fixture(include_bytes!("../tests/fixtures/mail/no-filename.eml"));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].filename, None);
         assert_eq!(
@@ -580,7 +588,9 @@ mod tests {
 
     #[test]
     fn hostile_content_type_falls_back_to_octet_stream() {
-        let parsed = fixture!("hostile-content-type.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/hostile-content-type.eml"
+        ));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(
             parsed.attachments[0].content_type,
@@ -618,7 +628,7 @@ mod tests {
 
     #[test]
     fn addresses_and_headers_stay_within_caps() {
-        let parsed = fixture!("plain.eml");
+        let parsed = fixture(include_bytes!("../tests/fixtures/mail/plain.eml"));
         assert!(parsed.content.headers.contains_key("Subject"));
         assert!(parsed.content.headers.contains_key("From"));
     }
@@ -651,7 +661,7 @@ mod tests {
     /// comment on `parse_inbound`'s body extraction.
     #[test]
     fn text_only_message_has_no_html_fallback() {
-        let parsed = fixture!("plain.eml");
+        let parsed = fixture(include_bytes!("../tests/fixtures/mail/plain.eml"));
         assert!(parsed.content.html.is_none());
         assert!(parsed.content.text.is_some());
     }
@@ -667,7 +677,9 @@ mod tests {
     /// fix must hold regardless of `Content-Transfer-Encoding`.
     #[test]
     fn inline_image_in_multipart_mixed_is_not_appended_to_text_body() {
-        let parsed = fixture!("inline-image-mixed.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/inline-image-mixed.eml"
+        ));
         assert_eq!(parsed.content.text.as_deref(), Some("Hello body."));
         assert_eq!(parsed.message.preview, "Hello body.");
         assert!(parsed.content.html.is_none());
@@ -694,7 +706,9 @@ mod tests {
     /// back empty while the text body was correct.
     #[test]
     fn inline_image_before_the_text_leaves_text_and_preview_intact() {
-        let parsed = fixture!("inline-image-first.eml");
+        let parsed = fixture(include_bytes!(
+            "../tests/fixtures/mail/inline-image-first.eml"
+        ));
         assert_eq!(parsed.content.text.as_deref(), Some("Hello body."));
         assert_eq!(parsed.message.preview, "Hello body.");
         assert_eq!(parsed.attachments.len(), 1);

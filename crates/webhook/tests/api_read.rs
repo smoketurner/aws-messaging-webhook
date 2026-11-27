@@ -5,12 +5,13 @@
 //! these reads return are the ones ingest would actually write.
 
 use mailbox::MessageId;
+use mailbox::labels::Label;
 use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content;
 use axum::http::{Method, StatusCode};
 use mailbox::content::MessageContent;
-use mailbox::test_fixtures::{at, label};
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, ids, time};
 use mailbox_store::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
@@ -236,7 +237,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
 async fn spam_and_trash_are_hidden_unless_asked_for() {
     let h = seeded().await;
     insert(&h, "2026-01-01T09:00:00.000Z", "t1", |m| {
-        m.labels = vec![label("received"), label("spam")];
+        m.labels = vec![Label::Received, Label::Spam];
     })
     .await;
     insert(&h, "2026-01-01T10:00:00.000Z", "t2", |m| {
@@ -260,7 +261,7 @@ async fn spam_and_trash_are_hidden_unless_asked_for() {
 async fn asking_for_a_label_overrides_the_flag_that_would_hide_it() {
     let h = seeded().await;
     insert(&h, "2026-01-01T09:00:00.000Z", "t1", |m| {
-        m.labels = vec![label("received"), label("trash")];
+        m.labels = vec![Label::Received, Label::Trash];
     })
     .await;
 

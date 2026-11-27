@@ -685,14 +685,14 @@ mod tests {
     use mailbox::thread::{apply_message, new_thread};
     use mailbox::{Direction, InboxId, test_fixtures};
 
-    fn message(inbox: &str, thread_id: &str, message_id: &str, labels: &[&str]) -> MailMessage {
+    fn message(inbox: &str, thread_id: &str, message_id: &str, labels: &[Label]) -> MailMessage {
         MailMessage {
             inbox_id: InboxId::new(inbox),
             thread_id: ThreadId::new(thread_id),
             message_id: MessageId::new(message_id),
             ses_message_id: None,
             rfc_message_id: format!("<{message_id}@example.com>"),
-            labels: labels.iter().map(|l| label(l)).collect(),
+            labels: labels.to_vec(),
             timestamp: at("2026-01-01T00:00:01.000Z"),
             size: 1_000,
             version: 0,
@@ -708,7 +708,7 @@ mod tests {
             "support@example.com",
             "tid-1",
             "mid-1",
-            &["received", "unread"],
+            &[Label::Received, Label::Unread],
         );
         let thread = new_thread(&msg);
         let ops = plan_insert(&msg, None, &thread, &AliasLookup::default()).unwrap();
@@ -735,7 +735,7 @@ mod tests {
             "support@example.com",
             "tid-1",
             "mid-1",
-            &["received", "unread"],
+            &[Label::Received, Label::Unread],
         );
         msg.expires_at = 1_900_000_000;
         let thread = new_thread(&msg);
@@ -751,14 +751,14 @@ mod tests {
 
         let mut outbound = msg.clone();
         outbound.direction = Direction::Outbound;
-        outbound.labels = vec![label("queued")];
+        outbound.labels = vec![Label::Queued];
         let claimed = queued_state(&outbound, None).claimed(at("2026-01-01T00:00:01.000Z"));
         let sent = claimed.sent(at("2026-01-01T00:00:02.000Z"));
         let ops = plan_mark(
             &claimed,
             &sent,
             &outbound,
-            &[label("sent")],
+            &[Label::Sent],
             None,
             Some(SesSent {
                 message_id: "ses-1",
@@ -818,14 +818,14 @@ mod tests {
             "support@example.com",
             "tid-1",
             "mid-1",
-            &["received", "unread"],
+            &[Label::Received, Label::Unread],
         );
         let before = new_thread(&first);
         let mut second = message(
             "support@example.com",
             "tid-1",
             "mid-2",
-            &["received", "unread"],
+            &[Label::Received, Label::Unread],
         );
         second.timestamp = at("2026-01-01T00:00:02.000Z");
         let after = apply_message(&before, &second);
@@ -857,7 +857,7 @@ mod tests {
     /// rather than keeping the whole item indexed until its TTL.
     #[test]
     fn only_a_sweepable_send_state_carries_the_status_index_keys() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &[Label::Queued]);
         msg.direction = Direction::Outbound;
         let queued = queued_state(&msg, None);
         let now = at("2026-01-01T00:00:10.000Z");
@@ -889,7 +889,7 @@ mod tests {
     fn plan_enqueue_puts_the_idempotency_key_first_and_lets_an_expired_one_go() {
         // The key op leads so a cancellation names the replay before any
         // other conflict, and an expired key must be reusable.
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &[Label::Queued]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, Some("SENDKEY#abc"));
@@ -928,7 +928,7 @@ mod tests {
     fn plan_enqueue_indexes_the_send_state_by_its_status() {
         // The sweep finds work through the status index, so a queued send has
         // to be in the queued partition.
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &[Label::Queued]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, None);
@@ -980,7 +980,7 @@ mod tests {
     /// are the exact names and values the table already holds.
     #[test]
     fn planned_items_carry_the_stored_key_attributes() {
-        let mut msg = message("support@example.com", "tid-1", "mid-1", &["queued"]);
+        let mut msg = message("support@example.com", "tid-1", "mid-1", &[Label::Queued]);
         msg.direction = Direction::Outbound;
         let thread = new_thread(&msg);
         let state = queued_state(&msg, None);
@@ -1113,11 +1113,9 @@ mod tests {
     /// duplicate or an out-of-order pair is refused.
     #[test]
     fn only_strictly_ascending_labels_are_sorted_and_deduped() {
-        let labels =
-            |values: &[&str]| -> Vec<Label> { values.iter().map(|value| label(value)).collect() };
         assert!(is_sorted_and_deduped::<Label>(&[]));
-        assert!(is_sorted_and_deduped(&labels(&["a", "b", "c"])));
-        assert!(!is_sorted_and_deduped(&labels(&["a", "a"])));
-        assert!(!is_sorted_and_deduped(&labels(&["b", "a"])));
+        assert!(is_sorted_and_deduped(&[label("a"), label("b"), label("c")]));
+        assert!(!is_sorted_and_deduped(&[label("a"), label("a")]));
+        assert!(!is_sorted_and_deduped(&[label("b"), label("a")]));
     }
 }

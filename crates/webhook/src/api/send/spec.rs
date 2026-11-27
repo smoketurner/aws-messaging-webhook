@@ -11,7 +11,6 @@ use crate::api::error::ApiError;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::mail::object_keys;
 use crate::mail::objects::ObjectStore;
-use mailbox::labels::SystemLabel;
 use mailbox::send::{Envelope, SendSpec, SendStatus, SpecAttachment};
 use mailbox::{AttachmentMeta, Direction, InboxId, MailMessage, ids, mime};
 use mailbox::{MessageId, ThreadId};
@@ -126,7 +125,7 @@ pub(super) fn queued_message(
     now: Timestamp,
 ) -> MailMessage {
     let mut labels = send.labels.clone();
-    labels.push(Label::from(SystemLabel::Queued));
+    labels.push(Label::Queued);
     labels.sort();
     labels.dedup();
 

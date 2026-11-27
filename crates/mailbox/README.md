@@ -25,9 +25,9 @@ The rest is organised by module:
 - `build`: `build_outbound`, the outbound MIME document from a send spec and its parts.
 - `content`: `MessageContent`, a message's write-once body document.
 - `ids`: message, attachment and event ids (`UUIDv7`), and our `Message-ID` forms.
-- `labels`: `Label` (a validated label, also enforced when deserializing), `SystemLabel` (the
-  labels the service sets, each convertible into a `Label`), user label counting and inbound
-  verdict classification.
+- `labels`: `Label`, a validated label (also enforced when deserializing): one variant per label
+  the service sets, plus `Label::User` for a caller's own; user label counting and inbound verdict
+  classification.
 - `mime`: `parse_inbound`, inbound MIME into a `ParsedInbound`.
 - `send`: `SendState`, `SendSpec`, `SendKey` and `mark_transition`, the outbound send.
 - `thread`: `ThreadState`, `AliasLookup`, `new_thread` and `apply_message`, thread

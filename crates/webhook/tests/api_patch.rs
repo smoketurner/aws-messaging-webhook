@@ -5,7 +5,8 @@
 
 use axum::http::{Method, StatusCode};
 use mailbox::MessageId;
-use mailbox::test_fixtures::{at, label};
+use mailbox::labels::Label;
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, ids, time};
 use mailbox_store::sample_message;
 use serde_json::{Value, json};
@@ -169,14 +170,14 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
         .update_labels(
             &InboxId::new(TEST_INBOX),
             &MessageId::new(ids[0].as_str()),
-            &[label("bounced")],
+            &[Label::Bounced],
             &[],
             at("2026-01-02T00:00:00.000Z"),
         )
         .await
         .unwrap()
         .unwrap();
-    assert!(labels.contains(&label("bounced")));
+    assert!(labels.contains(&Label::Bounced));
 }
 
 /// A request may name a full set of a caller's own labels plus a state toggle
