@@ -10,6 +10,8 @@
 //! writer moved a version, so anything computed from the previous read is
 //! stale.
 
+use mailbox::send;
+use mailbox::time::Timestamp;
 use std::collections::HashMap;
 
 use crate::keys::{self, PageKey};
@@ -56,7 +58,11 @@ impl<T: Table> Mailbox<T> {
     /// The store's error for a failed write or read, and
     /// [`MailStoreError::Transient`] when the inbox vanished between the
     /// failed condition and the read.
-    pub async fn ensure_inbox(&self, inbox: &InboxId, now: &str) -> Result<Inbox, MailStoreError> {
+    pub async fn ensure_inbox(
+        &self,
+        inbox: &InboxId,
+        now: Timestamp,
+    ) -> Result<Inbox, MailStoreError> {
         let (record, item) = plan::inbox_item(inbox, now)?;
         match self.table.put_if_absent(item, "PutItem(inbox)").await? {
             PutOutcome::Created => Ok(record),
@@ -482,7 +488,7 @@ impl<T: Table> Mailbox<T> {
     pub async fn claim_send(
         &self,
         message_id: &MessageId,
-        now: &str,
+        now: Timestamp,
     ) -> Result<Option<SendState>, MailStoreError> {
         for attempt in 0..=MAX_TXN_RETRIES {
             let Some(before) = self.read_send_state(message_id).await? else {
@@ -518,7 +524,7 @@ impl<T: Table> Mailbox<T> {
     pub async fn note_ses_call(
         &self,
         claimed: &SendState,
-        now: &str,
+        now: Timestamp,
     ) -> Result<Option<SendState>, MailStoreError> {
         let after = claimed.calling_ses(now);
         let ops = plan::plan_state_cas(claimed, &after, SendStatus::Sending)?;
@@ -547,7 +553,7 @@ impl<T: Table> Mailbox<T> {
         &self,
         state: &SendState,
         outcome: MarkOutcome<'_>,
-        now: &str,
+        now: Timestamp,
     ) -> Result<(), MailStoreError> {
         let mut taken = Vec::new();
         for attempt in 0..=MAX_TXN_RETRIES {
@@ -560,7 +566,7 @@ impl<T: Table> Mailbox<T> {
                     state.message_id
                 )));
             };
-            let (after, labels, ses) = mailbox::send::mark_transition(state, &msg, outcome, now);
+            let (after, labels, ses) = send::mark_transition(state, &msg, outcome, now);
             let (added, removed) = label_changes(&msg.labels, &labels);
             let thread = if added.is_empty() && removed.is_empty() {
                 None
@@ -628,7 +634,7 @@ impl<T: Table> Mailbox<T> {
         message_id: &MessageId,
         add: &[String],
         remove: &[String],
-        now: &str,
+        now: Timestamp,
     ) -> Result<Option<Vec<String>>, MailStoreError> {
         for attempt in 0..=MAX_TXN_RETRIES {
             let Some(msg) = self.read_message(inbox, message_id).await? else {

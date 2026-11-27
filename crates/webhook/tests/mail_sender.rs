@@ -15,6 +15,8 @@ use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mailbox::send::{SendFailure, SendState, SendStatus};
+use mailbox::test_fixtures::at;
+use mailbox::time::Timestamp;
 use mailbox::{InboxId, ids, time};
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use mailbox_store::keys::TableKey;
@@ -543,6 +545,34 @@ async fn an_accepted_send_that_cannot_be_recorded_keeps_its_ses_call_mark() {
     assert!(state.ses_call_at.is_some());
 }
 
+/// The sweep measures a claim's age against the time it is handed (its
+/// schedule's fire time), not the clock.
+#[tokio::test]
+async fn the_sweep_judges_a_claim_against_the_time_it_is_given() {
+    let h = api_harness().await;
+    let message_id = queued(&h, &body()).await;
+    h.state
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            at("2026-01-01T00:00:00.000Z"),
+        )
+        .await
+        .unwrap();
+
+    let fourteen_minutes_on = at("2026-01-01T00:14:00.000Z");
+    let report = sweep(&h.state, fourteen_minutes_on).await.unwrap();
+    assert_eq!(report.still_working, 1);
+    assert_eq!(report.released, 0);
+
+    let sixteen_minutes_on = at("2026-01-01T00:16:00.000Z");
+    let report = sweep(&h.state, sixteen_minutes_on).await.unwrap();
+    assert_eq!(report.released, 1);
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Queued);
+    assert_eq!(state.requeued_at, Some(at("2026-01-01T00:16:00.000Z")));
+}
+
 #[tokio::test]
 async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
     let h = api_harness().await;
@@ -552,19 +582,19 @@ async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap()
         .unwrap();
     h.state
         .mailbox
-        .note_ses_call(&claimed, "2020-01-01T00:00:01.000Z")
+        .note_ses_call(&claimed, at("2020-01-01T00:00:01.000Z"))
         .await
         .unwrap()
         .unwrap();
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.marked_unknown, 1);
     assert_eq!(report.released, 0);
@@ -582,14 +612,14 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
     }
     h.mail.inject(mailbox_store::Injected::Transient);
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.errors, 1);
     assert_eq!(report.released, 1);
@@ -811,13 +841,13 @@ async fn the_sweep_releases_a_claim_whose_sender_died() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sending);
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.released, 1);
     let state = state_of(&h, &message_id);
@@ -843,11 +873,11 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
-        let report = sweep(&h.state).await.unwrap();
+        let report = sweep(&h.state, Timestamp::now()).await.unwrap();
         abandoned += report.abandoned;
     }
 
@@ -873,7 +903,7 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
     assert_eq!(abandoned, 1);
 
     // Once failed it is no longer `sending`, so further sweeps leave it alone.
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
     assert_eq!(report.abandoned, 0);
     assert_eq!(report.released, 0);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
@@ -893,11 +923,11 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
-        let report = sweep(&h.state).await.unwrap();
+        let report = sweep(&h.state, Timestamp::now()).await.unwrap();
         assert_eq!(report.released, 1, "attempt {attempt} should be released");
         assert_eq!(
             report.abandoned, 0,
@@ -913,11 +943,11 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
     assert_eq!(report.released, 0);
     assert_eq!(report.abandoned, 1);
     let state = state_of(&h, &message_id);
@@ -932,14 +962,13 @@ async fn the_sweep_leaves_a_recent_claim_alone() {
     // message gets sent twice.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    let now = mailbox::time::format(mailbox::time::now_ms());
     h.state
         .mailbox
-        .claim_send(&MessageId::new(message_id.as_str()), &now)
+        .claim_send(&MessageId::new(message_id.as_str()), Timestamp::now())
         .await
         .unwrap();
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.released, 0);
     assert_eq!(report.still_working, 1);
@@ -958,7 +987,7 @@ async fn the_sweep_reports_unknown_sends_without_touching_them() {
         .await
         .unwrap();
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.unknown, 1);
     assert_eq!(report.released, 0);
@@ -977,6 +1006,152 @@ async fn stuck_unknown(h: &Harness) -> MessageId {
         .unwrap();
     assert_eq!(state_of(h, &message_id).send_status, SendStatus::Unknown);
     message_id
+}
+
+/// Feeds one SES event through the real webhook path for mail tagged as
+/// `message_id`, which SES accepted under `ses_message_id` at 00:00:30.
+async fn tagged_ses_event(
+    h: &Harness,
+    kind: &str,
+    ses_message_id: &str,
+    message_id: &MessageId,
+) -> StatusCode {
+    let inner = json!({
+        "eventType": kind,
+        "mail": {
+            "messageId": ses_message_id,
+            "timestamp": "2026-01-01T00:00:30.000Z",
+            "tags": {
+                "ses:configuration-set": ["ConfigSet"],
+                "mailbox_message": [message_id.as_str()],
+            },
+        },
+    });
+    let body = webhook_test_support::wrapped(h, &inner);
+    webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await
+}
+
+async fn stored_message(h: &Harness, message_id: &MessageId) -> mailbox::MailMessage {
+    h.state
+        .mailbox
+        .get_message(&InboxId::new(TEST_INBOX), message_id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// SES answered, but the answer never reached this service. The first event
+/// SES publishes for the message is the same answer arriving another way, so
+/// it settles the send without an operator.
+#[tokio::test]
+async fn an_ses_event_settles_an_unknown_send_as_sent() {
+    let h = api_harness().await;
+    let message_id = stuck_unknown_with_attachment(&h).await;
+
+    let status = tagged_ses_event(&h, "Delivery", "ses-real-id", &message_id).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Sent);
+    assert!(state.expires_at.is_some(), "a settled send ages out");
+    let message = stored_message(&h, &message_id).await;
+    assert!(message.labels.contains(&"sent".to_owned()));
+    assert!(!message.labels.contains(&"queued".to_owned()));
+    // Dated by when SES took the message, not by when the event arrived.
+    assert_eq!(message.sent_at, Some(at("2026-01-01T00:00:30.000Z")));
+    // The same event is then labelled onto it, as any later one will be.
+    assert!(
+        message.labels.contains(&"delivered".to_owned()),
+        "{:?}",
+        message.labels
+    );
+    assert_eq!(
+        h.state
+            .mailbox
+            .resolve_ses_message(&SesMessageId::new("ses-real-id"))
+            .await
+            .unwrap()
+            .map(|(_, id)| id),
+        Some(message_id.clone())
+    );
+    assert_outbox_cleared(&h, &message_id);
+    // Nothing was sent again to get here.
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 1);
+}
+
+/// The sender called SES and then could not record the answer: the send is
+/// still `sending`, carrying only its SES-call mark, until the sweep would
+/// make it `unknown`. An event arriving first settles it just the same.
+#[tokio::test]
+async fn an_ses_event_settles_a_send_whose_outcome_was_never_recorded() {
+    let h = api_harness().await;
+    let message_id = queued(&h, &body()).await;
+    let claimed = h
+        .state
+        .mailbox
+        .claim_send(&message_id, at("2026-01-01T00:00:00.000Z"))
+        .await
+        .unwrap()
+        .unwrap();
+    h.state
+        .mailbox
+        .note_ses_call(&claimed, at("2026-01-01T00:00:01.000Z"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // `Send` carries no label of its own; it is still SES saying it has it.
+    tagged_ses_event(&h, "Send", "ses-real-id", &message_id).await;
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
+    let message = stored_message(&h, &message_id).await;
+    assert!(message.labels.contains(&"sent".to_owned()));
+
+    // The sweep then has nothing left to recover.
+    let report = sweep(&h.state, at("2026-01-01T01:00:00.000Z"))
+        .await
+        .unwrap();
+    assert_eq!(report.marked_unknown, 0);
+    assert_eq!(report.unknown, 0);
+}
+
+/// A tag is only a claim by whoever sent the mail, and other senders share
+/// the configuration set. An event cannot settle a send this service has not
+/// itself offered to SES.
+#[tokio::test]
+async fn an_ses_event_cannot_settle_a_send_that_never_reached_ses() {
+    let h = api_harness().await;
+    let waiting = queued(&h, &body()).await;
+    let claimed = queued(&h, &body()).await;
+    h.state
+        .mailbox
+        .claim_send(&claimed, at("2026-01-01T00:00:00.000Z"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    tagged_ses_event(&h, "Delivery", "ses-forged-1", &waiting).await;
+    tagged_ses_event(&h, "Delivery", "ses-forged-2", &claimed).await;
+
+    assert_eq!(state_of(&h, &waiting).send_status, SendStatus::Queued);
+    assert_eq!(state_of(&h, &claimed).send_status, SendStatus::Sending);
+    for message_id in [&waiting, &claimed] {
+        let message = stored_message(&h, message_id).await;
+        assert!(message.labels.contains(&"queued".to_owned()));
+        assert!(!message.labels.contains(&"delivered".to_owned()));
+    }
+}
+
+/// SES raises `Reject` for a message it took but never tried to deliver, so
+/// it is no proof of a send; the send stays with the operator.
+#[tokio::test]
+async fn an_ses_reject_event_does_not_settle_an_unknown_send() {
+    let h = api_harness().await;
+    let message_id = stuck_unknown(&h).await;
+
+    tagged_ses_event(&h, "Reject", "ses-real-id", &message_id).await;
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
 }
 
 #[tokio::test]
@@ -1043,7 +1218,7 @@ async fn an_operator_can_close_an_unknown_message_as_failed() {
     let state = state_of(&h, &message_id);
     assert_eq!(state.send_status, SendStatus::Failed);
     assert_eq!(
-        state.failure.map(mailbox::send::SendFailure::as_str),
+        state.failure.map(SendFailure::as_str),
         Some("closed_by_operator")
     );
 }
@@ -1265,11 +1440,11 @@ async fn a_send_the_sweep_abandons_clears_its_outbox() {
             .mailbox
             .claim_send(
                 &MessageId::new(message_id.as_str()),
-                "2020-01-01T00:00:00.000Z",
+                at("2020-01-01T00:00:00.000Z"),
             )
             .await
             .unwrap();
-        sweep(&h.state).await.unwrap();
+        sweep(&h.state, Timestamp::now()).await.unwrap();
     }
 
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
@@ -1289,11 +1464,11 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.released, 1);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Queued);
@@ -1321,17 +1496,17 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
         .mailbox
         .claim_send(
             &MessageId::new(message_id.as_str()),
-            "2020-01-01T00:00:00.000Z",
+            at("2020-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap()
         .expect("the send was queued, so the claim wins");
     h.state
         .mailbox
-        .note_ses_call(&claimed, "2020-01-01T00:00:00.000Z")
+        .note_ses_call(&claimed, at("2020-01-01T00:00:00.000Z"))
         .await
         .unwrap();
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.marked_unknown, 1);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);

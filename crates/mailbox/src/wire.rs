@@ -8,6 +8,8 @@
 //! minus the fields a list response omits (`headers`, `references`, body
 //! content, and the embedded `messages[]`).
 
+use crate::thread::ThreadState;
+use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -56,14 +58,17 @@ pub struct Message {
     pub thread_id: ThreadId,
     pub message_id: MessageId,
     pub labels: Vec<String>,
-    pub timestamp: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
     pub from: String,
     /// Always serialized, even empty: the contract makes `to` required.
     #[serde(default)]
     pub to: Vec<String>,
     pub size: u64,
-    pub updated_at: String,
-    pub created_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_to: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -102,12 +107,12 @@ impl Message {
             thread_id: msg.thread_id.clone(),
             message_id: msg.message_id.clone(),
             labels: msg.labels.clone(),
-            timestamp: msg.timestamp.clone(),
+            timestamp: msg.timestamp,
             from: msg.from.clone(),
             to: msg.to.clone(),
             size: msg.size,
-            updated_at: msg.updated_at.clone(),
-            created_at: msg.created_at.clone(),
+            updated_at: msg.updated_at,
+            created_at: msg.created_at,
             reply_to: content.reply_to.clone(),
             cc: msg.cc.clone(),
             bcc: msg.bcc.clone(),
@@ -133,7 +138,8 @@ pub struct MessageItem {
     pub thread_id: ThreadId,
     pub message_id: MessageId,
     pub labels: Vec<String>,
-    pub timestamp: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
     pub from: String,
     /// Always serialized, even empty: matches [`Message::to`] and the
     /// module-doc "same shapes minus omitted fields" invariant.
@@ -152,8 +158,10 @@ pub struct MessageItem {
     pub attachments: Vec<Attachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
 }
 
 impl From<&MailMessage> for MessageItem {
@@ -163,7 +171,7 @@ impl From<&MailMessage> for MessageItem {
             thread_id: msg.thread_id.clone(),
             message_id: msg.message_id.clone(),
             labels: msg.labels.clone(),
-            timestamp: msg.timestamp.clone(),
+            timestamp: msg.timestamp,
             from: msg.from.clone(),
             to: msg.to.clone(),
             cc: msg.cc.clone(),
@@ -173,8 +181,8 @@ impl From<&MailMessage> for MessageItem {
             size: msg.size,
             attachments: msg.attachments.iter().map(Attachment::from).collect(),
             in_reply_to: msg.in_reply_to.clone(),
-            created_at: msg.created_at.clone(),
-            updated_at: msg.updated_at.clone(),
+            created_at: msg.created_at,
+            updated_at: msg.updated_at,
         }
     }
 }
@@ -184,14 +192,17 @@ pub struct Thread {
     pub inbox_id: String,
     pub thread_id: ThreadId,
     pub labels: Vec<String>,
-    pub timestamp: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
     pub senders: Vec<String>,
     pub recipients: Vec<String>,
     pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
-    pub updated_at: String,
-    pub created_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
     pub messages: Vec<Message>,
     /// The embedded `messages` are paginated independently of the thread
     /// list, so a long thread stays within one response.
@@ -199,10 +210,12 @@ pub struct Thread {
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub received_timestamp: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sent_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::time::fixed::option")]
+    pub received_timestamp: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::time::fixed::option")]
+    pub sent_timestamp: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,7 +229,7 @@ impl Thread {
     /// messages, oldest first.
     #[must_use]
     pub fn new(
-        thread: &crate::thread::ThreadState,
+        thread: &ThreadState,
         messages: Vec<Message>,
         limit: usize,
         next_page_token: Option<String>,
@@ -271,18 +284,23 @@ pub struct ThreadItem {
     pub inbox_id: String,
     pub thread_id: ThreadId,
     pub labels: Vec<String>,
-    pub timestamp: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
     pub senders: Vec<String>,
     pub recipients: Vec<String>,
     pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub received_timestamp: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sent_timestamp: Option<String>,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::time::fixed::option")]
+    pub received_timestamp: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::time::fixed::option")]
+    pub sent_timestamp: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,22 +338,22 @@ impl From<&MailMessage> for ThreadItem {
     }
 }
 
-impl From<&crate::thread::ThreadState> for ThreadItem {
-    fn from(thread: &crate::thread::ThreadState) -> Self {
+impl From<&ThreadState> for ThreadItem {
+    fn from(thread: &ThreadState) -> Self {
         Self {
             inbox_id: thread.inbox_id.as_str().to_owned(),
             thread_id: thread.thread_id.clone(),
             labels: thread.labels.clone(),
-            timestamp: thread.timestamp.clone(),
+            timestamp: thread.timestamp,
             senders: thread.senders.clone(),
             recipients: thread.recipients.clone(),
             last_message_id: thread.last_message_id.clone(),
             message_count: thread.message_count,
             size: thread.size,
-            created_at: thread.created_at.clone(),
-            updated_at: thread.updated_at.clone(),
-            received_timestamp: thread.received_timestamp.clone(),
-            sent_timestamp: thread.sent_timestamp.clone(),
+            created_at: thread.created_at,
+            updated_at: thread.updated_at,
+            received_timestamp: thread.received_timestamp,
+            sent_timestamp: thread.sent_timestamp,
             subject: (!thread.subject.is_empty()).then(|| thread.subject.clone()),
             preview: (!thread.preview.is_empty()).then(|| thread.preview.clone()),
             attachments: thread.attachments.iter().map(Attachment::from).collect(),
@@ -349,8 +367,10 @@ pub struct Inbox {
     pub pod_id: String,
     pub inbox_id: String,
     pub email: String,
-    pub updated_at: String,
-    pub created_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,8 +385,8 @@ impl From<&crate::Inbox> for Inbox {
             pod_id: "pod_default".to_owned(),
             inbox_id: inbox.inbox_id.as_str().to_owned(),
             email: inbox.email.clone(),
-            updated_at: inbox.updated_at.clone(),
-            created_at: inbox.created_at.clone(),
+            updated_at: inbox.updated_at,
+            created_at: inbox.created_at,
             display_name: inbox.display_name.clone(),
             client_id: None,
             metadata: inbox.metadata.clone(),
@@ -412,7 +432,8 @@ pub struct ThreadList {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Download {
     pub download_url: String,
-    pub expires_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub expires_at: Timestamp,
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<MessageId>,
@@ -442,6 +463,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::test_fixtures::at;
     use crate::{InboxId, test_fixtures};
 
     fn sample_message() -> MailMessage {
@@ -571,8 +593,8 @@ mod tests {
             email: "support@example.com".to_owned(),
             display_name: Some("Support".to_owned()),
             metadata: None,
-            created_at: "2026-01-15T09:30:00.000Z".to_owned(),
-            updated_at: "2026-01-15T09:30:00.000Z".to_owned(),
+            created_at: at("2026-01-15T09:30:00.000Z"),
+            updated_at: at("2026-01-15T09:30:00.000Z"),
         };
         let value = serde_json::to_value(Inbox::from(&inbox)).unwrap();
         assert_eq!(

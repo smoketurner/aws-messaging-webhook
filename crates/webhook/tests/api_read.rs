@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use aws_messaging_webhook::mail::content;
 use axum::http::{Method, StatusCode};
 use mailbox::content::MessageContent;
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, ids, time};
 use mailbox_store::sample_message;
 use webhook_test_support::{Harness, TEST_INBOX, api, grant_api_access, harness};
@@ -26,9 +27,9 @@ async fn insert(h: &Harness, at: &str, thread: &str, adjust: impl FnOnce(&mut Ma
     let ms = time::parse(at).unwrap();
     let id = ids::inbound_message_id(&format!("ses-{at}-{thread}"), ms).to_string();
     let mut msg = sample_message(TEST_INBOX, &id, thread);
-    msg.timestamp = at.to_owned();
-    msg.created_at = at.to_owned();
-    msg.updated_at = at.to_owned();
+    msg.timestamp = ms;
+    msg.created_at = ms;
+    msg.updated_at = ms;
     adjust(&mut msg);
     h.state.mailbox.insert_message(&msg, &[]).await.unwrap();
 }
@@ -150,7 +151,7 @@ async fn a_page_token_from_another_inbox_is_rejected() {
         .mailbox
         .ensure_inbox(
             &InboxId::new("billing@example.com"),
-            "2026-01-01T00:00:00.000Z",
+            at("2026-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();
@@ -218,7 +219,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
         .mailbox
         .ensure_inbox(
             &InboxId::new("billing@example.com"),
-            "2026-01-01T00:00:00.000Z",
+            at("2026-01-01T00:00:00.000Z"),
         )
         .await
         .unwrap();

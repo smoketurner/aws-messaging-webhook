@@ -15,6 +15,8 @@
 //! checker does not implement, so a payload passes only if it is exactly the
 //! documented shape.
 
+use mailbox::test_fixtures;
+use mailbox::wire::ContentDisposition;
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use std::collections::BTreeSet;
 use std::fs;
@@ -318,7 +320,7 @@ fn mail_record(event_name: &str, new_image: &Value, old_image: Option<&Value>) -
 /// A received message with every optional field populated, so the check
 /// covers each one's shape.
 fn received_message(labels: &[&str]) -> MailMessage {
-    let now = "2026-01-15T09:30:00.000Z".to_owned();
+    let now = test_fixtures::at("2026-01-15T09:30:00.000Z");
     let mut msg = MailMessage {
         inbox_id: InboxId::new(TEST_INBOX),
         thread_id: ThreadId::new("tid-1"),
@@ -328,7 +330,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
         rfc_message_id: "<orig-1@example.net>".to_owned(),
         in_reply_to: Some("<earlier@example.net>".to_owned()),
         labels: labels.iter().map(|label| (*label).to_owned()).collect(),
-        timestamp: now.clone(),
+        timestamp: now,
         from: "Sender <sender@example.net>".to_owned(),
         to: vec![TEST_INBOX.to_owned()],
         cc: vec!["cc@example.net".to_owned()],
@@ -342,7 +344,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
             size: 10,
             filename: Some("notes.txt".to_owned()),
             content_type: "text/plain".to_owned(),
-            content_disposition: mailbox::wire::ContentDisposition::Inline,
+            content_disposition: ContentDisposition::Inline,
             content_id: Some("<notes@example.net>".to_owned()),
         }],
         attachments_truncated: false,
@@ -352,7 +354,7 @@ fn received_message(labels: &[&str]) -> MailMessage {
         send_status: None,
         sent_at: None,
         version: 1,
-        created_at: now.clone(),
+        created_at: now,
         updated_at: now,
         expires_at: 0,
     };

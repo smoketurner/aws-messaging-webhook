@@ -7,6 +7,7 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem, Update};
 use aws_smithy_types::Blob;
 use aws_smithy_types::error::display::DisplayErrorContext;
+use mailbox::time;
 
 use crate::events_keys;
 use crate::metrics::names;
@@ -380,7 +381,10 @@ impl EventStore for EventsTable {
                 "sns_timestamp",
                 AttributeValue::S(record.event_timestamp.clone()),
             )
-            .item("received_at", AttributeValue::S(record.received_at.clone()))
+            .item(
+                "received_at",
+                AttributeValue::S(time::format(record.received_at)),
+            )
             .item(
                 "expires_at",
                 AttributeValue::N(record.expires_at.to_string()),
@@ -450,6 +454,7 @@ mod tests {
 
     use super::*;
     use crate::model::Source;
+    use mailbox::test_fixtures::at;
 
     fn record(source: Option<Source>, aggregate_id: &str) -> EventRecord {
         EventRecord {
@@ -460,7 +465,7 @@ mod tests {
             source,
             detail_type: "test".to_owned(),
             topic_arn: "arn:aws:sns:us-east-1:123456789012:t".to_owned(),
-            received_at: "2026-08-03T19:12:53.000Z".to_owned(),
+            received_at: at("2026-08-03T19:12:53.000Z"),
             expires_at: 1_800_000_000,
             aggregate_expires_at: 1_900_000_000,
         }

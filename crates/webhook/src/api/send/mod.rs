@@ -14,6 +14,7 @@ pub(crate) mod reply;
 pub(crate) mod spec;
 pub(crate) mod validate;
 
+use mailbox::content::MessageContent;
 use std::sync::Arc;
 
 use axum::Json;
@@ -23,10 +24,12 @@ use serde::Serialize;
 
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
+use crate::clock::RequestTime;
 use crate::mail::content;
 use crate::mail::objects::ObjectStore;
 use crate::state::{AppState, Backend};
 use mailbox::send::{Envelope, SendKey, SendSpec, SendState};
+use mailbox::time::Timestamp;
 use mailbox::{InboxId, MailMessage, ids, time};
 use mailbox::{MessageId, ThreadId};
 use mailbox_store::EnqueueOutcome;
@@ -61,24 +64,26 @@ pub(crate) struct SendAccepted {
 pub(crate) async fn send<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path(inbox): Path<InboxId>,
+    RequestTime(at): RequestTime,
     headers: HeaderMap,
     ApiJson(request): ApiJson<SendRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
-    enqueue(&state, inbox, request, &headers, None, "send").await
+    enqueue(&state, inbox, request, &headers, None, "send", at).await
 }
 
 /// Validates, uploads and commits one outbound message.
 ///
 /// `original`, when present, is the message being replied to, with its
 /// content document; together they give the new message its thread and its
-/// threading headers.
+/// threading headers. `at` is when the request arrived.
 async fn enqueue<B: Backend>(
     state: &AppState<B>,
     inbox: InboxId,
     request: SendRequest,
     headers: &HeaderMap,
-    original: Option<(&MailMessage, &mailbox::content::MessageContent)>,
+    original: Option<(&MailMessage, &MessageContent)>,
     route: &str,
+    at: Timestamp,
 ) -> Result<Json<SendAccepted>, ApiError> {
     let key_hash = idempotency_key_hash(headers)?;
 
@@ -102,20 +107,19 @@ async fn enqueue<B: Backend>(
     // A live key for this request is answered from what it recorded, without
     // queuing anything a second time.
     if let Some(hash) = &key_hash
-        && let Some(replayed) = replay_key(state, hash, &request_hash).await?
+        && let Some(replayed) = replay_key(state, hash, &request_hash, at).await?
     {
         return Ok(Json(replayed));
     }
 
-    let now_ms = time::now_ms();
-    let now = time::format(now_ms);
+    let now_epoch = time::unix_seconds(at);
     let uuid = ids::outbound_message_id();
     let message_id = MessageId::from(uuid);
     // A reply joins the original's thread; anything else starts its own.
     let thread_id =
         original.map_or_else(|| ThreadId::from(&message_id), |(o, _)| o.thread_id.clone());
 
-    let mut spec = build_spec(&inbox, &validated, uuid, &thread_id, &now);
+    let mut spec = build_spec(&inbox, &validated, uuid, &thread_id, at);
     if let Some((original, original_content)) = original {
         spec.in_reply_to = Some(original.rfc_message_id.clone());
         spec.references = threading_references(original, &original_content.references);
@@ -126,7 +130,7 @@ async fn enqueue<B: Backend>(
     if let Err(error) = upload_spec(&state.objects, &spec, &validated).await {
         return Err(discard_and_fail(&state.objects, &spec, error).await);
     }
-    let message_content = mailbox::content::MessageContent {
+    let message_content = MessageContent {
         text: validated.text.clone(),
         html: validated.html.clone(),
         headers: validated.headers.clone(),
@@ -151,10 +155,10 @@ async fn enqueue<B: Backend>(
             bcc: validated.bcc.clone(),
         },
         key_hash.as_ref().map(|hash| keys::send_key_pk(hash)),
-        &now,
+        at,
     );
-    let mut message = queued_message(&inbox, &validated, &spec, &now);
-    message.expires_at = time::expires_at(now_ms, config.retention_days);
+    let mut message = queued_message(&inbox, &validated, &spec, at);
+    message.expires_at = time::expires_at(at, config.retention_days);
     let key = key_hash.map(|hash| SendKey {
         key_hash: hash,
         inbox_id: inbox.clone(),
@@ -162,13 +166,13 @@ async fn enqueue<B: Backend>(
         thread_id: thread_id.clone(),
         request_hash: request_hash.clone(),
         route: route.to_owned(),
-        created_at: now.clone(),
-        expires_at: now_ms / 1_000 + KEY_TTL_SECONDS,
+        created_at: at,
+        expires_at: now_epoch + KEY_TTL_SECONDS,
     });
 
     let committed = state
         .mailbox
-        .enqueue_send(&message, &state_item, key.as_ref(), now_ms / 1_000)
+        .enqueue_send(&message, &state_item, key.as_ref(), now_epoch)
         .await;
     match committed {
         Ok(EnqueueOutcome::Committed | EnqueueOutcome::AlreadyQueued) => Ok(Json(SendAccepted {
@@ -181,7 +185,7 @@ async fn enqueue<B: Backend>(
         Ok(EnqueueOutcome::KeyExists) => {
             discard_uploads(&state.objects, &spec).await;
             let hash = key.as_ref().map_or_default(|key| key.key_hash.as_str());
-            match replay_key(state, hash, &request_hash).await? {
+            match replay_key(state, hash, &request_hash, at).await? {
                 Some(replayed) => Ok(Json(replayed)),
                 // Gone again already (expired): a retry will queue it afresh.
                 None => Err(ApiError::Conflict(

@@ -14,6 +14,7 @@
 //! inbox never received, where the second loses the parent's placeholder and
 //! must join the first one's thread.
 
+use mailbox::test_fixtures::at;
 use mailbox::{MessageId, ThreadId};
 use std::collections::HashMap;
 use std::future::Future;
@@ -112,7 +113,7 @@ async fn insert_message_recovers_when_a_thread_not_exists_race_loses_to_a_concur
     let store_inner = MailMemoryStore::default();
     let r1 = sample_message("support@example.com", "mid-r1", "shared-thread");
     let mut r2 = sample_message("support@example.com", "mid-r2", "shared-thread");
-    r2.timestamp = "00000002-0000".to_owned();
+    r2.timestamp = at("2026-01-01T00:00:02.000Z");
     let competing_plan =
         plan::plan_insert(&r1, None, &new_thread(&r1), &AliasLookup::default()).unwrap();
 
@@ -165,7 +166,7 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
     let mut r2 = sample_message("support@example.com", "mid-r2", "shared-thread");
     r2.direction = mailbox::Direction::Outbound;
     r2.labels = vec!["queued".to_owned()];
-    r2.timestamp = "00000002-0000".to_owned();
+    r2.timestamp = at("2026-01-01T00:00:02.000Z");
     let competing_plan =
         plan::plan_insert(&r1, None, &new_thread(&r1), &AliasLookup::default()).unwrap();
 
@@ -178,7 +179,7 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
             ..Envelope::default()
         },
         None,
-        "2026-01-01T00:00:00.000Z",
+        at("2026-01-01T00:00:00.000Z"),
     );
 
     let store = ConcurrentThreadWinner {
@@ -224,7 +225,7 @@ async fn insert_message_joins_the_thread_of_a_sibling_that_won_the_placeholder()
     let competing_plan = plan::plan_insert(&r1, None, &new_thread(&r1), &r1_aliases).unwrap();
 
     let mut r2 = sample_message("support@example.com", "mid-r2", "mid-r2");
-    r2.timestamp = "00000002-0000".to_owned();
+    r2.timestamp = at("2026-01-01T00:00:02.000Z");
 
     let store = ConcurrentThreadWinner {
         inner: &store_inner,

@@ -26,6 +26,9 @@ pub mod api;
 pub mod api_keys;
 pub mod objects;
 
+use mailbox::time;
+use mailbox::url_policy::AttachmentUrl;
+use sns_message_verifier::fixtures;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,6 +116,8 @@ fn action_result(action_error: &Mutex<Option<ActionErrorKind>>) -> Result<(), Ac
 #[derive(Default)]
 pub struct FakeEvents {
     calls: CallLog,
+    /// Every record handed to `persist_new`, in order.
+    pub records: Mutex<Vec<EventRecord>>,
     pub persist_outcome: Mutex<Option<PersistOutcome>>,
     pub fail_persist: AtomicBool,
 }
@@ -125,6 +130,7 @@ impl EventStore for FakeEvents {
     ) -> impl Future<Output = Result<PersistOutcome, StoreError>> + Send {
         self.calls
             .record(format!("persist:{}", record.aggregate_id));
+        self.records.lock().unwrap().push(record.clone());
         let result = if self.fail_persist.load(Ordering::SeqCst) {
             Err(StoreError(anyhow!("simulated persist failure")))
         } else {
@@ -320,7 +326,7 @@ impl FakeFetcher {
 impl AttachmentFetcher for FakeFetcher {
     fn fetch(
         &self,
-        url: &mailbox::url_policy::AttachmentUrl,
+        url: &AttachmentUrl,
         max_bytes: u64,
     ) -> impl Future<Output = Result<Fetched, FetchError>> + Send {
         self.fetched.lock().unwrap().push(url.as_str().to_owned());
@@ -545,7 +551,10 @@ pub async fn grant_api_access(h: &Harness) {
     h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
     h.state
         .mailbox
-        .ensure_inbox(&InboxId::new(TEST_INBOX), TEST_INBOX_CREATED_AT)
+        .ensure_inbox(
+            &InboxId::new(TEST_INBOX),
+            time::parse(TEST_INBOX_CREATED_AT).unwrap(),
+        )
         .await
         .unwrap();
 }
@@ -568,7 +577,7 @@ pub async fn post(state: Arc<AppState<Fakes>>, route: &str, body: &Value) -> Sta
 
 /// Wraps an inner AWS payload as the SNS `Message` of a signed notification.
 pub fn wrapped(h: &Harness, inner: &Value) -> Value {
-    let mut body = sns_message_verifier::fixtures::notification(&h.cert_url);
+    let mut body = fixtures::notification(&h.cert_url);
     body["Message"] = json!(inner.to_string());
     h.fixture.sign(&mut body, "2");
     body
@@ -626,7 +635,7 @@ pub fn function_url_event(path: &str, body: &Value) -> Value {
             "requestId": "request-id",
             "routeKey": "$default",
             "stage": "$default",
-            "time": "04/Aug/2026:00:00:00 +0000",
+            "time": "04/Aug/2025:00:00:00 +0000",
             "timeEpoch": 1_754_265_600_000_i64,
         },
         "body": body.to_string(),

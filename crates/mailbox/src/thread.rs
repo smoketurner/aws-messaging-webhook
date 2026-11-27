@@ -4,6 +4,7 @@
 //! version-conditioned, in the same transaction as whatever changed it, so
 //! two messages arriving at once cannot each overwrite the other's effect.
 
+use crate::time::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,8 @@ pub struct ThreadState {
     /// Fixed-width (`mail::time::format`) last-activity timestamp: the sort
     /// key component of the thread index, which is what orders a thread list
     /// by most recent activity.
-    pub timestamp: String,
+    #[serde(with = "crate::time::fixed")]
+    pub timestamp: Timestamp,
     pub subject: String,
     pub preview: String,
     #[serde(
@@ -68,14 +70,18 @@ pub struct ThreadState {
     pub message_count: u64,
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub received_timestamp: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub received_timestamp: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sent_timestamp: Option<String>,
+    #[serde(with = "crate::time::fixed::option")]
+    pub sent_timestamp: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentMeta>,
     pub version: u64,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(with = "crate::time::fixed")]
+    pub created_at: Timestamp,
+    #[serde(with = "crate::time::fixed")]
+    pub updated_at: Timestamp,
     /// DynamoDB TTL (epoch seconds): that of its newest message, so a thread
     /// outlives every message in it and then ages out with the last one.
     pub expires_at: u64,
@@ -187,7 +193,7 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
     ThreadState {
         inbox_id: msg.inbox_id.clone(),
         thread_id: msg.thread_id.clone(),
-        timestamp: msg.timestamp.clone(),
+        timestamp: msg.timestamp,
         subject: msg.subject.clone(),
         preview: msg.preview.clone(),
         senders,
@@ -197,13 +203,12 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
         last_message_id: msg.message_id.clone(),
         message_count: 1,
         size: msg.size,
-        received_timestamp: matches!(msg.direction, Direction::Inbound)
-            .then(|| msg.timestamp.clone()),
-        sent_timestamp: matches!(msg.direction, Direction::Outbound).then(|| msg.timestamp.clone()),
+        received_timestamp: matches!(msg.direction, Direction::Inbound).then(|| msg.timestamp),
+        sent_timestamp: matches!(msg.direction, Direction::Outbound).then(|| msg.timestamp),
         attachments,
         version: 0,
-        created_at: msg.created_at.clone(),
-        updated_at: msg.updated_at.clone(),
+        created_at: msg.created_at,
+        updated_at: msg.updated_at,
         expires_at: msg.expires_at,
     }
 }
@@ -219,8 +224,7 @@ pub fn new_thread(msg: &MailMessage) -> ThreadState {
 /// the same thread may have landed, and a late older message must neither
 /// pull the thread down the list (`timestamp` is the thread index's sort key)
 /// nor repoint its preview at a message that is no longer the latest. A tie
-/// goes to the message processed later. Timestamps are fixed-width
-/// (`mail::time::format`), so they compare as strings.
+/// goes to the message processed later.
 #[must_use]
 pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
     let mut next = existing.clone();
@@ -241,11 +245,8 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
         Direction::Inbound => &mut next.received_timestamp,
         Direction::Outbound => &mut next.sent_timestamp,
     };
-    if direction_timestamp
-        .as_deref()
-        .is_none_or(|current| msg.timestamp.as_str() >= current)
-    {
-        *direction_timestamp = Some(msg.timestamp.clone());
+    if direction_timestamp.is_none_or(|current| msg.timestamp >= current) {
+        *direction_timestamp = Some(msg.timestamp);
     }
 
     for attachment in &msg.attachments {
@@ -282,7 +283,7 @@ pub fn apply_label_patch(
     existing: &ThreadState,
     added: &[String],
     removed: &[String],
-    now: &str,
+    now: Timestamp,
 ) -> ThreadState {
     let mut next = existing.clone();
 
@@ -303,7 +304,7 @@ pub fn apply_label_patch(
     }
 
     next.version += 1;
-    now.clone_into(&mut next.updated_at);
+    next.updated_at = now;
     next
 }
 
@@ -330,13 +331,13 @@ impl From<&ThreadState> for ThreadSnapshot {
                 .take(THREAD_SNAPSHOT_ADDRESS_CAP)
                 .cloned()
                 .collect(),
-            timestamp: thread.timestamp.clone(),
-            created_at: thread.created_at.clone(),
-            updated_at: thread.updated_at.clone(),
+            timestamp: thread.timestamp,
+            created_at: thread.created_at,
+            updated_at: thread.updated_at,
             last_message_id: thread.last_message_id.clone(),
             size: thread.size,
-            received_timestamp: thread.received_timestamp.clone(),
-            sent_timestamp: thread.sent_timestamp.clone(),
+            received_timestamp: thread.received_timestamp,
+            sent_timestamp: thread.sent_timestamp,
             attachments: thread.attachments.clone(),
         }
     }
@@ -347,6 +348,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::test_fixtures::at;
+    use crate::wire::ContentDisposition;
     use crate::{AttachmentMeta, Direction, test_fixtures};
 
     fn message(direction: Direction, labels: &[&str]) -> MailMessage {
@@ -354,11 +357,11 @@ mod tests {
             ses_message_id: None,
             direction,
             labels: labels.iter().map(|l| (*l).to_owned()).collect(),
-            timestamp: "00000001-0000".to_owned(),
+            timestamp: at("2026-01-01T00:00:01.000Z"),
             size: 1_000,
             version: 0,
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            created_at: at("2026-01-01T00:00:00.000Z"),
+            updated_at: at("2026-01-01T00:00:00.000Z"),
             ..test_fixtures::message()
         }
     }
@@ -432,7 +435,10 @@ mod tests {
         assert_eq!(thread.message_count, 1);
         assert_eq!(thread.labels, vec!["received", "unread"]);
         assert_eq!(thread.label_counts["received"], 1);
-        assert_eq!(thread.received_timestamp.as_deref(), Some("00000001-0000"));
+        assert_eq!(
+            thread.received_timestamp,
+            Some(at("2026-01-01T00:00:01.000Z"))
+        );
         assert_eq!(thread.sent_timestamp, None);
         assert_eq!(thread.version, 0);
     }
@@ -509,24 +515,27 @@ mod tests {
     fn apply_message_out_of_order_keeps_the_newest_message_as_last() {
         let mut newer = message(Direction::Inbound, &["received", "unread"]);
         newer.message_id = MessageId::new("mid-newer");
-        newer.timestamp = "00000002-0000".to_owned();
+        newer.timestamp = at("2026-01-01T00:00:02.000Z");
         newer.preview = "Newer body".to_owned();
         let before = new_thread(&newer);
 
         let mut older = message(Direction::Inbound, &["received", "unread"]);
         older.message_id = MessageId::new("mid-older");
         older.from = "other@example.com".to_owned();
-        older.timestamp = "00000001-0000".to_owned();
+        older.timestamp = at("2026-01-01T00:00:01.000Z");
         older.preview = "Older body".to_owned();
         let after = apply_message(&before, &older);
 
         assert_eq!(after.message_count, 2);
         assert_eq!(after.version, before.version + 1);
         assert!(after.senders.contains(&"other@example.com".to_owned()));
-        assert_eq!(after.timestamp, "00000002-0000");
+        assert_eq!(after.timestamp, at("2026-01-01T00:00:02.000Z"));
         assert_eq!(after.last_message_id, "mid-newer");
         assert_eq!(after.preview, "Newer body");
-        assert_eq!(after.received_timestamp.as_deref(), Some("00000002-0000"));
+        assert_eq!(
+            after.received_timestamp,
+            Some(at("2026-01-01T00:00:02.000Z"))
+        );
     }
 
     /// `received_timestamp` is "Timestamp of last received message" and
@@ -535,34 +544,43 @@ mod tests {
     #[test]
     fn apply_message_direction_timestamps_track_the_newest_of_each_direction() {
         let mut first = message(Direction::Inbound, &["received"]);
-        first.timestamp = "00000001-0000".to_owned();
+        first.timestamp = at("2026-01-01T00:00:01.000Z");
         let thread = new_thread(&first);
 
         let mut reply = message(Direction::Outbound, &["sent"]);
         reply.message_id = MessageId::new("mid-reply");
-        reply.timestamp = "00000003-0000".to_owned();
+        reply.timestamp = at("2026-01-01T00:00:03.000Z");
         let thread = apply_message(&thread, &reply);
-        assert_eq!(thread.received_timestamp.as_deref(), Some("00000001-0000"));
-        assert_eq!(thread.sent_timestamp.as_deref(), Some("00000003-0000"));
+        assert_eq!(
+            thread.received_timestamp,
+            Some(at("2026-01-01T00:00:01.000Z"))
+        );
+        assert_eq!(thread.sent_timestamp, Some(at("2026-01-01T00:00:03.000Z")));
 
         let mut second = message(Direction::Inbound, &["received"]);
         second.message_id = MessageId::new("mid-2");
-        second.timestamp = "00000004-0000".to_owned();
+        second.timestamp = at("2026-01-01T00:00:04.000Z");
         let thread = apply_message(&thread, &second);
-        assert_eq!(thread.received_timestamp.as_deref(), Some("00000004-0000"));
+        assert_eq!(
+            thread.received_timestamp,
+            Some(at("2026-01-01T00:00:04.000Z"))
+        );
 
         let mut late_inbound = message(Direction::Inbound, &["received"]);
         late_inbound.message_id = MessageId::new("mid-late-in");
-        late_inbound.timestamp = "00000002-0000".to_owned();
+        late_inbound.timestamp = at("2026-01-01T00:00:02.000Z");
         let thread = apply_message(&thread, &late_inbound);
-        assert_eq!(thread.received_timestamp.as_deref(), Some("00000004-0000"));
+        assert_eq!(
+            thread.received_timestamp,
+            Some(at("2026-01-01T00:00:04.000Z"))
+        );
 
         let mut late_outbound = message(Direction::Outbound, &["sent"]);
         late_outbound.message_id = MessageId::new("mid-late-out");
-        late_outbound.timestamp = "00000002-0000".to_owned();
+        late_outbound.timestamp = at("2026-01-01T00:00:02.000Z");
         let thread = apply_message(&thread, &late_outbound);
-        assert_eq!(thread.sent_timestamp.as_deref(), Some("00000003-0000"));
-        assert_eq!(thread.timestamp, "00000004-0000");
+        assert_eq!(thread.sent_timestamp, Some(at("2026-01-01T00:00:03.000Z")));
+        assert_eq!(thread.timestamp, at("2026-01-01T00:00:04.000Z"));
         assert_eq!(thread.last_message_id, "mid-2");
         assert_eq!(thread.message_count, 5);
     }
@@ -624,7 +642,7 @@ mod tests {
                 size: 10,
                 filename: None,
                 content_type: "text/plain".to_owned(),
-                content_disposition: crate::wire::ContentDisposition::Attachment,
+                content_disposition: ContentDisposition::Attachment,
                 content_id: None,
             })
             .collect();
@@ -639,7 +657,7 @@ mod tests {
             size: 10,
             filename: None,
             content_type: "text/plain".to_owned(),
-            content_disposition: crate::wire::ContentDisposition::Attachment,
+            content_disposition: ContentDisposition::Attachment,
             content_id: None,
         }];
         let after = apply_message(&before, &second);

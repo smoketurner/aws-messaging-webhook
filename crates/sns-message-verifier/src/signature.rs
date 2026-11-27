@@ -1,3 +1,4 @@
+use crate::cert;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rsa::RsaPublicKey;
@@ -21,7 +22,7 @@ use crate::error::VerifyError;
 /// validity window, the `SignatureVersion` is unsupported, the signature is
 /// not valid base64, or verification fails.
 pub fn verify_with_cert(envelope: &SnsEnvelope, cert_pem: &[u8]) -> Result<(), VerifyError> {
-    let key = crate::cert::parse_cert_pem(cert_pem)?;
+    let key = cert::parse_cert_pem(cert_pem)?;
     verify_with_key(envelope, &key)
 }
 

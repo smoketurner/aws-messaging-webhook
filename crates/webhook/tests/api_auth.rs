@@ -4,6 +4,7 @@
 //! is rejected, a parameter-store outage is retryable rather than a
 //! rejection, and the webhook paths stay unauthenticated.
 
+use aws_messaging_webhook::app;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt as _;
@@ -92,7 +93,7 @@ async fn the_webhook_paths_stay_unauthenticated() {
     let h = harness().await;
     h.state.key_source.make_unavailable();
 
-    let response = aws_messaging_webhook::app::app(h.state.clone())
+    let response = app::app(h.state.clone())
         .oneshot(
             Request::post("/webhooks/ses/events")
                 .body(Body::from("{}"))
@@ -111,7 +112,7 @@ async fn healthz_stays_open() {
     let h = harness().await;
     h.state.key_source.make_unavailable();
 
-    let response = aws_messaging_webhook::app::app(h.state.clone())
+    let response = app::app(h.state.clone())
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
         .unwrap();

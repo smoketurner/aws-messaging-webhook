@@ -3,7 +3,10 @@
 //! notifications (top-level `notificationType`). Only the fields the pipeline
 //! acts on are typed; the full payload is persisted and forwarded verbatim.
 
+use std::collections::HashMap;
+
 use mailbox::open_string_enum;
+use mailbox::send::SES_MESSAGE_TAG;
 use serde::{Deserialize, Serialize};
 
 use mailbox::labels::SystemLabel;
@@ -52,6 +55,22 @@ pub struct SesMail {
     /// on inbound receipts and on sending events when header inclusion is on.
     #[serde(default)]
     pub common_headers: Option<SesCommonHeaders>,
+    /// The message's tags: SES's own (`ses:configuration-set`, …) and the
+    /// ones the sender attached. Present on event-publishing events only.
+    #[serde(default)]
+    pub tags: HashMap<String, Vec<String>>,
+}
+
+impl SesMail {
+    /// The mailbox message this mail was sent as, when the sender tagged it
+    /// ([`SES_MESSAGE_TAG`]). Absent for mail this service did not send.
+    #[must_use]
+    pub fn mailbox_message(&self) -> Option<&str> {
+        self.tags
+            .get(SES_MESSAGE_TAG)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
 }
 
 /// The subset of `commonHeaders` worth surfacing for routing/filtering.
@@ -223,6 +242,24 @@ impl SesEventKind {
             | Self::DeliveryDelay
             | Self::Subscription
             | Self::Other(_) => None,
+        }
+    }
+
+    /// Whether an event of this kind shows that SES accepted the message.
+    /// Every kind does except the two SES raises for a message it took but
+    /// never tried to deliver.
+    #[must_use]
+    pub fn confirms_send(&self) -> bool {
+        match self {
+            Self::Send
+            | Self::Delivery
+            | Self::Bounce
+            | Self::Complaint
+            | Self::Open
+            | Self::Click
+            | Self::DeliveryDelay
+            | Self::Subscription => true,
+            Self::Reject | Self::RenderingFailure | Self::Other(_) => false,
         }
     }
 

@@ -4,15 +4,21 @@
 //! truth — the persisted raw event is the audit trail. Actions never suppress
 //! the EventBridge event.
 
+use crate::mail::ingest;
+use crate::model::ses_notification::SesNotification;
 use std::future::Future;
 
 use crate::mail::ingest::IngestOutcome;
 use crate::mail::objects::ObjectError;
+use crate::mail::sender;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
-use mailbox::SesMessageId;
+use crate::store::Delivery;
+use mailbox::time;
+use mailbox::time::Timestamp;
+use mailbox::{MessageId, SesMessageId};
 use mailbox_store::MailStoreError;
 
 /// How an action failure affects the request, per the SNS retry contract.
@@ -217,7 +223,8 @@ pub(crate) fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> Keywo
 }
 
 /// Labels the mailbox message an SES event belongs to, when it belongs to
-/// one.
+/// one, first settling its send as sent if this service never recorded
+/// SES's answer ([`sender::confirm_sent`]).
 ///
 /// Most events on the configuration set are for mail this service did not
 /// send, so an unresolved id is the ordinary case and not a failure. The
@@ -226,29 +233,58 @@ pub(crate) fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> Keywo
 /// should say so.
 async fn apply_delivery_label<B: Backend>(
     state: &AppState<B>,
-    event: &crate::model::ses_notification::SesNotification,
+    event: &SesNotification,
+    at: Timestamp,
 ) -> Result<bool, ActionError> {
-    let Some(label) = event.kind.mailbox_label() else {
-        return Ok(false);
-    };
     // Mail is only tracked when the mailbox is configured.
     if state.config.mail.is_none() {
         return Ok(false);
     }
+    let label = event.kind.mailbox_label();
+    // The message id the sender tagged the mail with, when this event can
+    // stand as proof that SES accepted it.
+    let tagged = event
+        .mail
+        .mailbox_message()
+        .filter(|_| event.kind.confirms_send());
+    if label.is_none() && tagged.is_none() {
+        return Ok(false);
+    }
 
-    let resolved = state
+    let ses_message_id = SesMessageId::new(event.mail.message_id.as_str());
+    let mut resolved = state
         .mailbox
-        .resolve_ses_message(&SesMessageId::new(event.mail.message_id.as_str()))
+        .resolve_ses_message(&ses_message_id)
         .await
         .map_err(ActionError::from)?;
+    // SES's id is recorded by the write that marks a send sent. When that
+    // write never landed the id resolves to nothing, but the event is itself
+    // SES saying it has the message: settle the send from it.
+    if resolved.is_none()
+        && let Some(tagged) = tagged
+    {
+        // When SES took the message, which is when it was sent.
+        let accepted_at = event
+            .mail
+            .timestamp
+            .as_deref()
+            .and_then(time::parse_rfc3339)
+            .unwrap_or(at);
+        resolved =
+            sender::confirm_sent(state, &MessageId::new(tagged), &ses_message_id, accepted_at)
+                .await
+                .map_err(ActionError::from)?;
+    }
     let Some((inbox, message_id)) = resolved else {
         return Ok(false);
     };
+    let Some(label) = label else {
+        return Ok(false);
+    };
 
-    let now = mailbox::time::format(mailbox::time::now_ms());
     state
         .mailbox
-        .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
+        .update_labels(&inbox, &message_id, &[label.to_label()], &[], at)
         .await
         .map_err(ActionError::from)?;
 
@@ -343,10 +379,12 @@ pub(crate) async fn run<B: Backend>(
     // Threaded through for inbound-ingest time-boxing; only the
     // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
     deadline: tokio::time::Instant,
-    // The verified SNS envelope `Timestamp`, parsed to epoch ms by the
-    // caller; the third `received_ms` fallback, threaded to the
-    // `SesInbound` arm only.
-    envelope_ts_ms: Option<u64>,
+    // When the delivery arrived: what the mailbox writes are stamped with.
+    delivery: Delivery,
+    // The verified SNS envelope `Timestamp`, parsed by the caller: the
+    // inbound message id's third time source, threaded to the `SesInbound`
+    // arm only.
+    envelope_at: Option<Timestamp>,
 ) -> Result<ActionTaken, ActionError> {
     match event {
         DomainEvent::SmsInbound { event, .. } => {
@@ -410,7 +448,7 @@ pub(crate) async fn run<B: Backend>(
             // run, then returned so redelivery re-runs both (repeat-safe)
             // steps; the suppression write does not wait on that redelivery.
             let mut deferred = None;
-            let labelled = match apply_delivery_label(state, event).await {
+            let labelled = match apply_delivery_label(state, event, delivery.at).await {
                 Ok(labelled) => labelled,
                 Err(error) if error.kind == ActionErrorKind::Permanent => {
                     metrics::counter!(names::ACTION_FAILURES).increment(1);
@@ -453,7 +491,7 @@ pub(crate) async fn run<B: Backend>(
             })
         }
         DomainEvent::SesInbound { event, .. } => {
-            crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms)
+            ingest::ingest_inbound(state, event, deadline, delivery, envelope_at)
                 .await
                 .map(ActionTaken::Ingest)
         }

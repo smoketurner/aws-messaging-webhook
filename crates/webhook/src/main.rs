@@ -1,3 +1,5 @@
+use aws_messaging_webhook::logging;
+use aws_messaging_webhook::metrics;
 use std::sync::Arc;
 
 use aws_messaging_webhook::api::keys::KeyCache;
@@ -9,14 +11,14 @@ use sns_message_verifier::SnsVerifier;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_http::Error> {
-    aws_messaging_webhook::logging::init();
+    logging::init();
 
     let (config, allowlist) = Config::from_env()?;
 
     // The EMF collector's namespace is the stack name, falling back to the
     // event source when STACK_NAME is unset (local dev).
     let namespace = std::env::var("STACK_NAME").unwrap_or_else(|_| config.event_source.clone());
-    let collector = aws_messaging_webhook::metrics::init(namespace)
+    let collector = metrics::init(namespace)
         .map_err(|e| format!("failed to initialize metrics collector: {e}"))?;
 
     let sdk_config = aws_config::load_from_env().await;

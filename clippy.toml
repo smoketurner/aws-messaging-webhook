@@ -11,3 +11,58 @@ disallowed-methods = [
     { path = "mail_parser::Message::body_html", reason = "reads the unfiltered body list; use mime::parse_inbound's filtered html" },
     { path = "mail_parser::Message::body_preview", reason = "reads the unfiltered first body part; use mime::preview" },
 ]
+
+# Items from our own crates are brought in with `use`, not spelled inline as
+# `crate::mail::sender::sweep` or `mailbox::time::Timestamp`: import the type,
+# trait or const directly, and import a function's parent module
+# (`use mailbox::time;` then `time::format(..)`). `clippy::absolute_paths` flags
+# any path of more than two segments rooted at a crate; every external crate is
+# listed below so the lint reports only `crate::` and the workspace crates'
+# paths. The lint is denied in `[workspace.lints.clippy]`; a new external
+# dependency named by an absolute path belongs in this list.
+absolute-paths-max-segments = 2
+absolute-paths-allowed-crates = [
+    "std",
+    "core",
+    "alloc",
+    "anyhow",
+    "aws_config",
+    "aws_lambda_events",
+    "aws_sdk_dynamodb",
+    "aws_sdk_eventbridge",
+    "aws_sdk_pinpointsmsvoicev2",
+    "aws_sdk_s3",
+    "aws_sdk_sesv2",
+    "aws_sdk_ssm",
+    "aws_smithy_types",
+    "axum",
+    "base64",
+    "bytes",
+    "jiff",
+    "lambda_http",
+    "mail_builder",
+    "mail_parser",
+    "metrics",
+    "metrics_cloudwatch_embedded",
+    "mime",
+    "proptest",
+    "rand",
+    "reqwest",
+    "rsa",
+    "serde",
+    "serde_dynamo",
+    "serde_json",
+    "sha1",
+    "sha2",
+    "structured_email_address",
+    "subtle",
+    "thiserror",
+    "tokio",
+    "tower",
+    "tower_http",
+    "tracing",
+    "url",
+    "uuid",
+    "wiremock",
+    "x509_cert",
+]

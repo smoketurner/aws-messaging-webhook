@@ -20,23 +20,28 @@
 //! already hold the message, and sending it again is worse than leaving it
 //! for an operator to resolve.
 
+use crate::stream;
+use aws_lambda_events::dynamodb::{Event, EventRecord};
+use mailbox::send::SpecAttachment;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use crate::actions::SesApi as _;
 use crate::actions::{RawSend, SendOutcome};
+use crate::clock;
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
 use crate::mail::object_keys;
 use crate::mail::objects::ObjectError;
 use crate::mail::objects::ObjectStore as _;
 use crate::metrics::names;
 use crate::state::{AppState, Backend};
-use mailbox::MessageId;
 use mailbox::build::{BuildError, BuiltPart, build_outbound};
 use mailbox::send::{MarkOutcome, SesSent};
 use mailbox::send::{SendFailure, SendSpec, SendState, SendStatus};
+use mailbox::time::Timestamp;
 use mailbox::url_policy;
+use mailbox::{InboxId, MessageId, SesMessageId};
 use mailbox::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
 use mailbox_store::MailStoreError;
 use mailbox_store::keys;
@@ -86,7 +91,7 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
     payload: serde_json::Value,
     deadline: Instant,
 ) -> Result<serde_json::Value, lambda_http::Error> {
-    let event: aws_lambda_events::dynamodb::Event = serde_json::from_value(payload)
+    let event: Event = serde_json::from_value(payload)
         .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
 
     let mut failures = Vec::new();
@@ -110,18 +115,16 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
 }
 
 /// The message id a record is asking to be sent, if it is asking at all.
-fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<MessageId> {
+fn queued_send_id(record: &EventRecord) -> Option<MessageId> {
     let new_image = &record.change.new_image;
-    if crate::stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
+    if stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
         return None;
     }
-    if crate::stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
+    if stream::image_str(new_image, "send_status")? != SendStatus::Queued.as_str() {
         return None;
     }
 
-    let message_id = MessageId::new(keys::parse_outbox_pk(crate::stream::image_str(
-        new_image, "pk",
-    )?)?);
+    let message_id = MessageId::new(keys::parse_outbox_pk(stream::image_str(new_image, "pk")?)?);
 
     match record.event_name.as_str() {
         "INSERT" => Some(message_id),
@@ -129,9 +132,8 @@ fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<M
         // `requeued_at` appearing. Acting on every MODIFY would re-enter the
         // sender on its own claim and mark writes.
         "MODIFY" => {
-            let was_absent =
-                crate::stream::image_str(&record.change.old_image, "requeued_at").is_none();
-            let is_present = crate::stream::image_str(new_image, "requeued_at").is_some();
+            let was_absent = stream::image_str(&record.change.old_image, "requeued_at").is_none();
+            let is_present = stream::image_str(new_image, "requeued_at").is_some();
             (was_absent && is_present).then_some(message_id)
         }
         _ => None,
@@ -191,7 +193,8 @@ pub async fn resolve_unknown<B: Backend>(
     message_id: &MessageId,
     resolution: Resolution,
 ) -> Result<(), SenderError> {
-    let now = time::format(time::now_ms());
+    // An operator command carries no timestamp of its own.
+    let now = clock::now();
     let Some(send) = state
         .mailbox
         .get_send_state(message_id)
@@ -214,7 +217,7 @@ pub async fn resolve_unknown<B: Backend>(
         Resolution::CloseSent => MarkOutcome::ClosedSent,
         Resolution::CloseFailed => MarkOutcome::Failed(SendFailure::ClosedByOperator),
     };
-    record(state, &send, outcome, &now)
+    record(state, &send, outcome, now)
         .await
         .map_err(store_error)?;
 
@@ -227,12 +230,78 @@ pub async fn resolve_unknown<B: Backend>(
     Ok(())
 }
 
+/// Settles a send as sent on SES's own word, from an event it published for
+/// the message.
+///
+/// The sender records SES's answer in one write after the call. When that
+/// write is lost — the store was unavailable, or the sender died first — the
+/// send is left `sending` and then `unknown`, with nothing to say it went
+/// out. Any event SES publishes for the message says exactly that, and
+/// carries the id the sender tagged it with, so the first one to arrive
+/// finishes what the sender could not: the same write, with the same SES id.
+///
+/// Only a send this service is known to have offered to SES is settled this
+/// way: one that is `unknown`, or `sending` with its SES-call mark. An event
+/// naming any other send changes nothing — a tag is a claim made by whoever
+/// sent the mail, and other senders share the configuration set.
+///
+/// Returns the message the send belongs to once it is recorded as sent with
+/// this SES id, by this call or by a sender that got there first.
+///
+/// # Errors
+///
+/// The store's error for a failed read or write.
+pub(crate) async fn confirm_sent<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
+    ses_message_id: &SesMessageId,
+    accepted_at: Timestamp,
+) -> Result<Option<(InboxId, MessageId)>, MailStoreError> {
+    let Some(config) = state.config.mail.as_ref() else {
+        return Ok(None);
+    };
+    let Some(send) = state.mailbox.get_send_state(message_id).await? else {
+        return Ok(None);
+    };
+    let offered_to_ses = match send.send_status {
+        SendStatus::Unknown => true,
+        SendStatus::Sending => send.ses_call_at.is_some(),
+        _ => false,
+    };
+    if !offered_to_ses {
+        return Ok(None);
+    }
+
+    let sent = MarkOutcome::Sent(SesSent {
+        message_id: ses_message_id.as_str(),
+        region: &config.region,
+    });
+    match record(state, &send, sent, accepted_at).await {
+        Ok(()) => {}
+        // The sender recorded it in the meantime; its alias says for whom.
+        Err(MailStoreError::Conflict) => {
+            return state.mailbox.resolve_ses_message(ses_message_id).await;
+        }
+        Err(error) => return Err(error),
+    }
+    metrics::counter!(names::MESSAGES_SENT).increment(1);
+    tracing::warn!(
+        %message_id,
+        ses_message_id = ses_message_id.as_str(),
+        inbox_id = %send.inbox_id.as_str(),
+        was = send.send_status.as_str(),
+        event = "send_confirmed_by_ses_event",
+        "recorded a send as sent from an SES event; its own record of SES's answer was lost"
+    );
+    Ok(Some((send.inbox_id, send.message_id)))
+}
+
 /// How long a send may sit claimed before the sweep assumes its sender died.
 ///
 /// Comfortably longer than the sender's own timeout, so a send that is merely
 /// slow is never taken away from a sender that is still working on it — doing
 /// that is how the same message gets sent twice.
-const CLAIM_STALE_AFTER_MS: u64 = 15 * 60 * 1_000;
+const CLAIM_STALE_AFTER: Duration = Duration::from_mins(15);
 
 /// How many stuck sends one sweep looks at.
 const SWEEP_LIMIT: usize = 100;
@@ -296,12 +365,17 @@ pub struct SweepReport {
 /// briefly unavailable — is logged and skipped, so one does not stop the
 /// rest from being recovered.
 ///
+/// `at` is when the sweep's schedule fired. It is at or before the real
+/// time, which only ever makes a claim look younger, and so kept.
+///
 /// # Errors
 ///
 /// [`SenderError`] when the store cannot be listed.
-pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, SenderError> {
-    let now_ms = time::now_ms();
-    let now = time::format(now_ms);
+pub async fn sweep<B: Backend>(
+    state: &AppState<B>,
+    at: Timestamp,
+) -> Result<SweepReport, SenderError> {
+    let now = at;
     let mut report = SweepReport::default();
 
     for stuck in state
@@ -310,12 +384,10 @@ pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, Sende
         .await
         .map_err(store_error)?
     {
-        let claimed_ms = stuck
-            .sending_at
-            .as_deref()
-            .and_then(time::parse)
-            .unwrap_or(now_ms);
-        if now_ms.saturating_sub(claimed_ms) < CLAIM_STALE_AFTER_MS {
+        let claimed_at = stuck.sending_at.unwrap_or(at);
+        // A claim dated after the sweep's own time has been held for no time.
+        let held = Duration::try_from(at.duration_since(claimed_at)).unwrap_or_default();
+        if held < CLAIM_STALE_AFTER {
             report.still_working += 1;
             continue;
         }
@@ -323,11 +395,11 @@ pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, Sende
         let result = if stuck.ses_call_at.is_some() {
             tracing::error!(
                 message_id = %stuck.message_id,
-                ses_call_at = stuck.ses_call_at.as_deref().unwrap_or_default(),
+                ses_call_at = stuck.ses_call_at.map_or_default(time::format),
                 event = "send_claim_stale_after_ses_call",
                 "a sender died after it was about to call SES; the message may have gone out"
             );
-            record(state, &stuck, MarkOutcome::Unknown, &now)
+            record(state, &stuck, MarkOutcome::Unknown, now)
                 .await
                 .map(|()| report.marked_unknown += 1)
         } else if stuck.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
@@ -346,7 +418,7 @@ pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, Sende
                 state,
                 &stuck,
                 MarkOutcome::Failed(SendFailure::SenderAbandoned),
-                &now,
+                now,
             )
             .await
             .map(|()| {
@@ -356,11 +428,11 @@ pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, Sende
         } else {
             tracing::warn!(
                 message_id = %stuck.message_id,
-                sending_at = stuck.sending_at.as_deref().unwrap_or("unknown"),
+                sending_at = stuck.sending_at.map_or_default(time::format),
                 event = "send_claim_released",
                 "releasing a claim whose sender appears to be gone"
             );
-            record(state, &stuck, MarkOutcome::Released, &now)
+            record(state, &stuck, MarkOutcome::Released, now)
                 .await
                 .map(|()| report.released += 1)
         };
@@ -413,11 +485,13 @@ pub async fn handle_send<B: Backend>(
         .mail
         .as_ref()
         .ok_or(SenderError::NotConfigured)?;
-    let now = time::format(time::now_ms());
+    // The clock, not the stream record's time: the claim is a lease the
+    // sweep judges by age, and the record may be far older than this attempt.
+    let now = clock::now();
 
     let Some(claimed) = state
         .mailbox
-        .claim_send(message_id, &now)
+        .claim_send(message_id, now)
         .await
         .map_err(store_error)?
     else {
@@ -436,7 +510,7 @@ pub async fn handle_send<B: Backend>(
     let (spec, parts) = match tokio::time::timeout_at(load_by, load(state, message_id)).await {
         Ok(Ok(loaded)) => loaded,
         Ok(Err(LoadError::Permanent(failure))) => {
-            return fail(state, &claimed, failure, &now).await;
+            return fail(state, &claimed, failure, now).await;
         }
         Ok(Err(LoadError::Transient { failure, error })) => {
             tracing::warn!(
@@ -445,7 +519,7 @@ pub async fn handle_send<B: Backend>(
                 event = "send_load_unavailable",
                 "could not load the send; handing it back"
             );
-            return hand_back(state, &claimed, failure, &now, deadline).await;
+            return hand_back(state, &claimed, failure, now, deadline).await;
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -457,7 +531,7 @@ pub async fn handle_send<B: Backend>(
                 state,
                 &claimed,
                 SendFailure::AttachmentFetchUnavailable,
-                &now,
+                now,
                 deadline,
             )
             .await;
@@ -466,14 +540,16 @@ pub async fn handle_send<B: Backend>(
 
     let built = match build(&spec, &parts) {
         Ok(built) => built,
-        Err(failure) => return fail(state, &claimed, failure, &now).await,
+        Err(failure) => return fail(state, &claimed, failure, now).await,
     };
 
     // Recorded before the call, so a sender that dies from here on leaves a
     // claim the sweep will not release: it may already have been sent.
+    // Loading can take most of the invocation, so the clock is read again
+    // rather than reusing the claim's time.
     let Some(calling) = state
         .mailbox
-        .note_ses_call(&claimed, &now)
+        .note_ses_call(&claimed, clock::now())
         .await
         .map_err(store_error)?
     else {
@@ -499,7 +575,7 @@ pub async fn handle_send<B: Backend>(
         })
         .await;
 
-    record_outcome(state, &calling, outcome, &now, deadline).await
+    record_outcome(state, &calling, outcome, deadline).await
 }
 
 /// Assembles the raw message, or the failure a send that cannot be built
@@ -545,9 +621,10 @@ async fn record_outcome<B: Backend>(
     state: &AppState<B>,
     calling: &SendState,
     outcome: SendOutcome,
-    now: &str,
     deadline: Instant,
 ) -> Result<Handled, SenderError> {
+    // When SES answered: what `sent_at` and the `message.sent` event carry.
+    let now = clock::now();
     let message_id = calling.message_id.as_str();
     match outcome {
         SendOutcome::Sent { ses_message_id } => {
@@ -608,7 +685,7 @@ async fn mark_sent<B: Backend>(
     state: &AppState<B>,
     calling: &SendState,
     ses_message_id: &str,
-    now: &str,
+    now: Timestamp,
     deadline: Instant,
 ) -> Result<(), SenderError> {
     let config = state
@@ -632,8 +709,16 @@ async fn mark_sent<B: Backend>(
             .await;
         let error = match result {
             Ok(()) => return Ok(()),
-            // Another writer moved this send on; retrying cannot help.
-            Err(error @ MailStoreError::Conflict) => error,
+            // Another writer moved this send on; retrying cannot help. When
+            // that writer was an SES event for this very message, it has
+            // already recorded what this write would have.
+            Err(error @ MailStoreError::Conflict) => {
+                let current = state.mailbox.get_send_state(&calling.message_id).await;
+                if matches!(current, Ok(Some(current)) if current.send_status == SendStatus::Sent) {
+                    return Ok(());
+                }
+                error
+            }
             Err(error) if attempt >= MARK_SENT_ATTEMPTS => error,
             Err(error) => {
                 tracing::warn!(
@@ -669,7 +754,7 @@ async fn hand_back<B: Backend>(
     state: &AppState<B>,
     claimed: &SendState,
     failure: SendFailure,
-    now: &str,
+    now: Timestamp,
     deadline: Instant,
 ) -> Result<Handled, SenderError> {
     if claimed.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
@@ -677,7 +762,7 @@ async fn hand_back<B: Backend>(
     }
     let delay = Duration::from_secs(1 << claimed.transient_failures.min(4));
     wait_before_retry(delay, deadline).await;
-    record(state, claimed, MarkOutcome::Released, now)
+    record(state, claimed, MarkOutcome::Released, clock::now())
         .await
         .map_err(store_error)?;
     Ok(Handled::Skipped)
@@ -713,7 +798,7 @@ async fn record<B: Backend>(
     state: &AppState<B>,
     send: &SendState,
     outcome: MarkOutcome<'_>,
-    now: &str,
+    now: Timestamp,
 ) -> Result<(), MailStoreError> {
     state.mailbox.mark_send(send, outcome, now).await?;
     if outcome.settles() {
@@ -864,7 +949,7 @@ async fn load_spec<B: Backend>(
 /// One attachment's bytes, owned so the borrow checker does not tie them to
 /// the loop that fetched them.
 struct LoadedPart {
-    spec: mailbox::send::SpecAttachment,
+    spec: SpecAttachment,
     bytes: Vec<u8>,
 }
 
@@ -1012,7 +1097,7 @@ async fn fail<B: Backend>(
     state: &AppState<B>,
     claimed: &SendState,
     failure: SendFailure,
-    now: &str,
+    now: Timestamp,
 ) -> Result<Handled, SenderError> {
     record(state, claimed, MarkOutcome::Failed(failure), now)
         .await

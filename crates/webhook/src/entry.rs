@@ -18,12 +18,16 @@
 //! destination; the HTTP pathway's SNS delivery policy retries far longer.
 //!
 //! The `Sns` record is deliberately NOT parsed with `aws_lambda_events`'
-//! `SnsMessage`: that type parses `Timestamp` into `chrono::DateTime`, whose
+//! `SnsMessage`: that type parses `Timestamp` into a date-time whose
 //! serialization drops trailing `.000` subseconds — rebuilding the signed
 //! canonical string from it would reject every message published on a whole
 //! second. The record deserializes straight into the verifier's envelope,
 //! keeping all signed field values verbatim.
 
+use crate::mail::sender;
+use crate::mail::sender::Command;
+use crate::metrics::emit_cold_start;
+use crate::stream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime};
@@ -40,6 +44,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::app;
+use crate::clock::{self, Arrival};
 use crate::config::FunctionMode;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
@@ -89,7 +94,7 @@ pub async fn run<B: Backend>(
             // as a standalone EMF document. The `metrics_cloudwatch_embedded`
             // library only emits it through its own tower middleware, which this
             // handler does not use, so it is emitted explicitly here.
-            crate::metrics::emit_cold_start(&COLD_START_EMITTED, collector, std::io::stdout());
+            emit_cold_start(&COLD_START_EMITTED, collector, std::io::stdout());
             let start = Instant::now();
             let result = dispatch(state, router, event).await;
             // Record per-invocation latency as a histogram (milliseconds).
@@ -128,12 +133,13 @@ pub async fn dispatch<B: Backend>(
     // and no other pathway produces either shape.
     if state.config.mode == FunctionMode::Sender && payload.get("Records").is_none() {
         if payload.get("command").is_some() {
-            let command: crate::mail::sender::Command = serde_json::from_value(payload)
+            let command: Command = serde_json::from_value(payload)
                 .map_err(|e| format!("not a sender command: {e}"))?;
-            crate::mail::sender::handle_command(&state, &command).await?;
+            sender::handle_command(&state, &command).await?;
             return Ok(serde_json::json!({ "ok": true }));
         }
-        let report = crate::mail::sender::sweep(&state).await?;
+        let at = clock::scheduled_time(&payload).unwrap_or_else(clock::now);
+        let report = sender::sweep(&state, at).await?;
         return Ok(serde_json::to_value(report)?);
     }
 
@@ -146,21 +152,19 @@ pub async fn dispatch<B: Backend>(
             // ignores the records the other owns: the relay publishes message
             // inserts, the sender acts on send-state items.
             return match state.config.mode {
-                FunctionMode::Webhook => crate::stream::handle_stream(&state, payload).await,
+                FunctionMode::Webhook => stream::handle_stream(&state, payload).await,
                 FunctionMode::Sender => {
-                    crate::mail::sender::handle_sender_stream(
-                        &state,
-                        payload,
-                        context_deadline(&context),
-                    )
-                    .await
+                    sender::handle_sender_stream(&state, payload, context_deadline(&context)).await
                 }
             };
         }
         let event = SnsEvent::deserialize(payload)
             .map_err(|e| format!("payload has Records but is not an SNS event: {e}"))?;
         let deadline = context_deadline(&context);
-        handle_direct(&state, event, deadline).await?;
+        let arrival = Arrival::Invoke {
+            ends_by: clock::invocation_deadline(&context),
+        };
+        handle_direct(&state, event, deadline, arrival).await?;
         Ok(Value::Null)
     } else {
         serve_http(router, payload, context).await
@@ -199,10 +203,13 @@ async fn handle_direct<B: Backend>(
     state: &AppState<B>,
     event: SnsEvent,
     deadline: tokio::time::Instant,
+    arrival: Arrival,
 ) -> Result<(), lambda_http::Error> {
     for record in event.records {
         let raw_body = Bytes::from(serde_json::to_vec(&record.sns)?);
-        let status = process_record(state, raw_body, deadline).await.status();
+        let status = process_record(state, raw_body, deadline, arrival)
+            .await
+            .status();
         if status.is_server_error() {
             // Fail the whole invocation: any unprocessed records redeliver
             // with it, and the idempotent persist makes re-runs safe.
@@ -220,12 +227,13 @@ async fn process_record<B: Backend>(
     state: &AppState<B>,
     raw_body: Bytes,
     deadline: tokio::time::Instant,
+    arrival: Arrival,
 ) -> Response {
     let verified = match VerifiedSns::verify(state, raw_body).await {
         Ok(verified) => verified,
         Err(error) => return error.into_response(),
     };
-    match handle_sns(state, Ingress::Direct, verified, deadline).await {
+    match handle_sns(state, Ingress::Direct, verified, deadline, arrival).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }

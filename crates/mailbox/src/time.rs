@@ -1,156 +1,152 @@
-//! Fixed-width UTC timestamps for mail table attributes (`timestamp`,
-//! `created_at`, `updated_at`, …): `YYYY-MM-DDTHH:MM:SS.sssZ`, always exactly
-//! 24 bytes, so DynamoDB string comparison (and page-key/prefix bounds) sorts
-//! by wall-clock order.
+//! Instants and their stored form. An instant is a [`jiff::Timestamp`]; mail
+//! table attributes (`timestamp`, `created_at`, `updated_at`, …) hold it as a
+//! fixed-width UTC string, `YYYY-MM-DDTHH:MM:SS.sssZ`, always exactly 24
+//! bytes, so DynamoDB string comparison (and page-key/prefix bounds) sorts by
+//! wall-clock order.
 //!
-//! `aws_smithy_types::date_time`'s RFC 3339 formatter is not fixed-width — it
-//! omits the fractional-second component entirely at whole seconds and
-//! trims trailing zero digits otherwise — so it is not reused here. Calendar
-//! conversion uses Howard Hinnant's `days_from_civil` / `civil_from_days`
-//! algorithm (a small, well-known, dependency-free proleptic-Gregorian
-//! calendar), avoiding a `chrono` dependency for two conversions.
+//! Nothing here reads the clock. This crate is pure: every instant it handles
+//! is handed in, taken by the binary from the Lambda event being served.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+pub use jiff::Timestamp;
 
-const MS_PER_DAY: u64 = 86_400_000;
-const MS_PER_HOUR: u64 = 3_600_000;
-const MS_PER_MINUTE: u64 = 60_000;
-
-/// The current time as milliseconds since the Unix epoch. Saturates to
-/// `u64::MAX` in the astronomically unreachable case of a value that
-/// overflows `u64` milliseconds (the year 584,942,417).
+/// The DynamoDB TTL (epoch seconds) for an item written at `at`,
+/// `retention_days` later: for a mail item, the same span the mail bucket's
+/// lifecycle rules keep its objects, so both age out together.
+///
+/// `retention_days` is `u32`, so `days × 86_400` cannot overflow `u64`; a
+/// wider type would let a huge value wrap to a near-zero TTL.
 #[must_use]
-pub fn now_ms() -> u64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+pub fn expires_at(at: Timestamp, retention_days: u32) -> u64 {
+    unix_seconds(at) + u64::from(retention_days) * 86_400
 }
 
-/// The DynamoDB TTL (epoch seconds) for a mail item written at `now_ms`,
-/// `retention_days` later: the same span the mail bucket's lifecycle rules
-/// keep the item's objects, so both age out together.
+/// `at` as whole seconds since the Unix epoch, the unit of a DynamoDB TTL.
+/// An instant before the epoch clamps to zero.
 #[must_use]
-pub fn expires_at(now_ms: u64, retention_days: u32) -> u64 {
-    now_ms / 1_000 + u64::from(retention_days) * 86_400
+pub fn unix_seconds(at: Timestamp) -> u64 {
+    u64::try_from(at.as_second()).unwrap_or(0)
 }
 
-/// Formats `epoch_ms` as a fixed-width, millisecond-precision UTC timestamp:
-/// `YYYY-MM-DDTHH:MM:SS.sssZ` (24 bytes). Holds the fixed-width guarantee for
-/// any year in 0000–9999 (any epoch millisecond value this application will
-/// ever produce).
+/// `at` as milliseconds since the Unix epoch, the resolution ids and sort
+/// keys carry. An instant before the epoch, which nothing here produces,
+/// clamps to zero.
 #[must_use]
-pub fn format(epoch_ms: u64) -> String {
-    let days = epoch_ms / MS_PER_DAY;
-    let ms_of_day = epoch_ms % MS_PER_DAY;
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "days-since-epoch fits i64 for any u64 millisecond value this app produces"
-    )]
-    let (year, month, day) = civil_from_days(days as i64);
-    let hour = ms_of_day / MS_PER_HOUR;
-    let minute = (ms_of_day / MS_PER_MINUTE) % 60;
-    let second = (ms_of_day / 1000) % 60;
-    let millis = ms_of_day % 1000;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+pub fn unix_ms(at: Timestamp) -> u64 {
+    u64::try_from(at.as_millisecond()).unwrap_or(0)
 }
 
-/// Parses a string in exactly [`format`]'s shape back into epoch
-/// milliseconds. `None` for any other shape (wrong length, wrong separators,
-/// out-of-range field, a `day` that is invalid for the given `month`/`year`
-/// such as Feb 30 or Feb 29 of a non-leap year, or a date this pre-epoch
-/// check rejects).
+/// Formats `at` as a fixed-width, millisecond-precision UTC timestamp:
+/// `YYYY-MM-DDTHH:MM:SS.sssZ` (24 bytes), truncating anything finer. Holds
+/// the fixed-width guarantee for every year in 0000–9999, and a
+/// [`Timestamp`] cannot hold a later one.
 #[must_use]
-pub fn parse(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() != 24
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'.'
-        || b[23] != b'Z'
-    {
-        return None;
+pub fn format(at: Timestamp) -> String {
+    format!("{at:.3}")
+}
+
+/// Parses a string in exactly [`format`]'s shape. `None` for any other shape
+/// (a missing or extra fraction digit, an offset other than `Z`, a
+/// non-existent calendar date such as Feb 30, a leap second) and for an
+/// instant before the Unix epoch. Strict because these strings are compared
+/// bytewise as sort keys: accepting a second spelling of an instant would
+/// accept a key that sorts somewhere else.
+#[must_use]
+pub fn parse(s: &str) -> Option<Timestamp> {
+    let at = parse_rfc3339(s)?;
+    (at.as_millisecond() >= 0 && format(at) == s).then_some(at)
+}
+
+/// Parses [`format`]'s shape without its fraction, `YYYY-MM-DDTHH:MM:SSZ`,
+/// as strictly as [`parse`] reads the full one.
+#[must_use]
+pub fn parse_whole_second(s: &str) -> Option<Timestamp> {
+    let at = parse_rfc3339(s)?;
+    let canonical = format(at);
+    // The canonical form with its `.000` removed must be the input itself.
+    let whole = canonical.strip_suffix(".000Z")?;
+    (at.as_millisecond() >= 0 && s.strip_suffix('Z') == Some(whole)).then_some(at)
+}
+
+/// Parses any RFC 3339 timestamp, as AWS writes them in the events it
+/// delivers (an SNS envelope's `Timestamp`, a scheduled event's `time`),
+/// where the number of fraction digits varies by service. Anything finer
+/// than a millisecond is dropped: see [`to_millis`].
+#[must_use]
+pub fn parse_rfc3339(s: &str) -> Option<Timestamp> {
+    s.parse().ok().map(to_millis)
+}
+
+/// `at` with anything finer than a millisecond dropped. Every instant enters
+/// the program through this, so one that has been stored and read back
+/// equals the one that was written.
+#[must_use]
+pub fn to_millis(at: Timestamp) -> Timestamp {
+    Timestamp::from_millisecond(at.as_millisecond()).unwrap_or(at)
+}
+
+/// Serde for an instant stored or sent as a string: `#[serde(with =
+/// "time::fixed")]`. This is the one place an instant becomes text or text
+/// an instant; between a read and a write it stays a [`Timestamp`].
+///
+/// Writes [`format`]'s fixed-width shape, which sort keys and clients rely
+/// on. Reads any RFC 3339 timestamp, so an item written by something less
+/// strict still loads.
+pub mod fixed {
+    use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+    use super::Timestamp;
+
+    /// # Errors
+    ///
+    /// Only what the serializer itself returns.
+    pub fn serialize<S: Serializer>(at: &Timestamp, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&super::format(*at))
     }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let month: u32 = s.get(5..7)?.parse().ok()?;
-    let day: u32 = s.get(8..10)?.parse().ok()?;
-    let hour: u64 = s.get(11..13)?.parse().ok()?;
-    let minute: u64 = s.get(14..16)?.parse().ok()?;
-    let second: u64 = s.get(17..19)?.parse().ok()?;
-    let millis: u64 = s.get(20..23)?.parse().ok()?;
-    // Bounding `day` to the actual length of the
-    // month (with the leap-year rule for February) prevents `days_from_civil`
-    // from silently rolling an out-of-range day (e.g. Feb 30 -> Mar 2) into a
-    // different, valid-looking epoch millisecond value.
-    if !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    let days: u64 = days.try_into().ok()?;
-    Some(days * MS_PER_DAY + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * 1000 + millis)
-}
 
-/// The number of days in `month` of `year`, applying the Gregorian leap-year
-/// rule to February; 0 for a month outside `1..=12`, so no day is valid.
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-                29
-            } else {
-                28
+    /// # Errors
+    ///
+    /// When the value is not a string holding an RFC 3339 timestamp.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        super::parse_rfc3339(&text)
+            .ok_or_else(|| D::Error::custom(format_args!("not an RFC 3339 timestamp: {text}")))
+    }
+
+    /// The same for an optional instant: `#[serde(default, skip_serializing_if
+    /// = "Option::is_none", with = "time::fixed::option")]`.
+    pub mod option {
+        use serde::{Deserialize as _, Deserializer, Serializer};
+
+        use super::super::Timestamp;
+
+        /// # Errors
+        ///
+        /// Only what the serializer itself returns.
+        pub fn serialize<S: Serializer>(
+            at: &Option<Timestamp>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match at {
+                Some(at) => serializer.serialize_some(&super::super::format(*at)),
+                None => serializer.serialize_none(),
             }
         }
-        _ => 0,
+
+        /// A string that is not a timestamp reads as absent rather than
+        /// failing the item: an optional instant is never what an item is
+        /// keyed by, and one unreadable mark must not make a send
+        /// unlistable to the sweep that would recover it.
+        ///
+        /// # Errors
+        ///
+        /// When the value is neither null nor a string.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Timestamp>, D::Error> {
+            let text = Option::<String>::deserialize(deserializer)?;
+            Ok(text.as_deref().and_then(super::super::parse_rfc3339))
+        }
     }
-}
-
-/// Days since the Unix epoch (1970-01-01) for a UTC civil date. Howard
-/// Hinnant's `days_from_civil`: <https://howardhinnant.github.io/date_algorithms.html>.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (i64::from(m) + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
-/// The inverse of [`days_from_civil`]: the UTC civil date for `z` days since
-/// the Unix epoch.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "doy - (153*mp+2)/5 + 1 is in [1, 31] by construction"
-    )]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "mp is in [0, 11] by construction, so month is in [1, 12]"
-    )]
-    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if month <= 2 { y + 1 } else { y };
-    (y, month, day)
 }
 
 #[cfg(test)]
@@ -158,42 +154,76 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// The maximum epoch millisecond value whose formatted year stays within
-    /// RFC 3339's 0-9999 range (9999-12-31T23:59:59.999Z), bounding the
-    /// proptest to the range where [`format`]'s fixed-width guarantee holds.
-    const MAX_MS: u64 = 253_402_300_799_999;
+    /// The latest instant a [`Timestamp`] holds, 9999-12-30T22:00:00.999Z, in
+    /// epoch milliseconds: the upper bound of what [`format`] can be given.
+    const MAX_MS: u64 = 253_402_207_200_999;
+
+    #[test]
+    fn max_ms_is_the_latest_timestamp() {
+        assert_eq!(unix_ms(Timestamp::MAX), MAX_MS);
+    }
+
+    fn at(ms: u64) -> Timestamp {
+        Timestamp::from_millisecond(i64::try_from(ms).unwrap()).unwrap()
+    }
+
+    fn format_ms(ms: u64) -> String {
+        format(at(ms))
+    }
+
+    fn parse_ms(s: &str) -> Option<u64> {
+        parse(s).map(unix_ms)
+    }
+
+    fn days_in_month(year: i64, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+            _ => 28,
+        }
+    }
 
     #[test]
     fn formats_a_known_instant() {
         // 2015-09-11T20:32:33.936Z, from the SES documentation examples.
-        assert_eq!(format(1_442_003_553_936), "2015-09-11T20:32:33.936Z");
+        assert_eq!(format_ms(1_442_003_553_936), "2015-09-11T20:32:33.936Z");
     }
 
     #[test]
     fn formats_the_epoch() {
-        assert_eq!(format(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(format_ms(0), "1970-01-01T00:00:00.000Z");
     }
 
     #[test]
     fn formats_are_always_24_bytes() {
         for ms in [0, 1, 999, 1000, 1_442_003_553_936, MAX_MS] {
-            assert_eq!(format(ms).len(), 24, "ms={ms}");
+            assert_eq!(format_ms(ms).len(), 24, "ms={ms}");
         }
     }
 
     #[test]
     fn parses_a_known_instant() {
-        assert_eq!(parse("2015-09-11T20:32:33.936Z"), Some(1_442_003_553_936));
+        assert_eq!(
+            parse_ms("2015-09-11T20:32:33.936Z"),
+            Some(1_442_003_553_936)
+        );
     }
 
     #[test]
     fn parse_rejects_malformed_input() {
-        assert_eq!(parse(""), None);
-        assert_eq!(parse("2015-09-11T20:32:33.936"), None); // missing Z
-        assert_eq!(parse("2015-09-11 20:32:33.936Z"), None); // missing T
-        assert_eq!(parse("2015-13-11T20:32:33.936Z"), None); // month 13
-        assert_eq!(parse("2015-09-11T24:32:33.936Z"), None); // hour 24
-        assert_eq!(parse("not a timestamp, just text"), None);
+        assert_eq!(parse_ms(""), None);
+        assert_eq!(parse_ms("2015-09-11T20:32:33.936"), None); // missing Z
+        assert_eq!(parse_ms("2015-09-11 20:32:33.936Z"), None); // missing T
+        assert_eq!(parse_ms("2015-13-11T20:32:33.936Z"), None); // month 13
+        assert_eq!(parse_ms("2015-09-11T24:32:33.936Z"), None); // hour 24
+        assert_eq!(parse_ms("not a timestamp, just text"), None);
+        assert_eq!(parse_ms("2015-09-11T20:32:33Z"), None); // no fraction
+        assert_eq!(parse_ms("2015-09-11T20:32:33.9360Z"), None); // four digits
+        assert_eq!(parse_ms("2015-09-11T20:32:33.936+00:00"), None); // offset
+        assert_eq!(parse_ms("2015-09-11t20:32:33.936z"), None); // lowercase
+        assert_eq!(parse_ms("2015-06-30T23:59:60.000Z"), None); // leap second
+        assert_eq!(parse_ms("1969-12-31T23:59:59.999Z"), None); // pre-epoch
     }
 
     #[test]
@@ -201,16 +231,16 @@ mod tests {
         // Non-existent calendar dates the old `1..=31` bound accepted and
         // `days_from_civil` silently rolled into the next month, returning a
         // real but different epoch millisecond value.
-        assert_eq!(parse("2015-02-30T00:00:00.000Z"), None); // used to roll to Mar 2
-        assert_eq!(parse("2015-02-29T00:00:00.000Z"), None); // 2015 non-leap -> Mar 1
-        assert_eq!(parse("2015-04-31T00:00:00.000Z"), None); // used to roll to May 1
-        assert_eq!(parse("2015-06-31T00:00:00.000Z"), None);
-        assert_eq!(parse("2015-09-31T00:00:00.000Z"), None);
-        assert_eq!(parse("2015-11-31T00:00:00.000Z"), None);
-        assert_eq!(parse("2100-02-29T00:00:00.000Z"), None); // century non-leap
+        assert_eq!(parse_ms("2015-02-30T00:00:00.000Z"), None); // used to roll to Mar 2
+        assert_eq!(parse_ms("2015-02-29T00:00:00.000Z"), None); // 2015 non-leap -> Mar 1
+        assert_eq!(parse_ms("2015-04-31T00:00:00.000Z"), None); // used to roll to May 1
+        assert_eq!(parse_ms("2015-06-31T00:00:00.000Z"), None);
+        assert_eq!(parse_ms("2015-09-31T00:00:00.000Z"), None);
+        assert_eq!(parse_ms("2015-11-31T00:00:00.000Z"), None);
+        assert_eq!(parse_ms("2100-02-29T00:00:00.000Z"), None); // century non-leap
         // Upper bound of a 31-day month and day zero are still rejected.
-        assert_eq!(parse("2015-01-32T00:00:00.000Z"), None);
-        assert_eq!(parse("2015-01-00T00:00:00.000Z"), None);
+        assert_eq!(parse_ms("2015-01-32T00:00:00.000Z"), None);
+        assert_eq!(parse_ms("2015-01-00T00:00:00.000Z"), None);
     }
 
     #[test]
@@ -227,7 +257,7 @@ mod tests {
         // Feb 29 round-trips in a leap year, but rejects in a non-leap year.
         round_trips("2024-02-29T00:00:00.000Z"); // divisible by 4, not a century
         round_trips("2000-02-29T00:00:00.000Z"); // divisible by 400
-        assert_eq!(parse("2015-02-29T00:00:00.000Z"), None);
+        assert_eq!(parse_ms("2015-02-29T00:00:00.000Z"), None);
     }
 
     #[test]
@@ -246,7 +276,7 @@ mod tests {
                 // than rolled into the next month.
                 if dim < 31 {
                     let bad = format!("{year:04}-{month:02}-{}T00:00:00.000Z", dim + 1);
-                    assert_eq!(parse(&bad), None, "expected None for {bad}");
+                    assert_eq!(parse_ms(&bad), None, "expected None for {bad}");
                 }
             }
         }
@@ -255,14 +285,100 @@ mod tests {
     #[test]
     fn round_trips_millisecond_boundaries() {
         for ms in [0, 999, 1000, 86_399_999, 86_400_000, MAX_MS] {
-            assert_eq!(parse(&format(ms)), Some(ms), "ms={ms}");
+            assert_eq!(parse_ms(&format_ms(ms)), Some(ms), "ms={ms}");
         }
+    }
+
+    #[test]
+    fn parse_whole_second_takes_only_the_canonical_shape() {
+        assert_eq!(
+            parse_whole_second("2015-09-11T20:32:33Z"),
+            Some(at(1_442_003_553_000))
+        );
+        for rejected in [
+            "2015-09-11T20:32:33.000Z", // that is `parse`'s shape
+            "2015-09-11t20:32:33Z",     // lowercase separator
+            "2015-09-11T20:32:60Z",     // leap second
+            "2015-09-11T203233Z",       // basic time
+            "2015-09-11T20:32:33+00:00",
+            "1969-12-31T23:59:59Z",
+            "2015-09-11 20:32:33Z",
+        ] {
+            assert_eq!(parse_whole_second(rejected), None, "{rejected}");
+        }
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Marks {
+        #[serde(with = "fixed")]
+        at: Timestamp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "fixed::option")]
+        mark: Option<Timestamp>,
+    }
+
+    #[test]
+    fn fixed_writes_the_fixed_width_form_and_reads_it_back() {
+        let marks = Marks {
+            at: at(1_442_003_553_000),
+            mark: Some(at(1_442_003_553_936)),
+        };
+        let json = serde_json::to_value(&marks).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "at": "2015-09-11T20:32:33.000Z",
+                "mark": "2015-09-11T20:32:33.936Z",
+            })
+        );
+        assert_eq!(serde_json::from_value::<Marks>(json).unwrap(), marks);
+    }
+
+    #[test]
+    fn an_unreadable_optional_instant_reads_as_absent_and_a_required_one_fails() {
+        let read = |json| serde_json::from_value::<Marks>(json);
+        let at = "2015-09-11T20:32:33.000Z";
+        assert_eq!(
+            read(serde_json::json!({ "at": at, "mark": "garbage" }))
+                .unwrap()
+                .mark,
+            None
+        );
+        assert_eq!(read(serde_json::json!({ "at": at })).unwrap().mark, None);
+        assert!(read(serde_json::json!({ "at": "garbage" })).is_err());
+    }
+
+    #[test]
+    fn format_truncates_below_a_millisecond() {
+        let at = "2015-09-11T20:32:33.936999999Z".parse().unwrap();
+        assert_eq!(format(at), "2015-09-11T20:32:33.936Z");
+    }
+
+    #[test]
+    fn parse_rfc3339_accepts_the_shapes_aws_events_carry() {
+        let expected = Some(at(1_442_003_553_000));
+        assert_eq!(parse_rfc3339("2015-09-11T20:32:33Z"), expected);
+        assert_eq!(parse_rfc3339("2015-09-11T20:32:33.000Z"), expected);
+        assert_eq!(parse_rfc3339("2015-09-11T22:32:33+02:00"), expected);
+        assert_eq!(parse_rfc3339("yesterday"), None);
+    }
+
+    #[test]
+    fn expires_at_offsets_by_retention_days_in_seconds() {
+        assert_eq!(expires_at(Timestamp::UNIX_EPOCH, 0), 0);
+        assert_eq!(expires_at(Timestamp::UNIX_EPOCH, 30), 30 * 86_400);
+        assert_eq!(expires_at(at(1_999), 1), 1 + 86_400);
+        // The widest retention fits `u64` with room to spare.
+        assert_eq!(
+            expires_at(Timestamp::UNIX_EPOCH, u32::MAX),
+            u64::from(u32::MAX) * 86_400
+        );
     }
 
     proptest! {
         #[test]
         fn round_trip_holds_for_any_representable_instant(ms in 0u64..=MAX_MS) {
-            prop_assert_eq!(parse(&format(ms)), Some(ms));
+            prop_assert_eq!(parse_ms(&format_ms(ms)), Some(ms));
         }
 
         #[test]
@@ -270,7 +386,7 @@ mod tests {
             a in 0u64..=MAX_MS,
             b in 0u64..=MAX_MS,
         ) {
-            let (fa, fb) = (format(a), format(b));
+            let (fa, fb) = (format_ms(a), format_ms(b));
             prop_assert_eq!(fa.len(), 24);
             prop_assert_eq!(fb.len(), 24);
             prop_assert_eq!(a.cmp(&b), fa.cmp(&fb));

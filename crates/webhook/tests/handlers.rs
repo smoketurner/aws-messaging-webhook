@@ -3,6 +3,10 @@
 // functions that needed an explicit `unwrap_used` expectation live in the
 // `webhook-test-support` dev-dependency crate.
 
+use aws_messaging_webhook::allowlist::TopicAllowlist;
+use mailbox::test_fixtures::at;
+use mailbox::time::{self, Timestamp};
+use sns_message_verifier::fixtures::SnsFixture;
 use std::sync::atomic::Ordering;
 
 use aws_messaging_webhook::actions::ActionErrorKind;
@@ -617,7 +621,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     // A cold-start cert fetch that fails transiently must not be a permanent
     // 4xx — that would make SNS drop a correctly-signed message. The verifier
     // has no cached cert and the cert server 500s, so verify() -> CertFetch.
-    let fixture = sns_message_verifier::fixtures::SnsFixture::new();
+    let fixture = SnsFixture::new();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/cert.pem"))
@@ -628,9 +632,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
     let (state, _, _) = webhook_test_support::fake_state(
         webhook_test_support::test_config(),
         webhook_test_support::test_verifier(&server),
-        aws_messaging_webhook::allowlist::TopicAllowlist::parse(
-            webhook_test_support::ALLOWED_ACCOUNT,
-        ),
+        TopicAllowlist::parse(webhook_test_support::ALLOWED_ACCOUNT),
         Some(server.uri()),
     );
     let state = std::sync::Arc::new(state);
@@ -755,6 +757,91 @@ async fn function_url_payload_dispatches_through_the_router() {
         h.calls(),
         vec!["persist:165545c9-2a5c-472c-8df2-7ff2be2b3b1b".to_owned()]
     );
+}
+
+/// A Function URL delivery is dated by the request's `timeEpoch`, not by the
+/// clock: what it stores says when the request arrived, and counts retention
+/// from then.
+#[tokio::test]
+async fn a_function_url_delivery_is_dated_by_the_request_time() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    // `function_url_event` carries `timeEpoch: 1754265600000`.
+    let payload = function_url_event("/webhooks/ses/events", &body);
+
+    invoke(h.state.clone(), payload).await.unwrap();
+
+    let records = h.state.events.records.lock().unwrap();
+    assert_eq!(records[0].received_at, at("2025-08-04T00:00:00.000Z"));
+    assert_eq!(records[0].expires_at, 1_754_265_600 + 30 * 86_400);
+    assert_eq!(
+        records[0].aggregate_expires_at,
+        1_754_265_600 + 365 * 86_400
+    );
+    // The envelope's own time is still what keys the event.
+    assert_eq!(records[0].event_timestamp, "2026-08-03T19:12:52.000Z");
+}
+
+/// A direct invoke has no request, so the envelope SNS signed dates it — and
+/// a redelivery of the same message is dated the same.
+#[tokio::test]
+async fn a_direct_delivery_is_dated_by_the_envelope_timestamp() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+
+    let records = h.state.events.records.lock().unwrap();
+    assert_eq!(records[0].received_at, at("2026-08-03T19:12:52.000Z"));
+    assert_eq!(records[1].received_at, records[0].received_at);
+}
+
+/// The fixture envelope was published long before the test runs, as an event
+/// redriven from a failure destination would be. It keeps its date, but what
+/// it stores is retained from the invocation, not from the publish time —
+/// which would write it already most of the way to expiry.
+#[tokio::test]
+async fn a_direct_delivery_of_an_old_message_is_retained_from_the_invocation() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    let before = time::unix_seconds(Timestamp::now());
+
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+
+    let records = h.state.events.records.lock().unwrap();
+    // `test_context` ends the invocation 60 s from now; retention is 30 days.
+    let retained_until = before + 30 * 86_400;
+    assert!(
+        (retained_until..=retained_until + 120).contains(&records[0].expires_at),
+        "expires_at {} is not 30 days from the invocation",
+        records[0].expires_at
+    );
+}
+
+/// SNS cannot produce it, but a signed envelope whose `Timestamp` is not a
+/// timestamp has nothing to date a direct delivery by: it is dropped, not
+/// retried.
+#[tokio::test]
+async fn a_direct_delivery_without_a_usable_timestamp_is_dropped_not_retried() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    body["Timestamp"] = json!("not a timestamp");
+    h.fixture.sign(&mut body, "2");
+
+    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+
+    assert!(result.is_ok());
+    assert_eq!(h.calls(), [] as [String; 0]);
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use mailbox::MessageId;
 use mailbox::content::MessageContent;
 use mailbox::mime::parse_inbound;
 use mailbox::send::SendSpec;
+use mailbox::test_fixtures::at;
 use mailbox::{Direction, InboxId, MailMessage, ids, time};
 use mailbox_store::sample_message;
 use serde_json::{Value, json};
@@ -33,7 +34,7 @@ async fn seeded(adjust: impl FnOnce(&mut MailMessage)) -> (Harness, String) {
     let ms = time::parse(TEST_AT).unwrap();
     let id = ids::inbound_message_id("ses-1", ms).to_string();
     let mut msg = sample_message(TEST_INBOX, &id, "thread-1");
-    TEST_AT.clone_into(&mut msg.timestamp);
+    msg.timestamp = at(TEST_AT);
     "customer@example.net".clone_into(&mut msg.from);
     msg.to = vec![TEST_INBOX.to_owned()];
     "Order 42".clone_into(&mut msg.subject);

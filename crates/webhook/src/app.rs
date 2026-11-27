@@ -1,3 +1,4 @@
+use crate::api;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use lambda_http::RequestExt as _;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::clock::{Arrival, RequestTime};
 use crate::entry::context_deadline;
 use crate::model::Source;
 use crate::sns::extractor::VerifiedSns;
@@ -60,15 +62,23 @@ pub fn app<B: Backend>(state: Arc<AppState<B>>) -> Router {
             post(
                 move |State(state): State<Arc<AppState<B>>>,
                       Deadline(deadline): Deadline,
+                      RequestTime(at): RequestTime,
                       verified: VerifiedSns| async move {
-                    handle_sns(&state, Ingress::Http(source), verified, deadline).await
+                    handle_sns(
+                        &state,
+                        Ingress::Http(source),
+                        verified,
+                        deadline,
+                        Arrival::Request(at),
+                    )
+                    .await
                 },
             ),
         );
     }
     router
         .with_state(Arc::clone(&state))
-        .merge(Router::new().nest("/v0", crate::api::router(state)))
+        .merge(Router::new().nest("/v0", api::router(state)))
         .layer(TraceLayer::new_for_http())
         // Outside the trace layer, so a bearer key can never reach a log
         // line: the header is redacted before tracing records the request.

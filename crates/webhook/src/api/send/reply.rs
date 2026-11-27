@@ -12,6 +12,7 @@ use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
 use crate::api::send::validate::{Addresses, ReplyRequest, SendRequest};
 use crate::api::send::{SendAccepted, enqueue};
+use crate::clock::RequestTime;
 use crate::mail::content;
 use crate::state::{AppState, Backend};
 use mailbox::MessageId;
@@ -52,6 +53,7 @@ pub(super) fn threading_references(
 pub(crate) async fn reply<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, MessageId)>,
+    RequestTime(at): RequestTime,
     headers: HeaderMap,
     ApiJson(request): ApiJson<ReplyRequest>,
 ) -> Result<Json<SendAccepted>, ApiError> {
@@ -88,6 +90,7 @@ pub(crate) async fn reply<B: Backend>(
         &headers,
         Some((&original, &original_content)),
         "reply",
+        at,
     )
     .await
 }

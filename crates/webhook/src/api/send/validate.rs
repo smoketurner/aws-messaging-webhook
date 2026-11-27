@@ -10,6 +10,7 @@
 //! overridden at all, so a caller cannot rewrite `From` and send as another
 //! inbox.
 
+use crate::api::labels;
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
@@ -197,11 +198,8 @@ pub(crate) fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> 
         ));
     }
 
-    let labels = crate::api::labels::normalize_labels(
-        request.labels.unwrap_or_default(),
-        "labels",
-        &mut errors,
-    );
+    let labels =
+        labels::normalize_labels(request.labels.unwrap_or_default(), "labels", &mut errors);
     let headers = headers(request.headers, &mut errors);
     let attachments = attachments(request.attachments, &mut errors);
 

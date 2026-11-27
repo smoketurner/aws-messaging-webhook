@@ -188,6 +188,7 @@ mod tests {
     use super::*;
     use crate::InboxId;
     use crate::send::Envelope;
+    use crate::test_fixtures::at;
     use crate::{MessageId, ThreadId};
 
     fn spec() -> SendSpec {
@@ -211,7 +212,7 @@ mod tests {
             references: Vec::new(),
             headers: BTreeMap::new(),
             attachments: Vec::new(),
-            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            created_at: at("2026-01-01T00:00:00.000Z"),
         }
     }
 

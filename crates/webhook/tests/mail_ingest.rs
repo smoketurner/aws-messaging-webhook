@@ -12,6 +12,10 @@
 //! `ingest_inbound` with a short, precisely controlled `tokio::time::Instant`
 //! deadline.
 
+use aws_messaging_webhook::actions::ActionErrorKind;
+use aws_messaging_webhook::store::Delivery;
+use mailbox::time;
+use mailbox::time::Timestamp;
 use mailbox::{MessageId, ThreadId};
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -129,7 +133,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
 
     // The item and its thread expire with the bucket's lifecycle.
     let retention_secs = 365 * 86_400;
-    let now_secs = mailbox::time::now_ms() / 1_000;
+    let now_secs = time::unix_ms(Timestamp::now()) / 1_000;
     assert!(
         stored.expires_at > now_secs + retention_secs - 60
             && stored.expires_at <= now_secs + retention_secs,
@@ -915,8 +919,8 @@ fn notification(
 }
 
 /// A receipt with neither `mail.timestamp` nor `receipt.timestamp` set, for
-/// the timestamp tests: `received_ms` must fall back to the caller-supplied
-/// envelope timestamp, and never to wall-clock time.
+/// the timestamp tests: the received time must fall back to the caller-supplied
+/// envelope timestamp, and never to the delivery time.
 fn notification_without_timestamps(
     ses_id: &str,
     recipients: &[&str],
@@ -945,14 +949,21 @@ async fn deadline_timeout_returns_transient() {
     let event = notification("ses-1", TS, &["support@example.com"], "inbound/hang");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
+    let result = ingest::ingest_inbound(
+        &state,
+        &event,
+        deadline,
+        Delivery::at(Timestamp::now()),
+        None,
+    )
+    .await;
 
     let Err(error) = &result else {
         panic!("expected a transient timeout error, got {result:?}");
     };
     assert_eq!(
         error.kind,
-        aws_messaging_webhook::actions::ActionErrorKind::Transient,
+        ActionErrorKind::Transient,
         "a deadline elapse must be transient (5xx-equivalent) so it redelivers"
     );
 }
@@ -979,7 +990,14 @@ async fn resume_skips_an_already_present_part() {
         .seed(&object_key, original.clone(), "image/png");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
+    let result = ingest::ingest_inbound(
+        &state,
+        &event,
+        deadline,
+        Delivery::at(Timestamp::now()),
+        None,
+    )
+    .await;
     assert!(result.is_ok(), "{result:?}");
 
     // The pre-seeded content is untouched — `put_object_if_absent` never ran
@@ -1048,15 +1066,19 @@ async fn no_put_still_pending_after_the_deadline() {
     state.objects.inject(&hung_key, ObjectFailure::Hang);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
+    let result = ingest::ingest_inbound(
+        &state,
+        &event,
+        deadline,
+        Delivery::at(Timestamp::now()),
+        None,
+    )
+    .await;
 
     let Err(error) = &result else {
         panic!("expected a transient timeout error, got {result:?}");
     };
-    assert_eq!(
-        error.kind,
-        aws_messaging_webhook::actions::ActionErrorKind::Transient
-    );
+    assert_eq!(error.kind, ActionErrorKind::Transient);
 
     let count_at_timeout = state.objects.call_count(Op::Put, &hung_key);
     assert_eq!(
@@ -1095,7 +1117,14 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
     let envelope_ms = parse_ts(TS).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
-    let first = ingest::ingest_inbound(&state, &event, deadline, Some(envelope_ms)).await;
+    let first = ingest::ingest_inbound(
+        &state,
+        &event,
+        deadline,
+        Delivery::at(Timestamp::now()),
+        Some(envelope_ms),
+    )
+    .await;
     assert_eq!(first.unwrap(), ingest::IngestOutcome::Ingested);
 
     let message_id = inbound_message_id("ses-1", envelope_ms);
@@ -1109,7 +1138,14 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
             .is_some()
     );
 
-    let second = ingest::ingest_inbound(&state, &event, deadline, Some(envelope_ms)).await;
+    let second = ingest::ingest_inbound(
+        &state,
+        &event,
+        deadline,
+        Delivery::at(Timestamp::now()),
+        Some(envelope_ms),
+    )
+    .await;
     assert_eq!(
         second.unwrap(),
         ingest::IngestOutcome::Duplicate,
@@ -1119,7 +1155,7 @@ async fn envelope_timestamp_fallback_stays_deterministic_across_redelivery() {
 
 /// With no usable timestamp on any of the three fallbacks, ingest
 /// skips the message (`no_timestamp`) rather than inventing one via
-/// `time::now_ms()` — never fetching the raw object, since a wall-clock
+/// the delivery's own time — never fetching the raw object, since that
 /// value would make the id non-deterministic across a redelivery.
 #[tokio::test]
 async fn missing_every_timestamp_source_skips_rather_than_inventing_one() {
@@ -1127,7 +1163,14 @@ async fn missing_every_timestamp_source_skips_rather_than_inventing_one() {
     let event = notification_without_timestamps("ses-1", &["support@example.com"], "inbound/no-ts");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
-    let result = ingest::ingest_inbound(&state, &event, deadline, None).await;
+    let result = ingest::ingest_inbound(
+        &state,
+        &event,
+        deadline,
+        Delivery::at(Timestamp::now()),
+        None,
+    )
+    .await;
     assert_eq!(result.unwrap(), ingest::IngestOutcome::Skipped);
     assert_eq!(
         state.objects.call_count(Op::Get, "inbound/no-ts"),

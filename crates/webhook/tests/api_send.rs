@@ -12,6 +12,7 @@ use axum::http::{Method, Request, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mailbox::send::{SendState, SendStatus};
+use mailbox::test_fixtures::at;
 use mailbox::{InboxId, MESSAGE_USER_LABEL_CAP, labels};
 use mailbox::{MessageId, ThreadId};
 use mailbox_store::keys::TableKey;
@@ -791,7 +792,7 @@ async fn an_expired_key_with_a_different_request_is_accepted_not_conflicted() {
         thread_id: ThreadId::new("old-thread-id"),
         request_hash: "a-different-request-hash".to_owned(),
         route: "send".to_owned(),
-        created_at: "2025-01-01T00:00:00.000Z".to_owned(),
+        created_at: at("2025-01-01T00:00:00.000Z"),
         expires_at: 1, // long past the 24h lifetime; not yet reaped by DynamoDB
     };
     h.mail.seed_send_key(&expired_key);

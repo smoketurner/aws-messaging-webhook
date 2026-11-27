@@ -108,11 +108,41 @@ moves inline rather than making the item public.
   stays the single place that classifies failures. Note the direct pathway's async queue retries
   only twice; the HTTPS delivery policy retries far longer.
 - **Never parse the direct-invoke `Sns` record with `aws_lambda_events`' `SnsMessage`.** It
-  parses `Timestamp` into `chrono::DateTime`, whose serialization drops trailing `.000`
+  parses `Timestamp` into a `chrono::DateTime`, whose serialization drops trailing `.000`
   subseconds — rebuilding the signed canonical string from it rejects every message published
   on a whole second. `entry.rs` deserializes the record straight into `SnsEnvelope` (which
   aliases the Lambda-shape `SigningCertUrl`/`UnsubscribeUrl` casing) so signed values stay
   verbatim.
+- **"Now" is the Lambda event's timestamp, not a clock reading.** What an invocation writes
+  is stamped with the time AWS put on the event it is serving — a Function URL request's
+  `requestContext.timeEpoch` (the `RequestTime` extractor), a direct SNS delivery's envelope
+  `Timestamp`, a scheduled sweep's `time` — and threaded down as a `jiff::Timestamp`
+  (`mailbox::time::Timestamp`); the `mailbox` crate never reads the clock. Text becomes a
+  `Timestamp` once, where it enters (the event, a query parameter, a stored item), and stays
+  one: stored and wire structs hold `Timestamp` fields under `#[serde(with = "time::fixed")]`,
+  which writes the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form sort keys depend on (an
+  unreadable *optional* instant reads as absent; a required one fails the item). Don't pass
+  a formatted string between functions, and never `Display` a `Timestamp` (its width varies)
+  — `time::format` is for a key or a JSON literal being built by hand. `clock.rs` says
+  where each comes from and holds the one `now()`, for what no event can supply: the sender's
+  claim on a send (a lease the sweep judges by age — the stream record that triggered the
+  sender may be far older than the attempt, so dating the claim by it would make a live claim
+  look abandoned and send the message twice), an operator command, and tests that build a
+  request without a Lambda context. Monotonic deadlines and the verifier's certificate-validity
+  check use the real clock too; a signed `Timestamp` must never decide whether the certificate
+  that signed it is current. The inbound message id is seeded from the mail's own timestamps
+  (content), never from the delivery time, which differs on every HTTPS redelivery. A direct
+  delivery is dated by its envelope but *retained* from the invocation's deadline when that is
+  later (`clock::Arrival`), so an event redriven long after it was published is not stored
+  already expired. The sender reads the clock again for each mark it records (`ses_call_at`,
+  `sent_at`, a release): loading a send can take most of an invocation.
+- **A send is called once; SES's events are its second witness.** `SendEmail` has no
+  idempotency token, so the sender marks `ses_call_at` before the call and nothing automatic
+  ever calls SES again for a send carrying that mark. If the write recording SES's answer is
+  lost, the send waits as `sending` then `unknown` — and the first SES event for the message
+  (matched by the `mailbox_message` tag, `sender::confirm_sent`) records it as sent. Only a
+  send with the mark may be settled from an event: the tag is the mail sender's claim, and
+  the configuration set is shared.
 - **Persist before acting; actions stay repeat-safe.** The request path persists (the outbox
   entry) before running idempotent actions; a 5xx redelivery re-runs only the repeat-safe
   actions, so action APIs must stay repeat-safe.
@@ -124,7 +154,8 @@ moves inline rather than making the item public.
   `cargo lambda watch` against a fake SNS) is compiled in under `#[cfg(debug_assertions)]`
   only; `mail/fetch.rs`'s plain-http mode is `#[cfg(test)]`, and the URL parser behind it
   (`mailbox::url_policy`) is test builds or the dev-only `test-fixtures` feature, for the same
-  reason. The SNS HTTP
+  reason. Nothing a non-dev dependency enables (`mailbox-store`'s `memory`,
+  `webhook-test-support`'s dependencies) may turn that feature on. The SNS HTTP
   clients never follow redirects — that's part of the trust model, not a nicety. The one
   exception is `mail/fetch.rs`, which fetches caller-supplied attachment URLs and therefore
   *must* handle redirects; it follows them by hand, at most five hops, re-running the full
@@ -156,6 +187,17 @@ Workspace `Cargo.toml` pins exact versions (`=x.y.z`) with `default-features = f
 everything, listed alphabetically and without commentary; each crate opts into only the
 features it uses. Workspace lints deny `unwrap`/`panic`/etc.; `clippy.toml` relaxes them for
 test code.
+
+Items from the workspace's own crates are imported, not spelled inline: `clippy::absolute_paths`
+is denied with `absolute-paths-max-segments = 2`, so `crate::mail::sender::sweep` or
+`mailbox::time::Timestamp` in an expression is an error — `use` the type, or a function's
+parent module. External crates are exempt through `absolute-paths-allowed-crates` in
+`clippy.toml`; a new dependency named by an absolute path is added there.
+
+Dates and times are `jiff`, never `chrono`. `chrono` is in the build only as a dependency of
+`aws_lambda_events`, whose DynamoDB stream types (`stream.rs`, the sender) carry one field of
+it that this code never reads; `deny.toml` bans it for everything else. `jiff` is built with
+`std` only — every instant here is UTC, so no time-zone database is compiled in.
 
 Four pins are not free to move, and a bump that ignores them fails to resolve or reintroduces
 an advisory:

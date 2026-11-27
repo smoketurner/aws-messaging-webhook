@@ -6,6 +6,7 @@
 //! `src/alias_tests.rs`, because reading those rows needs crate internals.
 
 use mailbox::send::{Envelope, MarkOutcome, SendKey, SendState, SendStatus, SesSent};
+use mailbox::test_fixtures::at;
 use mailbox::{
     Direction, InboxId, InsertOutcome, MESSAGE_USER_LABEL_CAP, MailMessage, SesMessageId,
     THREAD_USER_LABEL_CAP,
@@ -46,7 +47,7 @@ async fn an_inbound_reply_lands_in_a_thread_full_of_user_labels() {
             &MessageId::new("mid-1"),
             &user_labels(THREAD_USER_LABEL_CAP),
             &[],
-            NOW,
+            at(NOW),
         )
         .await
         .unwrap();
@@ -57,7 +58,7 @@ async fn an_inbound_reply_lands_in_a_thread_full_of_user_labels() {
         "spam".to_owned(),
         "unread".to_owned(),
     ];
-    reply.timestamp = "00000002-0000".to_owned();
+    reply.timestamp = at("2026-01-01T00:00:02.000Z");
     assert_eq!(
         mailbox.insert_message(&reply, &[]).await.unwrap(),
         InsertOutcome::Fresh
@@ -73,7 +74,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
         .await
         .unwrap();
     let mut second = message("mid-2", "tid-1");
-    second.timestamp = "00000002-0000".to_owned();
+    second.timestamp = at("2026-01-01T00:00:02.000Z");
     mailbox.insert_message(&second, &[]).await.unwrap();
     mailbox
         .update_labels(
@@ -81,7 +82,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
             &MessageId::new("mid-1"),
             &user_labels(THREAD_USER_LABEL_CAP),
             &[],
-            NOW,
+            at(NOW),
         )
         .await
         .unwrap();
@@ -92,7 +93,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
             &MessageId::new("mid-2"),
             &["one-more".to_owned()],
             &[],
-            NOW,
+            at(NOW),
         )
         .await
         .unwrap_err();
@@ -106,7 +107,7 @@ async fn a_label_patch_over_the_thread_cap_is_refused_but_system_labels_are_not(
                 &MessageId::new("mid-2"),
                 &["spam".to_owned()],
                 &[],
-                NOW
+                at(NOW)
             )
             .await
             .is_ok()
@@ -127,7 +128,7 @@ async fn a_label_patch_over_the_message_cap_is_refused() {
             &MessageId::new("mid-1"),
             &user_labels(MESSAGE_USER_LABEL_CAP + 1),
             &[],
-            NOW,
+            at(NOW),
         )
         .await
         .unwrap_err();
@@ -145,7 +146,7 @@ async fn an_inbound_message_stores_the_thread_snapshot_as_of_its_arrival() {
         .await
         .unwrap();
     let mut second = message("mid-2", "tid-1");
-    second.timestamp = "00000002-0000".to_owned();
+    second.timestamp = at("2026-01-01T00:00:02.000Z");
     second.from = "other@example.com".to_owned();
     second.preview = "Second message body".to_owned();
     mailbox.insert_message(&second, &[]).await.unwrap();
@@ -182,7 +183,7 @@ fn queued(msg: &MailMessage) -> SendState {
             ..Envelope::default()
         },
         None,
-        "2026-01-01T00:00:00.000Z",
+        at("2026-01-01T00:00:00.000Z"),
     )
 }
 
@@ -255,7 +256,7 @@ async fn claimed(store: &MailMemoryStore, msg: &MailMessage) -> Result<SendState
         .enqueue_send(msg, &queued(msg), None, 1_800_000_000)
         .await?;
     mailbox
-        .claim_send(&msg.message_id, NOW)
+        .claim_send(&msg.message_id, at(NOW))
         .await?
         .ok_or(MailStoreError::NotFound)
 }
@@ -277,7 +278,7 @@ async fn a_send_is_listed_under_its_current_status() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].message_id, msg.message_id);
 
-    mailbox.claim_send(&msg.message_id, NOW).await.unwrap();
+    mailbox.claim_send(&msg.message_id, at(NOW)).await.unwrap();
     let still_queued = mailbox
         .list_by_status(SendStatus::Queued, 10)
         .await
@@ -301,8 +302,12 @@ async fn the_ses_call_is_recorded_only_over_the_claim_it_was_given() {
     let mailbox = store.mailbox();
     let claim = claimed(&store, &outbound("mid-1")).await.unwrap();
 
-    let noted = mailbox.note_ses_call(&claim, NOW).await.unwrap().unwrap();
-    assert_eq!(noted.ses_call_at.as_deref(), Some(NOW));
+    let noted = mailbox
+        .note_ses_call(&claim, at(NOW))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(noted.ses_call_at, Some(at(NOW)));
     assert_eq!(noted.version, claim.version + 1);
     let stored = mailbox
         .get_send_state(&claim.message_id)
@@ -311,7 +316,13 @@ async fn the_ses_call_is_recorded_only_over_the_claim_it_was_given() {
         .unwrap();
     assert_eq!(stored, noted);
 
-    assert!(mailbox.note_ses_call(&claim, NOW).await.unwrap().is_none());
+    assert!(
+        mailbox
+            .note_ses_call(&claim, at(NOW))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A sent mark moves the message's labels and status, rolls the new label
@@ -330,7 +341,7 @@ async fn a_sent_mark_relabels_the_message_and_thread_and_maps_the_ses_id() {
         region: "us-east-1",
     };
     mailbox
-        .mark_send(&claim, MarkOutcome::Sent(sent), NOW)
+        .mark_send(&claim, MarkOutcome::Sent(sent), at(NOW))
         .await
         .unwrap();
 
@@ -373,7 +384,13 @@ async fn a_label_patch_is_stored_on_the_message() {
     mailbox.insert_message(&msg, &[]).await.unwrap();
 
     let labels = mailbox
-        .update_labels(&inbox(), &msg.message_id, &["work".to_owned()], &[], NOW)
+        .update_labels(
+            &inbox(),
+            &msg.message_id,
+            &["work".to_owned()],
+            &[],
+            at(NOW),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -385,7 +402,7 @@ async fn a_label_patch_is_stored_on_the_message() {
     assert_eq!(stored.labels, labels);
     assert!(stored.labels.iter().any(|label| label == "work"));
     assert_eq!(stored.version, msg.version + 1);
-    assert_eq!(stored.updated_at, NOW);
+    assert_eq!(stored.updated_at, at(NOW));
 }
 
 fn send_key(msg: &MailMessage, expires_at: u64) -> SendKey {
@@ -396,7 +413,7 @@ fn send_key(msg: &MailMessage, expires_at: u64) -> SendKey {
         thread_id: msg.thread_id.clone(),
         request_hash: "request".to_owned(),
         route: "send".to_owned(),
-        created_at: NOW.to_owned(),
+        created_at: at(NOW),
         expires_at,
     }
 }

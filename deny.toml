@@ -8,6 +8,11 @@ ignore = [
   # workspace only verifies SNS signatures (public-key ops); the only private
   # keys touched are throwaway fixtures generated inside tests.
   { id = "RUSTSEC-2023-0071", reason = "rsa used for signature verification only; no private-key operations on secret material" },
+  # chrono is unmaintained. It is in the build only as a dependency of
+  # aws_lambda_events, whose DynamoDB stream record holds one chrono field
+  # (ApproximateCreationDateTime) this code never reads; our own dates and
+  # times are jiff, and `bans` keeps any other crate from depending on it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono reaches the build only through aws_lambda_events' stream types; no code here uses it" },
 ]
 
 [licenses]
@@ -27,6 +32,12 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
+deny = [
+  # Dates and times are jiff. chrono is in the build only because
+  # aws_lambda_events' DynamoDB stream types hold one field of it; no crate of
+  # ours may depend on it.
+  { crate = "chrono", wrappers = ["aws_lambda_events"], reason = "use jiff" },
+]
 wildcards = "deny"
 allow-wildcard-paths = true
 

@@ -11,6 +11,8 @@
 use sha2::{Digest as _, Sha256};
 use uuid::{Builder, Uuid};
 
+use crate::time::{Timestamp, unix_ms};
+
 /// The first 10 bytes of `SHA-256(input)`, the random-bytes slot
 /// `Builder::from_unix_timestamp_millis` takes in place of the CSPRNG output
 /// a plain `Uuid::now_v7()` would use — this is what makes the id
@@ -27,9 +29,9 @@ fn deterministic_seed(input: &str) -> [u8; 10] {
 /// (and, therefore, of the same S3 object) always resolves to the same
 /// message id, and attachments are stored once under it.
 #[must_use]
-pub fn inbound_message_id(ses_id: &str, received_ms: u64) -> Uuid {
+pub fn inbound_message_id(ses_id: &str, received: Timestamp) -> Uuid {
     let seed = deterministic_seed(&format!("inbound\n{ses_id}"));
-    Builder::from_unix_timestamp_millis(received_ms, &seed).into_uuid()
+    Builder::from_unix_timestamp_millis(unix_ms(received), &seed).into_uuid()
 }
 
 /// A fresh outbound message id: randomly seeded (nothing to derive
@@ -65,12 +67,13 @@ pub fn attachment_id(message_id: &Uuid, ordinal: usize) -> String {
     format!("att_{}", uuid.simple())
 }
 
-/// The sort-key time prefix: `ms` split into an 8-hex-digit high half
+/// The sort-key time prefix: `at`'s epoch milliseconds split into an 8-hex-digit high half
 /// and a 4-hex-digit low half, so `ByTime`/`ByThread`-style range bounds
 /// (`before`/`after`) can be built as plain string comparisons against a
 /// `UUIDv7` sort key, which begins with the same encoding of its timestamp.
 #[must_use]
-pub fn time_prefix(ms: u64) -> String {
+pub fn time_prefix(at: Timestamp) -> String {
+    let ms = unix_ms(at);
     format!("{:08x}-{:04x}", ms >> 16, ms & 0xffff)
 }
 
@@ -95,12 +98,12 @@ pub fn ses_rfc_ids(ses_message_id: &str, region: &str) -> [String; 2] {
 /// The EventBridge `event_id`: `evt_` followed by a deterministic
 /// simple-form `UUIDv7` seeded from `(inbox, message_id, event_type)`, so
 /// redelivery of the same underlying event produces the same `event_id`.
-/// `ts_ms` is the message timestamp for a received event and `sent_at` for
+/// `at` is the message timestamp for a received event and `sent_at` for
 /// sent.
 #[must_use]
-pub fn event_id(inbox: &str, message_id: &str, event_type: &str, ts_ms: u64) -> String {
+pub fn event_id(inbox: &str, message_id: &str, event_type: &str, at: Timestamp) -> String {
     let seed = deterministic_seed(&format!("{inbox}\n{message_id}\n{event_type}"));
-    let uuid = Builder::from_unix_timestamp_millis(ts_ms, &seed).into_uuid();
+    let uuid = Builder::from_unix_timestamp_millis(unix_ms(at), &seed).into_uuid();
     format!("evt_{uuid}")
 }
 
@@ -108,7 +111,7 @@ pub fn event_id(inbox: &str, message_id: &str, event_type: &str, ts_ms: u64) -> 
 /// several SES events of one type (a bounce per recipient batch, an open per
 /// open), so the SNS message id that carried this one joins the seed: a
 /// redelivery of the same notification rebuilds the same id, and a second
-/// notification of the same type gets its own. `ts_ms` is the notification's
+/// notification of the same type gets its own. `at` is the notification's
 /// timestamp.
 #[must_use]
 pub fn ses_event_id(
@@ -116,12 +119,12 @@ pub fn ses_event_id(
     message_id: &str,
     event_type: &str,
     sns_message_id: &str,
-    ts_ms: u64,
+    at: Timestamp,
 ) -> String {
     let seed = deterministic_seed(&format!(
         "{inbox}\n{message_id}\n{event_type}\n{sns_message_id}"
     ));
-    let uuid = Builder::from_unix_timestamp_millis(ts_ms, &seed).into_uuid();
+    let uuid = Builder::from_unix_timestamp_millis(unix_ms(at), &seed).into_uuid();
     format!("evt_{uuid}")
 }
 
@@ -130,23 +133,27 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn at(ms: u64) -> Timestamp {
+        Timestamp::from_millisecond(i64::try_from(ms).unwrap()).unwrap()
+    }
+
     fn is_v7(uuid: Uuid) -> bool {
         uuid.get_version_num() == 7
     }
 
     #[test]
     fn inbound_message_id_is_deterministic() {
-        let a = inbound_message_id("ses-1", 1_700_000_000_000);
-        let b = inbound_message_id("ses-1", 1_700_000_000_000);
+        let a = inbound_message_id("ses-1", at(1_700_000_000_000));
+        let b = inbound_message_id("ses-1", at(1_700_000_000_000));
         assert_eq!(a, b);
         assert!(is_v7(a));
     }
 
     #[test]
     fn inbound_message_id_differs_on_ses_id_or_timestamp() {
-        let base = inbound_message_id("ses-1", 1_700_000_000_000);
-        assert_ne!(base, inbound_message_id("ses-2", 1_700_000_000_000));
-        assert_ne!(base, inbound_message_id("ses-1", 1_700_000_000_001));
+        let base = inbound_message_id("ses-1", at(1_700_000_000_000));
+        assert_ne!(base, inbound_message_id("ses-2", at(1_700_000_000_000)));
+        assert_ne!(base, inbound_message_id("ses-1", at(1_700_000_000_001)));
     }
 
     #[test]
@@ -160,8 +167,8 @@ mod tests {
 
     #[test]
     fn attachment_id_is_deterministic_and_unique_per_ordinal() {
-        let mid = inbound_message_id("ses-1", 1_700_000_000_000);
-        let other_mid = inbound_message_id("ses-2", 1_700_000_000_000);
+        let mid = inbound_message_id("ses-1", at(1_700_000_000_000));
+        let other_mid = inbound_message_id("ses-2", at(1_700_000_000_000));
         let a0 = attachment_id(&mid, 0);
         let a0_again = attachment_id(&mid, 0);
         let a1 = attachment_id(&mid, 1);
@@ -173,7 +180,7 @@ mod tests {
 
     #[test]
     fn attachment_id_has_the_documented_shape() {
-        let mid = inbound_message_id("ses-1", 1_700_000_000_000);
+        let mid = inbound_message_id("ses-1", at(1_700_000_000_000));
         let id = attachment_id(&mid, 0);
         assert!(id.starts_with("att_"));
         assert_eq!(id.len(), 36);
@@ -188,7 +195,7 @@ mod tests {
 
     #[test]
     fn attachment_id_embeds_the_message_id_timestamp() {
-        let mid = inbound_message_id("ses-1", 1_700_000_000_000);
+        let mid = inbound_message_id("ses-1", at(1_700_000_000_000));
         let id = attachment_id(&mid, 0);
         let uuid = Uuid::parse_str(&id[4..]).unwrap();
         let (secs, nanos) = uuid.get_timestamp().unwrap().to_unix();
@@ -201,7 +208,7 @@ mod tests {
     /// re-deriving a new "correct" value.
     #[test]
     fn attachment_id_golden_vector() {
-        let mid = inbound_message_id("ses-1", 1_700_000_000_000);
+        let mid = inbound_message_id("ses-1", at(1_700_000_000_000));
         assert_eq!(mid.to_string(), "018bcfe5-6800-7bd1-8167-61246ff575b4");
         let id = attachment_id(&mid, 0);
         assert_eq!(id, "att_018bcfe5680070649b53ffdbc1b145b6");
@@ -210,8 +217,8 @@ mod tests {
     #[test]
     fn time_prefix_has_the_documented_shape() {
         // ms = 0x0001_0002 -> high = 0x0001, low = 0x0002
-        assert_eq!(time_prefix(0x0001_0002), "00000001-0002");
-        assert_eq!(time_prefix(0), "00000000-0000");
+        assert_eq!(time_prefix(at(0x0001_0002)), "00000001-0002");
+        assert_eq!(time_prefix(at(0)), "00000000-0000");
     }
 
     #[test]
@@ -236,8 +243,8 @@ mod tests {
 
     #[test]
     fn event_id_is_deterministic_and_prefixed() {
-        let a = event_id("inbox-1", "mid-1", "received", 1_700_000_000_000);
-        let b = event_id("inbox-1", "mid-1", "received", 1_700_000_000_000);
+        let a = event_id("inbox-1", "mid-1", "received", at(1_700_000_000_000));
+        let b = event_id("inbox-1", "mid-1", "received", at(1_700_000_000_000));
         assert_eq!(a, b);
         assert!(a.starts_with("evt_"));
         let uuid = Uuid::parse_str(a.trim_start_matches("evt_")).unwrap();
@@ -246,14 +253,14 @@ mod tests {
 
     #[test]
     fn event_id_differs_by_event_type() {
-        let received = event_id("inbox-1", "mid-1", "received", 1_700_000_000_000);
-        let sent = event_id("inbox-1", "mid-1", "sent", 1_700_000_000_000);
+        let received = event_id("inbox-1", "mid-1", "received", at(1_700_000_000_000));
+        let sent = event_id("inbox-1", "mid-1", "sent", at(1_700_000_000_000));
         assert_ne!(received, sent);
     }
 
     #[test]
     fn ses_event_id_is_deterministic_and_distinct_per_notification() {
-        let ts = 1_700_000_000_000;
+        let ts = at(1_700_000_000_000);
         let a = ses_event_id("inbox-1", "mid-1", "message.bounced", "sns-1", ts);
         assert_eq!(
             a,
@@ -273,21 +280,22 @@ mod tests {
     proptest! {
         #[test]
         fn time_prefix_is_monotonic_within_the_same_high_half(
-            base in 0u64..(1u64 << 48),
+            // 2^47 ms is the year 6429, inside what a `Timestamp` holds.
+            base in 0u64..(1u64 << 47),
             delta in 1u64..0xffff,
         ) {
             let low = base & !0xffff; // clear the low 16 bits so base+delta can't overflow into the high half
-            let a = time_prefix(low);
-            let b = time_prefix(low + delta);
+            let a = time_prefix(at(low));
+            let b = time_prefix(at(low + delta));
             prop_assert!(a < b);
         }
 
         #[test]
         fn attachment_ids_never_collide_across_a_small_ordinal_range(
             ses_id in "[a-z0-9-]{1,20}",
-            ts in 0u64..(1u64 << 48),
+            ts in 0u64..(1u64 << 47),
         ) {
-            let message_id = inbound_message_id(&ses_id, ts);
+            let message_id = inbound_message_id(&ses_id, at(ts));
             let ids: Vec<String> = (0..8).map(|i| attachment_id(&message_id, i)).collect();
             let unique: std::collections::HashSet<_> = ids.iter().collect();
             prop_assert_eq!(unique.len(), ids.len());
