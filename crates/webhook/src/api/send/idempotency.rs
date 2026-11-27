@@ -14,7 +14,7 @@ use crate::api::send::SendAccepted;
 use crate::api::send::validate::{AttachmentSource, ValidatedSend};
 use crate::state::{AppState, Backend};
 use mailbox::InboxId;
-use mailbox::time;
+use mailbox::time::{self, Timestamp};
 
 /// How long an `Idempotency-Key` is remembered.
 pub(super) const KEY_TTL_SECONDS: u64 = 24 * 60 * 60;
@@ -107,6 +107,7 @@ pub(super) async fn replay_key<B: Backend>(
     state: &AppState<B>,
     key_hash: &str,
     request_hash: &str,
+    at: Timestamp,
 ) -> Result<Option<SendAccepted>, ApiError> {
     let Some(existing) = state.mailbox.get_send_key(key_hash).await? else {
         return Ok(None);
@@ -115,8 +116,7 @@ pub(super) async fn replay_key<B: Backend>(
     // lazily, so a row past its TTL may still be returned here. Treat it as
     // absent — matching `Cond::NotExistsOrExpired` on the write path — so the
     // request falls through to enqueue and reclaims the slot.
-    let now_epoch = time::now_ms() / 1_000;
-    if existing.expires_at < now_epoch {
+    if existing.expires_at < time::unix_ms(at) / 1_000 {
         return Ok(None);
     }
     if existing.request_hash == request_hash {

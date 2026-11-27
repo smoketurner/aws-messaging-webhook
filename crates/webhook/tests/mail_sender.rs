@@ -15,6 +15,7 @@ use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use mailbox::send::{SendFailure, SendState, SendStatus};
+use mailbox::time::Timestamp;
 use mailbox::{InboxId, ids, time};
 use mailbox::{MessageId, SesMessageId, ThreadId};
 use mailbox_store::keys::TableKey;
@@ -543,6 +544,37 @@ async fn an_accepted_send_that_cannot_be_recorded_keeps_its_ses_call_mark() {
     assert!(state.ses_call_at.is_some());
 }
 
+/// The sweep measures a claim's age against the time it is handed (its
+/// schedule's fire time), not the clock.
+#[tokio::test]
+async fn the_sweep_judges_a_claim_against_the_time_it_is_given() {
+    let h = api_harness().await;
+    let message_id = queued(&h, &body()).await;
+    h.state
+        .mailbox
+        .claim_send(
+            &MessageId::new(message_id.as_str()),
+            "2026-01-01T00:00:00.000Z",
+        )
+        .await
+        .unwrap();
+
+    let fourteen_minutes_on = time::parse("2026-01-01T00:14:00.000Z").unwrap();
+    let report = sweep(&h.state, fourteen_minutes_on).await.unwrap();
+    assert_eq!(report.still_working, 1);
+    assert_eq!(report.released, 0);
+
+    let sixteen_minutes_on = time::parse("2026-01-01T00:16:00.000Z").unwrap();
+    let report = sweep(&h.state, sixteen_minutes_on).await.unwrap();
+    assert_eq!(report.released, 1);
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Queued);
+    assert_eq!(
+        state.requeued_at.as_deref(),
+        Some("2026-01-01T00:16:00.000Z")
+    );
+}
+
 #[tokio::test]
 async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
     let h = api_harness().await;
@@ -564,7 +596,7 @@ async fn the_sweep_marks_a_stale_claim_unknown_once_ses_may_have_been_called() {
         .unwrap()
         .unwrap();
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.marked_unknown, 1);
     assert_eq!(report.released, 0);
@@ -589,7 +621,7 @@ async fn the_sweep_carries_on_past_a_send_it_cannot_update() {
     }
     h.mail.inject(mailbox_store::Injected::Transient);
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.errors, 1);
     assert_eq!(report.released, 1);
@@ -817,7 +849,7 @@ async fn the_sweep_releases_a_claim_whose_sender_died() {
         .unwrap();
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sending);
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.released, 1);
     let state = state_of(&h, &message_id);
@@ -847,7 +879,7 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
             )
             .await
             .unwrap();
-        let report = sweep(&h.state).await.unwrap();
+        let report = sweep(&h.state, Timestamp::now()).await.unwrap();
         abandoned += report.abandoned;
     }
 
@@ -873,7 +905,7 @@ async fn a_send_whose_sender_keeps_dying_eventually_fails_past_the_cap() {
     assert_eq!(abandoned, 1);
 
     // Once failed it is no longer `sending`, so further sweeps leave it alone.
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
     assert_eq!(report.abandoned, 0);
     assert_eq!(report.released, 0);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
@@ -897,7 +929,7 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
             )
             .await
             .unwrap();
-        let report = sweep(&h.state).await.unwrap();
+        let report = sweep(&h.state, Timestamp::now()).await.unwrap();
         assert_eq!(report.released, 1, "attempt {attempt} should be released");
         assert_eq!(
             report.abandoned, 0,
@@ -917,7 +949,7 @@ async fn the_sweep_releases_until_the_cap_lets_it_fail() {
         )
         .await
         .unwrap();
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
     assert_eq!(report.released, 0);
     assert_eq!(report.abandoned, 1);
     let state = state_of(&h, &message_id);
@@ -932,14 +964,14 @@ async fn the_sweep_leaves_a_recent_claim_alone() {
     // message gets sent twice.
     let h = api_harness().await;
     let message_id = queued(&h, &body()).await;
-    let now = mailbox::time::format(mailbox::time::now_ms());
+    let now = mailbox::time::format(Timestamp::now());
     h.state
         .mailbox
         .claim_send(&MessageId::new(message_id.as_str()), &now)
         .await
         .unwrap();
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.released, 0);
     assert_eq!(report.still_working, 1);
@@ -958,7 +990,7 @@ async fn the_sweep_reports_unknown_sends_without_touching_them() {
         .await
         .unwrap();
 
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.unknown, 1);
     assert_eq!(report.released, 0);
@@ -1269,7 +1301,7 @@ async fn a_send_the_sweep_abandons_clears_its_outbox() {
             )
             .await
             .unwrap();
-        sweep(&h.state).await.unwrap();
+        sweep(&h.state, Timestamp::now()).await.unwrap();
     }
 
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Failed);
@@ -1293,7 +1325,7 @@ async fn a_send_the_sweep_releases_keeps_its_outbox() {
         )
         .await
         .unwrap();
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.released, 1);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Queued);
@@ -1331,7 +1363,7 @@ async fn a_stale_claim_moved_to_unknown_keeps_its_outbox() {
         .note_ses_call(&claimed, "2020-01-01T00:00:00.000Z")
         .await
         .unwrap();
-    let report = sweep(&h.state).await.unwrap();
+    let report = sweep(&h.state, Timestamp::now()).await.unwrap();
 
     assert_eq!(report.marked_unknown, 1);
     assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);

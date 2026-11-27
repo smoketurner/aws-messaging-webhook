@@ -7,6 +7,7 @@ pub(crate) mod extractor;
 use anyhow::{Context as _, anyhow};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use mailbox::time::Timestamp;
 use serde_json::json;
 use sns_message_verifier::{MessageType, SnsEnvelope};
 
@@ -41,7 +42,8 @@ impl Ingress {
 }
 
 /// Entry point for both ingress pathways; input is already allowlisted and
-/// signature-verified.
+/// signature-verified. `at` is when the delivery arrived, taken from the
+/// Lambda event that carried it.
 ///
 /// # Errors
 ///
@@ -52,6 +54,7 @@ pub(crate) async fn handle_sns<B: Backend>(
     ingress: Ingress,
     verified: VerifiedSns,
     deadline: tokio::time::Instant,
+    at: Timestamp,
 ) -> Result<Response, AppError> {
     match verified.envelope.message_type {
         MessageType::SubscriptionConfirmation => {
@@ -61,7 +64,7 @@ pub(crate) async fn handle_sns<B: Backend>(
             handle_unsubscribe(state, ingress, &verified.envelope).await
         }
         MessageType::Notification => {
-            process_notification(state, ingress, &verified, deadline).await
+            process_notification(state, ingress, &verified, deadline, at).await
         }
     }
 }
@@ -158,6 +161,7 @@ async fn process_notification<B: Backend>(
     ingress: Ingress,
     verified: &VerifiedSns,
     deadline: tokio::time::Instant,
+    at: Timestamp,
 ) -> Result<Response, AppError> {
     let envelope = &verified.envelope;
     let event = DomainEvent::classify(&envelope.message);
@@ -202,7 +206,8 @@ async fn process_notification<B: Backend>(
         verified.raw_body.clone(),
         &event,
         &state.config,
-    )?;
+        at,
+    );
 
     let outcome = state
         .events
@@ -215,12 +220,12 @@ async fn process_notification<B: Backend>(
     // if a prior attempt persisted but died before acting. Publishing the event
     // to EventBridge is the stream relay's job (see `crate::stream`), not the
     // request path's: the persisted item is the outbox entry.
-    // The verified envelope's own `Timestamp` is `received_ms`'s third
-    // fallback (after `mail.timestamp`/`receipt.timestamp`), so a redelivery
-    // never has to fall back to wall-clock time to compute the same
-    // deterministic inbound message id.
-    let envelope_ts_ms = mailbox::time::parse(&envelope.timestamp);
-    let action = match actions::run(state, &event, deadline, envelope_ts_ms).await {
+    // The verified envelope's own `Timestamp` is the inbound message id's
+    // third time source (after `mail.timestamp`/`receipt.timestamp`). It is
+    // content, where `at` on the HTTPS pathway is the delivery attempt's
+    // time, so a redelivery computes the same deterministic id.
+    let envelope_at = mailbox::time::parse(&envelope.timestamp);
+    let action = match actions::run(state, &event, deadline, at, envelope_at).await {
         Ok(action) => action,
         Err(error) => match error.kind {
             ActionErrorKind::Transient => {

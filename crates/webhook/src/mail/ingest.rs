@@ -17,6 +17,7 @@ use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
 use crate::state::{AppState, Backend};
 use mailbox::labels::SystemLabel;
 use mailbox::mime::{ParseError, ParsedAttachment, ParsedMessage, parse_inbound};
+use mailbox::time::Timestamp;
 use mailbox::{
     AttachmentMeta, Direction, InboxId, MAX_INBOUND_RAW_BYTES, MailMessage, MessageId,
     SesMessageId, ThreadId, ids, labels, strip_angle_brackets, thread, time,
@@ -70,7 +71,8 @@ pub async fn ingest_inbound<B: Backend>(
     state: &AppState<B>,
     event: &SesInboundNotification,
     deadline: tokio::time::Instant,
-    envelope_ts_ms: Option<u64>,
+    at: Timestamp,
+    envelope_at: Option<Timestamp>,
 ) -> Result<IngestOutcome, ActionError> {
     let Some(mail_config) = state.config.mail.as_ref() else {
         return Ok(IngestOutcome::MailDisabled);
@@ -78,21 +80,21 @@ pub async fn ingest_inbound<B: Backend>(
     let Some(key) = guarded_s3_pointer(event, mail_config) else {
         return Ok(IngestOutcome::Skipped);
     };
-    let Some(received_ms) = received_ms(event, envelope_ts_ms) else {
+    let Some(received) = received_at(event, envelope_at) else {
         metrics::counter!(names::INGEST_SKIPPED).increment(1);
         tracing::warn!(
             event = "ingest_skipped",
             reason = "no_timestamp",
             "none of mail.timestamp, receipt.timestamp or the SNS envelope Timestamp parsed \
-             (wall-clock time is never a fallback: it would make the message id \
-             differ across a redelivery)"
+             (the delivery's own time is never a fallback: it would make the message \
+             id differ across a redelivery)"
         );
         return Ok(IngestOutcome::Skipped);
     };
 
     let mut resolution = InboxResolution::default();
     for recipient in normalized_recipients(&event.receipt) {
-        resolve_recipient(state, mail_config, &recipient, &mut resolution).await;
+        resolve_recipient(state, mail_config, &recipient, at, &mut resolution).await;
     }
     if resolution.inboxes.is_empty() {
         if resolution.had_permanent {
@@ -110,7 +112,7 @@ pub async fn ingest_inbound<B: Backend>(
         return finish(resolution.had_transient, IngestOutcome::Skipped);
     }
 
-    let uuid = ids::inbound_message_id(&event.mail.message_id, received_ms);
+    let uuid = ids::inbound_message_id(&event.mail.message_id, received);
     let message_id = MessageId::from(uuid);
 
     let inboxes = std::mem::take(&mut resolution.inboxes);
@@ -129,7 +131,15 @@ pub async fn ingest_inbound<B: Backend>(
         .saturating_sub(DEADLINE_MARGIN);
     let outcome = tokio::time::timeout(
         budget,
-        ingest_into_targets(state, key, event, targets, uuid, &message_id, received_ms),
+        ingest_into_targets(
+            state,
+            key,
+            event,
+            targets,
+            uuid,
+            &message_id,
+            Instants { received, at },
+        ),
     )
     .await;
 
@@ -264,6 +274,7 @@ async fn resolve_recipient<B: Backend>(
     state: &AppState<B>,
     mail_config: &MailConfig,
     address: &str,
+    at: Timestamp,
     resolution: &mut InboxResolution,
 ) {
     if address != mail_config.inbox.as_str() {
@@ -289,8 +300,11 @@ async fn resolve_recipient<B: Backend>(
         }
     }
 
-    let now = time::format(time::now_ms());
-    match state.mailbox.ensure_inbox(&inbox_id, &now).await {
+    match state
+        .mailbox
+        .ensure_inbox(&inbox_id, &time::format(at))
+        .await
+    {
         Ok(_) => resolution.inboxes.push(inbox_id),
         Err(error) => record_resolution_error(resolution, error),
     }
@@ -318,24 +332,37 @@ fn record_resolution_error(resolution: &mut InboxResolution, error: MailStoreErr
     }
 }
 
-/// `received_ms` = `mail.timestamp`, else `receipt.timestamp`, else
-/// `envelope_ts_ms` (the verified SNS envelope's `Timestamp`, parsed and
+/// When the mail was received: `mail.timestamp`, else `receipt.timestamp`,
+/// else `envelope_at` (the verified SNS envelope's `Timestamp`, parsed and
 /// threaded in from `sns::mod::process_notification` via `actions::run`).
-/// [`time::now_ms`] is never a fallback: `received_ms` seeds
-/// `inbound_message_id`, so a wall-clock value would make the id
-/// non-deterministic across a redelivery, defeating `message_exists`'s
-/// dedup. `None` when all three sources are missing or fail to parse — the
-/// caller skips the message (`no_timestamp`) rather than inventing one; a
-/// real SES receipt always populates `mail.timestamp`, so this is
-/// unreachable in practice.
-fn received_ms(event: &SesInboundNotification, envelope_ts_ms: Option<u64>) -> Option<u64> {
+/// The delivery's own time is never a fallback: this instant seeds
+/// `inbound_message_id`, and on the HTTPS pathway each delivery attempt has
+/// a different time, so it would make the id differ across a redelivery,
+/// defeating `message_exists`'s dedup. `None` when all three sources are
+/// missing or fail to parse — the caller skips the message (`no_timestamp`)
+/// rather than inventing one; a real SES receipt always populates
+/// `mail.timestamp`, so this is unreachable in practice.
+fn received_at(
+    event: &SesInboundNotification,
+    envelope_at: Option<Timestamp>,
+) -> Option<Timestamp> {
     event
         .mail
         .timestamp
         .as_deref()
         .and_then(time::parse)
         .or_else(|| event.receipt.timestamp.as_deref().and_then(time::parse))
-        .or(envelope_ts_ms)
+        .or(envelope_at)
+}
+
+/// The two instants an ingested message is stamped with.
+#[derive(Clone, Copy)]
+struct Instants {
+    /// When the mail was received: the message's `timestamp`.
+    received: Timestamp,
+    /// When this delivery arrived: `created_at`, and what retention counts
+    /// from.
+    at: Timestamp,
 }
 
 /// Fetches, parses and extracts the raw MIME once, then inserts the built
@@ -347,29 +374,28 @@ async fn ingest_into_targets<B: Backend>(
     targets: Vec<InboxId>,
     uuid: Uuid,
     message_id: &MessageId,
-    received_ms: u64,
+    instants: Instants,
 ) -> Result<IngestOutcome, ActionError> {
     let (parsed, mut content, attachments) =
         fetch_parse_and_extract(state, key, uuid, message_id).await?;
 
     let verdict =
         labels::classify_inbound(event.receipt.is_quarantined(), auth_failed(&event.receipt));
-    let now_ms = time::now_ms();
     content.verdicts = Some(verdicts_json(&event.receipt));
     let draft = InboundDraft {
         parsed,
         message_id: message_id.clone(),
         ses_message_id: SesMessageId::new(event.mail.message_id.as_str()),
         labels: verdict_labels(verdict),
-        timestamp: time::format(received_ms),
-        now: time::format(now_ms),
+        timestamp: time::format(instants.received),
+        now: time::format(instants.at),
         raw_s3_key: key.to_owned(),
         attachments,
         expires_at: state
             .config
             .mail
             .as_ref()
-            .map_or(0, |mail| time::expires_at(now_ms, mail.retention_days)),
+            .map_or(0, |mail| time::expires_at(instants.at, mail.retention_days)),
     };
 
     if !insert_into_all_targets(state, &draft, &content, targets).await? {
@@ -815,27 +841,28 @@ mod tests {
     }
 
     /// `mail.timestamp` beats `receipt.timestamp` beats the envelope
-    /// timestamp; `time::now_ms()` is never consulted, so all three missing
-    /// is `None` rather than a wall-clock value.
+    /// timestamp; nothing else is consulted, so all three missing is `None`
+    /// rather than an invented value.
     #[test]
-    fn received_ms_follows_the_fallback_order_and_never_falls_back_to_now() {
+    fn received_at_follows_the_fallback_order_and_never_invents_a_time() {
+        let envelope = Some(Timestamp::UNIX_EPOCH);
         let both = notification_with_timestamps(
             Some("2026-01-01T00:00:00.000Z"),
             Some("2026-01-02T00:00:00.000Z"),
         );
         assert_eq!(
-            received_ms(&both, Some(999)),
+            received_at(&both, envelope),
             time::parse("2026-01-01T00:00:00.000Z")
         );
 
         let receipt_only = notification_with_timestamps(None, Some("2026-01-02T00:00:00.000Z"));
         assert_eq!(
-            received_ms(&receipt_only, Some(999)),
+            received_at(&receipt_only, envelope),
             time::parse("2026-01-02T00:00:00.000Z")
         );
 
         let neither = notification_with_timestamps(None, None);
-        assert_eq!(received_ms(&neither, Some(999)), Some(999));
-        assert_eq!(received_ms(&neither, None), None);
+        assert_eq!(received_at(&neither, envelope), envelope);
+        assert_eq!(received_at(&neither, None), None);
     }
 }

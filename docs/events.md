@@ -25,7 +25,7 @@ Events publish to the `<stack-name>-events` bus with `source` set to `pEventSour
     "messageId": "…",        // DynamoDB key: pk = MSG#<messageId>
     "previousMessageId": "…", // sms.inbound replies only
     "topicArn": "…",
-    "receivedAt": "…",
+    "receivedAt": "…",       // when the delivery arrived: the Function URL request's time, or the SNS Timestamp for a direct invoke
     "webhookPath": "/webhooks/ses/events",
     "s3": { "bucket": "…", "key": "…" },  // ses.inbound via the S3 action only
     "inbound": {                           // ses.inbound only

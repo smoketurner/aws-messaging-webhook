@@ -26,6 +26,7 @@ use tokio::time::Instant;
 
 use crate::actions::SesApi as _;
 use crate::actions::{RawSend, SendOutcome};
+use crate::clock;
 use crate::mail::fetch::{AttachmentFetcher, FetchError};
 use crate::mail::object_keys;
 use crate::mail::objects::ObjectError;
@@ -36,6 +37,7 @@ use mailbox::MessageId;
 use mailbox::build::{BuildError, BuiltPart, build_outbound};
 use mailbox::send::{MarkOutcome, SesSent};
 use mailbox::send::{SendFailure, SendSpec, SendState, SendStatus};
+use mailbox::time::Timestamp;
 use mailbox::url_policy;
 use mailbox::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
 use mailbox_store::MailStoreError;
@@ -86,7 +88,7 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
     payload: serde_json::Value,
     deadline: Instant,
 ) -> Result<serde_json::Value, lambda_http::Error> {
-    let event: aws_lambda_events::dynamodb::Event = serde_json::from_value(payload)
+    let event: crate::stream::StreamEvent = serde_json::from_value(payload)
         .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
 
     let mut failures = Vec::new();
@@ -110,7 +112,7 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
 }
 
 /// The message id a record is asking to be sent, if it is asking at all.
-fn queued_send_id(record: &aws_lambda_events::dynamodb::EventRecord) -> Option<MessageId> {
+fn queued_send_id(record: &crate::stream::StreamRecord) -> Option<MessageId> {
     let new_image = &record.change.new_image;
     if crate::stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
         return None;
@@ -191,7 +193,8 @@ pub async fn resolve_unknown<B: Backend>(
     message_id: &MessageId,
     resolution: Resolution,
 ) -> Result<(), SenderError> {
-    let now = time::format(time::now_ms());
+    // An operator command carries no timestamp of its own.
+    let now = time::format(clock::now());
     let Some(send) = state
         .mailbox
         .get_send_state(message_id)
@@ -296,12 +299,17 @@ pub struct SweepReport {
 /// briefly unavailable — is logged and skipped, so one does not stop the
 /// rest from being recovered.
 ///
+/// `at` is when the sweep's schedule fired. It is at or before the real
+/// time, which only ever makes a claim look younger, and so kept.
+///
 /// # Errors
 ///
 /// [`SenderError`] when the store cannot be listed.
-pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, SenderError> {
-    let now_ms = time::now_ms();
-    let now = time::format(now_ms);
+pub async fn sweep<B: Backend>(
+    state: &AppState<B>,
+    at: Timestamp,
+) -> Result<SweepReport, SenderError> {
+    let now = time::format(at);
     let mut report = SweepReport::default();
 
     for stuck in state
@@ -310,12 +318,13 @@ pub async fn sweep<B: Backend>(state: &AppState<B>) -> Result<SweepReport, Sende
         .await
         .map_err(store_error)?
     {
-        let claimed_ms = stuck
+        let claimed_at = stuck
             .sending_at
             .as_deref()
             .and_then(time::parse)
-            .unwrap_or(now_ms);
-        if now_ms.saturating_sub(claimed_ms) < CLAIM_STALE_AFTER_MS {
+            .unwrap_or(at);
+        let held_ms = time::unix_ms(at).saturating_sub(time::unix_ms(claimed_at));
+        if held_ms < CLAIM_STALE_AFTER_MS {
             report.still_working += 1;
             continue;
         }
@@ -413,7 +422,9 @@ pub async fn handle_send<B: Backend>(
         .mail
         .as_ref()
         .ok_or(SenderError::NotConfigured)?;
-    let now = time::format(time::now_ms());
+    // The clock, not the stream record's time: the claim is a lease the
+    // sweep judges by age, and the record may be far older than this attempt.
+    let now = time::format(clock::now());
 
     let Some(claimed) = state
         .mailbox

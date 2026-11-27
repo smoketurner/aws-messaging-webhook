@@ -25,6 +25,9 @@ pub(crate) enum AppError {
     #[error("SubscribeURL is not an SNS endpoint")]
     SubscribeUrlRejected,
 
+    #[error("SNS Timestamp is not an RFC 3339 timestamp")]
+    InvalidTimestamp,
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -33,9 +36,10 @@ impl AppError {
     #[must_use]
     pub(crate) fn status(&self) -> StatusCode {
         match self {
-            Self::MissingSnsHeader | Self::UnreadableBody | Self::SubscribeUrlRejected => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::MissingSnsHeader
+            | Self::UnreadableBody
+            | Self::SubscribeUrlRejected
+            | Self::InvalidTimestamp => StatusCode::BAD_REQUEST,
             Self::TopicNotAllowed(_) => StatusCode::FORBIDDEN,
             Self::Verification(error) => verification_status(error),
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

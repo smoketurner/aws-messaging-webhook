@@ -757,6 +757,69 @@ async fn function_url_payload_dispatches_through_the_router() {
     );
 }
 
+/// A Function URL delivery is dated by the request's `timeEpoch`, not by the
+/// clock: what it stores says when the request arrived, and counts retention
+/// from then.
+#[tokio::test]
+async fn a_function_url_delivery_is_dated_by_the_request_time() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    // `function_url_event` carries `timeEpoch: 1754265600000`.
+    let payload = function_url_event("/webhooks/ses/events", &body);
+
+    invoke(h.state.clone(), payload).await.unwrap();
+
+    let records = h.state.events.records.lock().unwrap();
+    assert_eq!(records[0].received_at, "2025-08-04T00:00:00.000Z");
+    assert_eq!(records[0].expires_at, 1_754_265_600 + 30 * 86_400);
+    assert_eq!(
+        records[0].aggregate_expires_at,
+        1_754_265_600 + 365 * 86_400
+    );
+    // The envelope's own time is still what keys the event.
+    assert_eq!(records[0].event_timestamp, "2026-08-03T19:12:52.000Z");
+}
+
+/// A direct invoke has no request, so the envelope SNS signed dates it — and
+/// a redelivery of the same message therefore writes the same values.
+#[tokio::test]
+async fn a_direct_delivery_is_dated_by_the_envelope_timestamp() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+
+    let records = h.state.events.records.lock().unwrap();
+    assert_eq!(records[0].received_at, "2026-08-03T19:12:52.000Z");
+    // 2026-08-03T19:12:52Z is 1785784372.
+    assert_eq!(records[0].expires_at, 1_785_784_372 + 30 * 86_400);
+    assert_eq!(records[1].received_at, records[0].received_at);
+    assert_eq!(records[1].expires_at, records[0].expires_at);
+}
+
+/// SNS cannot produce it, but a signed envelope whose `Timestamp` is not a
+/// timestamp has nothing to date a direct delivery by: it is dropped, not
+/// retried.
+#[tokio::test]
+async fn a_direct_delivery_without_a_usable_timestamp_is_dropped_not_retried() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    body["Timestamp"] = json!("not a timestamp");
+    h.fixture.sign(&mut body, "2");
+
+    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+
+    assert!(result.is_ok());
+    assert_eq!(h.calls(), [] as [String; 0]);
+}
+
 #[tokio::test]
 async fn unrecognized_invoke_payload_is_an_error() {
     let h = harness().await;

@@ -17,12 +17,14 @@ use axum::extract::{Path, State};
 
 use crate::api::error::ApiError;
 use crate::api::pagination::ListRequest;
+use crate::clock::RequestTime;
 use crate::config::Config;
 use crate::mail::content;
 use crate::mail::objects;
 use crate::mail::objects::ObjectStore as _;
 use crate::state::{AppState, Backend};
 use mailbox::thread::ThreadState;
+use mailbox::time::Timestamp;
 use mailbox::wire;
 use mailbox::{InboxId, MailMessage, time};
 use mailbox::{MessageId, ThreadId};
@@ -234,6 +236,7 @@ pub(crate) async fn get_message<B: Backend>(
 pub(crate) async fn get_raw<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id)): Path<(InboxId, MessageId)>,
+    RequestTime(at): RequestTime,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .mailbox
@@ -251,7 +254,7 @@ pub(crate) async fn get_raw<B: Backend>(
 
     Ok(Json(wire::Download {
         download_url: url,
-        expires_at: expires_at(ttl),
+        expires_at: expires_at(at, ttl),
         size: message.size,
         message_id: Some(message_id),
         attachment_id: None,
@@ -271,6 +274,7 @@ pub(crate) async fn get_raw<B: Backend>(
 pub(crate) async fn get_attachment<B: Backend>(
     State(state): State<Arc<AppState<B>>>,
     Path((inbox, message_id, attachment_id)): Path<(InboxId, MessageId, String)>,
+    RequestTime(at): RequestTime,
 ) -> Result<Json<wire::Download>, ApiError> {
     let message = state
         .mailbox
@@ -296,7 +300,7 @@ pub(crate) async fn get_attachment<B: Backend>(
 
     Ok(Json(wire::Download {
         download_url: url,
-        expires_at: expires_at(ttl),
+        expires_at: expires_at(at, ttl),
         size: attachment.size,
         message_id: Some(message_id),
         attachment_id: Some(attachment_id),
@@ -319,11 +323,11 @@ fn download_ttl(config: &Config) -> Duration {
         .map_or(objects::DOWNLOAD_URL_TTL, |mail| mail.attachment_url_ttl)
 }
 
-/// When the URL just issued stops working — `now + ttl`, so it matches the
-/// lifetime the presigned URL was actually signed for.
-fn expires_at(ttl: Duration) -> String {
-    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(0);
-    time::format(time::now_ms().saturating_add(ttl_ms))
+/// When the URL just issued stops working: the request's time plus `ttl`.
+/// The URL is signed moments after the request arrived, so it outlives this
+/// by that much and never falls short of it.
+fn expires_at(at: Timestamp, ttl: Duration) -> String {
+    time::format(at.saturating_add(ttl).unwrap_or(Timestamp::MAX))
 }
 
 /// `GET /v0/inboxes/{inbox_id}/threads`

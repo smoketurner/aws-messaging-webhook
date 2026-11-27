@@ -18,7 +18,7 @@
 //! destination; the HTTP pathway's SNS delivery policy retries far longer.
 //!
 //! The `Sns` record is deliberately NOT parsed with `aws_lambda_events`'
-//! `SnsMessage`: that type parses `Timestamp` into `chrono::DateTime`, whose
+//! `SnsMessage`: that type parses `Timestamp` into a date-time whose
 //! serialization drops trailing `.000` subseconds — rebuilding the signed
 //! canonical string from it would reject every message published on a whole
 //! second. The record deserializes straight into the verifier's envelope,
@@ -40,7 +40,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::app;
+use crate::clock;
 use crate::config::FunctionMode;
+use crate::error::AppError;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
 use crate::sns::{Ingress, handle_sns};
@@ -133,7 +135,8 @@ pub async fn dispatch<B: Backend>(
             crate::mail::sender::handle_command(&state, &command).await?;
             return Ok(serde_json::json!({ "ok": true }));
         }
-        let report = crate::mail::sender::sweep(&state).await?;
+        let at = clock::scheduled_time(&payload).unwrap_or_else(clock::now);
+        let report = crate::mail::sender::sweep(&state, at).await?;
         return Ok(serde_json::to_value(report)?);
     }
 
@@ -225,7 +228,12 @@ async fn process_record<B: Backend>(
         Ok(verified) => verified,
         Err(error) => return error.into_response(),
     };
-    match handle_sns(state, Ingress::Direct, verified, deadline).await {
+    // A direct invoke has no request to time, so the delivery is dated by
+    // the envelope SNS signed.
+    let Some(at) = mailbox::time::parse_rfc3339(&verified.envelope.timestamp) else {
+        return AppError::InvalidTimestamp.into_response();
+    };
+    match handle_sns(state, Ingress::Direct, verified, deadline, at).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }

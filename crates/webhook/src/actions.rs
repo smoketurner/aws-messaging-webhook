@@ -13,6 +13,7 @@ use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
 use mailbox::SesMessageId;
+use mailbox::time::Timestamp;
 use mailbox_store::MailStoreError;
 
 /// How an action failure affects the request, per the SNS retry contract.
@@ -227,6 +228,7 @@ pub(crate) fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> Keywo
 async fn apply_delivery_label<B: Backend>(
     state: &AppState<B>,
     event: &crate::model::ses_notification::SesNotification,
+    at: Timestamp,
 ) -> Result<bool, ActionError> {
     let Some(label) = event.kind.mailbox_label() else {
         return Ok(false);
@@ -245,7 +247,7 @@ async fn apply_delivery_label<B: Backend>(
         return Ok(false);
     };
 
-    let now = mailbox::time::format(mailbox::time::now_ms());
+    let now = mailbox::time::format(at);
     state
         .mailbox
         .update_labels(&inbox, &message_id, &[label.to_label()], &[], &now)
@@ -343,10 +345,12 @@ pub(crate) async fn run<B: Backend>(
     // Threaded through for inbound-ingest time-boxing; only the
     // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
     deadline: tokio::time::Instant,
-    // The verified SNS envelope `Timestamp`, parsed to epoch ms by the
-    // caller; the third `received_ms` fallback, threaded to the
-    // `SesInbound` arm only.
-    envelope_ts_ms: Option<u64>,
+    // When the delivery arrived: what the mailbox writes are stamped with.
+    at: Timestamp,
+    // The verified SNS envelope `Timestamp`, parsed by the caller: the
+    // inbound message id's third time source, threaded to the `SesInbound`
+    // arm only.
+    envelope_at: Option<Timestamp>,
 ) -> Result<ActionTaken, ActionError> {
     match event {
         DomainEvent::SmsInbound { event, .. } => {
@@ -410,7 +414,7 @@ pub(crate) async fn run<B: Backend>(
             // run, then returned so redelivery re-runs both (repeat-safe)
             // steps; the suppression write does not wait on that redelivery.
             let mut deferred = None;
-            let labelled = match apply_delivery_label(state, event).await {
+            let labelled = match apply_delivery_label(state, event, at).await {
                 Ok(labelled) => labelled,
                 Err(error) if error.kind == ActionErrorKind::Permanent => {
                     metrics::counter!(names::ACTION_FAILURES).increment(1);
@@ -453,7 +457,7 @@ pub(crate) async fn run<B: Backend>(
             })
         }
         DomainEvent::SesInbound { event, .. } => {
-            crate::mail::ingest::ingest_inbound(state, event, deadline, envelope_ts_ms)
+            crate::mail::ingest::ingest_inbound(state, event, deadline, at, envelope_at)
                 .await
                 .map(ActionTaken::Ingest)
         }

@@ -27,6 +27,11 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
+deny = [
+  # Dates and times are jiff. Nothing may bring chrono in, directly or through
+  # a dependency's feature (aws_lambda_events' `dynamodb`, `sns`, … would).
+  { crate = "chrono", reason = "use jiff" },
+]
 wildcards = "deny"
 allow-wildcard-paths = true
 

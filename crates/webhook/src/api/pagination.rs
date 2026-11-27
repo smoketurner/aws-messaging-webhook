@@ -12,6 +12,7 @@
 use crate::api::error::{ApiError, FieldError};
 use mailbox::labels::SystemLabel;
 use mailbox::thread::ThreadState;
+use mailbox::time::Timestamp;
 use mailbox::{MailMessage, ids, time};
 use mailbox_store::{DEFAULT_LIMIT, MAX_LIMIT};
 
@@ -37,10 +38,10 @@ pub(crate) struct ListRequest {
     pub limit: usize,
     /// Oldest first when true; newest first (the default) when false.
     pub ascending: bool,
-    /// Exclusive upper bound as epoch milliseconds: items strictly older.
-    pub before_ms: Option<u64>,
-    /// Inclusive lower bound as epoch milliseconds: items at or after it.
-    pub after_ms: Option<u64>,
+    /// Exclusive upper bound: items strictly older.
+    pub before: Option<Timestamp>,
+    /// Inclusive lower bound: items at or after it.
+    pub after: Option<Timestamp>,
     pub page_token: Option<String>,
     pub filters: Filters,
 }
@@ -128,8 +129,8 @@ impl ListRequest {
     #[must_use]
     pub(crate) fn message_bounds(&self) -> (Option<String>, Option<String>) {
         (
-            self.before_ms.map(ids::time_prefix),
-            self.after_ms.map(ids::time_prefix),
+            self.before.map(ids::time_prefix),
+            self.after.map(ids::time_prefix),
         )
     }
 
@@ -138,10 +139,7 @@ impl ListRequest {
     /// extends it, so the same half-open range holds.
     #[must_use]
     pub(crate) fn thread_bounds(&self) -> (Option<String>, Option<String>) {
-        (
-            self.before_ms.map(time::format),
-            self.after_ms.map(time::format),
-        )
+        (self.before.map(time::format), self.after.map(time::format))
     }
 
     /// The query shape a page token is bound to: the sort order and time
@@ -152,8 +150,8 @@ impl ListRequest {
         format!(
             "asc={};before={};after={}",
             self.ascending,
-            self.before_ms.map_or_else(String::new, |ms| ms.to_string()),
-            self.after_ms.map_or_else(String::new, |ms| ms.to_string()),
+            self.before.map_or_else(String::new, |ms| ms.to_string()),
+            self.after.map_or_else(String::new, |ms| ms.to_string()),
         )
     }
 
@@ -168,8 +166,8 @@ impl ListRequest {
         let mut request = Self {
             limit: DEFAULT_LIMIT,
             ascending: false,
-            before_ms: None,
-            after_ms: None,
+            before: None,
+            after: None,
             page_token: None,
             filters: Filters::default(),
         };
@@ -191,11 +189,11 @@ impl ListRequest {
                     None => errors.push(FieldError::new("ascending", "must be true or false")),
                 },
                 "before" => match parse_instant(&value) {
-                    Some(ms) => request.before_ms = Some(ms),
+                    Some(ms) => request.before = Some(ms),
                     None => errors.push(FieldError::new("before", TIMESTAMP_HELP)),
                 },
                 "after" => match parse_instant(&value) {
-                    Some(ms) => request.after_ms = Some(ms),
+                    Some(ms) => request.after = Some(ms),
                     None => errors.push(FieldError::new("after", TIMESTAMP_HELP)),
                 },
                 "page_token" => {
@@ -222,7 +220,7 @@ impl ListRequest {
             }
         }
 
-        if let (Some(after), Some(before)) = (request.after_ms, request.before_ms)
+        if let (Some(after), Some(before)) = (request.after, request.before)
             && after >= before
         {
             errors.push(FieldError::new("after", "must be earlier than `before`"));
@@ -264,13 +262,12 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Parses a UTC timestamp into epoch milliseconds, accepting both the
-/// millisecond form this service emits and the whole-second form clients
-/// commonly send. Offsets other than `Z` are rejected rather than silently
-/// misread as UTC.
-fn parse_instant(value: &str) -> Option<u64> {
-    if let Some(ms) = time::parse(value) {
-        return Some(ms);
+/// Parses a UTC timestamp, accepting both the millisecond form this service
+/// emits and the whole-second form clients commonly send. Any other shape is
+/// rejected, an offset other than `Z` included.
+fn parse_instant(value: &str) -> Option<Timestamp> {
+    if let Some(at) = time::parse(value) {
+        return Some(at);
     }
     // `YYYY-MM-DDTHH:MM:SSZ` — the same shape without the fraction.
     let seconds = value.strip_suffix('Z')?;
@@ -302,8 +299,8 @@ mod tests {
         let request = parse_ok("");
         assert_eq!(request.limit, DEFAULT_LIMIT);
         assert!(!request.ascending);
-        assert_eq!(request.before_ms, None);
-        assert_eq!(request.after_ms, None);
+        assert_eq!(request.before, None);
+        assert_eq!(request.after, None);
         assert_eq!(request.page_token, None);
         // Every include_* flag defaults off, so all four labels are excluded.
         assert_eq!(
@@ -356,16 +353,10 @@ mod tests {
     #[test]
     fn timestamps_accept_both_precisions_and_reject_offsets() {
         let with_millis = parse_ok("after=2026-01-15T09:30:00.250Z");
-        assert_eq!(
-            with_millis.after_ms,
-            time::parse("2026-01-15T09:30:00.250Z")
-        );
+        assert_eq!(with_millis.after, time::parse("2026-01-15T09:30:00.250Z"));
 
         let whole_second = parse_ok("after=2026-01-15T09:30:00Z");
-        assert_eq!(
-            whole_second.after_ms,
-            time::parse("2026-01-15T09:30:00.000Z")
-        );
+        assert_eq!(whole_second.after, time::parse("2026-01-15T09:30:00.000Z"));
 
         assert_eq!(errors("after=2026-01-15T09:30:00+01:00"), vec!["after"]);
         assert_eq!(errors("before=yesterday"), vec!["before"]);
@@ -389,12 +380,8 @@ mod tests {
 
         // A real Feb 29 in a leap year is still accepted in both precisions
         // (no regression in the happy path).
-        assert!(
-            parse_ok("after=2024-02-29T00:00:00.000Z")
-                .after_ms
-                .is_some()
-        );
-        assert!(parse_ok("before=2024-02-29T00:00:00Z").before_ms.is_some());
+        assert!(parse_ok("after=2024-02-29T00:00:00.000Z").after.is_some());
+        assert!(parse_ok("before=2024-02-29T00:00:00Z").before.is_some());
     }
 
     #[test]

@@ -15,9 +15,11 @@
 //! logged and skipped rather than retried forever; the raw item remains in
 //! DynamoDB for manual recovery.
 //!
-//! The stream event is deserialized with `aws_lambda_events::dynamodb` and its
-//! images with `serde_dynamo`, so the typed `AttributeValue`s (including the
-//! base64 binary `raw_body`) are decoded by the library rather than by hand.
+//! The stream event deserializes into [`StreamEvent`], which names only the
+//! fields this binary reads, and its images with `serde_dynamo`, so the typed
+//! `AttributeValue`s (including the base64 binary `raw_body`) are decoded by
+//! the library rather than by hand. `aws_lambda_events`' own stream types are
+//! not used: they are the one thing that would bring `chrono` into the build.
 //!
 //! The same consumer also relays the mail table's stream: its
 //! items are told apart from the events-table's by `sk` prefix (`MSG#` for a
@@ -33,8 +35,8 @@
 //! [`crate::mail::events`] works from the same struct the store reads and
 //! writes.
 
-use aws_lambda_events::dynamodb::Event;
 use axum::body::Bytes;
+use serde::{Deserialize, Deserializer};
 use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
 use sns_message_verifier::SnsEnvelope;
@@ -55,6 +57,41 @@ use mailbox::SesMessageId;
 use mailbox::labels::SystemLabel;
 use mailbox_store::MailStoreError;
 use mailbox_store::keys;
+
+/// A DynamoDB Streams invocation: the batch of change records.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamEvent {
+    #[serde(rename = "Records")]
+    pub records: Vec<StreamRecord>,
+}
+
+/// One change to one item.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamRecord {
+    /// `INSERT`, `MODIFY` or `REMOVE`.
+    #[serde(rename = "eventName")]
+    pub event_name: String,
+    #[serde(rename = "dynamodb")]
+    pub change: StreamChange,
+}
+
+/// The item before and after the change. An image the stream does not send
+/// (the old one of an INSERT, the new one of a REMOVE) is empty.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StreamChange {
+    #[serde(rename = "NewImage", default, deserialize_with = "image")]
+    pub new_image: Item,
+    #[serde(rename = "OldImage", default, deserialize_with = "image")]
+    pub old_image: Item,
+    /// What `batchItemFailures` names a record by.
+    #[serde(rename = "SequenceNumber", default)]
+    pub sequence_number: Option<String>,
+}
+
+/// An image, reading an explicit `null` as an absent one.
+fn image<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Item, D::Error> {
+    Ok(Option::<Item>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Reads a DynamoDB `String` attribute from a stream image.
 pub(crate) fn image_str<'a>(image: &'a Item, key: &str) -> Option<&'a str> {
@@ -156,7 +193,7 @@ pub(crate) async fn handle_stream<B: Backend>(
     state: &AppState<B>,
     payload: Value,
 ) -> Result<Value, lambda_http::Error> {
-    let event: Event = serde_json::from_value(payload)
+    let event: StreamEvent = serde_json::from_value(payload)
         .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
 
     let mut failures: Vec<Value> = Vec::new();

@@ -108,11 +108,24 @@ moves inline rather than making the item public.
   stays the single place that classifies failures. Note the direct pathway's async queue retries
   only twice; the HTTPS delivery policy retries far longer.
 - **Never parse the direct-invoke `Sns` record with `aws_lambda_events`' `SnsMessage`.** It
-  parses `Timestamp` into `chrono::DateTime`, whose serialization drops trailing `.000`
+  parses `Timestamp` into a `chrono::DateTime`, whose serialization drops trailing `.000`
   subseconds — rebuilding the signed canonical string from it rejects every message published
   on a whole second. `entry.rs` deserializes the record straight into `SnsEnvelope` (which
   aliases the Lambda-shape `SigningCertUrl`/`UnsubscribeUrl` casing) so signed values stay
   verbatim.
+- **"Now" is the Lambda event's timestamp, not a clock reading.** What an invocation writes
+  is stamped with the time AWS put on the event it is serving — a Function URL request's
+  `requestContext.timeEpoch` (the `RequestTime` extractor), a direct SNS delivery's envelope
+  `Timestamp`, a scheduled sweep's `time` — and threaded down as a `jiff::Timestamp`
+  (`mailbox::time::Timestamp`); the `mailbox` crate never reads the clock. `clock.rs` says
+  where each comes from and holds the one `now()`, for what no event can supply: the sender's
+  claim on a send (a lease the sweep judges by age — the stream record that triggered the
+  sender may be far older than the attempt, so dating the claim by it would make a live claim
+  look abandoned and send the message twice), an operator command, and tests that build a
+  request without a Lambda context. Monotonic deadlines and the verifier's certificate-validity
+  check use the real clock too; a signed `Timestamp` must never decide whether the certificate
+  that signed it is current. The inbound message id is seeded from the mail's own timestamps
+  (content), never from the delivery time, which differs on every HTTPS redelivery.
 - **Persist before acting; actions stay repeat-safe.** The request path persists (the outbox
   entry) before running idempotent actions; a 5xx redelivery re-runs only the repeat-safe
   actions, so action APIs must stay repeat-safe.
@@ -156,6 +169,11 @@ Workspace `Cargo.toml` pins exact versions (`=x.y.z`) with `default-features = f
 everything, listed alphabetically and without commentary; each crate opts into only the
 features it uses. Workspace lints deny `unwrap`/`panic`/etc.; `clippy.toml` relaxes them for
 test code.
+
+Dates and times are `jiff`, never `chrono`: `deny.toml` bans `chrono` outright, which is why
+the DynamoDB stream event is read into `stream.rs`'s own structs rather than through
+`aws_lambda_events`' `dynamodb` feature (the one thing that would pull it in). `jiff` is built
+with `std` only — every instant here is UTC, so no time-zone database is compiled in.
 
 Four pins are not free to move, and a bump that ignores them fails to resolve or reintroduces
 an advisory:

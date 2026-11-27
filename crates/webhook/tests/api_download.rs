@@ -4,6 +4,7 @@
 
 use axum::http::{Method, StatusCode};
 use mailbox::AttachmentMeta;
+use mailbox::time::Timestamp;
 use mailbox::{ids, time};
 use mailbox_store::sample_message;
 use webhook_test_support::{
@@ -192,7 +193,7 @@ async fn the_configured_ttl_surfaces_in_the_presigned_url_and_expires_at_header(
     })
     .await;
 
-    let now = time::now_ms();
+    let now = time::unix_ms(Timestamp::now());
     let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw")).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -205,7 +206,7 @@ async fn the_configured_ttl_surfaces_in_the_presigned_url_and_expires_at_header(
     // The header matches now + 3,600 s within a generous slack for the test's
     // own runtime, and is not the constant's now + 900 s.
     let expires_at = body["expires_at"].as_str().unwrap();
-    let expires_ms = time::parse(expires_at).unwrap();
+    let expires_ms = time::unix_ms(time::parse(expires_at).unwrap());
     assert!(
         expires_ms >= now + 3_600_000 && expires_ms <= now + 3_600_000 + 5_000,
         "expires_at={expires_at} should be ~now+3600s (now={now}, got={expires_ms})"
@@ -230,7 +231,7 @@ async fn the_configured_ttl_surfaces_on_the_attachment_route() {
     })
     .await;
 
-    let now = time::now_ms();
+    let now = time::unix_ms(Timestamp::now());
     let (status, body) = api::get(
         &h,
         &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/attachments/att_1"),
@@ -242,7 +243,7 @@ async fn the_configured_ttl_surfaces_on_the_attachment_route() {
     assert!(url.contains("X-Amz-Expires=3600"), "{url}");
 
     let expires_at = body["expires_at"].as_str().unwrap();
-    let expires_ms = time::parse(expires_at).unwrap();
+    let expires_ms = time::unix_ms(time::parse(expires_at).unwrap());
     assert!(
         expires_ms >= now + 3_600_000 && expires_ms <= now + 3_600_000 + 5_000,
         "expires_at={expires_at} should be ~now+3600s (now={now}, got={expires_ms})"
@@ -257,7 +258,7 @@ async fn the_configured_ttl_surfaces_on_the_attachment_route() {
 async fn the_default_ttl_applies_when_mail_is_not_configured() {
     let (h, id) = seeded(|m| m.raw_s3_key = Some("inbound/raw-1".to_owned())).await;
 
-    let now = time::now_ms();
+    let now = time::unix_ms(Timestamp::now());
     let (status, body) = api::get(&h, &format!("/v0/inboxes/{TEST_INBOX}/messages/{id}/raw")).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -265,7 +266,7 @@ async fn the_default_ttl_applies_when_mail_is_not_configured() {
     assert!(url.contains("X-Amz-Expires=900"), "{url}");
 
     let expires_at = body["expires_at"].as_str().unwrap();
-    let expires_ms = time::parse(expires_at).unwrap();
+    let expires_ms = time::unix_ms(time::parse(expires_at).unwrap());
     assert!(
         expires_ms >= now + 900_000 && expires_ms <= now + 900_000 + 5_000,
         "expires_at={expires_at} should be ~now+900s (now={now}, got={expires_ms})"

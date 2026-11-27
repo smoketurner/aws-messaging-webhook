@@ -6,6 +6,7 @@ pub mod allowlist;
 pub mod api;
 pub mod app;
 pub mod aws;
+mod clock;
 pub mod config;
 pub mod entry;
 mod error;
