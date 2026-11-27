@@ -25,7 +25,9 @@ The rest is organised by module:
 - `build`: `build_outbound`, the outbound MIME document from a send spec and its parts.
 - `content`: `MessageContent`, a message's write-once body document.
 - `ids`: message, attachment and event ids (`UUIDv7`), and our `Message-ID` forms.
-- `labels`: system labels, user label counting and inbound verdict classification.
+- `labels`: `Label`, a validated label (also enforced when deserializing): one variant per label
+  the service sets, plus `Label::User` for a caller's own; user label counting and inbound verdict
+  classification.
 - `mime`: `parse_inbound`, inbound MIME into a `ParsedInbound`.
 - `send`: `SendState`, `SendSpec`, `SendKey` and `mark_transition`, the outbound send.
 - `thread`: `ThreadState`, `AliasLookup`, `new_thread` and `apply_message`, thread
@@ -38,7 +40,8 @@ The rest is organised by module:
 ## Features
 
 - `test-fixtures`: adds `test_fixtures::message`, a sample `MailMessage` at
-  `support@example.com`, `test_fixtures::at` for timestamp literals, and
+  `support@example.com`, `test_fixtures::at` and `test_fixtures::label` for timestamp and label
+  literals, and
   `url_policy::parse_attachment_url_allowing_http`, the plain-http parser behind the attachment
   fetcher's test mode. `mailbox-store` and `aws-messaging-webhook` enable it for their tests
   only; no non-dev dependency may, because it loosens the attachment URL policy.

@@ -9,9 +9,6 @@
 //! reconstructing the omitted value — which would break the stream relay and
 //! every store read.
 
-#[macro_use]
-mod string_enum;
-
 pub mod address;
 pub mod build;
 pub mod content;
@@ -27,6 +24,7 @@ pub mod wire;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures;
 
+use crate::labels::Label;
 use crate::send::SendStatus;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
@@ -41,7 +39,7 @@ use crate::wire::ContentDisposition;
 
 pub const MESSAGE_USER_LABEL_CAP: usize = 20;
 pub const THREAD_USER_LABEL_CAP: usize = 20;
-/// Non-empty, no `#`, whitespace or control characters.
+/// The longest label, in bytes; [`labels::Label`] says which characters it may use.
 pub const LABEL_MAX_BYTES: usize = 64;
 pub const SUBJECT_MAX_BYTES: usize = 2_000;
 pub const ADDRESS_MAX_BYTES: usize = 320;
@@ -116,76 +114,147 @@ impl std::fmt::Display for InboxId {
     }
 }
 
-/// A string id type: stored and serialized as its bare string, but not
-/// interchangeable with another kind of id.
-macro_rules! string_id {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(
-            Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-        )]
-        #[serde(transparent)]
-        pub struct $name(String);
+/// A mailbox message id: a hyphenated lowercase `UUIDv7` for every id
+/// this service mints (`ids::inbound_message_id`,
+/// `ids::outbound_message_id`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageId(String);
 
-        impl $name {
-            #[must_use]
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
-            }
+impl MessageId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 
-            #[must_use]
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl PartialEq<str> for $name {
-            fn eq(&self, other: &str) -> bool {
-                self.0 == other
-            }
-        }
-
-        impl PartialEq<String> for $name {
-            fn eq(&self, other: &String) -> bool {
-                &self.0 == other
-            }
-        }
-
-        impl PartialEq<&str> for $name {
-            fn eq(&self, other: &&str) -> bool {
-                self.0 == *other
-            }
-        }
-    };
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-string_id! {
-    /// A mailbox message id: a hyphenated lowercase `UUIDv7` for every id
-    /// this service mints (`ids::inbound_message_id`,
-    /// `ids::outbound_message_id`).
-    MessageId
+impl std::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
-string_id! {
-    /// A thread id: the id of the message that started the thread.
-    ThreadId
+impl AsRef<str> for MessageId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
-string_id! {
-    /// The message id SES assigned to a send or a receipt.
-    SesMessageId
+impl PartialEq<str> for MessageId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<String> for MessageId {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<&str> for MessageId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// A thread id: the id of the message that started the thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ThreadId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for ThreadId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<String> for ThreadId {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ThreadId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// The message id SES assigned to a send or a receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SesMessageId(String);
+
+impl SesMessageId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SesMessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for SesMessageId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for SesMessageId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<String> for SesMessageId {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SesMessageId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
 }
 
 impl From<uuid::Uuid> for MessageId {
@@ -265,7 +334,7 @@ pub struct ThreadSnapshot {
     pub preview: String,
     pub message_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub senders: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -314,7 +383,7 @@ pub struct MailMessage {
         skip_serializing_if = "Vec::is_empty",
         with = "serde_dynamo::string_set"
     )]
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     /// Fixed-width (`mail::time::format`).
     #[serde(with = "crate::time::fixed")]
     pub timestamp: Timestamp,

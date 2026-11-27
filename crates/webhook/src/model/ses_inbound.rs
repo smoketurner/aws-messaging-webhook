@@ -2,7 +2,6 @@
 //! receiving-email-notifications-contents. The verdicts drive quarantine
 //! classification — nothing is dropped, and the full payload is forwarded.
 
-use mailbox::open_string_enum;
 use serde::{Deserialize, Serialize};
 
 use super::ses_notification::{SesCommonHeaders, SesMail};
@@ -76,13 +75,53 @@ pub struct SesReceiptAction {
     pub object_key: Option<String>,
 }
 
-open_string_enum! {
-    /// A receipt verdict's `status`. The documented value set is not closed.
-    pub enum VerdictStatus {
-        Pass = "PASS",
-        Fail = "FAIL",
-        Gray = "GRAY",
-        ProcessingFailed = "PROCESSING_FAILED",
+/// A receipt verdict's `status`. The documented value set is not closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum VerdictStatus {
+    Pass,
+    Fail,
+    Gray,
+    ProcessingFailed,
+    /// A value this service has no variant for, kept verbatim.
+    Other(String),
+}
+
+impl VerdictStatus {
+    /// The value as AWS sent it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Gray => "GRAY",
+            Self::ProcessingFailed => "PROCESSING_FAILED",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl From<String> for VerdictStatus {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "PASS" => Self::Pass,
+            "FAIL" => Self::Fail,
+            "GRAY" => Self::Gray,
+            "PROCESSING_FAILED" => Self::ProcessingFailed,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<VerdictStatus> for String {
+    fn from(value: VerdictStatus) -> Self {
+        match value {
+            VerdictStatus::Pass => "PASS".to_owned(),
+            VerdictStatus::Fail => "FAIL".to_owned(),
+            VerdictStatus::Gray => "GRAY".to_owned(),
+            VerdictStatus::ProcessingFailed => "PROCESSING_FAILED".to_owned(),
+            VerdictStatus::Other(value) => value,
+        }
     }
 }
 

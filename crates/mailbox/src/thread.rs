@@ -4,6 +4,7 @@
 //! version-conditioned, in the same transaction as whatever changed it, so
 //! two messages arriving at once cannot each overwrite the other's effect.
 
+use crate::labels::Label;
 use crate::time::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 
@@ -63,9 +64,9 @@ pub struct ThreadState {
         skip_serializing_if = "Vec::is_empty",
         with = "serde_dynamo::string_set"
     )]
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub label_counts: BTreeMap<String, u64>,
+    pub label_counts: BTreeMap<Label, u64>,
     pub last_message_id: MessageId,
     pub message_count: u64,
     pub size: u64,
@@ -148,9 +149,9 @@ fn bump(count: &mut u64) {
     *count = count.saturating_add(1);
 }
 
-fn add_label(labels: &mut Vec<String>, label: &str) {
-    if let Err(index) = labels.binary_search_by(|l| l.as_str().cmp(label)) {
-        labels.insert(index, label.to_owned());
+fn add_label(labels: &mut Vec<Label>, label: &Label) {
+    if let Err(index) = labels.binary_search(label) {
+        labels.insert(index, label.clone());
     }
 }
 
@@ -287,8 +288,8 @@ pub fn apply_message(existing: &ThreadState, msg: &MailMessage) -> ThreadState {
 #[must_use]
 pub fn apply_label_patch(
     existing: &ThreadState,
-    added: &[String],
-    removed: &[String],
+    added: &[Label],
+    removed: &[Label],
     now: Timestamp,
 ) -> ThreadState {
     let mut next = existing.clone();
@@ -358,11 +359,11 @@ mod tests {
     use crate::wire::ContentDisposition;
     use crate::{AttachmentMeta, Direction, test_fixtures};
 
-    fn message(direction: Direction, labels: &[&str]) -> MailMessage {
+    fn message(direction: Direction, labels: &[Label]) -> MailMessage {
         MailMessage {
             ses_message_id: None,
             direction,
-            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            labels: labels.to_vec(),
             timestamp: at("2026-01-01T00:00:01.000Z"),
             size: 1_000,
             version: 0,
@@ -436,7 +437,7 @@ mod tests {
 
     #[test]
     fn new_thread_seeds_counts_from_the_first_message() {
-        let msg = message(Direction::Inbound, &["received", "unread"]);
+        let msg = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let thread = new_thread(&msg);
         assert_eq!(thread.message_count, 1);
         assert_eq!(thread.labels, vec!["received", "unread"]);
@@ -451,9 +452,9 @@ mod tests {
 
     #[test]
     fn apply_message_increments_version_and_counts() {
-        let first = message(Direction::Inbound, &["received", "unread"]);
+        let first = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let before = new_thread(&first);
-        let mut second = message(Direction::Inbound, &["received", "unread"]);
+        let mut second = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         second.message_id = MessageId::new("mid-2");
         second.from = "other@example.com".to_owned();
         second.preview = "Second body".to_owned();
@@ -479,11 +480,11 @@ mod tests {
     /// "received" qualifier, so a reply's preview becomes the thread's.
     #[test]
     fn apply_message_advances_preview_across_an_outbound_reply() {
-        let first = message(Direction::Inbound, &["received", "unread"]);
+        let first = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let before = new_thread(&first);
         assert_eq!(before.preview, "Hello there");
 
-        let mut reply = message(Direction::Outbound, &["sent"]);
+        let mut reply = message(Direction::Outbound, &[Label::Sent]);
         reply.message_id = MessageId::new("mid-reply");
         reply.preview = "Re: Hello, here is the answer".to_owned();
         let after = apply_message(&before, &reply);
@@ -498,11 +499,11 @@ mod tests {
     /// second message with a different subject must not overwrite the first's.
     #[test]
     fn apply_message_advances_preview_but_keeps_the_first_subject() {
-        let first = message(Direction::Inbound, &["received", "unread"]);
+        let first = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let before = new_thread(&first);
         assert_eq!(before.subject, "Hello");
 
-        let mut second = message(Direction::Inbound, &["received", "unread"]);
+        let mut second = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         second.message_id = MessageId::new("mid-2");
         second.subject = "Re: Hello".to_owned();
         second.preview = "Second body".to_owned();
@@ -519,13 +520,13 @@ mod tests {
     /// `preview` keep describing the same, newest message.
     #[test]
     fn apply_message_out_of_order_keeps_the_newest_message_as_last() {
-        let mut newer = message(Direction::Inbound, &["received", "unread"]);
+        let mut newer = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         newer.message_id = MessageId::new("mid-newer");
         newer.timestamp = at("2026-01-01T00:00:02.000Z");
         newer.preview = "Newer body".to_owned();
         let before = new_thread(&newer);
 
-        let mut older = message(Direction::Inbound, &["received", "unread"]);
+        let mut older = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         older.message_id = MessageId::new("mid-older");
         older.from = "other@example.com".to_owned();
         older.timestamp = at("2026-01-01T00:00:01.000Z");
@@ -549,11 +550,11 @@ mod tests {
     /// newest message of its direction, and neither moves backwards.
     #[test]
     fn apply_message_direction_timestamps_track_the_newest_of_each_direction() {
-        let mut first = message(Direction::Inbound, &["received"]);
+        let mut first = message(Direction::Inbound, &[Label::Received]);
         first.timestamp = at("2026-01-01T00:00:01.000Z");
         let thread = new_thread(&first);
 
-        let mut reply = message(Direction::Outbound, &["sent"]);
+        let mut reply = message(Direction::Outbound, &[Label::Sent]);
         reply.message_id = MessageId::new("mid-reply");
         reply.timestamp = at("2026-01-01T00:00:03.000Z");
         let thread = apply_message(&thread, &reply);
@@ -563,7 +564,7 @@ mod tests {
         );
         assert_eq!(thread.sent_timestamp, Some(at("2026-01-01T00:00:03.000Z")));
 
-        let mut second = message(Direction::Inbound, &["received"]);
+        let mut second = message(Direction::Inbound, &[Label::Received]);
         second.message_id = MessageId::new("mid-2");
         second.timestamp = at("2026-01-01T00:00:04.000Z");
         let thread = apply_message(&thread, &second);
@@ -572,7 +573,7 @@ mod tests {
             Some(at("2026-01-01T00:00:04.000Z"))
         );
 
-        let mut late_inbound = message(Direction::Inbound, &["received"]);
+        let mut late_inbound = message(Direction::Inbound, &[Label::Received]);
         late_inbound.message_id = MessageId::new("mid-late-in");
         late_inbound.timestamp = at("2026-01-01T00:00:02.000Z");
         let thread = apply_message(&thread, &late_inbound);
@@ -581,7 +582,7 @@ mod tests {
             Some(at("2026-01-01T00:00:04.000Z"))
         );
 
-        let mut late_outbound = message(Direction::Outbound, &["sent"]);
+        let mut late_outbound = message(Direction::Outbound, &[Label::Sent]);
         late_outbound.message_id = MessageId::new("mid-late-out");
         late_outbound.timestamp = at("2026-01-01T00:00:02.000Z");
         let thread = apply_message(&thread, &late_outbound);
@@ -596,12 +597,12 @@ mod tests {
     /// thread lists it once, in the spelling it first arrived in.
     #[test]
     fn senders_and_recipients_hold_each_mailbox_once() {
-        let mut first = message(Direction::Inbound, &["received"]);
+        let mut first = message(Direction::Inbound, &[Label::Received]);
         "Alice <alice@example.net>".clone_into(&mut first.from);
         first.cc = vec!["bob@example.net".to_owned()];
         let thread = new_thread(&first);
 
-        let mut next = message(Direction::Inbound, &["received"]);
+        let mut next = message(Direction::Inbound, &[Label::Received]);
         "ALICE@example.net".clone_into(&mut next.from);
         next.to = vec!["Support <support@example.com>".to_owned()];
         next.cc = vec!["Bob <Bob@Example.net>".to_owned()];
@@ -616,7 +617,7 @@ mod tests {
 
     #[test]
     fn apply_message_never_evicts_an_existing_sender_at_cap() {
-        let first = message(Direction::Inbound, &["received"]);
+        let first = message(Direction::Inbound, &[Label::Received]);
         let mut before = new_thread(&first);
         for i in 0..THREAD_ADDRESS_SET_CAP {
             add_to_capped_set(
@@ -627,7 +628,7 @@ mod tests {
         }
         assert_eq!(before.senders.len(), THREAD_ADDRESS_SET_CAP);
 
-        let mut next = message(Direction::Inbound, &["received"]);
+        let mut next = message(Direction::Inbound, &[Label::Received]);
         next.from = "new-overflow@example.com".to_owned();
         let after = apply_message(&before, &next);
         assert_eq!(after.senders.len(), THREAD_ADDRESS_SET_CAP);
@@ -640,7 +641,7 @@ mod tests {
 
     #[test]
     fn apply_message_keeps_only_the_newest_attachments() {
-        let mut first = message(Direction::Inbound, &["received"]);
+        let mut first = message(Direction::Inbound, &[Label::Received]);
         first.attachments = (0..THREAD_ATTACHMENT_SUMMARIES)
             .map(|i| AttachmentMeta {
                 attachment_id: format!("att-{i}"),
@@ -655,7 +656,7 @@ mod tests {
         let before = new_thread(&first);
         assert_eq!(before.attachments.len(), THREAD_ATTACHMENT_SUMMARIES);
 
-        let mut second = message(Direction::Inbound, &["received"]);
+        let mut second = message(Direction::Inbound, &[Label::Received]);
         second.message_id = MessageId::new("mid-2");
         second.attachments = vec![AttachmentMeta {
             attachment_id: "att-new".to_owned(),
@@ -674,7 +675,7 @@ mod tests {
 
     #[test]
     fn thread_state_round_trips_through_serde_dynamo() {
-        let msg = message(Direction::Inbound, &["received", "unread"]);
+        let msg = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let thread = new_thread(&msg);
         let item: serde_dynamo::Item = serde_dynamo::to_item(&thread).unwrap();
         let back: ThreadState = serde_dynamo::from_item(item).unwrap();
@@ -686,9 +687,9 @@ mod tests {
 
     #[test]
     fn thread_snapshot_from_thread_state_carries_full_fidelity() {
-        let first = message(Direction::Inbound, &["received", "unread"]);
+        let first = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let before = new_thread(&first);
-        let mut second = message(Direction::Inbound, &["received", "unread"]);
+        let mut second = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         second.message_id = MessageId::new("mid-2");
         second.from = "other@example.com".to_owned();
         second.preview = "Second body".to_owned();
@@ -712,7 +713,7 @@ mod tests {
 
     #[test]
     fn thread_snapshot_caps_senders_and_recipients_at_twenty() {
-        let mut thread = new_thread(&message(Direction::Inbound, &["received"]));
+        let mut thread = new_thread(&message(Direction::Inbound, &[Label::Received]));
         thread.senders = (0..THREAD_ADDRESS_SET_CAP)
             .map(|i| format!("s{i}@example.com"))
             .collect();
@@ -727,7 +728,7 @@ mod tests {
 
     #[test]
     fn thread_labels_serialize_as_a_string_set() {
-        let msg = message(Direction::Inbound, &["received", "unread"]);
+        let msg = message(Direction::Inbound, &[Label::Received, Label::Unread]);
         let thread = new_thread(&msg);
         let item: serde_dynamo::Item = serde_dynamo::to_item(&thread).unwrap();
         assert!(matches!(

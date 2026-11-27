@@ -14,6 +14,7 @@
 //! inbox never received, where the second loses the parent's placeholder and
 //! must join the first one's thread.
 
+use mailbox::labels::Label;
 use mailbox::test_fixtures::at;
 use mailbox::{MessageId, ThreadId};
 use std::collections::HashMap;
@@ -161,7 +162,7 @@ async fn enqueue_send_recovers_when_a_thread_not_exists_race_loses_to_a_concurre
     let r1 = sample_message("support@example.com", "mid-r1", "shared-thread");
     let mut r2 = sample_message("support@example.com", "mid-r2", "shared-thread");
     r2.direction = mailbox::Direction::Outbound;
-    r2.labels = vec!["queued".to_owned()];
+    r2.labels = vec![Label::Queued];
     r2.timestamp = at("2026-01-01T00:00:02.000Z");
     let competing_plan =
         plan::plan_insert(&r1, None, &new_thread(&r1), &AliasLookup::default()).unwrap();

@@ -22,9 +22,9 @@ use serde_json::{Value, json};
 use crate::model::ses_notification::{SesEventKind, SesNotification};
 use crate::publish::{PUT_EVENTS_ENTRY_CAP_BYTES, detail_bytes};
 use mailbox::content::MessageContent;
-use mailbox::labels::SystemLabel;
+use mailbox::labels::Label;
 use mailbox::time::Timestamp;
-use mailbox::{MailMessage, ids, labels, time, wire};
+use mailbox::{MailMessage, ids, time, wire};
 
 /// One outbound mailbox event, before publishing.
 #[derive(Debug, Clone)]
@@ -77,10 +77,10 @@ fn to_json<T: Serialize>(value: &T) -> Value {
 /// failure, which beats a plain receipt. `spam` and `unauthenticated`
 /// co-exist with the `received` system label rather than
 /// replacing it, so the event type is chosen from the label set.
-fn received_event_type(labels: &[String]) -> &'static str {
-    if labels::has(labels, SystemLabel::Spam) {
+fn received_event_type(labels: &[Label]) -> &'static str {
+    if labels.contains(&Label::Spam) {
         "message.received.spam"
-    } else if labels::has(labels, SystemLabel::Unauthenticated) {
+    } else if labels.contains(&Label::Unauthenticated) {
         "message.received.unauthenticated"
     } else {
         "message.received"
@@ -97,7 +97,7 @@ pub(crate) fn build_received_event(
     content: &MessageContent,
     event_source: &str,
 ) -> Option<MailEvent> {
-    if !labels::has(&msg.labels, SystemLabel::Received) {
+    if !msg.labels.contains(&Label::Received) {
         return None;
     }
     let event_type = received_event_type(&msg.labels);
@@ -143,8 +143,8 @@ pub(crate) fn build_received_event(
 /// `old_labels`. Any other write — a delivery label, a read receipt, a
 /// user's own label — builds nothing.
 #[must_use]
-pub(crate) fn build_sent_event(msg: &MailMessage, old_labels: &[String]) -> Option<MailEvent> {
-    if !labels::has(&msg.labels, SystemLabel::Sent) || labels::has(old_labels, SystemLabel::Sent) {
+pub(crate) fn build_sent_event(msg: &MailMessage, old_labels: &[Label]) -> Option<MailEvent> {
+    if !msg.labels.contains(&Label::Sent) || old_labels.contains(&Label::Sent) {
         return None;
     }
     let event_type = "message.sent";
@@ -360,7 +360,7 @@ mod tests {
             subject: "Hello".to_owned(),
             preview: "Hello there".to_owned(),
             message_count: 1,
-            labels: vec!["received".to_owned(), "unread".to_owned()],
+            labels: vec![Label::Received, Label::Unread],
             senders: vec!["sender@example.com".to_owned()],
             recipients: vec!["support@example.com".to_owned()],
             timestamp: at("2026-01-15T09:30:00.000Z"),
@@ -385,7 +385,7 @@ mod tests {
     fn sent_message() -> MailMessage {
         let mut msg = sample_message();
         msg.direction = Direction::Outbound;
-        msg.labels = vec!["sent".to_owned()];
+        msg.labels = vec![Label::Sent];
         msg.from = "support@example.com".to_owned();
         msg.to = vec!["a@example.net".to_owned()];
         msg.cc = vec!["b@example.net".to_owned()];
@@ -499,11 +499,7 @@ mod tests {
     #[test]
     fn spam_takes_precedence_over_unauthenticated() {
         let mut msg = sample_message();
-        msg.labels = vec![
-            "received".to_owned(),
-            "spam".to_owned(),
-            "unauthenticated".to_owned(),
-        ];
+        msg.labels = vec![Label::Received, Label::Spam, Label::Unauthenticated];
         let event = received(&msg, &sample_content());
         assert_eq!(event.detail_type, "message.received.spam");
         assert_eq!(event.detail["event_type"], "message.received.spam");
@@ -512,7 +508,7 @@ mod tests {
     #[test]
     fn unauthenticated_without_spam() {
         let mut msg = sample_message();
-        msg.labels = vec!["received".to_owned(), "unauthenticated".to_owned()];
+        msg.labels = vec![Label::Received, Label::Unauthenticated];
         let event = received(&msg, &sample_content());
         assert_eq!(event.detail_type, "message.received.unauthenticated");
     }
@@ -520,7 +516,7 @@ mod tests {
     #[test]
     fn no_received_label_builds_nothing() {
         let mut msg = sample_message();
-        msg.labels = vec!["queued".to_owned()];
+        msg.labels = vec![Label::Queued];
         assert!(build_received_event(&msg, &sample_content(), EVENT_SOURCE).is_none());
     }
 
@@ -535,7 +531,7 @@ mod tests {
     #[test]
     fn the_queued_to_sent_relabel_builds_the_send_payload() {
         let msg = sent_message();
-        let event = build_sent_event(&msg, &["queued".to_owned()]).expect("a send event");
+        let event = build_sent_event(&msg, &[Label::Queued]).expect("a send event");
         assert_eq!(event.detail_type, "message.sent");
         assert_eq!(
             keys_of(&event.detail),
@@ -551,7 +547,7 @@ mod tests {
                 "recipients": ["a@example.net", "b@example.net", "c@example.net"],
             })
         );
-        let replay = build_sent_event(&msg, &["queued".to_owned()]).unwrap();
+        let replay = build_sent_event(&msg, &[Label::Queued]).unwrap();
         assert_eq!(event.detail["event_id"], replay.detail["event_id"]);
     }
 
@@ -561,10 +557,10 @@ mod tests {
     #[test]
     fn writes_other_than_the_sent_relabel_build_nothing() {
         let mut msg = sent_message();
-        msg.labels = vec!["sent".to_owned(), "delivered".to_owned()];
-        assert!(build_sent_event(&msg, &["sent".to_owned()]).is_none());
+        msg.labels = vec![Label::Sent, Label::Delivered];
+        assert!(build_sent_event(&msg, &[Label::Sent]).is_none());
         let received = sample_message();
-        assert!(build_sent_event(&received, &["received".to_owned()]).is_none());
+        assert!(build_sent_event(&received, &[Label::Received]).is_none());
     }
 
     #[test]

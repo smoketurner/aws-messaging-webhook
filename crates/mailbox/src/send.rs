@@ -16,32 +16,45 @@
 //! it during a send does not touch the message — so the relay sees at most
 //! one message change per outcome rather than one per attempt.
 
-use crate::labels;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::InboxId;
-use crate::labels::SystemLabel;
+use crate::labels::Label;
 use crate::wire::ContentDisposition;
 use crate::{MessageId, ThreadId};
 
-string_enum! {
-    /// Where a send has got to.
-    ///
-    /// `sending` never reaches the message item's mirrored copy: it changes on
-    /// every attempt, and mirroring it would make the relay publish an event for
-    /// each one.
-    pub enum SendStatus {
-        Queued = "queued",
-        Sending = "sending",
-        Sent = "sent",
-        Failed = "failed",
-        /// SES may have accepted the message, or may not: the call was made and
-        /// no usable answer came back. Never resent without an operator saying
-        /// so, because the alternative risks sending twice.
-        Unknown = "unknown",
+/// Where a send has got to.
+///
+/// `sending` never reaches the message item's mirrored copy: it changes on
+/// every attempt, and mirroring it would make the relay publish an event for
+/// each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendStatus {
+    Queued,
+    Sending,
+    Sent,
+    Failed,
+    /// SES may have accepted the message, or may not: the call was made and
+    /// no usable answer came back. Never resent without an operator saying
+    /// so, because the alternative risks sending twice.
+    Unknown,
+}
+
+impl SendStatus {
+    /// The stored form, identical to the serde name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Sending => "sending",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
@@ -96,35 +109,54 @@ impl Envelope {
     }
 }
 
-string_enum! {
-    /// Why a send stopped for good.
-    pub enum SendFailure {
-        /// The spec object is gone, so there is nothing to build from.
-        SendSpecMissing = "send_spec_missing",
-        /// A URL-backed attachment could not be fetched, permanently.
-        AttachmentFetchFailed = "attachment_fetch_failed",
-        /// Repeated transient failures fetching an attachment.
-        AttachmentFetchUnavailable = "attachment_fetch_unavailable",
-        /// The object store refused the spec or a stored part (for example
-        /// access denied), or stayed unavailable across every attempt.
-        OutboxUnavailable = "outbox_unavailable",
-        /// The assembled message exceeds what SES accepts.
-        MessageTooLarge = "message_too_large",
-        /// The message could not be assembled from its spec and parts.
-        BuildFailed = "build_failed",
-        /// SES refused it: a bad address, an unverified identity, a paused
-        /// account.
-        Rejected = "rejected",
-        /// SES stayed unavailable across every attempt.
-        SesUnavailable = "ses_unavailable",
-        /// An operator closed it by hand.
-        ClosedByOperator = "closed_by_operator",
-        /// The send was claimed and abandoned by its sender too many times in a
-        /// row; it never reached SES. A sender that is killed before it records
-        /// `ses_call_at` leaves a stale claim the sweep releases, and after the
-        /// transient-failure cap is exceeded that release would loop forever, so
-        /// the sweep fails the send instead.
-        SenderAbandoned = "sender_abandoned",
+/// Why a send stopped for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendFailure {
+    /// The spec object is gone, so there is nothing to build from.
+    SendSpecMissing,
+    /// A URL-backed attachment could not be fetched, permanently.
+    AttachmentFetchFailed,
+    /// Repeated transient failures fetching an attachment.
+    AttachmentFetchUnavailable,
+    /// The object store refused the spec or a stored part (for example
+    /// access denied), or stayed unavailable across every attempt.
+    OutboxUnavailable,
+    /// The assembled message exceeds what SES accepts.
+    MessageTooLarge,
+    /// The message could not be assembled from its spec and parts.
+    BuildFailed,
+    /// SES refused it: a bad address, an unverified identity, a paused
+    /// account.
+    Rejected,
+    /// SES stayed unavailable across every attempt.
+    SesUnavailable,
+    /// An operator closed it by hand.
+    ClosedByOperator,
+    /// The send was claimed and abandoned by its sender too many times in a
+    /// row; it never reached SES. A sender that is killed before it records
+    /// `ses_call_at` leaves a stale claim the sweep releases, and after the
+    /// transient-failure cap is exceeded that release would loop forever, so
+    /// the sweep fails the send instead.
+    SenderAbandoned,
+}
+
+impl SendFailure {
+    /// The stored form, identical to the serde name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SendSpecMissing => "send_spec_missing",
+            Self::AttachmentFetchFailed => "attachment_fetch_failed",
+            Self::AttachmentFetchUnavailable => "attachment_fetch_unavailable",
+            Self::OutboxUnavailable => "outbox_unavailable",
+            Self::MessageTooLarge => "message_too_large",
+            Self::BuildFailed => "build_failed",
+            Self::Rejected => "rejected",
+            Self::SesUnavailable => "ses_unavailable",
+            Self::ClosedByOperator => "closed_by_operator",
+            Self::SenderAbandoned => "sender_abandoned",
+        }
     }
 }
 
@@ -416,7 +448,7 @@ impl SendState {
 /// Labels present in `after` but not `before`, and the reverse: the patch
 /// a status transition applies to the message's thread.
 #[must_use]
-pub fn label_changes(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
+pub fn label_changes(before: &[Label], after: &[Label]) -> (Vec<Label>, Vec<Label>) {
     let mut added = Vec::new();
     for label in after {
         if !before.contains(label) {
@@ -492,16 +524,16 @@ pub fn mark_transition<'a>(
     msg: &crate::MailMessage,
     outcome: MarkOutcome<'a>,
     now: Timestamp,
-) -> (SendState, Vec<String>, Option<SesSent<'a>>) {
-    let relabel = |remove: SystemLabel, add: SystemLabel| {
-        let mut labels: Vec<String> = msg
+) -> (SendState, Vec<Label>, Option<SesSent<'a>>) {
+    let relabel = |remove: Label, add: Label| {
+        let mut labels: Vec<Label> = msg
             .labels
             .iter()
-            .filter(|label| label.as_str() != remove.as_str())
+            .filter(|label| **label != remove)
             .cloned()
             .collect();
-        if !labels::has(&labels, add) {
-            labels.push(add.to_label());
+        if !labels.contains(&add) {
+            labels.push(add);
         }
         labels.sort();
         labels
@@ -516,12 +548,12 @@ pub fn mark_transition<'a>(
     match outcome {
         MarkOutcome::Sent(sent) => (
             settled(state.sent(now)),
-            relabel(SystemLabel::Queued, SystemLabel::Sent),
+            relabel(Label::Queued, Label::Sent),
             Some(sent),
         ),
         MarkOutcome::Failed(failure) => (
             settled(state.failed(failure, now)),
-            relabel(SystemLabel::Queued, SystemLabel::Rejected),
+            relabel(Label::Queued, Label::Rejected),
             None,
         ),
         // Neither sent nor known to have failed, so the labels do not move:
@@ -532,7 +564,7 @@ pub fn mark_transition<'a>(
         // message is labelled as if it had.
         MarkOutcome::ClosedSent => (
             settled(state.sent(now)),
-            relabel(SystemLabel::Queued, SystemLabel::Sent),
+            relabel(Label::Queued, Label::Sent),
             None,
         ),
         MarkOutcome::Resumed => (state.resumed(now), msg.labels.clone(), None),
@@ -559,25 +591,28 @@ mod tests {
                 format!("\"{expected}\"")
             );
         }
-        assert_eq!(SendStatus::ALL.len(), 5);
     }
 
     #[test]
     fn failures_round_trip_as_the_stored_strings() {
-        let expected = [
-            "send_spec_missing",
-            "attachment_fetch_failed",
-            "attachment_fetch_unavailable",
-            "outbox_unavailable",
-            "message_too_large",
-            "build_failed",
-            "rejected",
-            "ses_unavailable",
-            "closed_by_operator",
-            "sender_abandoned",
-        ];
-        assert_eq!(SendFailure::ALL.len(), expected.len());
-        for (failure, wire) in SendFailure::ALL.into_iter().zip(expected) {
+        for (failure, wire) in [
+            (SendFailure::SendSpecMissing, "send_spec_missing"),
+            (
+                SendFailure::AttachmentFetchFailed,
+                "attachment_fetch_failed",
+            ),
+            (
+                SendFailure::AttachmentFetchUnavailable,
+                "attachment_fetch_unavailable",
+            ),
+            (SendFailure::OutboxUnavailable, "outbox_unavailable"),
+            (SendFailure::MessageTooLarge, "message_too_large"),
+            (SendFailure::BuildFailed, "build_failed"),
+            (SendFailure::Rejected, "rejected"),
+            (SendFailure::SesUnavailable, "ses_unavailable"),
+            (SendFailure::ClosedByOperator, "closed_by_operator"),
+            (SendFailure::SenderAbandoned, "sender_abandoned"),
+        ] {
             assert_eq!(failure.as_str(), wire);
             assert_eq!(
                 serde_json::to_value(failure).unwrap(),

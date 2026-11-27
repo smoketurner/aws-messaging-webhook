@@ -5,6 +5,7 @@
 //! these reads return are the ones ingest would actually write.
 
 use mailbox::MessageId;
+use mailbox::labels::Label;
 use std::collections::BTreeMap;
 
 use aws_messaging_webhook::mail::content;
@@ -236,7 +237,7 @@ async fn a_page_token_crosses_casing_variants_of_the_same_inbox() {
 async fn spam_and_trash_are_hidden_unless_asked_for() {
     let h = seeded().await;
     insert(&h, "2026-01-01T09:00:00.000Z", "t1", |m| {
-        m.labels = vec!["received".to_owned(), "spam".to_owned()];
+        m.labels = vec![Label::Received, Label::Spam];
     })
     .await;
     insert(&h, "2026-01-01T10:00:00.000Z", "t2", |m| {
@@ -260,7 +261,7 @@ async fn spam_and_trash_are_hidden_unless_asked_for() {
 async fn asking_for_a_label_overrides_the_flag_that_would_hide_it() {
     let h = seeded().await;
     insert(&h, "2026-01-01T09:00:00.000Z", "t1", |m| {
-        m.labels = vec!["received".to_owned(), "trash".to_owned()];
+        m.labels = vec![Label::Received, Label::Trash];
     })
     .await;
 

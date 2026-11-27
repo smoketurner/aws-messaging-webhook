@@ -8,6 +8,7 @@
 //! minus the fields a list response omits (`headers`, `references`, body
 //! content, and the embedded `messages[]`).
 
+use crate::labels::Label;
 use crate::thread::ThreadState;
 use crate::time::Timestamp;
 use std::collections::BTreeMap;
@@ -57,7 +58,7 @@ pub struct Message {
     pub inbox_id: String,
     pub thread_id: ThreadId,
     pub message_id: MessageId,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(with = "crate::time::fixed")]
     pub timestamp: Timestamp,
     pub from: String,
@@ -137,7 +138,7 @@ pub struct MessageItem {
     pub inbox_id: String,
     pub thread_id: ThreadId,
     pub message_id: MessageId,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(with = "crate::time::fixed")]
     pub timestamp: Timestamp,
     pub from: String,
@@ -191,7 +192,7 @@ impl From<&MailMessage> for MessageItem {
 pub struct Thread {
     pub inbox_id: String,
     pub thread_id: ThreadId,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(with = "crate::time::fixed")]
     pub timestamp: Timestamp,
     pub senders: Vec<String>,
@@ -283,7 +284,7 @@ impl Thread {
 pub struct ThreadItem {
     pub inbox_id: String,
     pub thread_id: ThreadId,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     #[serde(with = "crate::time::fixed")]
     pub timestamp: Timestamp,
     pub senders: Vec<String>,
@@ -453,7 +454,7 @@ pub struct Download {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageLabels {
     pub message_id: MessageId,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
 }
 
 #[cfg(test)]

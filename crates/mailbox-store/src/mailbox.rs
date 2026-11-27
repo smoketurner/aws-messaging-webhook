@@ -10,6 +10,7 @@
 //! writer moved a version, so anything computed from the previous read is
 //! stale.
 
+use mailbox::labels::Label;
 use mailbox::send;
 use mailbox::time::Timestamp;
 use std::collections::HashMap;
@@ -632,10 +633,10 @@ impl<T: Table> Mailbox<T> {
         &self,
         inbox: &InboxId,
         message_id: &MessageId,
-        add: &[String],
-        remove: &[String],
+        add: &[Label],
+        remove: &[Label],
         now: Timestamp,
-    ) -> Result<Option<Vec<String>>, MailStoreError> {
+    ) -> Result<Option<Vec<Label>>, MailStoreError> {
         for attempt in 0..=MAX_TXN_RETRIES {
             let Some(msg) = self.read_message(inbox, message_id).await? else {
                 return Ok(None);
@@ -716,12 +717,12 @@ fn assemble_thread_view(
 /// changes that actually happened (adding a label twice, or removing one
 /// that isn't there, changes nothing).
 struct LabelPatch {
-    labels: Vec<String>,
-    added: Vec<String>,
-    removed: Vec<String>,
+    labels: Vec<Label>,
+    added: Vec<Label>,
+    removed: Vec<Label>,
 }
 
-fn patch_labels(current: &[String], add: &[String], remove: &[String]) -> LabelPatch {
+fn patch_labels(current: &[Label], add: &[Label], remove: &[Label]) -> LabelPatch {
     let mut labels = current.to_vec();
     let mut added = Vec::new();
     for label in add {
@@ -748,6 +749,7 @@ fn patch_labels(current: &[String], add: &[String], remove: &[String]) -> LabelP
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailbox::test_fixtures::label;
 
     // --- get_thread: assemble_thread_view ---------------------------------
     //
@@ -787,11 +789,11 @@ mod tests {
 
     #[test]
     fn a_patch_reports_only_the_changes_it_made() {
-        let current = vec!["received".to_owned(), "unread".to_owned()];
+        let current = vec![Label::Received, Label::Unread];
         let patch = patch_labels(
             &current,
-            &["unread".to_owned(), "invoices".to_owned()],
-            &["spam".to_owned(), "received".to_owned()],
+            &[Label::Unread, label("invoices")],
+            &[Label::Spam, Label::Received],
         );
         assert_eq!(patch.labels, vec!["invoices", "unread"]);
         assert_eq!(patch.added, vec!["invoices"]);
@@ -800,10 +802,10 @@ mod tests {
 
     #[test]
     fn a_patch_that_changes_nothing_reports_nothing() {
-        let current = vec!["received".to_owned()];
-        let patch = patch_labels(&current, &["received".to_owned()], &["spam".to_owned()]);
-        assert_eq!(patch.added, Vec::<String>::new());
-        assert_eq!(patch.removed, Vec::<String>::new());
+        let current = vec![Label::Received];
+        let patch = patch_labels(&current, &[Label::Received], &[Label::Spam]);
+        assert_eq!(patch.added, Vec::<Label>::new());
+        assert_eq!(patch.removed, Vec::<Label>::new());
         assert_eq!(patch.labels, current);
     }
 }

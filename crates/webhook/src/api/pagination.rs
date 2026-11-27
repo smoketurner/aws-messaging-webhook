@@ -10,7 +10,7 @@
 //! by `<timestamp>#<thread_id>`. Each gets its own boundary encoding.
 
 use crate::api::error::{ApiError, FieldError};
-use mailbox::labels::SystemLabel;
+use mailbox::labels::Label;
 use mailbox::thread::ThreadState;
 use mailbox::time::Timestamp;
 use mailbox::{MailMessage, ids, time};
@@ -23,13 +23,10 @@ use mailbox_store::{DEFAULT_LIMIT, MAX_LIMIT};
 /// the flag is honored so a client that sets it behaves the same here as
 /// against the reference implementation.
 const INCLUDE_FLAGS: [(&str, &str); 4] = [
-    ("include_spam", SystemLabel::Spam.as_str()),
+    ("include_spam", Label::Spam.as_str()),
     ("include_blocked", "blocked"),
-    (
-        "include_unauthenticated",
-        SystemLabel::Unauthenticated.as_str(),
-    ),
-    ("include_trash", SystemLabel::Trash.as_str()),
+    ("include_unauthenticated", Label::Unauthenticated.as_str()),
+    ("include_trash", Label::Trash.as_str()),
 ];
 
 /// A parsed, validated list request.
@@ -62,7 +59,7 @@ pub(crate) struct Filters {
 }
 
 impl Filters {
-    fn labels_match(&self, labels: &[String]) -> bool {
+    fn labels_match(&self, labels: &[Label]) -> bool {
         if self
             .excluded
             .iter()
@@ -72,7 +69,7 @@ impl Filters {
         }
         self.labels
             .iter()
-            .all(|wanted| labels.iter().any(|label| label == wanted))
+            .all(|wanted| labels.iter().any(|label| label == wanted.as_str()))
     }
 
     #[must_use]

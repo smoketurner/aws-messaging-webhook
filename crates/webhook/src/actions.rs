@@ -284,7 +284,7 @@ async fn apply_delivery_label<B: Backend>(
 
     state
         .mailbox
-        .update_labels(&inbox, &message_id, &[label.to_label()], &[], at)
+        .update_labels(&inbox, &message_id, std::slice::from_ref(&label), &[], at)
         .await
         .map_err(ActionError::from)?;
 

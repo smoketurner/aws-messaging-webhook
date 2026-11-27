@@ -20,6 +20,7 @@ use serde::Deserialize;
 use crate::api::error::{ApiError, FieldError};
 use crate::api::json::OneOrMany;
 use mailbox::address::envelope_address;
+use mailbox::labels::Label;
 use mailbox::url_policy::{self, AttachmentUrl};
 use mailbox::wire::ContentDisposition;
 use mailbox::{
@@ -144,7 +145,7 @@ pub(crate) struct ValidatedSend {
     pub subject: String,
     pub text: Option<String>,
     pub html: Option<String>,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     pub headers: BTreeMap<String, String>,
     pub attachments: Vec<ValidatedAttachment>,
 }

@@ -5,6 +5,7 @@
 
 use axum::http::{Method, StatusCode};
 use mailbox::MessageId;
+use mailbox::labels::Label;
 use mailbox::test_fixtures::at;
 use mailbox::{InboxId, ids, time};
 use mailbox_store::sample_message;
@@ -169,14 +170,14 @@ async fn a_thread_full_of_user_labels_still_takes_system_labels() {
         .update_labels(
             &InboxId::new(TEST_INBOX),
             &MessageId::new(ids[0].as_str()),
-            &["bounced".to_owned()],
+            &[Label::Bounced],
             &[],
             at("2026-01-02T00:00:00.000Z"),
         )
         .await
         .unwrap()
         .unwrap();
-    assert!(labels.contains(&"bounced".to_owned()));
+    assert!(labels.contains(&Label::Bounced));
 }
 
 /// A request may name a full set of a caller's own labels plus a state toggle
@@ -234,6 +235,17 @@ async fn service_owned_labels_are_rejected() {
     let (h, ids) = seeded("t1", 1).await;
 
     let (status, body) = patch(&h, &ids[0], json!({"add_labels": ["received"]})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["name"], "ValidationError");
+    assert_eq!(body["errors"][0]["path"], "add_labels");
+}
+
+#[tokio::test]
+async fn a_label_outside_the_character_set_is_rejected() {
+    let (h, ids) = seeded("t1", 1).await;
+
+    let (status, body) = patch(&h, &ids[0], json!({"add_labels": ["bad#label"]})).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["name"], "ValidationError");
