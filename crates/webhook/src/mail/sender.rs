@@ -21,8 +21,7 @@
 //! for an operator to resolve.
 
 use crate::stream;
-use crate::stream::StreamEvent;
-use crate::stream::StreamRecord;
+use aws_lambda_events::dynamodb::{Event, EventRecord};
 use mailbox::send::SpecAttachment;
 use std::time::Duration;
 
@@ -92,7 +91,7 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
     payload: serde_json::Value,
     deadline: Instant,
 ) -> Result<serde_json::Value, lambda_http::Error> {
-    let event: StreamEvent = serde_json::from_value(payload)
+    let event: Event = serde_json::from_value(payload)
         .map_err(|e| format!("payload has Records but is not a DynamoDB stream event: {e}"))?;
 
     let mut failures = Vec::new();
@@ -116,7 +115,7 @@ pub(crate) async fn handle_sender_stream<B: Backend>(
 }
 
 /// The message id a record is asking to be sent, if it is asking at all.
-fn queued_send_id(record: &StreamRecord) -> Option<MessageId> {
+fn queued_send_id(record: &EventRecord) -> Option<MessageId> {
     let new_image = &record.change.new_image;
     if stream::image_str(new_image, "sk")? != keys::SEND_STATE_SK {
         return None;

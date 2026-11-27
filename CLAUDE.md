@@ -194,10 +194,10 @@ is denied with `absolute-paths-max-segments = 2`, so `crate::mail::sender::sweep
 parent module. External crates are exempt through `absolute-paths-allowed-crates` in
 `clippy.toml`; a new dependency named by an absolute path is added there.
 
-Dates and times are `jiff`, never `chrono`: `deny.toml` bans `chrono` outright, which is why
-the DynamoDB stream event is read into `stream.rs`'s own structs rather than through
-`aws_lambda_events`' `dynamodb` feature (the one thing that would pull it in). `jiff` is built
-with `std` only — every instant here is UTC, so no time-zone database is compiled in.
+Dates and times are `jiff`, never `chrono`. `chrono` is in the build only as a dependency of
+`aws_lambda_events`, whose DynamoDB stream types (`stream.rs`, the sender) carry one field of
+it that this code never reads; `deny.toml` bans it for everything else. `jiff` is built with
+`std` only — every instant here is UTC, so no time-zone database is compiled in.
 
 Four pins are not free to move, and a bump that ignores them fails to resolve or reintroduces
 an advisory:

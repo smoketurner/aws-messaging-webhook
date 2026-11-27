@@ -25,6 +25,7 @@ aws-sdk-s3 = { version = "=1.159.0", default-features = false }
 aws-sdk-sesv2 = { version = "=1.147.0", default-features = false }
 aws-sdk-ssm = { version = "=1.136.0", default-features = false }
 aws-smithy-types = { version = "=1.9.4", default-features = false }
+aws_lambda_events = { version = "=1.2.1", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
 base64 = { version = "=0.23.1", default-features = false }
 bytes = { version = "=1.12.1", default-features = false }

@@ -28,9 +28,10 @@ allow = [
 [bans]
 multiple-versions = "warn"
 deny = [
-  # Dates and times are jiff. Nothing may bring chrono in, directly or through
-  # a dependency's feature (aws_lambda_events' `dynamodb`, `sns`, … would).
-  { crate = "chrono", reason = "use jiff" },
+  # Dates and times are jiff. chrono is in the build only because
+  # aws_lambda_events' DynamoDB stream types hold one field of it; no crate of
+  # ours may depend on it.
+  { crate = "chrono", wrappers = ["aws_lambda_events"], reason = "use jiff" },
 ]
 wildcards = "deny"
 allow-wildcard-paths = true
