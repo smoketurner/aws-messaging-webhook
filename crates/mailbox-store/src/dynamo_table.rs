@@ -58,11 +58,13 @@ impl KeyCondition {
             (Some(after), Some(before)) => {
                 values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
                 values.insert(":before".to_owned(), DynamoAv::S(before.to_owned()));
-                // Not BETWEEN, which includes both ends: `ListQuery`'s bounds
-                // are exclusive, and they are exclusive in the one-sided
-                // cases below, so an item exactly on a bound must not depend
-                // on whether the caller gave the other one.
-                Some(" AND #sk > :after AND #sk < :before")
+                // A key condition allows one test on the sort key, so both
+                // bounds take `BETWEEN`, which includes its ends. That matches
+                // the exclusive one-sided cases below because every bound is
+                // a strict prefix of the keys it brackets (a `UUIDv7`'s
+                // leading time digits, or a timestamp before `#<thread_id>`),
+                // so no stored key equals one.
+                Some(" AND #sk BETWEEN :after AND :before")
             }
             (Some(after), None) => {
                 values.insert(":after".to_owned(), DynamoAv::S(after.to_owned()));
@@ -670,17 +672,15 @@ mod tests {
         assert_placeholders_match(&key);
     }
 
-    /// `ListQuery`'s bounds are exclusive, and a caller who gives both must
-    /// get the same items they would get from two one-sided queries —
-    /// `BETWEEN` would quietly include the endpoints instead.
+    /// DynamoDB refuses a key condition with two tests on the sort key, so a
+    /// window bounded on both sides is one `BETWEEN`.
     #[test]
-    fn both_bounds_stay_exclusive() {
+    fn both_bounds_are_one_sort_key_test() {
         let key = KeyCondition::new("gsi1pk", "gsi1sk", "INBOX#x#MSG", Some("a"), Some("b"));
         assert_eq!(
             key.expression,
-            "#pk = :pk AND #sk > :after AND #sk < :before"
+            "#pk = :pk AND #sk BETWEEN :after AND :before"
         );
-        assert!(!key.expression.contains("BETWEEN"));
         assert_placeholders_match(&key);
     }
 
@@ -689,6 +689,12 @@ mod tests {
         for (after, before) in [(Some("a"), None), (None, Some("b")), (Some("a"), Some("b"))] {
             let key = KeyCondition::new("gsi1pk", "gsi1sk", "INBOX#x#MSG", after, before);
             assert_eq!(key.names.get("#sk").map(String::as_str), Some("gsi1sk"));
+            assert_eq!(
+                key.expression.matches("#sk").count(),
+                1,
+                "a key condition takes one sort-key test: {}",
+                key.expression
+            );
             assert_placeholders_match(&key);
         }
     }
@@ -1872,7 +1878,7 @@ mod tests {
                 vec![json!({
                     "TableName": TABLE,
                     "IndexName": "ByThread",
-                    "KeyConditionExpression": "#pk = :pk AND #sk > :after AND #sk < :before",
+                    "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :after AND :before",
                     "ExpressionAttributeNames": {"#pk": "gsi2pk", "#sk": "gsi2sk"},
                     "ExpressionAttributeValues": {
                         ":pk": {"S": "INBOX#a#MSG"},
