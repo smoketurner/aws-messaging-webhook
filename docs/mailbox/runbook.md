@@ -31,7 +31,10 @@ not an API key.
 ## A send is `unknown`
 
 SES may or may not hold the message. Nothing retries it automatically, because a resend can
-deliver twice. Find these sends in the sweep's `sends_outcome_unknown` log line or the `ByStatus`
+deliver twice. If SES does hold it, the first event SES publishes for the message (send, delivery,
+bounce, complaint, open, click) settles the send as `sent` by itself and logs
+`send_confirmed_by_ses_event`, so a send still `unknown` after a few minutes most likely never
+reached SES or was rejected by it. Find these sends in the sweep's `sends_outcome_unknown` log line or the `ByStatus`
 index, then choose:
 
 ```bash

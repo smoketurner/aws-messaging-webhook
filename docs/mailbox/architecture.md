@@ -48,7 +48,14 @@ calls SES. Four mechanisms keep each send to at most one delivery:
 3. **No SDK retries on the send call.** The sender retries only 429 and 503, which mean SES
    didn't accept the request.
 4. **Ambiguous outcomes stop.** A timeout, dropped connection or other 5xx marks the send
-   `unknown`. Only an operator resolves it.
+   `unknown`. Nothing resends it; an operator resolves it unless SES does first.
+5. **SES's events confirm a send.** Every send is tagged `mailbox_message=<message id>`, and SES
+   repeats the tag on each event it publishes for the message. When an event arrives for a send
+   that is `unknown`, or still `sending` with its SES-call mark, and SES's id was never recorded,
+   the event is SES saying it has the message: the send is recorded as sent with that id, dated
+   by when SES accepted it. `Reject` and `Rendering Failure` confirm nothing. A send that never
+   carried the SES-call mark cannot be settled this way, since other senders share the
+   configuration set and a tag is only their claim.
 
 A transient failure (SES throttling, S3 or an attachment host briefly down) hands the send back
 with `requeued_at` set, which re-triggers the sender. The sender backs off from 1 to 16 seconds.

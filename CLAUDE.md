@@ -136,6 +136,13 @@ moves inline rather than making the item public.
   later (`clock::Arrival`), so an event redriven long after it was published is not stored
   already expired. The sender reads the clock again for each mark it records (`ses_call_at`,
   `sent_at`, a release): loading a send can take most of an invocation.
+- **A send is called once; SES's events are its second witness.** `SendEmail` has no
+  idempotency token, so the sender marks `ses_call_at` before the call and nothing automatic
+  ever calls SES again for a send carrying that mark. If the write recording SES's answer is
+  lost, the send waits as `sending` then `unknown` — and the first SES event for the message
+  (matched by the `mailbox_message` tag, `sender::confirm_sent`) records it as sent. Only a
+  send with the mark may be settled from an event: the tag is the mail sender's claim, and
+  the configuration set is shared.
 - **Persist before acting; actions stay repeat-safe.** The request path persists (the outbox
   entry) before running idempotent actions; a 5xx redelivery re-runs only the repeat-safe
   actions, so action APIs must stay repeat-safe.

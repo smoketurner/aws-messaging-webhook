@@ -37,12 +37,12 @@ use crate::mail::objects::ObjectError;
 use crate::mail::objects::ObjectStore as _;
 use crate::metrics::names;
 use crate::state::{AppState, Backend};
-use mailbox::MessageId;
 use mailbox::build::{BuildError, BuiltPart, build_outbound};
 use mailbox::send::{MarkOutcome, SesSent};
 use mailbox::send::{SendFailure, SendSpec, SendState, SendStatus};
 use mailbox::time::Timestamp;
 use mailbox::url_policy;
+use mailbox::{InboxId, MessageId, SesMessageId};
 use mailbox::{MAX_OUTBOUND_DECODED_BYTES, MAX_OUTBOUND_RAW_BYTES, time};
 use mailbox_store::MailStoreError;
 use mailbox_store::keys;
@@ -229,6 +229,72 @@ pub async fn resolve_unknown<B: Backend>(
         "an operator resolved a send whose outcome SES never confirmed"
     );
     Ok(())
+}
+
+/// Settles a send as sent on SES's own word, from an event it published for
+/// the message.
+///
+/// The sender records SES's answer in one write after the call. When that
+/// write is lost — the store was unavailable, or the sender died first — the
+/// send is left `sending` and then `unknown`, with nothing to say it went
+/// out. Any event SES publishes for the message says exactly that, and
+/// carries the id the sender tagged it with, so the first one to arrive
+/// finishes what the sender could not: the same write, with the same SES id.
+///
+/// Only a send this service is known to have offered to SES is settled this
+/// way: one that is `unknown`, or `sending` with its SES-call mark. An event
+/// naming any other send changes nothing — a tag is a claim made by whoever
+/// sent the mail, and other senders share the configuration set.
+///
+/// Returns the message the send belongs to once it is recorded as sent with
+/// this SES id, by this call or by a sender that got there first.
+///
+/// # Errors
+///
+/// The store's error for a failed read or write.
+pub(crate) async fn confirm_sent<B: Backend>(
+    state: &AppState<B>,
+    message_id: &MessageId,
+    ses_message_id: &SesMessageId,
+    accepted_at: Timestamp,
+) -> Result<Option<(InboxId, MessageId)>, MailStoreError> {
+    let Some(config) = state.config.mail.as_ref() else {
+        return Ok(None);
+    };
+    let Some(send) = state.mailbox.get_send_state(message_id).await? else {
+        return Ok(None);
+    };
+    let offered_to_ses = match send.send_status {
+        SendStatus::Unknown => true,
+        SendStatus::Sending => send.ses_call_at.is_some(),
+        _ => false,
+    };
+    if !offered_to_ses {
+        return Ok(None);
+    }
+
+    let sent = MarkOutcome::Sent(SesSent {
+        message_id: ses_message_id.as_str(),
+        region: &config.region,
+    });
+    match record(state, &send, sent, accepted_at).await {
+        Ok(()) => {}
+        // The sender recorded it in the meantime; its alias says for whom.
+        Err(MailStoreError::Conflict) => {
+            return state.mailbox.resolve_ses_message(ses_message_id).await;
+        }
+        Err(error) => return Err(error),
+    }
+    metrics::counter!(names::MESSAGES_SENT).increment(1);
+    tracing::warn!(
+        %message_id,
+        ses_message_id = ses_message_id.as_str(),
+        inbox_id = %send.inbox_id.as_str(),
+        was = send.send_status.as_str(),
+        event = "send_confirmed_by_ses_event",
+        "recorded a send as sent from an SES event; its own record of SES's answer was lost"
+    );
+    Ok(Some((send.inbox_id, send.message_id)))
 }
 
 /// How long a send may sit claimed before the sweep assumes its sender died.
@@ -644,8 +710,16 @@ async fn mark_sent<B: Backend>(
             .await;
         let error = match result {
             Ok(()) => return Ok(()),
-            // Another writer moved this send on; retrying cannot help.
-            Err(error @ MailStoreError::Conflict) => error,
+            // Another writer moved this send on; retrying cannot help. When
+            // that writer was an SES event for this very message, it has
+            // already recorded what this write would have.
+            Err(error @ MailStoreError::Conflict) => {
+                let current = state.mailbox.get_send_state(&calling.message_id).await;
+                if matches!(current, Ok(Some(current)) if current.send_status == SendStatus::Sent) {
+                    return Ok(());
+                }
+                error
+            }
             Err(error) if attempt >= MARK_SENT_ATTEMPTS => error,
             Err(error) => {
                 tracing::warn!(

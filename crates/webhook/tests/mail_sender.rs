@@ -1008,6 +1008,152 @@ async fn stuck_unknown(h: &Harness) -> MessageId {
     message_id
 }
 
+/// Feeds one SES event through the real webhook path for mail tagged as
+/// `message_id`, which SES accepted under `ses_message_id` at 00:00:30.
+async fn tagged_ses_event(
+    h: &Harness,
+    kind: &str,
+    ses_message_id: &str,
+    message_id: &MessageId,
+) -> StatusCode {
+    let inner = json!({
+        "eventType": kind,
+        "mail": {
+            "messageId": ses_message_id,
+            "timestamp": "2026-01-01T00:00:30.000Z",
+            "tags": {
+                "ses:configuration-set": ["ConfigSet"],
+                "mailbox_message": [message_id.as_str()],
+            },
+        },
+    });
+    let body = webhook_test_support::wrapped(h, &inner);
+    webhook_test_support::post(h.state.clone(), "/webhooks/ses/events", &body).await
+}
+
+async fn stored_message(h: &Harness, message_id: &MessageId) -> mailbox::MailMessage {
+    h.state
+        .mailbox
+        .get_message(&InboxId::new(TEST_INBOX), message_id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// SES answered, but the answer never reached this service. The first event
+/// SES publishes for the message is the same answer arriving another way, so
+/// it settles the send without an operator.
+#[tokio::test]
+async fn an_ses_event_settles_an_unknown_send_as_sent() {
+    let h = api_harness().await;
+    let message_id = stuck_unknown_with_attachment(&h).await;
+
+    let status = tagged_ses_event(&h, "Delivery", "ses-real-id", &message_id).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let state = state_of(&h, &message_id);
+    assert_eq!(state.send_status, SendStatus::Sent);
+    assert!(state.expires_at.is_some(), "a settled send ages out");
+    let message = stored_message(&h, &message_id).await;
+    assert!(message.labels.contains(&"sent".to_owned()));
+    assert!(!message.labels.contains(&"queued".to_owned()));
+    // Dated by when SES took the message, not by when the event arrived.
+    assert_eq!(message.sent_at, Some(at("2026-01-01T00:00:30.000Z")));
+    // The same event is then labelled onto it, as any later one will be.
+    assert!(
+        message.labels.contains(&"delivered".to_owned()),
+        "{:?}",
+        message.labels
+    );
+    assert_eq!(
+        h.state
+            .mailbox
+            .resolve_ses_message(&SesMessageId::new("ses-real-id"))
+            .await
+            .unwrap()
+            .map(|(_, id)| id),
+        Some(message_id.clone())
+    );
+    assert_outbox_cleared(&h, &message_id);
+    // Nothing was sent again to get here.
+    assert_eq!(h.state.ses.sent.lock().unwrap().len(), 1);
+}
+
+/// The sender called SES and then could not record the answer: the send is
+/// still `sending`, carrying only its SES-call mark, until the sweep would
+/// make it `unknown`. An event arriving first settles it just the same.
+#[tokio::test]
+async fn an_ses_event_settles_a_send_whose_outcome_was_never_recorded() {
+    let h = api_harness().await;
+    let message_id = queued(&h, &body()).await;
+    let claimed = h
+        .state
+        .mailbox
+        .claim_send(&message_id, at("2026-01-01T00:00:00.000Z"))
+        .await
+        .unwrap()
+        .unwrap();
+    h.state
+        .mailbox
+        .note_ses_call(&claimed, at("2026-01-01T00:00:01.000Z"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // `Send` carries no label of its own; it is still SES saying it has it.
+    tagged_ses_event(&h, "Send", "ses-real-id", &message_id).await;
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Sent);
+    let message = stored_message(&h, &message_id).await;
+    assert!(message.labels.contains(&"sent".to_owned()));
+
+    // The sweep then has nothing left to recover.
+    let report = sweep(&h.state, at("2026-01-01T01:00:00.000Z"))
+        .await
+        .unwrap();
+    assert_eq!(report.marked_unknown, 0);
+    assert_eq!(report.unknown, 0);
+}
+
+/// A tag is only a claim by whoever sent the mail, and other senders share
+/// the configuration set. An event cannot settle a send this service has not
+/// itself offered to SES.
+#[tokio::test]
+async fn an_ses_event_cannot_settle_a_send_that_never_reached_ses() {
+    let h = api_harness().await;
+    let waiting = queued(&h, &body()).await;
+    let claimed = queued(&h, &body()).await;
+    h.state
+        .mailbox
+        .claim_send(&claimed, at("2026-01-01T00:00:00.000Z"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    tagged_ses_event(&h, "Delivery", "ses-forged-1", &waiting).await;
+    tagged_ses_event(&h, "Delivery", "ses-forged-2", &claimed).await;
+
+    assert_eq!(state_of(&h, &waiting).send_status, SendStatus::Queued);
+    assert_eq!(state_of(&h, &claimed).send_status, SendStatus::Sending);
+    for message_id in [&waiting, &claimed] {
+        let message = stored_message(&h, message_id).await;
+        assert!(message.labels.contains(&"queued".to_owned()));
+        assert!(!message.labels.contains(&"delivered".to_owned()));
+    }
+}
+
+/// SES raises `Reject` for a message it took but never tried to deliver, so
+/// it is no proof of a send; the send stays with the operator.
+#[tokio::test]
+async fn an_ses_reject_event_does_not_settle_an_unknown_send() {
+    let h = api_harness().await;
+    let message_id = stuck_unknown(&h).await;
+
+    tagged_ses_event(&h, "Reject", "ses-real-id", &message_id).await;
+
+    assert_eq!(state_of(&h, &message_id).send_status, SendStatus::Unknown);
+}
+
 #[tokio::test]
 async fn an_operator_can_send_an_unknown_message_again() {
     let h = api_harness().await;

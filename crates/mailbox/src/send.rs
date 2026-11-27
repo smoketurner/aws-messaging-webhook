@@ -60,6 +60,11 @@ impl SendStatus {
     }
 }
 
+/// The SES message tag every send carries its message id under. SES repeats
+/// a message's tags on each event it publishes for it, which is how an event
+/// names the send it belongs to even when SES's own id was never recorded.
+pub const SES_MESSAGE_TAG: &str = "mailbox_message";
+
 /// The real recipient lists, as given.
 ///
 /// Kept apart from the message item's display lists, which are capped for

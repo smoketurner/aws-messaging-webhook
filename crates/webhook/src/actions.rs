@@ -10,13 +10,15 @@ use std::future::Future;
 
 use crate::mail::ingest::IngestOutcome;
 use crate::mail::objects::ObjectError;
+use crate::mail::sender;
 use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
 use crate::store::Delivery;
-use mailbox::SesMessageId;
+use mailbox::time;
 use mailbox::time::Timestamp;
+use mailbox::{MessageId, SesMessageId};
 use mailbox_store::MailStoreError;
 
 /// How an action failure affects the request, per the SNS retry contract.
@@ -221,7 +223,8 @@ pub(crate) fn keyword_intent(keyword: Option<&str>, body: Option<&str>) -> Keywo
 }
 
 /// Labels the mailbox message an SES event belongs to, when it belongs to
-/// one.
+/// one, first settling its send as sent if this service never recorded
+/// SES's answer ([`sender::confirm_sent`]).
 ///
 /// Most events on the configuration set are for mail this service did not
 /// send, so an unresolved id is the ordinary case and not a failure. The
@@ -233,20 +236,49 @@ async fn apply_delivery_label<B: Backend>(
     event: &SesNotification,
     at: Timestamp,
 ) -> Result<bool, ActionError> {
-    let Some(label) = event.kind.mailbox_label() else {
-        return Ok(false);
-    };
     // Mail is only tracked when the mailbox is configured.
     if state.config.mail.is_none() {
         return Ok(false);
     }
+    let label = event.kind.mailbox_label();
+    // The message id the sender tagged the mail with, when this event can
+    // stand as proof that SES accepted it.
+    let tagged = event
+        .mail
+        .mailbox_message()
+        .filter(|_| event.kind.confirms_send());
+    if label.is_none() && tagged.is_none() {
+        return Ok(false);
+    }
 
-    let resolved = state
+    let ses_message_id = SesMessageId::new(event.mail.message_id.as_str());
+    let mut resolved = state
         .mailbox
-        .resolve_ses_message(&SesMessageId::new(event.mail.message_id.as_str()))
+        .resolve_ses_message(&ses_message_id)
         .await
         .map_err(ActionError::from)?;
+    // SES's id is recorded by the write that marks a send sent. When that
+    // write never landed the id resolves to nothing, but the event is itself
+    // SES saying it has the message: settle the send from it.
+    if resolved.is_none()
+        && let Some(tagged) = tagged
+    {
+        // When SES took the message, which is when it was sent.
+        let accepted_at = event
+            .mail
+            .timestamp
+            .as_deref()
+            .and_then(time::parse_rfc3339)
+            .unwrap_or(at);
+        resolved =
+            sender::confirm_sent(state, &MessageId::new(tagged), &ses_message_id, accepted_at)
+                .await
+                .map_err(ActionError::from)?;
+    }
     let Some((inbox, message_id)) = resolved else {
+        return Ok(false);
+    };
+    let Some(label) = label else {
         return Ok(false);
     };
 

@@ -10,6 +10,7 @@ use aws_sdk_sesv2::types::{
 };
 use aws_smithy_types::Blob;
 use aws_smithy_types::error::display::DisplayErrorContext;
+use mailbox::send::SES_MESSAGE_TAG;
 
 use crate::actions::{ActionError, RawSend, SendOutcome, SesApi, SuppressionReason};
 use crate::aws::FromSdkFailure as _;
@@ -73,7 +74,7 @@ impl SesApi for SesClient {
             }
         };
         let tag = match MessageTag::builder()
-            .name("mailbox_message")
+            .name(SES_MESSAGE_TAG)
             .value(request.message_id)
             .build()
         {
