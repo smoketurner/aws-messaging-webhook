@@ -18,6 +18,7 @@ use mailbox::time;
 use mailbox::time::Timestamp;
 use mailbox::{MessageId, ThreadId};
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_messaging_webhook::allowlist::TopicAllowlist;
@@ -94,7 +95,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
         ),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
     assert_eq!(status, StatusCode::OK);
 
     let message_id = expected_message_id("ses-1", TS);
@@ -133,7 +134,7 @@ async fn plain_message_ingests_and_creates_a_thread() {
 
     // The item and its thread expire with the bucket's lifecycle.
     let retention_secs = 365 * 86_400;
-    let now_secs = time::unix_ms(Timestamp::now()) / 1_000;
+    let now_secs = time::unix_seconds(Timestamp::now());
     assert!(
         stored.expires_at > now_secs + retention_secs - 60
             && stored.expires_at <= now_secs + retention_secs,
@@ -187,7 +188,7 @@ async fn inline_image_in_multipart_mixed_ingests_without_polluting_the_text_body
         ),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
     assert_eq!(status, StatusCode::OK);
 
     let message_id = expected_message_id("ses-1", TS);
@@ -283,7 +284,7 @@ async fn a_giant_references_id_stores_a_readable_content_document() {
             "PASS",
         ),
     );
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
     assert_eq!(status, StatusCode::OK, "ingest should accept the message");
 
     let message_id = expected_message_id("ses-1", TS);
@@ -345,7 +346,7 @@ async fn a_giant_message_id_is_capped_and_ingested_instead_of_dropped() {
             "PASS",
         ),
     );
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
     assert_eq!(status, StatusCode::OK, "ingest should accept the message");
 
     let message_id = expected_message_id("ses-1", TS);
@@ -407,7 +408,7 @@ async fn direct_sns_invocation_also_ingests() {
         ),
     );
 
-    let result = invoke(h.state.clone(), direct_sns_event(&envelope)).await;
+    let result = invoke(Arc::clone(&h.state), direct_sns_event(&envelope)).await;
     assert!(result.is_ok(), "{result:?}");
 
     let message_id = expected_message_id("ses-1", TS);
@@ -454,7 +455,7 @@ async fn reply_threads_under_its_parent() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &first).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &first).await,
         StatusCode::OK
     );
     let parent_id = expected_message_id("ses-1", TS);
@@ -474,7 +475,7 @@ async fn reply_threads_under_its_parent() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &second).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &second).await,
         StatusCode::OK
     );
     let reply_id = expected_message_id("ses-2", reply_ts);
@@ -517,7 +518,7 @@ async fn spam_message_gets_the_spam_label() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
 
@@ -558,7 +559,7 @@ async fn unauthenticated_message_gets_the_unauthenticated_label() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
 
@@ -600,7 +601,7 @@ async fn redelivery_is_idempotent() {
     );
 
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
     // Redelivery: every target inbox already has the (deterministic) id, so
@@ -609,7 +610,7 @@ async fn redelivery_is_idempotent() {
         .objects
         .inject("inbound/msg-1", ObjectFailure::Permanent);
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK,
         "a redelivery must not re-fetch the (now-failing) raw object"
     );
@@ -627,7 +628,7 @@ async fn missing_s3_pointer_skips() {
         }),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
     // No S3 pointer means nothing was ever fetched or inserted; a configured
@@ -655,7 +656,7 @@ async fn wrong_bucket_is_a_permanent_skip() {
     // The status is 200 (skips are a success outcome), and nothing is fetched
     // from the (unseeded, and therefore would-404) real bucket key.
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
     let message_id = expected_message_id("ses-1", TS);
@@ -688,7 +689,7 @@ async fn missing_object_is_a_permanent_failure_but_still_200() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK,
         "a permanent ingest failure is logged and counted, not surfaced as a 5xx"
     );
@@ -724,7 +725,7 @@ async fn transient_s3_error_returns_500() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
@@ -748,7 +749,7 @@ async fn the_ses_setup_notification_is_acknowledged_and_ignored() {
         ),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -787,7 +788,7 @@ async fn a_message_reusing_a_known_message_id_joins_that_thread() {
             ),
         );
         assert_eq!(
-            post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+            post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
             StatusCode::OK
         );
     }
@@ -832,7 +833,7 @@ async fn only_the_configured_inbox_receives_a_multi_recipient_message() {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
 
@@ -1187,11 +1188,11 @@ fn threaded_eml(message_id: &str, in_reply_to: Option<&str>, references: &[&str]
          Message-ID: <{message_id}>\r\n"
     );
     if let Some(parent) = in_reply_to {
-        let _ = write!(headers, "In-Reply-To: <{parent}>\r\n");
+        write!(headers, "In-Reply-To: <{parent}>\r\n").unwrap();
     }
     if !references.is_empty() {
         let list: Vec<String> = references.iter().map(|id| format!("<{id}>")).collect();
-        let _ = write!(headers, "References: {}\r\n", list.join(" "));
+        write!(headers, "References: {}\r\n", list.join(" ")).unwrap();
     }
     Bytes::from(format!(
         "{headers}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHi.\r\n"
@@ -1219,7 +1220,7 @@ async fn deliver_and_thread(h: &Harness, n: u32, raw: Bytes) -> String {
         ),
     );
     assert_eq!(
-        post(h.state.clone(), "/webhooks/ses/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await,
         StatusCode::OK
     );
     let inbox = mailbox::InboxId::new("support@example.com");

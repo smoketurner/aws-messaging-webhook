@@ -1,19 +1,23 @@
 //! A `/v0` client over the real router: the request helpers every mailbox
 //! API test drives. [`get`], [`post`] and [`patch`] authenticate with
-//! [`TEST_API_KEY`](crate::TEST_API_KEY); [`call`] sends exactly the headers
+//! [`TEST_API_KEY`]; [`call`] sends exactly the headers
 //! it is given, for the unauthenticated cases.
 
 use aws_messaging_webhook::app;
 use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt as _;
 
 use crate::{Harness, TEST_API_KEY};
 
 /// Sends `request` through the router and returns the status and raw body.
 pub async fn send(h: &Harness, request: Request<Body>) -> (StatusCode, Bytes) {
-    let response = app::app(h.state.clone()).oneshot(request).await.unwrap();
+    let response = app::app(Arc::clone(&h.state))
+        .oneshot(request)
+        .await
+        .unwrap();
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

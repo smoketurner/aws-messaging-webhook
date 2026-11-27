@@ -122,7 +122,7 @@ pub(crate) async fn fetch_and_parse(
     // `bytes()` would already have buffered all of it.
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > MAX_CERT_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > MAX_CERT_RESPONSE_BYTES {
             return Err(VerifyError::CertParse(
                 "certificate response too large".to_owned(),
             ));

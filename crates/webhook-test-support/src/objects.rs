@@ -221,7 +221,7 @@ impl ObjectStore for FakeObjectStore {
                     true
                 }
                 Some(n) => {
-                    *guard = Some(n - 1);
+                    *guard = Some(n.saturating_sub(1));
                     false
                 }
                 None => false,
@@ -274,7 +274,7 @@ impl ObjectStore for FakeObjectStore {
         }
         let mut url =
             format!("https://example-bucket.s3.amazonaws.test/{key}?X-Amz-Signature=fake");
-        let _ = write!(url, "&X-Amz-Expires={}", ttl.as_secs());
+        write!(url, "&X-Amz-Expires={}", ttl.as_secs()).unwrap();
         if let Some(disposition) = disposition {
             url.push_str("&response-content-disposition=");
             url.push_str(&urlencode(disposition));
@@ -295,10 +295,7 @@ fn urlencode(value: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(char::from(*byte));
         } else {
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            out.push('%');
-            out.push(char::from(HEX[usize::from(byte >> 4)]));
-            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            write!(out, "%{byte:02X}").unwrap();
         }
     }
     out
@@ -428,7 +425,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         hung.abort();
-        let _ = hung.await;
+        assert!(hung.await.unwrap_err().is_cancelled());
 
         assert_eq!(
             store.call_count(Op::Put, "k"),

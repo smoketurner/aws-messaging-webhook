@@ -249,5 +249,6 @@ pub(crate) fn context_deadline(ctx: &Context) -> tokio::time::Instant {
         .deadline()
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO);
-    tokio::time::Instant::now() + remaining
+    let now = tokio::time::Instant::now();
+    now.checked_add(remaining).unwrap_or(now)
 }

@@ -12,7 +12,7 @@ use super::ses_notification::{SesCommonHeaders, SesMail};
 pub struct SesInboundNotification {
     /// Always `Received`.
     pub notification_type: String,
-    pub mail: super::ses_notification::SesMail,
+    pub mail: SesMail,
     pub receipt: SesReceipt,
 }
 
@@ -240,7 +240,7 @@ mod tests {
             r#"{"notificationType":"Received","receipt":{},"mail":{"messageId":"m1"}}"#,
         )
         .unwrap();
-        assert_eq!(event.receipt.recipients, [] as [String; 0]);
+        assert_eq!(event.receipt.recipients, Vec::<String>::new());
         assert_eq!(event.receipt.timestamp, None);
     }
 

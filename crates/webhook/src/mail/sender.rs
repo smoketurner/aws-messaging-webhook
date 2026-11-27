@@ -356,8 +356,8 @@ pub struct SweepReport {
 /// already have been delivered, so it becomes `unknown` for an operator:
 /// releasing it could send the message twice. A release that never reaches
 /// SES bumps `transient_failures`, and once that would exceed
-/// [`MAX_TRANSIENT_FAILURES`] the send is failed instead of requeued — the
-/// same cap [`hand_back`] enforces on the live retry path — so a send whose
+/// `MAX_TRANSIENT_FAILURES` the send is failed instead of requeued — the
+/// same cap `hand_back` enforces on the live retry path — so a send whose
 /// sender is repeatedly killed during load cannot loop forever.
 ///
 /// Sends in `unknown` are counted and left alone. A stuck send that cannot be
@@ -388,7 +388,7 @@ pub async fn sweep<B: Backend>(
         // A claim dated after the sweep's own time has been held for no time.
         let held = Duration::try_from(at.duration_since(claimed_at)).unwrap_or_default();
         if held < CLAIM_STALE_AFTER {
-            report.still_working += 1;
+            report.still_working = report.still_working.saturating_add(1);
             continue;
         }
 
@@ -401,8 +401,8 @@ pub async fn sweep<B: Backend>(
             );
             record(state, &stuck, MarkOutcome::Unknown, now)
                 .await
-                .map(|()| report.marked_unknown += 1)
-        } else if stuck.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
+                .map(|()| report.marked_unknown = report.marked_unknown.saturating_add(1))
+        } else if stuck.transient_failures.saturating_add(1) >= MAX_TRANSIENT_FAILURES {
             // The sender vanished before it called SES, and this is not the
             // first time: a release would requeue and the next sweep would
             // release again, looping forever. `hand_back` enforces this same
@@ -422,7 +422,7 @@ pub async fn sweep<B: Backend>(
             )
             .await
             .map(|()| {
-                report.abandoned += 1;
+                report.abandoned = report.abandoned.saturating_add(1);
                 metrics::counter!(names::SEND_FAILURES).increment(1);
             })
         } else {
@@ -434,10 +434,10 @@ pub async fn sweep<B: Backend>(
             );
             record(state, &stuck, MarkOutcome::Released, now)
                 .await
-                .map(|()| report.released += 1)
+                .map(|()| report.released = report.released.saturating_add(1))
         };
         if let Err(error) = result {
-            report.errors += 1;
+            report.errors = report.errors.saturating_add(1);
             tracing::warn!(
                 message_id = %stuck.message_id,
                 error = ?error,
@@ -467,7 +467,7 @@ pub async fn sweep<B: Backend>(
 /// Claims `message_id`, sends it, and records the outcome.
 ///
 /// `deadline` is when the invocation ends. Loading the send must finish
-/// [`SEND_RESERVE`] before it, which is what keeps a slow attachment from
+/// `SEND_RESERVE` before it, which is what keeps a slow attachment from
 /// getting the invocation killed while it holds the claim.
 ///
 /// # Errors
@@ -693,9 +693,9 @@ async fn mark_sent<B: Backend>(
         .mail
         .as_ref()
         .ok_or(SenderError::NotConfigured)?;
-    let mut attempt = 0;
+    let mut attempt: u32 = 0;
     loop {
-        attempt += 1;
+        attempt = attempt.saturating_add(1);
         let result = state
             .mailbox
             .mark_send(
@@ -757,7 +757,7 @@ async fn hand_back<B: Backend>(
     now: Timestamp,
     deadline: Instant,
 ) -> Result<Handled, SenderError> {
-    if claimed.transient_failures + 1 >= MAX_TRANSIENT_FAILURES {
+    if claimed.transient_failures.saturating_add(1) >= MAX_TRANSIENT_FAILURES {
         return fail(state, claimed, failure, now).await;
     }
     let delay = Duration::from_secs(1 << claimed.transient_failures.min(4));
@@ -774,7 +774,10 @@ async fn wait_before_retry(delay: Duration, deadline: Instant) {
     let latest = deadline
         .checked_sub(RELEASE_RESERVE)
         .unwrap_or_else(Instant::now);
-    tokio::time::sleep_until((Instant::now() + delay).min(latest)).await;
+    let wake = Instant::now()
+        .checked_add(delay)
+        .map_or(latest, |at| at.min(latest));
+    tokio::time::sleep_until(wake).await;
 }
 
 /// Records an outcome for a send and disposes of what that outcome makes

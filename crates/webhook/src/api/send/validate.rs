@@ -165,7 +165,7 @@ pub(crate) fn validate(request: SendRequest) -> Result<ValidatedSend, ApiError> 
     let bcc = addresses(request.bcc, "bcc", &mut errors);
     let reply_to = addresses(request.reply_to, "reply_to", &mut errors);
 
-    let recipients = to.len() + cc.len() + bcc.len();
+    let recipients = to.len().saturating_add(cc.len()).saturating_add(bcc.len());
     if recipients == 0 {
         errors.push(FieldError::new(
             "to",
@@ -325,7 +325,9 @@ fn headers(
             ));
             continue;
         }
-        budget += trimmed.len() + value.len();
+        budget = budget
+            .saturating_add(trimmed.len())
+            .saturating_add(value.len());
         out.insert(trimmed.to_owned(), value);
     }
 
@@ -424,7 +426,7 @@ fn attachments(
 
         let source = attachment_source(&attachment, &path, errors);
         if let Some(AttachmentSource::Inline(bytes)) = &source {
-            decoded_bytes += bytes.len() as u64;
+            decoded_bytes = decoded_bytes.saturating_add(bytes.len() as u64);
         }
 
         if let Some(filename) = &attachment.filename {
@@ -539,7 +541,7 @@ mod tests {
         assert_eq!(send.to, vec!["to@example.com"]);
         assert_eq!(send.subject, "Hello");
         assert_eq!(send.text.as_deref(), Some("body"));
-        assert_eq!(send.attachments, [] as [ValidatedAttachment; 0]);
+        assert_eq!(send.attachments, Vec::<ValidatedAttachment>::new());
     }
 
     #[test]
@@ -855,13 +857,11 @@ mod tests {
     #[test]
     fn inline_content_is_decoded_and_whitespace_is_tolerated() {
         let mut request = minimal();
+        let encoded = STANDARD.encode("hello world");
+        let (head, tail) = encoded.split_at(8);
         request.attachments = Some(vec![AttachmentInput {
             // Wrapped the way a mail client would wrap it.
-            content: Some(format!(
-                "{}\r\n{}",
-                &STANDARD.encode("hello world")[..8],
-                &STANDARD.encode("hello world")[8..]
-            )),
+            content: Some(format!("{head}\r\n{tail}")),
             url: None,
             filename: Some("a.txt".to_owned()),
             content_type: Some("text/plain".to_owned()),

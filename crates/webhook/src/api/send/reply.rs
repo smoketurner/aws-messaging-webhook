@@ -33,10 +33,12 @@ pub(super) fn threading_references(
     // Keep the oldest and the most recent, which is what threading actually
     // relies on, and drop the middle when the chain runs long.
     if references.len() > REFERENCES_MAX {
-        let keep_from = references.len() - (REFERENCES_MAX - 1);
-        let mut trimmed = vec![references[0].clone()];
-        trimmed.extend_from_slice(&references[keep_from..]);
-        references = trimmed;
+        let keep_from = references
+            .len()
+            .saturating_sub(REFERENCES_MAX.saturating_sub(1));
+        let mut recent = references.split_off(keep_from);
+        references.truncate(1);
+        references.append(&mut recent);
     }
     references
 }

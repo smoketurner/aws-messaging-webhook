@@ -294,6 +294,7 @@ impl MailMemoryStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[expect(
             clippy::unwrap_used,
+            clippy::unwrap_in_result,
             reason = "test double: a poisoned lock is a test bug"
         )]
         let mut guard = self.inner.lock().unwrap();
@@ -365,6 +366,7 @@ impl MailMemoryStore {
         let (pk_attr, sk_attr) = query.index.key_attributes();
         #[expect(
             clippy::unwrap_used,
+            clippy::unwrap_in_result,
             reason = "test double: a poisoned lock is a test bug"
         )]
         let guard = self.inner.lock().unwrap();

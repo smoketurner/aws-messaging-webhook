@@ -64,10 +64,10 @@ impl IngestOutcome {
 ///
 /// # Errors
 ///
-/// Returns [`ActionError::Transient`] for an S3 or store transient failure,
-/// or when the deadline elapses — a 5xx, so SNS or the async-invoke queue
-/// redelivers. Returns [`ActionError::Permanent`] for a missing or malformed
-/// object, a size or label cap violation, or throttling that outlasts the
+/// Returns an [`ActionError`] of kind [`ActionErrorKind::Transient`] for an
+/// S3 or store transient failure, or when the deadline elapses — a 5xx, so
+/// SNS or the async-invoke queue redelivers. Returns one of kind
+/// [`ActionErrorKind::Permanent`] for a missing or malformed object, a size or label cap violation, or throttling that outlasts the
 /// transaction retry budget; those are logged and counted, and the inbound
 /// event still publishes.
 pub async fn ingest_inbound<B: Backend>(
@@ -676,7 +676,9 @@ async fn resume_filtered<'a, B: Backend>(
     message_id: &MessageId,
     attachments: &'a [(String, ParsedAttachment)],
 ) -> Result<Vec<&'a (String, ParsedAttachment)>, ActionError> {
-    let (first_id, _) = &attachments[0];
+    let Some((first_id, _)) = attachments.first() else {
+        return Ok(Vec::new());
+    };
     let first_present = state
         .objects
         .head_object(&object_keys::attachment(message_id, first_id))

@@ -7,6 +7,7 @@ use aws_messaging_webhook::allowlist::TopicAllowlist;
 use mailbox::test_fixtures::at;
 use mailbox::time::{self, Timestamp};
 use sns_message_verifier::fixtures::SnsFixture;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use aws_messaging_webhook::actions::ActionErrorKind;
@@ -30,7 +31,7 @@ async fn valid_notification_persists() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     // The request path persists only; the stream relay publishes.
@@ -48,7 +49,7 @@ async fn mis_wired_topic_still_classifies_correctly() {
     // family_mismatch warning) instead of degrading to unknown.
     let body = wrapped(&h, &inbound_sms("HELLO"));
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     // The family comes from the payload shape, so it persists under the
@@ -63,10 +64,10 @@ async fn tampered_signature_rejected_and_nothing_touched() {
     h.fixture.sign(&mut body, "1");
     body["Message"] = json!("tampered");
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -81,10 +82,10 @@ async fn unlisted_topic_rejected_before_any_verification_work() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "1");
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
     h.server.verify().await;
 }
 
@@ -94,7 +95,7 @@ async fn missing_sns_header_is_bad_request() {
     let request = Request::post("/webhooks/ses/events")
         .body(Body::from("{}"))
         .unwrap();
-    let status = app(h.state.clone())
+    let status = app(Arc::clone(&h.state))
         .oneshot(request)
         .await
         .unwrap()
@@ -106,13 +107,13 @@ async fn missing_sns_header_is_bad_request() {
 async fn non_json_body_is_bad_request() {
     let h = harness().await;
     let status = post(
-        h.state.clone(),
+        Arc::clone(&h.state),
         "/webhooks/ses/events",
         &json!("not an envelope"),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -121,7 +122,7 @@ async fn duplicate_delivery_still_runs_the_idempotent_action() {
     *h.state.events.persist_outcome.lock().unwrap() = Some(PersistOutcome::Duplicate);
     let body = wrapped(&h, &inbound_sms("STOP"));
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     // A redelivery re-runs the (idempotent) action so a crash before the first
     // attempt's action cannot lose it. Publishing is the stream relay's job.
@@ -142,7 +143,7 @@ async fn persist_failure_returns_500_for_redelivery() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "1");
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(h.calls().len(), 1);
@@ -161,7 +162,7 @@ async fn subscription_confirmation_gets_the_subscribe_url() {
     body["SubscribeURL"] = json!(format!("{}/confirm", h.server.uri()));
     h.fixture.sign(&mut body, "1");
 
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(h.calls().is_empty(), "confirmations are not persisted");
@@ -182,7 +183,7 @@ async fn unsubscribe_confirmation_resubscribes_and_publishes_notice() {
     body["SubscribeURL"] = json!(format!("{}/confirm", h.server.uri()));
     h.fixture.sign(&mut body, "1");
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.calls(), vec!["publish:subscription.changed".to_owned()]);
@@ -211,10 +212,10 @@ async fn auto_resubscribe_disabled_leaves_unsubscribe_alone() {
     body["SubscribeURL"] = json!(format!("{}/confirm", h.server.uri()));
     h.fixture.sign(&mut body, "1");
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
     h.server.verify().await;
 }
 
@@ -230,7 +231,7 @@ async fn failed_confirmation_get_returns_500_so_sns_retries() {
     body["SubscribeURL"] = json!(format!("{}/confirm", h.server.uri()));
     h.fixture.sign(&mut body, "1");
 
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
@@ -239,7 +240,7 @@ async fn failed_confirmation_get_returns_500_so_sns_retries() {
 async fn healthz_responds_ok() {
     let h = harness().await;
     let request = Request::get("/healthz").body(Body::empty()).unwrap();
-    let response = app(h.state.clone()).oneshot(request).await.unwrap();
+    let response = app(Arc::clone(&h.state)).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -258,7 +259,7 @@ async fn stop_keyword_opts_out() {
     let h = harness().await;
     let body = wrapped(&h, &inbound_sms("STOP"));
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -275,7 +276,7 @@ async fn start_keyword_opts_back_in() {
     let h = harness().await;
     let body = wrapped(&h, &inbound_sms("START"));
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(h.calls().contains(&"opt_in:+14255550182".to_owned()));
@@ -290,7 +291,7 @@ async fn keyword_without_opt_out_list_configured_is_forwarded_only() {
     .await;
     let body = wrapped(&h, &inbound_sms("STOP"));
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -311,7 +312,7 @@ async fn ordinary_inbound_sms_takes_no_action() {
     });
     let body = wrapped(&h, &inner);
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.calls(), vec!["persist:in-msg-2".to_owned()]);
@@ -323,7 +324,7 @@ async fn delivered_dlr_reports_received_feedback() {
     let inner = json!({"eventType": "TEXT_DELIVERED", "messageId": "out-1", "isFinal": true});
     let body = wrapped(&h, &inner);
 
-    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -340,7 +341,7 @@ async fn failed_dlr_reports_failed_feedback() {
         json!({"eventType": "TEXT_CARRIER_UNREACHABLE", "messageId": "out-2", "isFinal": true});
     let body = wrapped(&h, &inner);
 
-    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(h.calls().contains(&"feedback:out-2:Failed".to_owned()));
@@ -352,7 +353,7 @@ async fn intermediate_dlr_sends_no_feedback() {
     let inner = json!({"eventType": "TEXT_QUEUED", "messageId": "out-3", "isFinal": false});
     let body = wrapped(&h, &inner);
 
-    let status = post(h.state.clone(), "/webhooks/sms/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -382,7 +383,7 @@ async fn permanent_bounce_suppresses_every_recipient() {
         &ses_bounce("Permanent", &["a@example.com", "b@example.com"]),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -398,7 +399,7 @@ async fn transient_bounce_is_not_suppressed() {
     let h = harness().await;
     let body = wrapped(&h, &ses_bounce("Transient", &["a@example.com"]));
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -418,7 +419,7 @@ async fn complaint_suppresses_recipients() {
     });
     let body = wrapped(&h, &inner);
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -459,7 +460,7 @@ async fn permanent_suppression_failure_for_one_bounce_recipient_continues_to_oth
         ),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     // A permanent per-recipient failure is logged and swallowed; the event
     // is still persisted (and published by the stream relay).
@@ -495,7 +496,7 @@ async fn permanent_suppression_failure_for_one_complaint_recipient_continues_to_
         &ses_complaint(&["c@example.com", "bad-address", "d@example.com"]),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     let calls = h.calls();
@@ -520,7 +521,7 @@ async fn transient_suppression_failure_fails_fast_and_returns_500() {
         &ses_bounce("Permanent", &["a@example.com", "b@example.com"]),
     );
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let calls = h.calls();
@@ -535,6 +536,10 @@ async fn transient_suppression_failure_fails_fast_and_returns_500() {
     assert!(calls.contains(&"persist:ses-msg-1".to_owned()));
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test: JSON indexing; a panic here is the test failing"
+)]
 fn ses_inbound(virus_status: &str, content: Option<&str>) -> Value {
     let mut inner = json!({
         "notificationType": "Received",
@@ -556,7 +561,7 @@ async fn clean_inbound_email_persists() {
     let h = harness().await;
     let body = wrapped(&h, &ses_inbound("PASS", Some("Subject: hi\r\n\r\nhello")));
 
-    let status = post(h.state.clone(), "/webhooks/ses/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/inbound", &body).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(h.calls().contains(&"persist:inbound-msg-1".to_owned()));
@@ -568,7 +573,7 @@ async fn transient_action_failure_returns_500() {
     *h.state.sms.action_error.lock().unwrap() = Some(ActionErrorKind::Transient);
     let body = wrapped(&h, &inbound_sms("STOP"));
 
-    let status = post(h.state.clone(), "/webhooks/sms/inbound", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(h.calls().contains(&"opt_out:+14255550182".to_owned()));
@@ -580,7 +585,7 @@ async fn redelivery_after_transient_action_failure_reruns_the_action() {
     *h.state.sms.action_error.lock().unwrap() = Some(ActionErrorKind::Transient);
     let body = wrapped(&h, &inbound_sms("STOP"));
     assert_eq!(
-        post(h.state.clone(), "/webhooks/sms/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
 
@@ -588,7 +593,7 @@ async fn redelivery_after_transient_action_failure_reruns_the_action() {
     *h.state.sms.action_error.lock().unwrap() = None;
     *h.state.events.persist_outcome.lock().unwrap() = Some(PersistOutcome::Duplicate);
     assert_eq!(
-        post(h.state.clone(), "/webhooks/sms/inbound", &body).await,
+        post(Arc::clone(&h.state), "/webhooks/sms/inbound", &body).await,
         StatusCode::OK
     );
 
@@ -606,7 +611,7 @@ async fn permanent_action_failure_still_persists() {
     *h.state.ses.action_error.lock().unwrap() = Some(ActionErrorKind::Permanent);
     let body = wrapped(&h, &ses_bounce("Permanent", &["a@example.com"]));
 
-    let status = post(h.state.clone(), "/webhooks/ses/events", &body).await;
+    let status = post(Arc::clone(&h.state), "/webhooks/ses/events", &body).await;
 
     // A permanent action failure is logged and swallowed; the event is still
     // durably persisted (and will be published by the stream relay).
@@ -635,7 +640,7 @@ async fn transient_cert_fetch_failure_returns_500_not_403() {
         TopicAllowlist::parse(webhook_test_support::ALLOWED_ACCOUNT),
         Some(server.uri()),
     );
-    let state = std::sync::Arc::new(state);
+    let state = Arc::new(state);
     let mut body = notification(&cert_url);
     fixture.sign(&mut body, "2");
 
@@ -650,7 +655,7 @@ async fn direct_invoke_persists() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
 
-    let result = invoke(h.state.clone(), direct_sns_event(&body))
+    let result = invoke(Arc::clone(&h.state), direct_sns_event(&body))
         .await
         .unwrap();
 
@@ -671,7 +676,7 @@ async fn direct_invoke_processes_every_record() {
     h.fixture.sign(&mut second, "2");
     let payload = json!({ "Records": [direct_sns_record(&first), direct_sns_record(&second)] });
 
-    invoke(h.state.clone(), payload).await.unwrap();
+    invoke(Arc::clone(&h.state), payload).await.unwrap();
 
     let persists = h
         .calls()
@@ -690,10 +695,10 @@ async fn direct_invoke_tampered_signature_is_dropped_not_retried() {
 
     // A 4xx-class rejection must complete the invocation (Ok): failing it
     // would ask Lambda to redeliver a permanently rejected message.
-    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+    let result = invoke(Arc::clone(&h.state), direct_sns_event(&body)).await;
 
     assert!(result.is_ok());
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -707,10 +712,10 @@ async fn direct_invoke_unlisted_topic_rejected_before_any_verification_work() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
 
-    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+    let result = invoke(Arc::clone(&h.state), direct_sns_event(&body)).await;
 
     assert!(result.is_ok());
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
     h.server.verify().await;
 }
 
@@ -721,7 +726,7 @@ async fn direct_invoke_classifies_by_payload_shape() {
     // canonical path reported to consumers) comes from the payload alone.
     let body = wrapped(&h, &inbound_sms("HELLO"));
 
-    invoke(h.state.clone(), direct_sns_event(&body))
+    invoke(Arc::clone(&h.state), direct_sns_event(&body))
         .await
         .unwrap();
 
@@ -735,7 +740,7 @@ async fn direct_invoke_transient_failure_fails_the_invocation_for_retry() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
 
-    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+    let result = invoke(Arc::clone(&h.state), direct_sns_event(&body)).await;
 
     assert!(
         result.is_err(),
@@ -750,7 +755,7 @@ async fn function_url_payload_dispatches_through_the_router() {
     h.fixture.sign(&mut body, "2");
     let payload = function_url_event("/webhooks/ses/events", &body);
 
-    let response = invoke(h.state.clone(), payload).await.unwrap();
+    let response = invoke(Arc::clone(&h.state), payload).await.unwrap();
 
     assert_eq!(response["statusCode"], 200);
     assert_eq!(
@@ -770,7 +775,7 @@ async fn a_function_url_delivery_is_dated_by_the_request_time() {
     // `function_url_event` carries `timeEpoch: 1754265600000`.
     let payload = function_url_event("/webhooks/ses/events", &body);
 
-    invoke(h.state.clone(), payload).await.unwrap();
+    invoke(Arc::clone(&h.state), payload).await.unwrap();
 
     let records = h.state.events.records.lock().unwrap();
     assert_eq!(records[0].received_at, at("2025-08-04T00:00:00.000Z"));
@@ -791,10 +796,10 @@ async fn a_direct_delivery_is_dated_by_the_envelope_timestamp() {
     let mut body = notification(&h.cert_url);
     h.fixture.sign(&mut body, "2");
 
-    invoke(h.state.clone(), direct_sns_event(&body))
+    invoke(Arc::clone(&h.state), direct_sns_event(&body))
         .await
         .unwrap();
-    invoke(h.state.clone(), direct_sns_event(&body))
+    invoke(Arc::clone(&h.state), direct_sns_event(&body))
         .await
         .unwrap();
 
@@ -814,7 +819,7 @@ async fn a_direct_delivery_of_an_old_message_is_retained_from_the_invocation() {
     h.fixture.sign(&mut body, "2");
     let before = time::unix_seconds(Timestamp::now());
 
-    invoke(h.state.clone(), direct_sns_event(&body))
+    invoke(Arc::clone(&h.state), direct_sns_event(&body))
         .await
         .unwrap();
 
@@ -838,18 +843,18 @@ async fn a_direct_delivery_without_a_usable_timestamp_is_dropped_not_retried() {
     body["Timestamp"] = json!("not a timestamp");
     h.fixture.sign(&mut body, "2");
 
-    let result = invoke(h.state.clone(), direct_sns_event(&body)).await;
+    let result = invoke(Arc::clone(&h.state), direct_sns_event(&body)).await;
 
     assert!(result.is_ok());
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
 }
 
 #[tokio::test]
 async fn unrecognized_invoke_payload_is_an_error() {
     let h = harness().await;
-    let result = invoke(h.state.clone(), json!({"hello": "world"})).await;
+    let result = invoke(Arc::clone(&h.state), json!({"hello": "world"})).await;
     assert!(result.is_err());
-    assert_eq!(h.calls(), [] as [String; 0]);
+    assert_eq!(h.calls(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -864,7 +869,7 @@ async fn stream_publishes_persisted_event() {
         "seq-1",
     );
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.state.publisher.published.lock().unwrap();
@@ -880,7 +885,7 @@ async fn stream_skips_aggregate_and_non_event_records() {
     let raw = serde_json::to_vec(&body).unwrap();
     let event = webhook_test_support::dynamodb_insert_event(&raw, "AGG", "seq-agg");
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     assert!(h.state.publisher.published.lock().unwrap().is_empty());
@@ -895,7 +900,7 @@ async fn stream_reports_publish_failure_for_retry() {
     let raw = serde_json::to_vec(&body).unwrap();
     let event = webhook_test_support::dynamodb_insert_event(&raw, "EVT#t#sns-1", "seq-9");
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     // The failed record's sequence number is returned so the ESM retries only
     // it (and, past the retry limit, routes it to the DLQ).
@@ -910,7 +915,7 @@ async fn stream_publishes_status_change_on_transition() {
     let h = harness().await;
     let event = webhook_test_support::dynamodb_agg_event("MODIFY", Some("delivered"), Some("sent"));
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     let published = h.state.publisher.published.lock().unwrap();
@@ -926,7 +931,7 @@ async fn stream_publishes_initial_status_on_aggregate_insert() {
     let h = harness().await;
     let event = webhook_test_support::dynamodb_agg_event("INSERT", Some("sent"), None);
 
-    invoke(h.state.clone(), event).await.unwrap();
+    invoke(Arc::clone(&h.state), event).await.unwrap();
 
     let published = h.state.publisher.published.lock().unwrap();
     assert_eq!(published.len(), 1);
@@ -941,7 +946,7 @@ async fn stream_skips_status_event_when_status_unchanged() {
     let event =
         webhook_test_support::dynamodb_agg_event("MODIFY", Some("delivered"), Some("delivered"));
 
-    let result = invoke(h.state.clone(), event).await.unwrap();
+    let result = invoke(Arc::clone(&h.state), event).await.unwrap();
 
     assert_eq!(result, json!({ "batchItemFailures": [] }));
     assert!(h.state.publisher.published.lock().unwrap().is_empty());

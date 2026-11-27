@@ -420,7 +420,7 @@ impl Table for DynamoTable {
             if attempts > 0 {
                 tokio::time::sleep(Duration::from_millis(50 * u64::from(attempts))).await;
             }
-            attempts += 1;
+            attempts = attempts.saturating_add(1);
 
             let request_items = KeysAndAttributes::builder()
                 .set_keys(Some(pending_keys.clone()))
@@ -581,8 +581,10 @@ impl Table for DynamoTable {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos(),
-        ) % base_ms;
-        tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+        )
+        .checked_rem(base_ms)
+        .unwrap_or_default();
+        tokio::time::sleep(Duration::from_millis(base_ms.saturating_add(jitter_ms))).await;
     }
 }
 
@@ -595,7 +597,7 @@ mod tests {
     use mailbox::{Inbox, InboxId};
     use mailbox::{MessageId, SesMessageId, ThreadId};
 
-    fn alias_put(message_id: Option<&str>) -> aws_sdk_dynamodb::types::Put {
+    fn alias_put(message_id: Option<&str>) -> Put {
         let op = WriteOp::AliasFirstWriter {
             pk: "RFC#support@example.com#a@example.com".to_owned(),
             sk: "RFC".to_owned(),
@@ -766,14 +768,15 @@ mod tests {
         let inbox = InboxId::new("support@example.com");
         // The interceptor short-circuits every request with an error; only
         // the emitted requests are asserted on.
-        let _ = Mailbox::new(&aws).get_inbox(&inbox).await;
-        let _ = Table::get::<Inbox>(
+        Mailbox::new(&aws).get_inbox(&inbox).await.unwrap_err();
+        Table::get::<Inbox>(
             &aws,
             keys::inbox(&inbox),
             Read::Consistent,
             "GetItem(inbox)",
         )
-        .await;
+        .await
+        .unwrap_err();
 
         let requests: Vec<GetItemInput> = captured
             .lock()
@@ -810,19 +813,28 @@ mod tests {
         let inbox = InboxId::new("support@example.com");
 
         let mailbox = Mailbox::new(&aws);
-        let _ = mailbox.get_message(&inbox, &MessageId::new("mid-1")).await;
-        let _ = mailbox.get_send_key("keyhash").await;
-        let _ = mailbox.get_send_state(&MessageId::new("mid-1")).await;
-        let _ = mailbox
+        mailbox
+            .get_message(&inbox, &MessageId::new("mid-1"))
+            .await
+            .unwrap_err();
+        mailbox.get_send_key("keyhash").await.unwrap_err();
+        mailbox
+            .get_send_state(&MessageId::new("mid-1"))
+            .await
+            .unwrap_err();
+        mailbox
             .resolve_ses_message(&SesMessageId::new("ses-1"))
-            .await;
-        let _ = mailbox
+            .await
+            .unwrap_err();
+        mailbox
             .get_thread(&inbox, &ThreadId::new("tid-1"), 10, None)
-            .await;
-        let _ = mailbox
+            .await
+            .unwrap_err();
+        mailbox
             .message_exists(&inbox, &MessageId::new("mid-1"))
-            .await;
-        let _ = mailbox
+            .await
+            .unwrap_err();
+        mailbox
             .update_labels(
                 &inbox,
                 &MessageId::new("mid-1"),
@@ -830,7 +842,8 @@ mod tests {
                 &[],
                 at("2026-01-01T00:00:00.000Z"),
             )
-            .await;
+            .await
+            .unwrap_err();
 
         let requests: Vec<GetItemInput> = captured
             .lock()

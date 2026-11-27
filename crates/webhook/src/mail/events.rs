@@ -276,12 +276,12 @@ pub(crate) fn build_ses_event(
         sns_message_id,
         at,
     );
-    let mut detail = json!({
+    let detail = json!({
         "type": "event",
         "event_type": event_type,
         "event_id": event_id,
+        key: object,
     });
-    detail[key] = object;
     Some(MailEvent {
         detail_type: event_type,
         detail,
@@ -291,7 +291,7 @@ pub(crate) fn build_ses_event(
 /// The detail budget for one entry: the `PutEvents` cap less the
 /// `detail_type` and event `Source` that ride along with it.
 fn entry_cap(detail_type: &str, event_source: &str) -> usize {
-    PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(detail_type.len() + event_source.len())
+    PUT_EVENTS_ENTRY_CAP_BYTES.saturating_sub(detail_type.len().saturating_add(event_source.len()))
 }
 
 /// Keeps only `keep`'s keys of a JSON object.
@@ -761,7 +761,9 @@ mod tests {
     }
 
     fn entry_bytes(event: &MailEvent, event_source: &str) -> usize {
-        detail_bytes(&event.detail) + event.detail_type.len() + event_source.len()
+        detail_bytes(&event.detail)
+            .saturating_add(event.detail_type.len())
+            .saturating_add(event_source.len())
     }
 
     #[test]

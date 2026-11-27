@@ -47,7 +47,11 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> {
         let deadline = parts.lambda_context_ref().map_or_else(
-            || tokio::time::Instant::now() + Duration::from_secs(FALLBACK_DEADLINE_SECS),
+            || {
+                let now = tokio::time::Instant::now();
+                now.checked_add(Duration::from_secs(FALLBACK_DEADLINE_SECS))
+                    .unwrap_or(now)
+            },
             context_deadline,
         );
         std::future::ready(Ok(Self(deadline)))

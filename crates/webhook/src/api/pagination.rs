@@ -174,7 +174,7 @@ impl ListRequest {
             filters: Filters::default(),
         };
         // Absent flags default to false, which excludes the label.
-        let mut include: [bool; 4] = [false; 4];
+        let mut include = [false; INCLUDE_FLAGS.len()];
 
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             let value = value.trim().to_owned();
@@ -208,9 +208,13 @@ impl ListRequest {
                 "to" => push_non_empty(&mut request.filters.to, value),
                 "subject" => push_non_empty(&mut request.filters.subject, value),
                 other => {
-                    if let Some(index) = INCLUDE_FLAGS.iter().position(|(flag, _)| *flag == other) {
+                    if let Some((_, slot)) = INCLUDE_FLAGS
+                        .iter()
+                        .zip(include.iter_mut())
+                        .find(|((flag, _), _)| *flag == other)
+                    {
                         match parse_bool(&value) {
-                            Some(on) => include[index] = on,
+                            Some(on) => *slot = on,
                             None => errors
                                 .push(FieldError::new(other.to_owned(), "must be true or false")),
                         }
@@ -228,8 +232,8 @@ impl ListRequest {
             errors.push(FieldError::new("after", "must be earlier than `before`"));
         }
 
-        for (index, (_, label)) in INCLUDE_FLAGS.iter().enumerate() {
-            if !include[index] {
+        for ((_, label), included) in INCLUDE_FLAGS.iter().zip(include) {
+            if !included {
                 request.filters.excluded.push(label);
             }
         }

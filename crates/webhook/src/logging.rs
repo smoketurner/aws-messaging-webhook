@@ -6,7 +6,7 @@
 //! log full request/response bodies at `TRACE` — a source of credential and
 //! PII leakage this application must never enable, even if an operator (or a
 //! stack that predates this restriction) sets `AWS_LAMBDA_LOG_LEVEL=TRACE`.
-//! [`directives`] builds an `EnvFilter` directive string that caps the
+//! `directives` builds an `EnvFilter` directive string that caps the
 //! untargeted (dependency) default at `DEBUG` while letting this crate's own
 //! target run at the configured level.
 
@@ -28,7 +28,7 @@ pub(crate) fn directives(level: &str) -> String {
 /// Installs the process-global tracing subscriber.
 ///
 /// Reads `AWS_LAMBDA_LOG_LEVEL` only — `RUST_LOG` is ignored, so the filter is
-/// fully determined by [`directives`] rather than an operator-supplied
+/// fully determined by `directives` rather than an operator-supplied
 /// directive string that could re-enable `TRACE` on a dependency. Emits JSON
 /// when `AWS_LAMBDA_LOG_FORMAT=json`, matching Lambda's advanced logging
 /// controls.

@@ -40,8 +40,8 @@ where
 {
     type Rejection = ApiError;
 
-    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(request, state).await {
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
             Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
                 Err(ApiError::TooLarge)

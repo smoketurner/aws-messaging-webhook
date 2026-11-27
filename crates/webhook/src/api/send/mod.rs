@@ -167,7 +167,7 @@ async fn enqueue<B: Backend>(
         request_hash: request_hash.clone(),
         route: route.to_owned(),
         created_at: at,
-        expires_at: now_epoch + KEY_TTL_SECONDS,
+        expires_at: now_epoch.saturating_add(KEY_TTL_SECONDS),
     });
 
     let committed = state

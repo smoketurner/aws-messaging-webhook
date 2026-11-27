@@ -91,10 +91,10 @@ pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
         if middle.is_empty() {
             continue;
         }
-        let Some(index) = rest.find(*middle) else {
+        let Some((_, after)) = rest.split_once(*middle) else {
             return false;
         };
-        rest = &rest[index + middle.len()..];
+        rest = after;
     }
     rest.ends_with(*last)
 }

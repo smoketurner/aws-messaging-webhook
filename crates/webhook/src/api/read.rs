@@ -441,14 +441,13 @@ mod tests {
     /// Pages through `0..ITEMS` the way the store does: resume after the
     /// start key, return at most `limit`, and a key only when more remain.
     async fn page(round: ListQuery) -> Result<Page<u32>, MailStoreError> {
-        let from = round
-            .start
-            .as_ref()
-            .map_or(0, |start| start.sort.parse::<u32>().unwrap() + 1);
+        let from = round.start.as_ref().map_or(0, |start| {
+            start.sort.parse::<u32>().unwrap().checked_add(1).unwrap()
+        });
         let items: Vec<u32> = (from..ITEMS).take(round.limit).collect();
         let next = items
             .last()
-            .filter(|last| **last + 1 < ITEMS)
+            .filter(|last| last.checked_add(1).unwrap() < ITEMS)
             .map(|last| key(*last));
         Ok(Page { items, next })
     }

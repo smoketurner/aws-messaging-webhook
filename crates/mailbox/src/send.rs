@@ -84,7 +84,10 @@ impl Envelope {
     /// Every recipient across all three lists.
     #[must_use]
     pub(crate) fn recipient_count(&self) -> usize {
-        self.to.len() + self.cc.len() + self.bcc.len()
+        self.to
+            .len()
+            .saturating_add(self.cc.len())
+            .saturating_add(self.bcc.len())
     }
 
     #[must_use]
@@ -311,7 +314,7 @@ impl SendState {
     pub fn claimed(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Sending,
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             sending_at: Some(now),
             ses_call_at: None,
             // Cleared so a later release can set it again and re-trigger the
@@ -326,7 +329,7 @@ impl SendState {
     #[must_use]
     pub fn calling_ses(&self, now: Timestamp) -> Self {
         Self {
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             ses_call_at: Some(now),
             updated_at: now,
             ..self.clone()
@@ -338,7 +341,7 @@ impl SendState {
     pub fn sent(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Sent,
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             sending_at: None,
             updated_at: now,
             ..self.clone()
@@ -350,7 +353,7 @@ impl SendState {
     pub fn failed(&self, failure: SendFailure, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Failed,
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             sending_at: None,
             failure: Some(failure),
             updated_at: now,
@@ -366,7 +369,7 @@ impl SendState {
     pub fn unknown(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Unknown,
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             sending_at: None,
             updated_at: now,
             ..self.clone()
@@ -383,7 +386,7 @@ impl SendState {
     pub fn resumed(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Queued,
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             sending_at: None,
             ses_call_at: None,
             requeued_at: Some(now),
@@ -399,11 +402,11 @@ impl SendState {
     pub fn released(&self, now: Timestamp) -> Self {
         Self {
             send_status: SendStatus::Queued,
-            version: self.version + 1,
+            version: self.version.saturating_add(1),
             sending_at: None,
             ses_call_at: None,
             requeued_at: Some(now),
-            transient_failures: self.transient_failures + 1,
+            transient_failures: self.transient_failures.saturating_add(1),
             updated_at: now,
             ..self.clone()
         }
@@ -453,7 +456,7 @@ impl MarkOutcome<'_> {
     /// Whether this outcome settles the send: the record takes its message's
     /// TTL and the message will never be assembled from its outbox again.
     ///
-    /// Pairs one-to-one with the arms [`mailbox::send::mark_transition`]
+    /// Pairs one-to-one with the arms [`mark_transition`]
     /// wraps in `settled(..)`, and is what the sender keys outbox cleanup off:
     /// the `outbox/` prefix has no lifecycle rule, so a settled send that does
     /// not clear its own objects leaks them forever.

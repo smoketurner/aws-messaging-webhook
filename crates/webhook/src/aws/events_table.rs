@@ -165,18 +165,14 @@ fn aggregate_update(
             &mut set_clauses,
             AggregateStatus::Received,
         )),
-        DomainEvent::SmsDelivery { event, .. } => {
-            if event.is_final {
-                let status = if event.is_successful_delivery() {
-                    AggregateStatus::Delivered
-                } else {
-                    AggregateStatus::Failed
-                };
-                Some(overwrite_status(&mut set_clauses, status))
+        DomainEvent::SmsDelivery { event, .. } => event.is_final.then(|| {
+            let status = if event.is_successful_delivery() {
+                AggregateStatus::Delivered
             } else {
-                None
-            }
-        }
+                AggregateStatus::Failed
+            };
+            overwrite_status(&mut set_clauses, status)
+        }),
         // SES `current_status` is set three ways:
         //  - `Send` uses an `if_not_exists` guard here — it is the initial
         //    rung and must not overwrite a terminal status set by an

@@ -82,18 +82,14 @@ impl Table for ConcurrentThreadWinner<'_> {
         ops: &[PlannedOp],
     ) -> impl Future<Output = Result<TxnOutcome, MailStoreError>> + Send {
         let armed = self.armed.swap(false, Ordering::SeqCst);
-        let competing = if armed {
-            Some(self.competing_plan.clone())
-        } else {
-            None
-        };
+        let competing = armed.then(|| self.competing_plan.clone());
         let owned_ops = ops.to_vec();
         let inner = self.inner;
         Box::pin(async move {
             if let Some(plan) = competing {
                 // A concurrent writer committed a distinct message in this
                 // same thread, resurrecting it, between our read and commit.
-                let _ = inner.transact(&plan).await?;
+                drop(inner.transact(&plan).await?);
             }
             inner.transact(&owned_ops).await
         })

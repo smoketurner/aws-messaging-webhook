@@ -23,7 +23,7 @@ use crate::MAX_INBOUND_RAW_BYTES;
 /// the document is written rather than assumed from the input size.
 pub const MAX_CONTENT_BYTES: u64 = 2 * MAX_INBOUND_RAW_BYTES;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageContent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -158,7 +158,7 @@ mod tests {
         let content = MessageContent {
             text: Some("\0".repeat(10_000)),
             html: None,
-            references: vec!["<".to_owned() + &"\0".repeat(10_000) + ">"],
+            references: vec![format!("<{}>", "\0".repeat(10_000))],
             reply_to: vec!["a@example.com".to_owned()],
             headers: BTreeMap::from([("Subject".to_owned(), "hi".to_owned())]),
             verdicts: Some(serde_json::json!({"spam": "PASS"})),
@@ -186,7 +186,7 @@ mod tests {
         let content = MessageContent {
             text: Some("\0".repeat(10_000)),
             html: Some("\0".repeat(10_000)),
-            references: vec!["<".to_owned() + &"\0".repeat(10_000) + ">"],
+            references: vec![format!("<{}>", "\0".repeat(10_000))],
             reply_to: vec!["x".repeat(10_000)],
             headers: BTreeMap::from([("X-Big".to_owned(), "\0".repeat(10_000))]),
             verdicts: Some(serde_json::Value::String("\0".repeat(10_000))),

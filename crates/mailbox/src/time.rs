@@ -17,7 +17,7 @@ pub use jiff::Timestamp;
 /// wider type would let a huge value wrap to a near-zero TTL.
 #[must_use]
 pub fn expires_at(at: Timestamp, retention_days: u32) -> u64 {
-    unix_seconds(at) + u64::from(retention_days) * 86_400
+    unix_seconds(at).saturating_add(u64::from(retention_days).saturating_mul(86_400))
 }
 
 /// `at` as whole seconds since the Unix epoch, the unit of a DynamoDB TTL.
@@ -44,7 +44,7 @@ pub fn format(at: Timestamp) -> String {
     format!("{at:.3}")
 }
 
-/// Parses a string in exactly [`format`]'s shape. `None` for any other shape
+/// Parses a string in exactly [`format`](fn@format)'s shape. `None` for any other shape
 /// (a missing or extra fraction digit, an offset other than `Z`, a
 /// non-existent calendar date such as Feb 30, a leap second) and for an
 /// instant before the Unix epoch. Strict because these strings are compared
@@ -56,7 +56,7 @@ pub fn parse(s: &str) -> Option<Timestamp> {
     (at.as_millisecond() >= 0 && format(at) == s).then_some(at)
 }
 
-/// Parses [`format`]'s shape without its fraction, `YYYY-MM-DDTHH:MM:SSZ`,
+/// Parses [`format`](fn@format)'s shape without its fraction, `YYYY-MM-DDTHH:MM:SSZ`,
 /// as strictly as [`parse`] reads the full one.
 #[must_use]
 pub fn parse_whole_second(s: &str) -> Option<Timestamp> {
@@ -88,7 +88,7 @@ pub fn to_millis(at: Timestamp) -> Timestamp {
 /// "time::fixed")]`. This is the one place an instant becomes text or text
 /// an instant; between a read and a write it stays a [`Timestamp`].
 ///
-/// Writes [`format`]'s fixed-width shape, which sort keys and clients rely
+/// Writes [`format`](fn@format)'s fixed-width shape, which sort keys and clients rely
 /// on. Reads any RFC 3339 timestamp, so an item written by something less
 /// strict still loads.
 pub mod fixed {
@@ -155,7 +155,7 @@ mod tests {
     use proptest::prelude::*;
 
     /// The latest instant a [`Timestamp`] holds, 9999-12-30T22:00:00.999Z, in
-    /// epoch milliseconds: the upper bound of what [`format`] can be given.
+    /// epoch milliseconds: the upper bound of what [`format`](fn@format) can be given.
     const MAX_MS: u64 = 253_402_207_200_999;
 
     #[test]

@@ -62,7 +62,7 @@ where
 }
 
 /// An error type with a transient and a permanent case, which an SDK failure
-/// maps onto through [`sdk_error_is_transient`].
+/// maps onto through `sdk_error_is_transient`.
 pub trait FromSdkFailure: Sized {
     fn transient(source: anyhow::Error) -> Self;
 
