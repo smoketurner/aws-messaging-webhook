@@ -12,7 +12,7 @@ persists these types and the binary serves and sends them; nothing here knows ab
 The crate root holds the stored item types and the caps every layer enforces:
 
 - `MailMessage`: one stored message, bounded by the caps below.
-- `InboxId`, `Inbox`: an inbox's normalized id and its record.
+- `InboxId`: an inbox's normalized id.
 - `ThreadSnapshot`, `RfcHit`, `AttachmentMeta`: what a message records about its thread,
   an alias row's target, and one attachment.
 - `InsertOutcome`, `PutOutcome`: the results of an insert and of a conditional create.
@@ -32,13 +32,16 @@ The rest is organised by module:
   resolution.
 - `time`: fixed-width UTC timestamps that sort as strings.
 - `url_policy`: `parse_attachment_url`, which outbound URLs may be fetched.
-- `wire`: the JSON shapes the `/v0` API and the event relay serialize.
+- `wire`: the JSON shapes the `/v0` API and the event relay serialize, including `Inbox`, an
+  inbox's record.
 
 ## Features
 
 - `test-fixtures`: adds `test_fixtures::message`, a sample `MailMessage` at
-  `support@example.com`. `mailbox-store` and `aws-messaging-webhook` enable it for their
-  tests only.
+  `support@example.com`, `test_fixtures::at` for timestamp literals, and
+  `url_policy::parse_attachment_url_allowing_http`, the plain-http parser behind the attachment
+  fetcher's test mode. `mailbox-store` and `aws-messaging-webhook` enable it for their tests
+  only; no non-dev dependency may, because it loosens the attachment URL policy.
 
 ## Tests
 

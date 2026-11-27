@@ -65,7 +65,8 @@ Tests live where the code they exercise lives: `mailbox` has inline unit tests o
 `mailbox-store` tests behaviour through its public API in `crates/mailbox-store/tests/`
 against `MailMemoryStore`, keeps tests that need crate internals inline (alias rows, the
 thread race, planning), and pins the exact DynamoDB requests inline beside `DynamoTable`;
-`crates/webhook/tests/` only drives the router or the Lambda entry. Crates expose only what
+`crates/webhook/tests/` drives the router, the Lambda entry, or the per-message entry points
+(`DomainEvent::classify`, `ingest::ingest_inbound`, the sender's `handle_send`). Crates expose only what
 another crate uses: `unreachable_pub` is a workspace lint, so a test needing an internal item
 moves inline rather than making the item public.
 

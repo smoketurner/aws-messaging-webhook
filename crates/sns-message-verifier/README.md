@@ -43,10 +43,7 @@ Re-exported from the internal modules:
 - `SnsEnvelope`, `MessageType`: the parsed envelope and its message-type field.
 - `VerifyError`, `CertUrlRejection`: the error type and the reasons a
   `SigningCertURL` is rejected.
-- `build_string_to_sign`: the canonical string-to-sign builder.
 - `validate_sns_url`: the `SigningCertURL` host-policy check.
-- `verify_with_cert`: verifies an envelope against an already-parsed
-  certificate.
 
 ## Features
 

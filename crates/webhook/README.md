@@ -3,22 +3,24 @@
 The Lambda binary. A single executable that runs as two functions: the webhook
 (`FUNCTION_MODE=webhook`, the default), which ingests SNS over a Function URL
 (Axum) and direct invoke, runs verify then persist then act then publish, serves
-the bearer-authenticated `/v0` mailbox API, and relays the events table's
-DynamoDB stream to EventBridge; and the mail sender (`FUNCTION_MODE=sender`),
+the bearer-authenticated `/v0` mailbox API, and relays the events and mail
+tables' DynamoDB streams to EventBridge; and the mail sender (`FUNCTION_MODE=sender`),
 which consumes the mail table's stream to send, sweep, redrive and close. It is
 the sole EventBridge publisher.
 
 Dependencies point one way: `aws-messaging-webhook` → `mailbox-store` →
 `mailbox`. This crate persists and serves the mailbox types through a `Mailbox`
-and owns every AWS integration; the two crates below it know nothing about it.
+and owns every AWS integration; the crates below it (`mailbox-store`,
+`mailbox`, `sns-message-verifier`) know nothing about it.
 `webhook-test-support` sits above it, depending on the binary's public modules
 to drive its integration tests.
 
 ## API
 
-This crate is a binary (`publish = false`), not a published library, but its
-modules are public so the integration test binaries and `webhook-test-support`
-can reach them. The seam everything is generic over is the `Backend` trait and
+This crate is a binary (`publish = false`), not a published library, but most
+of its modules are public so the integration test binaries and
+`webhook-test-support` can reach them. `sns`, `stream`, `error`, `clock` and
+`events_keys` are private: only the crate itself uses them. The seam everything is generic over is the `Backend` trait and
 `AppState<B>` in `state.rs`.
 
 - `state`: the `Backend` trait (associated types `Table`, `Events`,

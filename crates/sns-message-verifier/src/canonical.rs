@@ -9,7 +9,7 @@ use crate::error::VerifyError;
 ///
 /// Returns [`VerifyError::MissingField`] if a confirmation message lacks
 /// `SubscribeURL` or `Token`.
-pub fn build_string_to_sign(envelope: &SnsEnvelope) -> Result<String, VerifyError> {
+pub(crate) fn build_string_to_sign(envelope: &SnsEnvelope) -> Result<String, VerifyError> {
     let mut canonical = String::new();
     match envelope.message_type {
         MessageType::Notification => {

@@ -24,8 +24,9 @@ store.
   page-token and label-limit cases.
 - `FromSdkFailure`: maps any SDK failure onto transient or permanent; the binary's other AWS
   clients share it.
-- `keys`: `TableKey`, `PageKey`, the key builders (`keys::inbox`, `keys::message`, ...) and
-  `encode_page_token` / `decode_page_token`.
+- `keys`: `TableKey`, `PageKey`, the key builders (`keys::inbox`, `keys::message`, ...),
+  `message_page_key` / `thread_page_key` (the key that resumes a listing after a given item),
+  and `encode_page_token` / `decode_page_token`.
 
 The planner (`WriteOp`, `Cond`, the `plan_*` functions) and cancellation decoding are
 crate-private.

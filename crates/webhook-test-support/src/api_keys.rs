@@ -23,18 +23,6 @@ pub struct FakeApiKeys {
 }
 
 impl FakeApiKeys {
-    /// A source holding one key with the given id, as an operator would store
-    /// it: the SHA-256 hash, never the key.
-    #[must_use]
-    pub fn with_key(key: &str, id: &str) -> Self {
-        let source = Self {
-            outcome: Mutex::new(Outcome::Unavailable),
-            fetches: AtomicUsize::new(0),
-        };
-        source.set_keys(&[(key, id)]);
-        source
-    }
-
     /// A source whose parameter cannot be read.
     #[must_use]
     pub fn unavailable() -> Self {

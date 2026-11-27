@@ -551,7 +551,7 @@ pub const TEST_INBOX: &str = "support@example.com";
 pub const TEST_AT: &str = "2026-01-01T09:00:00.000Z";
 
 /// When [`grant_api_access`] creates [`TEST_INBOX`].
-pub const TEST_INBOX_CREATED_AT: &str = "2026-01-01T00:00:00.000Z";
+const TEST_INBOX_CREATED_AT: &str = "2026-01-01T00:00:00.000Z";
 
 /// Authorizes [`TEST_API_KEY`] on `h` and creates [`TEST_INBOX`].
 pub async fn grant_api_access(h: &Harness) {
@@ -595,7 +595,7 @@ pub fn wrapped(h: &Harness, inner: &Value) -> Value {
 }
 
 /// Re-keys a signed envelope to the casing a direct SNS → Lambda record uses.
-pub fn lambda_record_casing(mut envelope: Value) -> Value {
+fn lambda_record_casing(mut envelope: Value) -> Value {
     let record = envelope.as_object_mut().unwrap();
     if let Some(url) = record.remove("SigningCertURL") {
         record.insert("SigningCertUrl".to_owned(), url);
