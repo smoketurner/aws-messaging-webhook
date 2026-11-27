@@ -26,7 +26,7 @@ use crate::store::{MailStoreError, Page};
 use crate::table::{PageQuery, Read, Table, TxnOutcome};
 use crate::txn::{CancellationReason, TxnDecision, decode_cancellation};
 use mailbox::send::SendKey;
-use mailbox::test_fixtures::at;
+use mailbox::time::Timestamp;
 use mailbox::{InboxId, MailMessage, MessageId, PutOutcome, ThreadId};
 use serde_dynamo::{AttributeValue, Item};
 
@@ -93,7 +93,8 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         rfc_message_id: format!("<{message_id}@example.com>"),
         in_reply_to: None,
         labels: vec!["received".to_owned(), "unread".to_owned()],
-        timestamp: at("2026-01-01T00:00:01.000Z"),
+        // 2026-01-01T00:00:01Z, a second after it was created.
+        timestamp: Timestamp::constant(1_767_225_601, 0),
         from: "sender@example.com".to_owned(),
         to: vec![format!("{inbox}@example.com")],
         cc: Vec::new(),
@@ -109,8 +110,8 @@ pub fn sample_message(inbox: &str, message_id: &str, thread_id: &str) -> MailMes
         send_status: None,
         sent_at: None,
         version: 0,
-        created_at: at("2026-01-01T00:00:00.000Z"),
-        updated_at: at("2026-01-01T00:00:00.000Z"),
+        created_at: Timestamp::constant(1_767_225_600, 0),
+        updated_at: Timestamp::constant(1_767_225_600, 0),
         expires_at: 0,
     }
 }
@@ -566,6 +567,7 @@ mod tests {
     use crate::store::ListQuery;
     use mailbox::send::MarkOutcome;
     use mailbox::send::SendState;
+    use mailbox::test_fixtures::at;
     use mailbox::{InsertOutcome, RfcHit};
 
     fn message(message_id: &str, thread_id: &str) -> MailMessage {

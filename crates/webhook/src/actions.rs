@@ -14,6 +14,7 @@ use crate::metrics::names;
 use crate::model::DomainEvent;
 use crate::model::ses_notification::SesRecipient;
 use crate::state::{AppState, Backend};
+use crate::store::Delivery;
 use mailbox::SesMessageId;
 use mailbox::time::Timestamp;
 use mailbox_store::MailStoreError;
@@ -347,7 +348,7 @@ pub(crate) async fn run<B: Backend>(
     // `SesInbound` arm (wired up by the mail-ingest track) uses it today.
     deadline: tokio::time::Instant,
     // When the delivery arrived: what the mailbox writes are stamped with.
-    at: Timestamp,
+    delivery: Delivery,
     // The verified SNS envelope `Timestamp`, parsed by the caller: the
     // inbound message id's third time source, threaded to the `SesInbound`
     // arm only.
@@ -415,7 +416,7 @@ pub(crate) async fn run<B: Backend>(
             // run, then returned so redelivery re-runs both (repeat-safe)
             // steps; the suppression write does not wait on that redelivery.
             let mut deferred = None;
-            let labelled = match apply_delivery_label(state, event, at).await {
+            let labelled = match apply_delivery_label(state, event, delivery.at).await {
                 Ok(labelled) => labelled,
                 Err(error) if error.kind == ActionErrorKind::Permanent => {
                     metrics::counter!(names::ACTION_FAILURES).increment(1);
@@ -458,7 +459,7 @@ pub(crate) async fn run<B: Backend>(
             })
         }
         DomainEvent::SesInbound { event, .. } => {
-            ingest::ingest_inbound(state, event, deadline, at, envelope_at)
+            ingest::ingest_inbound(state, event, deadline, delivery, envelope_at)
                 .await
                 .map(ActionTaken::Ingest)
         }

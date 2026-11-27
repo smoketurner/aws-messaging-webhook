@@ -3,6 +3,7 @@
 //! details; the request path only publishes control-plane notices
 //! (`subscription.changed`).
 
+use mailbox::time;
 use std::future::Future;
 
 use serde_json::{Value, json};
@@ -86,7 +87,7 @@ pub(crate) fn build_outbound(
         "snsMessageId": record.sns_message_id,
         "messageId": record.aggregate_id,
         "topicArn": record.topic_arn,
-        "receivedAt": record.received_at,
+        "receivedAt": time::format(record.received_at),
         // The classified family's canonical path; null for unknown events.
         // A label for consumers, not the literal arrival path — a direct
         // SNS → Lambda delivery never had one.
@@ -200,6 +201,7 @@ mod tests {
     use super::*;
     use crate::model::{DomainEvent, Source};
     use crate::store::EventRecord;
+    use mailbox::test_fixtures::at;
 
     /// The default `Config::event_source`, mirroring `config.rs`'s fallback so
     /// the entry-size assertions model the envelope `EventBridgePublisher::publish`
@@ -222,7 +224,7 @@ mod tests {
             source,
             detail_type: detail_type.to_owned(),
             topic_arn: "arn:aws:sns:us-east-1:123456789012:t".to_owned(),
-            received_at: "2026-08-03T19:12:53.000Z".to_owned(),
+            received_at: at("2026-08-03T19:12:53.000Z"),
             expires_at: 1_800_000_000,
             aggregate_expires_at: 1_900_000_000,
         }
@@ -241,7 +243,7 @@ mod tests {
             source: Some(Source::SesInbound),
             detail_type: "ses.inbound".to_owned(),
             topic_arn: "arn:aws:sns:us-east-1:123456789012:my-ses-inbound-topic".to_owned(),
-            received_at: "2026-08-03T19:12:53.456Z".to_owned(),
+            received_at: at("2026-08-03T19:12:53.456Z"),
             expires_at: 1_800_000_000,
             aggregate_expires_at: 1_900_000_000,
         }
@@ -750,7 +752,7 @@ mod tests {
             .inbound_meta()
             .expect("ses.inbound carries meta.inbound");
         pre_step3["meta"]["topicArn"] = json!(rec.topic_arn);
-        pre_step3["meta"]["receivedAt"] = json!(rec.received_at);
+        pre_step3["meta"]["receivedAt"] = json!(time::format(rec.received_at));
         let pre_detail = detail_bytes(&pre_step3);
         let pre_entry = entry_bytes(&pre_step3, &out.detail_type, DEFAULT_EVENT_SOURCE);
 

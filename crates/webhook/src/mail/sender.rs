@@ -480,9 +480,11 @@ pub async fn handle_send<B: Backend>(
 
     // Recorded before the call, so a sender that dies from here on leaves a
     // claim the sweep will not release: it may already have been sent.
+    // Loading can take most of the invocation, so the clock is read again
+    // rather than reusing the claim's time.
     let Some(calling) = state
         .mailbox
-        .note_ses_call(&claimed, now)
+        .note_ses_call(&claimed, clock::now())
         .await
         .map_err(store_error)?
     else {
@@ -508,7 +510,7 @@ pub async fn handle_send<B: Backend>(
         })
         .await;
 
-    record_outcome(state, &calling, outcome, now, deadline).await
+    record_outcome(state, &calling, outcome, deadline).await
 }
 
 /// Assembles the raw message, or the failure a send that cannot be built
@@ -554,9 +556,10 @@ async fn record_outcome<B: Backend>(
     state: &AppState<B>,
     calling: &SendState,
     outcome: SendOutcome,
-    now: Timestamp,
     deadline: Instant,
 ) -> Result<Handled, SenderError> {
+    // When SES answered: what `sent_at` and the `message.sent` event carry.
+    let now = clock::now();
     let message_id = calling.message_id.as_str();
     match outcome {
         SendOutcome::Sent { ses_message_id } => {
@@ -686,7 +689,7 @@ async fn hand_back<B: Backend>(
     }
     let delay = Duration::from_secs(1 << claimed.transient_failures.min(4));
     wait_before_retry(delay, deadline).await;
-    record(state, claimed, MarkOutcome::Released, now)
+    record(state, claimed, MarkOutcome::Released, clock::now())
         .await
         .map_err(store_error)?;
     Ok(Handled::Skipped)

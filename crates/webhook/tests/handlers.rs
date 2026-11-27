@@ -4,6 +4,8 @@
 // `webhook-test-support` dev-dependency crate.
 
 use aws_messaging_webhook::allowlist::TopicAllowlist;
+use mailbox::test_fixtures::at;
+use mailbox::time::{self, Timestamp};
 use sns_message_verifier::fixtures::SnsFixture;
 use std::sync::atomic::Ordering;
 
@@ -771,7 +773,7 @@ async fn a_function_url_delivery_is_dated_by_the_request_time() {
     invoke(h.state.clone(), payload).await.unwrap();
 
     let records = h.state.events.records.lock().unwrap();
-    assert_eq!(records[0].received_at, "2025-08-04T00:00:00.000Z");
+    assert_eq!(records[0].received_at, at("2025-08-04T00:00:00.000Z"));
     assert_eq!(records[0].expires_at, 1_754_265_600 + 30 * 86_400);
     assert_eq!(
         records[0].aggregate_expires_at,
@@ -782,7 +784,7 @@ async fn a_function_url_delivery_is_dated_by_the_request_time() {
 }
 
 /// A direct invoke has no request, so the envelope SNS signed dates it — and
-/// a redelivery of the same message therefore writes the same values.
+/// a redelivery of the same message is dated the same.
 #[tokio::test]
 async fn a_direct_delivery_is_dated_by_the_envelope_timestamp() {
     let h = harness().await;
@@ -797,11 +799,33 @@ async fn a_direct_delivery_is_dated_by_the_envelope_timestamp() {
         .unwrap();
 
     let records = h.state.events.records.lock().unwrap();
-    assert_eq!(records[0].received_at, "2026-08-03T19:12:52.000Z");
-    // 2026-08-03T19:12:52Z is 1785784372.
-    assert_eq!(records[0].expires_at, 1_785_784_372 + 30 * 86_400);
+    assert_eq!(records[0].received_at, at("2026-08-03T19:12:52.000Z"));
     assert_eq!(records[1].received_at, records[0].received_at);
-    assert_eq!(records[1].expires_at, records[0].expires_at);
+}
+
+/// The fixture envelope was published long before the test runs, as an event
+/// redriven from a failure destination would be. It keeps its date, but what
+/// it stores is retained from the invocation, not from the publish time —
+/// which would write it already most of the way to expiry.
+#[tokio::test]
+async fn a_direct_delivery_of_an_old_message_is_retained_from_the_invocation() {
+    let h = harness().await;
+    let mut body = notification(&h.cert_url);
+    h.fixture.sign(&mut body, "2");
+    let before = time::unix_seconds(Timestamp::now());
+
+    invoke(h.state.clone(), direct_sns_event(&body))
+        .await
+        .unwrap();
+
+    let records = h.state.events.records.lock().unwrap();
+    // `test_context` ends the invocation 60 s from now; retention is 30 days.
+    let retained_until = before + 30 * 86_400;
+    assert!(
+        (retained_until..=retained_until + 120).contains(&records[0].expires_at),
+        "expires_at {} is not 30 days from the invocation",
+        records[0].expires_at
+    );
 }
 
 /// SNS cannot produce it, but a signed envelope whose `Timestamp` is not a

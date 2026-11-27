@@ -26,7 +26,7 @@ pub mod api;
 pub mod api_keys;
 pub mod objects;
 
-use mailbox::test_fixtures::at;
+use mailbox::time;
 use mailbox::url_policy::AttachmentUrl;
 use sns_message_verifier::fixtures;
 use std::future::Future;
@@ -551,7 +551,10 @@ pub async fn grant_api_access(h: &Harness) {
     h.state.key_source.set_keys(&[(TEST_API_KEY, "key_1")]);
     h.state
         .mailbox
-        .ensure_inbox(&InboxId::new(TEST_INBOX), at(TEST_INBOX_CREATED_AT))
+        .ensure_inbox(
+            &InboxId::new(TEST_INBOX),
+            time::parse(TEST_INBOX_CREATED_AT).unwrap(),
+        )
         .await
         .unwrap();
 }

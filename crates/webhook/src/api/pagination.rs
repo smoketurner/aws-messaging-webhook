@@ -150,8 +150,10 @@ impl ListRequest {
         format!(
             "asc={};before={};after={}",
             self.ascending,
-            self.before.map_or_else(String::new, |ms| ms.to_string()),
-            self.after.map_or_else(String::new, |ms| ms.to_string()),
+            self.before
+                .map_or_else(String::new, |at| time::unix_ms(at).to_string()),
+            self.after
+                .map_or_else(String::new, |at| time::unix_ms(at).to_string()),
         )
     }
 
@@ -266,9 +268,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// emits and the whole-second form clients commonly send. Any other shape is
 /// rejected, an offset other than `Z` included.
 fn parse_instant(value: &str) -> Option<Timestamp> {
-    // `YYYY-MM-DDTHH:MM:SS.sssZ` or `YYYY-MM-DDTHH:MM:SSZ`.
-    let shaped = matches!(value.len(), 20 | 24) && value.ends_with('Z') && !value.contains(' ');
-    shaped.then(|| time::parse_rfc3339(value)).flatten()
+    time::parse(value).or_else(|| time::parse_whole_second(value))
 }
 
 #[cfg(test)]
@@ -355,6 +355,24 @@ mod tests {
         assert_eq!(errors("after=2026-01-15T09:30:00+01:00"), vec!["after"]);
         assert_eq!(errors("before=yesterday"), vec!["before"]);
         assert_eq!(errors("before=2026-01-15"), vec!["before"]);
+        // Shapes a general RFC 3339 parser takes but this API never has.
+        assert_eq!(errors("after=2026-01-15t09:30:00Z"), vec!["after"]);
+        assert_eq!(errors("after=2026-01-15T09:30:60Z"), vec!["after"]);
+        assert_eq!(errors("after=2026-01-15T09:30:00,250Z"), vec!["after"]);
+        assert_eq!(errors("after=2026-01-15T093000.00000Z"), vec!["after"]);
+        assert_eq!(errors("before=1969-12-31T23:59:59Z"), vec!["before"]);
+    }
+
+    /// A page token is bound to this string, so its spelling is part of the
+    /// contract with tokens already handed out: the bounds are epoch
+    /// milliseconds, however the instant is held.
+    #[test]
+    fn the_token_scope_spells_its_bounds_as_epoch_milliseconds() {
+        let request = parse_ok("ascending=true&before=2026-01-15T09:30:00Z");
+        assert_eq!(
+            request.token_scope(),
+            "asc=true;before=1768469400000;after="
+        );
     }
 
     #[test]

@@ -9,6 +9,30 @@ use std::future::Future;
 use crate::config::Config;
 use crate::model::{DomainEvent, Source};
 
+/// When one SNS delivery arrived, and when what it stores starts to age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivery {
+    /// When the delivery arrived: the Function URL request's time, or for a
+    /// direct invoke the envelope's own `Timestamp`.
+    pub at: Timestamp,
+    /// What retention counts from. The same instant, except for a direct
+    /// invoke of a message published long ago (an event redriven from a
+    /// failure destination), which is kept for its full retention from the
+    /// invocation that stored it.
+    pub retain_from: Timestamp,
+}
+
+impl Delivery {
+    /// A delivery that arrived at `at` and ages from then.
+    #[must_use]
+    pub fn at(at: Timestamp) -> Self {
+        Self {
+            at,
+            retain_from: at,
+        }
+    }
+}
+
 /// One received SNS notification, ready to persist.
 #[derive(Debug, Clone)]
 pub struct EventRecord {
@@ -26,8 +50,8 @@ pub struct EventRecord {
     pub detail_type: String,
     pub topic_arn: String,
     /// When the delivery reached this service, as the Lambda event states
-    /// it. Fixed-width (`mailbox::time::format`).
-    pub received_at: String,
+    /// it.
+    pub received_at: Timestamp,
     /// Epoch seconds for the DynamoDB TTL attribute.
     pub expires_at: u64,
     /// Epoch seconds for the aggregate item's TTL — derived from
@@ -38,15 +62,13 @@ pub struct EventRecord {
 
 impl EventRecord {
     /// Assembles a record from a verified envelope and its parsed event.
-    /// `at` is when the delivery arrived: the Function URL request's time, or
-    /// for a direct invoke the envelope's own `Timestamp`.
     pub(crate) fn build(
         source: Option<Source>,
         envelope: &SnsEnvelope,
         raw_body: Bytes,
         event: &DomainEvent,
         config: &Config,
-        at: Timestamp,
+        delivery: Delivery,
     ) -> Self {
         Self {
             aggregate_id: event.aggregate_id(&envelope.message_id),
@@ -56,9 +78,12 @@ impl EventRecord {
             source,
             detail_type: event.detail_type().to_owned(),
             topic_arn: envelope.topic_arn.clone(),
-            received_at: time::format(at),
-            expires_at: time::expires_at(at, config.raw_event_retention_days),
-            aggregate_expires_at: time::expires_at(at, config.aggregate_retention_days),
+            received_at: delivery.at,
+            expires_at: time::expires_at(delivery.retain_from, config.raw_event_retention_days),
+            aggregate_expires_at: time::expires_at(
+                delivery.retain_from,
+                config.aggregate_retention_days,
+            ),
         }
     }
 

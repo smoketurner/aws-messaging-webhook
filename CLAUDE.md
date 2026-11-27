@@ -120,7 +120,8 @@ moves inline rather than making the item public.
   (`mailbox::time::Timestamp`); the `mailbox` crate never reads the clock. Text becomes a
   `Timestamp` once, where it enters (the event, a query parameter, a stored item), and stays
   one: stored and wire structs hold `Timestamp` fields under `#[serde(with = "time::fixed")]`,
-  which writes the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form sort keys depend on. Don't pass
+  which writes the fixed-width `YYYY-MM-DDTHH:MM:SS.sssZ` form sort keys depend on (an
+  unreadable *optional* instant reads as absent; a required one fails the item). Don't pass
   a formatted string between functions, and never `Display` a `Timestamp` (its width varies)
   — `time::format` is for a key or a JSON literal being built by hand. `clock.rs` says
   where each comes from and holds the one `now()`, for what no event can supply: the sender's
@@ -130,7 +131,11 @@ moves inline rather than making the item public.
   request without a Lambda context. Monotonic deadlines and the verifier's certificate-validity
   check use the real clock too; a signed `Timestamp` must never decide whether the certificate
   that signed it is current. The inbound message id is seeded from the mail's own timestamps
-  (content), never from the delivery time, which differs on every HTTPS redelivery.
+  (content), never from the delivery time, which differs on every HTTPS redelivery. A direct
+  delivery is dated by its envelope but *retained* from the invocation's deadline when that is
+  later (`clock::Arrival`), so an event redriven long after it was published is not stored
+  already expired. The sender reads the clock again for each mark it records (`ses_call_at`,
+  `sent_at`, a release): loading a send can take most of an invocation.
 - **Persist before acting; actions stay repeat-safe.** The request path persists (the outbox
   entry) before running idempotent actions; a 5xx redelivery re-runs only the repeat-safe
   actions, so action APIs must stay repeat-safe.
@@ -142,7 +147,8 @@ moves inline rather than making the item public.
   `cargo lambda watch` against a fake SNS) is compiled in under `#[cfg(debug_assertions)]`
   only; `mail/fetch.rs`'s plain-http mode is `#[cfg(test)]`, and the URL parser behind it
   (`mailbox::url_policy`) is test builds or the dev-only `test-fixtures` feature, for the same
-  reason. The SNS HTTP
+  reason. Nothing a non-dev dependency enables (`mailbox-store`'s `memory`,
+  `webhook-test-support`'s dependencies) may turn that feature on. The SNS HTTP
   clients never follow redirects — that's part of the trust model, not a nicety. The one
   exception is `mail/fetch.rs`, which fetches caller-supplied attachment URLs and therefore
   *must* handle redirects; it follows them by hand, at most five hops, re-running the full

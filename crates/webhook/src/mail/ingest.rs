@@ -17,6 +17,7 @@ use crate::mail::{content, object_keys};
 use crate::metrics::names;
 use crate::model::ses_inbound::{SesInboundNotification, SesReceipt, Verdict};
 use crate::state::{AppState, Backend};
+use crate::store::Delivery;
 use mailbox::labels::SystemLabel;
 use mailbox::mime::{ParseError, ParsedAttachment, ParsedMessage, parse_inbound};
 use mailbox::time::Timestamp;
@@ -73,7 +74,7 @@ pub async fn ingest_inbound<B: Backend>(
     state: &AppState<B>,
     event: &SesInboundNotification,
     deadline: tokio::time::Instant,
-    at: Timestamp,
+    delivery: Delivery,
     envelope_at: Option<Timestamp>,
 ) -> Result<IngestOutcome, ActionError> {
     let Some(mail_config) = state.config.mail.as_ref() else {
@@ -96,7 +97,7 @@ pub async fn ingest_inbound<B: Backend>(
 
     let mut resolution = InboxResolution::default();
     for recipient in normalized_recipients(&event.receipt) {
-        resolve_recipient(state, mail_config, &recipient, at, &mut resolution).await;
+        resolve_recipient(state, mail_config, &recipient, delivery.at, &mut resolution).await;
     }
     if resolution.inboxes.is_empty() {
         if resolution.had_permanent {
@@ -140,7 +141,7 @@ pub async fn ingest_inbound<B: Backend>(
             targets,
             uuid,
             &message_id,
-            Instants { received, at },
+            Instants { received, delivery },
         ),
     )
     .await;
@@ -358,9 +359,9 @@ fn received_at(
 struct Instants {
     /// When the mail was received: the message's `timestamp`.
     received: Timestamp,
-    /// When this delivery arrived: `created_at`, and what retention counts
+    /// When this delivery arrived (`created_at`) and what retention counts
     /// from.
-    at: Timestamp,
+    delivery: Delivery,
 }
 
 /// Fetches, parses and extracts the raw MIME once, then inserts the built
@@ -386,14 +387,12 @@ async fn ingest_into_targets<B: Backend>(
         ses_message_id: SesMessageId::new(event.mail.message_id.as_str()),
         labels: verdict_labels(verdict),
         timestamp: instants.received,
-        now: instants.at,
+        now: instants.delivery.at,
         raw_s3_key: key.to_owned(),
         attachments,
-        expires_at: state
-            .config
-            .mail
-            .as_ref()
-            .map_or(0, |mail| time::expires_at(instants.at, mail.retention_days)),
+        expires_at: state.config.mail.as_ref().map_or(0, |mail| {
+            time::expires_at(instants.delivery.retain_from, mail.retention_days)
+        }),
     };
 
     if !insert_into_all_targets(state, &draft, &content, targets).await? {

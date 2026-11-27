@@ -13,7 +13,7 @@ use lambda_http::RequestExt as _;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::clock::RequestTime;
+use crate::clock::{Arrival, RequestTime};
 use crate::entry::context_deadline;
 use crate::model::Source;
 use crate::sns::extractor::VerifiedSns;
@@ -64,7 +64,14 @@ pub fn app<B: Backend>(state: Arc<AppState<B>>) -> Router {
                       Deadline(deadline): Deadline,
                       RequestTime(at): RequestTime,
                       verified: VerifiedSns| async move {
-                    handle_sns(&state, Ingress::Http(source), verified, deadline, Some(at)).await
+                    handle_sns(
+                        &state,
+                        Ingress::Http(source),
+                        verified,
+                        deadline,
+                        Arrival::Request(at),
+                    )
+                    .await
                 },
             ),
         );

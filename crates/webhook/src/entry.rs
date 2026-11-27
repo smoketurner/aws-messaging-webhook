@@ -44,7 +44,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app::app;
-use crate::clock;
+use crate::clock::{self, Arrival};
 use crate::config::FunctionMode;
 use crate::metrics::names;
 use crate::sns::extractor::VerifiedSns;
@@ -161,7 +161,10 @@ pub async fn dispatch<B: Backend>(
         let event = SnsEvent::deserialize(payload)
             .map_err(|e| format!("payload has Records but is not an SNS event: {e}"))?;
         let deadline = context_deadline(&context);
-        handle_direct(&state, event, deadline).await?;
+        let arrival = Arrival::Invoke {
+            ends_by: clock::invocation_deadline(&context),
+        };
+        handle_direct(&state, event, deadline, arrival).await?;
         Ok(Value::Null)
     } else {
         serve_http(router, payload, context).await
@@ -200,10 +203,13 @@ async fn handle_direct<B: Backend>(
     state: &AppState<B>,
     event: SnsEvent,
     deadline: tokio::time::Instant,
+    arrival: Arrival,
 ) -> Result<(), lambda_http::Error> {
     for record in event.records {
         let raw_body = Bytes::from(serde_json::to_vec(&record.sns)?);
-        let status = process_record(state, raw_body, deadline).await.status();
+        let status = process_record(state, raw_body, deadline, arrival)
+            .await
+            .status();
         if status.is_server_error() {
             // Fail the whole invocation: any unprocessed records redeliver
             // with it, and the idempotent persist makes re-runs safe.
@@ -221,14 +227,13 @@ async fn process_record<B: Backend>(
     state: &AppState<B>,
     raw_body: Bytes,
     deadline: tokio::time::Instant,
+    arrival: Arrival,
 ) -> Response {
     let verified = match VerifiedSns::verify(state, raw_body).await {
         Ok(verified) => verified,
         Err(error) => return error.into_response(),
     };
-    // A direct invoke has no request to time: the envelope SNS signed dates
-    // the delivery.
-    match handle_sns(state, Ingress::Direct, verified, deadline, None).await {
+    match handle_sns(state, Ingress::Direct, verified, deadline, arrival).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }

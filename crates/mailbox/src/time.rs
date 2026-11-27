@@ -56,6 +56,17 @@ pub fn parse(s: &str) -> Option<Timestamp> {
     (at.as_millisecond() >= 0 && format(at) == s).then_some(at)
 }
 
+/// Parses [`format`]'s shape without its fraction, `YYYY-MM-DDTHH:MM:SSZ`,
+/// as strictly as [`parse`] reads the full one.
+#[must_use]
+pub fn parse_whole_second(s: &str) -> Option<Timestamp> {
+    let at = parse_rfc3339(s)?;
+    let canonical = format(at);
+    // The canonical form with its `.000` removed must be the input itself.
+    let whole = canonical.strip_suffix(".000Z")?;
+    (at.as_millisecond() >= 0 && s.strip_suffix('Z') == Some(whole)).then_some(at)
+}
+
 /// Parses any RFC 3339 timestamp, as AWS writes them in the events it
 /// delivers (an SNS envelope's `Timestamp`, a scheduled event's `time`),
 /// where the number of fraction digits varies by service. Anything finer
@@ -104,7 +115,7 @@ pub mod fixed {
     /// The same for an optional instant: `#[serde(default, skip_serializing_if
     /// = "Option::is_none", with = "time::fixed::option")]`.
     pub mod option {
-        use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+        use serde::{Deserialize as _, Deserializer, Serializer};
 
         use super::super::Timestamp;
 
@@ -121,19 +132,19 @@ pub mod fixed {
             }
         }
 
+        /// A string that is not a timestamp reads as absent rather than
+        /// failing the item: an optional instant is never what an item is
+        /// keyed by, and one unreadable mark must not make a send
+        /// unlistable to the sweep that would recover it.
+        ///
         /// # Errors
         ///
-        /// When the value is neither null nor an RFC 3339 timestamp.
+        /// When the value is neither null nor a string.
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<Timestamp>, D::Error> {
-            Option::<String>::deserialize(deserializer)?
-                .map(|text| {
-                    super::super::parse_rfc3339(&text).ok_or_else(|| {
-                        D::Error::custom(format_args!("not an RFC 3339 timestamp: {text}"))
-                    })
-                })
-                .transpose()
+            let text = Option::<String>::deserialize(deserializer)?;
+            Ok(text.as_deref().and_then(super::super::parse_rfc3339))
         }
     }
 }
@@ -276,6 +287,65 @@ mod tests {
         for ms in [0, 999, 1000, 86_399_999, 86_400_000, MAX_MS] {
             assert_eq!(parse_ms(&format_ms(ms)), Some(ms), "ms={ms}");
         }
+    }
+
+    #[test]
+    fn parse_whole_second_takes_only_the_canonical_shape() {
+        assert_eq!(
+            parse_whole_second("2015-09-11T20:32:33Z"),
+            Some(at(1_442_003_553_000))
+        );
+        for rejected in [
+            "2015-09-11T20:32:33.000Z", // that is `parse`'s shape
+            "2015-09-11t20:32:33Z",     // lowercase separator
+            "2015-09-11T20:32:60Z",     // leap second
+            "2015-09-11T203233Z",       // basic time
+            "2015-09-11T20:32:33+00:00",
+            "1969-12-31T23:59:59Z",
+            "2015-09-11 20:32:33Z",
+        ] {
+            assert_eq!(parse_whole_second(rejected), None, "{rejected}");
+        }
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Marks {
+        #[serde(with = "fixed")]
+        at: Timestamp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "fixed::option")]
+        mark: Option<Timestamp>,
+    }
+
+    #[test]
+    fn fixed_writes_the_fixed_width_form_and_reads_it_back() {
+        let marks = Marks {
+            at: at(1_442_003_553_000),
+            mark: Some(at(1_442_003_553_936)),
+        };
+        let json = serde_json::to_value(&marks).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "at": "2015-09-11T20:32:33.000Z",
+                "mark": "2015-09-11T20:32:33.936Z",
+            })
+        );
+        assert_eq!(serde_json::from_value::<Marks>(json).unwrap(), marks);
+    }
+
+    #[test]
+    fn an_unreadable_optional_instant_reads_as_absent_and_a_required_one_fails() {
+        let read = |json| serde_json::from_value::<Marks>(json);
+        let at = "2015-09-11T20:32:33.000Z";
+        assert_eq!(
+            read(serde_json::json!({ "at": at, "mark": "garbage" }))
+                .unwrap()
+                .mark,
+            None
+        );
+        assert_eq!(read(serde_json::json!({ "at": at })).unwrap().mark, None);
+        assert!(read(serde_json::json!({ "at": "garbage" })).is_err());
     }
 
     #[test]

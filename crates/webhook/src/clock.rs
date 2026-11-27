@@ -27,6 +27,8 @@ use lambda_http::request::RequestContext;
 use mailbox::time::{self, Timestamp};
 use serde_json::Value;
 
+use crate::store::Delivery;
+
 /// The current time, read from the clock, to the millisecond. See the module docs for when that
 /// is the right source; everywhere else, take the event's time.
 pub(crate) fn now() -> Timestamp {
@@ -55,6 +57,46 @@ where
         };
         std::future::ready(Ok(Self(at.unwrap_or_else(now))))
     }
+}
+
+/// What the Lambda event says about when an SNS delivery arrived.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Arrival {
+    /// A Function URL request, received at this time.
+    Request(Timestamp),
+    /// A direct invoke, whose event carries no arrival time: the envelope
+    /// SNS signed dates the delivery. `ends_by` is the invocation's own
+    /// deadline, the one instant the runtime gives that is known to be no
+    /// earlier than the arrival.
+    Invoke { ends_by: Timestamp },
+}
+
+impl Arrival {
+    /// The delivery this arrival and the envelope's `Timestamp` describe.
+    /// `None` for a direct invoke whose envelope has no usable timestamp.
+    pub(crate) fn delivery(self, envelope_at: Option<Timestamp>) -> Option<Delivery> {
+        match self {
+            Self::Request(at) => Some(Delivery::at(at)),
+            Self::Invoke { ends_by } => {
+                let at = envelope_at?;
+                // Retention counts from the invocation when the message is
+                // older than it, so a redriven event is not stored already
+                // expired; that is at most the function timeout past now.
+                Some(Delivery {
+                    at,
+                    retain_from: at.max(ends_by),
+                })
+            }
+        }
+    }
+}
+
+/// When a direct invocation ends: the runtime's deadline for it.
+pub(crate) fn invocation_deadline(context: &lambda_http::Context) -> Timestamp {
+    i64::try_from(context.deadline)
+        .ok()
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+        .unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// `timeEpoch` as an instant. `None` for zero, which is what the field
@@ -114,6 +156,33 @@ mod tests {
         let Ok(RequestTime(at)) = RequestTime::from_request_parts(&mut parts, &()).await;
 
         assert_eq!(time::format(at), "2025-08-04T00:00:00.250Z");
+    }
+
+    #[test]
+    fn a_request_is_dated_and_aged_by_its_own_time() {
+        let at = time::parse_rfc3339("2026-08-04T00:00:00Z").unwrap();
+        let envelope = time::parse_rfc3339("2026-08-03T00:00:00Z");
+        assert_eq!(
+            Arrival::Request(at).delivery(envelope),
+            Some(Delivery::at(at))
+        );
+        assert_eq!(Arrival::Request(at).delivery(None), Some(Delivery::at(at)));
+    }
+
+    #[test]
+    fn a_direct_invoke_is_dated_by_the_envelope_and_aged_from_the_invocation() {
+        let published = time::parse_rfc3339("2026-08-03T00:00:00Z").unwrap();
+        let ends_by = time::parse_rfc3339("2026-09-10T00:00:30Z").unwrap();
+        // A message redriven weeks after it was published keeps its date but
+        // not its age.
+        assert_eq!(
+            Arrival::Invoke { ends_by }.delivery(Some(published)),
+            Some(Delivery {
+                at: published,
+                retain_from: ends_by,
+            })
+        );
+        assert_eq!(Arrival::Invoke { ends_by }.delivery(None), None);
     }
 
     #[test]

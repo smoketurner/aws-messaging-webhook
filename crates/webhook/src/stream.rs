@@ -38,6 +38,7 @@
 use axum::body::Bytes;
 use mailbox::content::MessageContent;
 use mailbox::labels;
+use mailbox::time::{self, Timestamp};
 use serde::{Deserialize, Deserializer};
 use serde_dynamo::{AttributeValue, Item};
 use serde_json::{Value, json};
@@ -289,9 +290,11 @@ async fn publish_record<B: Backend>(state: &AppState<B>, image: &Item) -> RelayO
         source: event.family(),
         detail_type: event.detail_type().to_owned(),
         topic_arn: envelope.topic_arn.clone(),
+        // Always written with the item; an item somehow lacking it still
+        // publishes, dated at the epoch rather than not at all.
         received_at: image_str(image, "received_at")
-            .unwrap_or_default()
-            .to_owned(),
+            .and_then(time::parse_rfc3339)
+            .unwrap_or(Timestamp::UNIX_EPOCH),
         // TTLs are irrelevant to publishing; the stored item owns them.
         expires_at: 0,
         aggregate_expires_at: 0,

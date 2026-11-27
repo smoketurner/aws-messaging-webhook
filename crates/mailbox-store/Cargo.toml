@@ -10,7 +10,7 @@ publish = false
 readme = "README.md"
 
 [features]
-memory = ["mailbox/test-fixtures"]
+memory = []
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
